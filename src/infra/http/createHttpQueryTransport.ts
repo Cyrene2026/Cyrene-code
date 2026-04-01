@@ -1,34 +1,103 @@
-import axios from "axios";
 import { z } from "zod";
 import type { QueryTransport } from "../../core/query/transport";
 
 const envSchema = z.object({
-  QUERY_BASE_URL: z.string().url().optional(),
+  CYRENE_BASE_URL: z.string().url().optional(),
+  CYRENE_API_KEY: z.string().min(1).optional(),
+  CYRENE_MODEL: z.string().min(1).optional(),
 });
 
-const responseSchema = z.object({
-  streamUrl: z.string().url(),
-});
-
-const parseSseEventData = (rawEvent: string): string | null => {
+const parseSseEventData = (rawEvent: string): string[] => {
   const lines = rawEvent.split("\n");
-  const dataLines = lines
+  return lines
     .filter(line => line.startsWith("data:"))
     .map(line => line.replace(/^data:\s?/, ""));
-
-  if (dataLines.length === 0) {
-    return null;
-  }
-
-  return dataLines.join("\n");
 };
 
-async function* streamSse(streamUrl: string): AsyncGenerator<string> {
-  const response = await fetch(streamUrl, {
-    method: "GET",
+const normalizeBaseUrl = (url: string) => url.replace(/\/+$/, "");
+const resolveChatCompletionsUrl = (baseUrl: string) => {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.endsWith("/chat/completions")) {
+    return normalized;
+  }
+  if (normalized.endsWith("/v1")) {
+    return `${normalized}/chat/completions`;
+  }
+  return `${normalized}/v1/chat/completions`;
+};
+const DONE_EVENT = JSON.stringify({ type: "done" });
+
+const normalizeOpenAIEvent = (data: string): string[] => {
+  if (data === "[DONE]") {
+    return [DONE_EVENT];
+  }
+
+  try {
+    const parsed = JSON.parse(data) as {
+      choices?: Array<{
+        delta?: {
+          content?: string;
+          tool_calls?: Array<{
+            function?: { name?: string; arguments?: string };
+          }>;
+        };
+      }>;
+    };
+
+    const choice = parsed.choices?.[0];
+    if (!choice?.delta) {
+      return [];
+    }
+
+    const events: string[] = [];
+
+    if (choice.delta.content) {
+      events.push(
+        JSON.stringify({ type: "text_delta", text: choice.delta.content })
+      );
+    }
+
+    if (choice.delta.tool_calls) {
+      for (const call of choice.delta.tool_calls) {
+        if (!call.function?.name && !call.function?.arguments) {
+          continue;
+        }
+        events.push(
+          JSON.stringify({
+            type: "tool_call",
+            toolName: call.function?.name ?? "unknown_tool",
+            input: {
+              argumentsChunk: call.function?.arguments ?? "",
+            },
+          })
+        );
+      }
+    }
+
+    return events;
+  } catch {
+    return [];
+  }
+};
+
+async function* streamSseOpenAI(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  query: string
+): AsyncGenerator<string> {
+  const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
+    method: "POST",
     headers: {
       Accept: "text/event-stream",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
     },
+    body: JSON.stringify({
+      model,
+      stream: true,
+      messages: [{ role: "user", content: query }],
+    }),
   });
 
   if (!response.ok || !response.body) {
@@ -52,13 +121,16 @@ async function* streamSse(streamUrl: string): AsyncGenerator<string> {
       const rawEvent = buffer.slice(0, splitIndex);
       buffer = buffer.slice(splitIndex + 2);
 
-      const data = parseSseEventData(rawEvent);
-      if (data) {
-        if (data === "[DONE]") {
-          return;
+      const dataLines = parseSseEventData(rawEvent);
+      for (const line of dataLines) {
+        const events = normalizeOpenAIEvent(line);
+        for (const event of events) {
+          if (event === DONE_EVENT) {
+            yield event;
+            return;
+          }
+          yield event;
         }
-
-        yield data;
       }
 
       splitIndex = buffer.indexOf("\n\n");
@@ -66,29 +138,67 @@ async function* streamSse(streamUrl: string): AsyncGenerator<string> {
   }
 
   if (buffer.trim().length > 0) {
-    const data = parseSseEventData(buffer);
-    if (data && data !== "[DONE]") {
-      yield data;
+    const dataLines = parseSseEventData(buffer);
+    for (const line of dataLines) {
+      const events = normalizeOpenAIEvent(line);
+      for (const event of events) {
+        yield event;
+      }
     }
   }
+
+  yield JSON.stringify({ type: "done" });
 }
 
 export const createHttpQueryTransport = (): QueryTransport => {
   const env = envSchema.safeParse({
-    QUERY_BASE_URL: process.env.QUERY_BASE_URL,
+    CYRENE_BASE_URL: process.env.CYRENE_BASE_URL,
+    CYRENE_API_KEY: process.env.CYRENE_API_KEY,
+    CYRENE_MODEL: process.env.CYRENE_MODEL,
   });
 
-  const baseURL = env.success
-    ? env.data.QUERY_BASE_URL ?? "https://example.invalid"
-    : "https://example.invalid";
-
-  const client = axios.create({ baseURL });
+  const baseUrl = env.success ? env.data.CYRENE_BASE_URL : undefined;
+  const apiKey = env.success ? env.data.CYRENE_API_KEY : undefined;
+  let currentModel = env.success
+    ? env.data.CYRENE_MODEL ?? "gpt-4o-mini"
+    : "gpt-4o-mini";
+  const sessionQueries = new Map<string, string>();
 
   return {
-    requestStreamUrl: async (query: string) => {
-      const response = await client.post("/query", { query });
-      return responseSchema.parse(response.data).streamUrl;
+    getModel: () => currentModel,
+    setModel: (model: string) => {
+      const next = model.trim();
+      if (next) {
+        currentModel = next;
+      }
     },
-    stream: (streamUrl: string) => streamSse(streamUrl),
+    requestStreamUrl: async (query: string) => {
+      if (!baseUrl || !apiKey) {
+        throw new Error(
+          "Missing CYRENE_BASE_URL or CYRENE_API_KEY for HTTP transport."
+        );
+      }
+      const sessionId = crypto.randomUUID();
+      sessionQueries.set(sessionId, query);
+      return `openai://${sessionId}`;
+    },
+    stream: async function* (streamUrl: string) {
+      const sessionId = streamUrl.replace("openai://", "");
+      const query = sessionQueries.get(sessionId);
+      sessionQueries.delete(sessionId);
+
+      if (!query || !baseUrl || !apiKey) {
+        throw new Error("Invalid HTTP stream session.");
+      }
+
+      for await (const event of streamSseOpenAI(
+        baseUrl,
+        apiKey,
+        currentModel,
+        query
+      )) {
+        yield event;
+      }
+    },
   };
 };

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { runQuerySession } from "../../core/query/runQuerySession";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
 import { compressContext } from "../../core/session/contextCompression";
@@ -13,9 +13,14 @@ import { createApprovalActionLock } from "./approvalActionLock";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import { useInputAdapter } from "./inputAdapter";
 import {
+  canRetryBlockedApproval,
   clampPreviewOffset,
+  clearApprovalBlockOnSelectionChange,
+  computeNextApprovalSelection,
   cycleSelection,
   movePagedSelection,
+  shouldKeepApprovalPanelOpen,
+  shouldBlockRepeatedApproval,
 } from "./chatStateHelpers";
 
 type UseChatAppParams = {
@@ -50,6 +55,7 @@ type ModelPickerState = {
 };
 
 type ApprovalPreviewMode = "summary" | "full";
+type ApprovalActionKind = "approve" | "reject";
 
 type ApprovalPanelState = {
   active: boolean;
@@ -57,6 +63,10 @@ type ApprovalPanelState = {
   previewMode: ApprovalPreviewMode;
   previewOffset: number;
   lastOpenedAt: string | null;
+  blockedItemId: string | null;
+  blockedReason: string | null;
+  blockedAt: number | null;
+  lastAction: ApprovalActionKind | null;
 };
 
 const defaultSystemText =
@@ -159,6 +169,12 @@ const getApprovalPreviewText = (
   return mode === "full" ? item.previewFull : item.previewSummary;
 };
 
+const getPendingQueueSignature = (pending: PendingReviewItem[]) =>
+  pending.map(item => item.id).join("|");
+
+const HOTKEY_REPEAT_COOLDOWN_MS = 900;
+const APPROVAL_BLOCK_RETRY_MS = 1500;
+
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -209,13 +225,26 @@ export const useChatApp = ({
     previewMode: "summary",
     previewOffset: 0,
     lastOpenedAt: null,
+    blockedItemId: null,
+    blockedReason: null,
+    blockedAt: null,
+    lastAction: null,
   });
 
   const queueRef = useRef(Promise.resolve());
   const approvalActionRef = useRef(createApprovalActionLock());
+  const resumePickerRef = useRef(resumePicker);
+  const sessionsPanelRef = useRef(sessionsPanel);
+  const modelPickerRef = useRef(modelPicker);
   const approvalPanelRef = useRef(approvalPanel);
   const pendingReviewsRef = useRef(pendingReviews);
+  const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
+  const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
+  const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
 
+  resumePickerRef.current = resumePicker;
+  sessionsPanelRef.current = sessionsPanel;
+  modelPickerRef.current = modelPicker;
   approvalPanelRef.current = approvalPanel;
   pendingReviewsRef.current = pendingReviews;
 
@@ -285,6 +314,44 @@ export const useChatApp = ({
       });
       return next;
     });
+  };
+
+  const isRepeatedApprovalInteraction = (
+    ref: { current: { token: string; at: number } | null },
+    token: string,
+    cooldownMs = HOTKEY_REPEAT_COOLDOWN_MS
+  ) => {
+    const now = Date.now();
+    const last = ref.current;
+    if (last && last.token === token && now - last.at < cooldownMs) {
+      return true;
+    }
+    ref.current = { token, at: now };
+    return false;
+  };
+
+  const clearApprovalBlock = (
+    state: ApprovalPanelState
+  ): ApprovalPanelState => ({
+    ...state,
+    blockedItemId: null,
+    blockedReason: null,
+    blockedAt: null,
+    lastAction: null,
+  });
+
+  const syncApprovalBlockToQueue = (
+    state: ApprovalPanelState,
+    pending: PendingReviewItem[]
+  ): ApprovalPanelState => {
+    if (
+      !state.blockedItemId ||
+      pending.some(item => item.id === state.blockedItemId)
+    ) {
+      return state;
+    }
+
+    return clearApprovalBlock(state);
   };
 
   const ensureActiveSession = async (titleHint?: string) => {
@@ -369,30 +436,36 @@ export const useChatApp = ({
   };
 
   const closeModelPicker = () => {
-    setModelPicker({
+    const nextState = {
       active: false,
       models: [],
       selectedIndex: 0,
       pageSize: MODEL_PAGE_SIZE,
-    });
+    };
+    modelPickerRef.current = nextState;
+    setModelPicker(nextState);
   };
 
   const closeResumePicker = () => {
-    setResumePicker({
+    const nextState = {
       active: false,
       sessions: [],
       selectedIndex: 0,
       pageSize: RESUME_PAGE_SIZE,
-    });
+    };
+    resumePickerRef.current = nextState;
+    setResumePicker(nextState);
   };
 
   const closeSessionsPanel = () => {
-    setSessionsPanel({
+    const nextState = {
       active: false,
       sessions: [],
       selectedIndex: 0,
       pageSize: RESUME_PAGE_SIZE,
-    });
+    };
+    sessionsPanelRef.current = nextState;
+    setSessionsPanel(nextState);
   };
 
   const closeAllOverlayPanels = (options?: {
@@ -411,6 +484,14 @@ export const useChatApp = ({
       closeSessionsPanel();
     }
     if (!options?.keepApproval) {
+      dismissedApprovalQueueSignatureRef.current = getPendingQueueSignature(
+        pendingReviewsRef.current
+      );
+      approvalPanelRef.current = {
+        ...approvalPanelRef.current,
+        active: false,
+        previewOffset: 0,
+      };
       setApprovalPanel(previous => ({
         ...previous,
         active: false,
@@ -491,6 +572,91 @@ export const useChatApp = ({
     });
   };
 
+  const createNextApprovalPanelState = (
+    nextPending: PendingReviewItem[],
+    options?: {
+      open?: boolean;
+      focusLatest?: boolean;
+      selectId?: string;
+      selectedIndex?: number;
+      previewMode?: ApprovalPreviewMode;
+      clearBlocked?: boolean;
+      blocked?: {
+        itemId: string;
+        reason: string;
+        at: number;
+        lastAction: ApprovalActionKind;
+      } | null;
+    }
+  ): ApprovalPanelState => {
+    const previous = approvalPanelRef.current;
+
+    if (nextPending.length === 0) {
+      return {
+        active: false,
+        selectedIndex: 0,
+        previewMode: options?.previewMode ?? previous.previewMode,
+        previewOffset: 0,
+        lastOpenedAt: previous.lastOpenedAt,
+        blockedItemId: null,
+        blockedReason: null,
+        blockedAt: null,
+        lastAction: null,
+      };
+    }
+
+    let nextIndex = previous.selectedIndex;
+    if (typeof options?.selectedIndex === "number") {
+      nextIndex = options.selectedIndex;
+    } else if (options?.selectId) {
+      const matchedIndex = nextPending.findIndex(item => item.id === options.selectId);
+      if (matchedIndex >= 0) {
+        nextIndex = matchedIndex;
+      }
+    } else if (options?.focusLatest) {
+      nextIndex = nextPending.length - 1;
+    }
+
+    const boundedIndex = computeNextApprovalSelection(nextIndex, nextPending.length);
+    const nextPreviewMode = options?.previewMode ?? previous.previewMode;
+    const selectedItem = nextPending[boundedIndex];
+    const selectedPreview = getApprovalPreviewText(selectedItem, nextPreviewMode);
+    const previewOffset =
+      options?.previewMode && options.previewMode !== previous.previewMode
+        ? 0
+        : boundedIndex !== previous.selectedIndex
+          ? 0
+          : clampPreviewOffset(selectedPreview, previous.previewOffset);
+    const nextActive = options?.open ?? previous.active;
+    let nextState: ApprovalPanelState = {
+      active: nextActive,
+      selectedIndex: boundedIndex,
+      previewMode: nextPreviewMode,
+      previewOffset,
+      lastOpenedAt: nextActive ? new Date().toISOString() : previous.lastOpenedAt,
+      blockedItemId: previous.blockedItemId,
+      blockedReason: previous.blockedReason,
+      blockedAt: previous.blockedAt,
+      lastAction: previous.lastAction,
+    };
+
+    if (options?.clearBlocked) {
+      nextState = clearApprovalBlock(nextState);
+    } else if (options?.blocked) {
+      nextState = {
+        ...nextState,
+        blockedItemId: options.blocked.itemId,
+        blockedReason: options.blocked.reason,
+        blockedAt: options.blocked.at,
+        lastAction: options.blocked.lastAction,
+      };
+    } else if (boundedIndex !== previous.selectedIndex) {
+      nextState = clearApprovalBlock(nextState);
+    }
+
+    return syncApprovalBlockToQueue(nextState, nextPending);
+  };
+
   const updatePendingState = (
     nextPending: PendingReviewItem[],
     options?: {
@@ -499,58 +665,38 @@ export const useChatApp = ({
       selectId?: string;
       selectedIndex?: number;
       previewMode?: ApprovalPreviewMode;
+      clearBlocked?: boolean;
+      blocked?: {
+        itemId: string;
+        reason: string;
+        at: number;
+        lastAction: ApprovalActionKind;
+      } | null;
     }
   ) => {
+    pendingReviewsRef.current = nextPending;
+    if (nextPending.length === 0) {
+      dismissedApprovalQueueSignatureRef.current = null;
+    }
+    const nextPanelState = createNextApprovalPanelState(nextPending, options);
+    approvalPanelRef.current = nextPanelState;
     setPendingReviews(nextPending);
-    setApprovalPanel(previous => {
-      if (nextPending.length === 0) {
-        return {
-          active: false,
-          selectedIndex: 0,
-          previewMode: options?.previewMode ?? previous.previewMode,
-          previewOffset: 0,
-          lastOpenedAt: previous.lastOpenedAt,
-        };
-      }
-
-      let nextIndex = previous.selectedIndex;
-      if (typeof options?.selectedIndex === "number") {
-        nextIndex = options.selectedIndex;
-      } else if (options?.selectId) {
-        const matchedIndex = nextPending.findIndex(
-          item => item.id === options.selectId
-        );
-        if (matchedIndex >= 0) {
-          nextIndex = matchedIndex;
-        }
-      } else if (options?.focusLatest) {
-        nextIndex = nextPending.length - 1;
-      }
-
-      const boundedIndex = Math.max(0, Math.min(nextIndex, nextPending.length - 1));
-      const nextActive = options?.open ?? previous.active;
-      const nextPreviewMode = options?.previewMode ?? previous.previewMode;
-      const selectedItem = nextPending[boundedIndex];
-      const selectedPreview = getApprovalPreviewText(selectedItem, nextPreviewMode);
-
-      return {
-        active: nextActive,
-        selectedIndex: boundedIndex,
-        previewMode: nextPreviewMode,
-        previewOffset:
-          options?.previewMode && options.previewMode !== previous.previewMode
-            ? 0
-            : boundedIndex !== previous.selectedIndex
-              ? 0
-              : clampPreviewOffset(selectedPreview, previous.previewOffset),
-        lastOpenedAt: nextActive
-          ? new Date().toISOString()
-          : previous.lastOpenedAt,
-      };
-    });
+    setApprovalPanel(nextPanelState);
   };
 
-  const closeApprovalPanel = () => {
+  const closeApprovalPanel = (options?: { suppressCurrentQueue?: boolean }) => {
+    lastApprovalIntentRef.current = null;
+    lastApprovalHintRef.current = null;
+    if (options?.suppressCurrentQueue) {
+      dismissedApprovalQueueSignatureRef.current = getPendingQueueSignature(
+        pendingReviewsRef.current
+      );
+    }
+    approvalPanelRef.current = {
+      ...approvalPanelRef.current,
+      active: false,
+      previewOffset: 0,
+    };
     setApprovalPanel(previous => ({
       ...previous,
       active: false,
@@ -567,6 +713,9 @@ export const useChatApp = ({
       previewMode?: ApprovalPreviewMode;
     }
   ) => {
+    lastApprovalIntentRef.current = null;
+    lastApprovalHintRef.current = null;
+    dismissedApprovalQueueSignatureRef.current = null;
     closeAllOverlayPanels({ keepApproval: true });
     updatePendingState(nextPending, {
       ...options,
@@ -574,7 +723,47 @@ export const useChatApp = ({
     });
   };
 
+  const syncApprovalPanelState = (
+    updater: (previous: ApprovalPanelState) => ApprovalPanelState
+  ) => {
+    const nextState = updater(approvalPanelRef.current);
+    approvalPanelRef.current = nextState;
+    setApprovalPanel(nextState);
+  };
+
+  useEffect(() => {
+    if (pendingReviews.length === 0 || approvalPanelRef.current.active) {
+      return;
+    }
+
+    const queueSignature = getPendingQueueSignature(pendingReviews);
+    if (dismissedApprovalQueueSignatureRef.current === queueSignature) {
+      return;
+    }
+
+    syncApprovalPanelState(previous => ({
+      ...createNextApprovalPanelState(pendingReviews, {
+        open: true,
+        selectedIndex: previous.selectedIndex,
+        previewMode: previous.previewMode,
+      }),
+      lastOpenedAt: new Date().toISOString(),
+    }));
+  }, [approvalPanel.active, pendingReviews]);
+
+  const isBlockedApprovalAttempt = (id: string, now = Date.now()) =>
+    shouldBlockRepeatedApproval(
+      approvalPanelRef.current.blockedItemId,
+      id,
+      approvalPanelRef.current.blockedAt,
+      now,
+      APPROVAL_BLOCK_RETRY_MS
+    );
+
   const approvePendingReview = (id: string) => {
+    if (isBlockedApprovalAttempt(id)) {
+      return;
+    }
     if (!approvalActionRef.current.acquire(`approve:${id}`)) {
       return;
     }
@@ -582,18 +771,22 @@ export const useChatApp = ({
       try {
         const before = mcpService.listPending();
         const target = before.find(item => item.id === id);
-        const currentIndex = Math.max(
-          0,
-          before.findIndex(item => item.id === id)
+        const currentIndex = computeNextApprovalSelection(
+          before.findIndex(item => item.id === id),
+          before.length
         );
         const result = await mcpService.approve(id);
         const nextPending = mcpService.listPending();
-        updatePendingState(nextPending, {
-          open: approvalPanelRef.current.active && nextPending.length > 0,
-          selectedIndex: Math.min(currentIndex, Math.max(0, nextPending.length - 1)),
-        });
 
         if (!target) {
+          updatePendingState(nextPending, {
+            open: shouldKeepApprovalPanelOpen(
+              nextPending.length,
+              approvalPanelRef.current.active
+            ),
+            selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
+            clearBlocked: true,
+          });
           pushSystemMessage(buildApprovalMessage("Approval error", undefined, [result.message]), {
             kind: "error",
             tone: "danger",
@@ -603,6 +796,19 @@ export const useChatApp = ({
         }
 
         if (!result.ok) {
+          updatePendingState(nextPending, {
+            open: shouldKeepApprovalPanelOpen(
+              nextPending.length,
+              approvalPanelRef.current.active
+            ),
+            selectedIndex: currentIndex,
+            blocked: {
+              itemId: target.id,
+              reason: extractMessageBody(result.message) || result.message,
+              at: Date.now(),
+              lastAction: "approve",
+            },
+          });
           pushSystemMessage(
             buildApprovalMessage("Approval error", target, [
               extractMessageBody(result.message) || result.message,
@@ -615,6 +821,15 @@ export const useChatApp = ({
           );
           return;
         }
+
+        updatePendingState(nextPending, {
+          open: shouldKeepApprovalPanelOpen(
+            nextPending.length,
+            approvalPanelRef.current.active
+          ),
+          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
+          clearBlocked: true,
+        });
 
         const output = extractMessageBody(result.message);
         pushSystemMessage(
@@ -639,18 +854,21 @@ export const useChatApp = ({
       try {
         const before = mcpService.listPending();
         const target = before.find(item => item.id === id);
-        const currentIndex = Math.max(
-          0,
-          before.findIndex(item => item.id === id)
+        const currentIndex = computeNextApprovalSelection(
+          before.findIndex(item => item.id === id),
+          before.length
         );
         const result = mcpService.reject(id);
         const nextPending = mcpService.listPending();
-        updatePendingState(nextPending, {
-          open: approvalPanelRef.current.active && nextPending.length > 0,
-          selectedIndex: Math.min(currentIndex, Math.max(0, nextPending.length - 1)),
-        });
 
         if (!target || !result.ok) {
+          updatePendingState(nextPending, {
+            open: shouldKeepApprovalPanelOpen(
+              nextPending.length,
+              approvalPanelRef.current.active
+            ),
+            selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
+          });
           pushSystemMessage(
             buildApprovalMessage(
               "Approval error",
@@ -665,6 +883,15 @@ export const useChatApp = ({
           );
           return;
         }
+
+        updatePendingState(nextPending, {
+          open: shouldKeepApprovalPanelOpen(
+            nextPending.length,
+            approvalPanelRef.current.active
+          ),
+          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
+          clearBlocked: true,
+        });
 
         pushSystemMessage(buildApprovalMessage("Rejected", target), {
           kind: "review_status",
@@ -691,6 +918,26 @@ export const useChatApp = ({
     if (approvalActionRef.current.isLocked()) {
       return;
     }
+    const now = Date.now();
+    if (
+      !canRetryBlockedApproval(
+        approvalPanelRef.current.blockedItemId,
+        target.id,
+        approvalPanelRef.current.blockedAt,
+        now,
+        APPROVAL_BLOCK_RETRY_MS
+      )
+    ) {
+      return;
+    }
+    if (
+      isRepeatedApprovalInteraction(
+        lastApprovalIntentRef,
+        `approve:${target.id}:${approvalPanelRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     pushSystemMessage(`Approving ${target.id}...`, {
       kind: "system_hint",
       tone: "info",
@@ -713,6 +960,14 @@ export const useChatApp = ({
     if (approvalActionRef.current.isLocked()) {
       return;
     }
+    if (
+      isRepeatedApprovalInteraction(
+        lastApprovalIntentRef,
+        `reject:${target.id}:${approvalPanelRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     pushSystemMessage(`Rejecting ${target.id}...`, {
       kind: "system_hint",
       tone: "info",
@@ -722,7 +977,7 @@ export const useChatApp = ({
   };
 
   useInputAdapter((inputValue, key) => {
-    if (modelPicker.active) {
+    if (modelPickerRef.current.active) {
       if (key.escape) {
         closeModelPicker();
         pushSystemMessage("Model picker closed.");
@@ -778,7 +1033,7 @@ export const useChatApp = ({
       return;
     }
 
-    if (resumePicker.active) {
+    if (resumePickerRef.current.active) {
       if (key.escape) {
         closeResumePicker();
         pushSystemMessage("Resume picker closed.");
@@ -834,7 +1089,7 @@ export const useChatApp = ({
       return;
     }
 
-    if (sessionsPanel.active) {
+    if (sessionsPanelRef.current.active) {
       if (key.escape) {
         closeSessionsPanel();
         pushSystemMessage("Sessions panel closed.");
@@ -890,53 +1145,66 @@ export const useChatApp = ({
       return;
     }
 
-    if (!approvalPanel.active) {
+    if (!approvalPanelRef.current.active) {
       return;
     }
 
-    if (pendingReviews.length === 0) {
+    if (pendingReviewsRef.current.length === 0) {
       closeApprovalPanel();
       return;
     }
 
-    if (key.escape) {
-      closeApprovalPanel();
-      pushSystemMessage("Approval panel closed.", {
-        kind: "system_hint",
-        tone: "neutral",
+      if (key.escape) {
+        closeApprovalPanel({ suppressCurrentQueue: true });
+        pushSystemMessage("Approval panel closed.", {
+          kind: "system_hint",
+          tone: "neutral",
         color: "gray",
       });
       return;
     }
 
     if (key.upArrow) {
-      setApprovalPanel(previous => ({
-        ...previous,
-        selectedIndex: cycleSelection(
+      lastApprovalIntentRef.current = null;
+      syncApprovalPanelState(previous => {
+        const nextSelectedIndex = cycleSelection(
           previous.selectedIndex,
-          pendingReviews.length,
+          pendingReviewsRef.current.length,
           "up"
-        ),
-        previewOffset: 0,
-      }));
+        );
+        return clearApprovalBlockOnSelectionChange(
+          {
+            ...previous,
+            previewOffset: 0,
+          },
+          nextSelectedIndex
+        );
+      });
       return;
     }
 
     if (key.downArrow) {
-      setApprovalPanel(previous => ({
-        ...previous,
-        selectedIndex: cycleSelection(
+      lastApprovalIntentRef.current = null;
+      syncApprovalPanelState(previous => {
+        const nextSelectedIndex = cycleSelection(
           previous.selectedIndex,
-          pendingReviews.length,
+          pendingReviewsRef.current.length,
           "down"
-        ),
-        previewOffset: 0,
-      }));
+        );
+        return clearApprovalBlockOnSelectionChange(
+          {
+            ...previous,
+            previewOffset: 0,
+          },
+          nextSelectedIndex
+        );
+      });
       return;
     }
 
     if (key.tab) {
-      setApprovalPanel(previous => ({
+      lastApprovalIntentRef.current = null;
+      syncApprovalPanelState(previous => ({
         ...previous,
         previewMode: previous.previewMode === "summary" ? "full" : "summary",
         previewOffset: 0,
@@ -945,7 +1213,8 @@ export const useChatApp = ({
     }
 
     if (key.pageDown || inputValue.toLowerCase() === "j") {
-      setApprovalPanel(previous => ({
+      lastApprovalIntentRef.current = null;
+      syncApprovalPanelState(previous => ({
         ...previous,
         previewOffset: clampPreviewOffset(
           getApprovalPreviewText(
@@ -959,7 +1228,8 @@ export const useChatApp = ({
     }
 
     if (key.pageUp || inputValue.toLowerCase() === "k") {
-      setApprovalPanel(previous => ({
+      lastApprovalIntentRef.current = null;
+      syncApprovalPanelState(previous => ({
         ...previous,
         previewOffset: clampPreviewOffset(
           getApprovalPreviewText(
@@ -978,6 +1248,11 @@ export const useChatApp = ({
     }
 
     if (key.return) {
+      const selected = pendingReviewsRef.current[approvalPanelRef.current.selectedIndex];
+      const token = `enter-hint:${selected?.id ?? "none"}:${approvalPanelRef.current.selectedIndex}`;
+      if (isRepeatedApprovalInteraction(lastApprovalHintRef, token, 1500)) {
+        return;
+      }
       pushSystemMessage(
         "Approval panel uses a to approve and r to reject. Enter is disabled to avoid accidental approval.",
         {
@@ -989,7 +1264,7 @@ export const useChatApp = ({
       return;
     }
 
-    if (inputValue.toLowerCase() === "r") {
+    if (inputValue.toLowerCase() === "r" || inputValue.toLowerCase() === "d") {
       rejectCurrentPendingReview();
     }
   });
@@ -1046,19 +1321,21 @@ export const useChatApp = ({
     if (query === "/model") {
       enqueueTask(async () => {
         const models = await transport.listModels();
-        if (models.length === 0) {
+      if (models.length === 0) {
           pushSystemMessage("No models available. Try /model refresh.");
           return;
         }
         const current = transport.getModel();
         const selectedIndex = Math.max(0, models.indexOf(current));
         closeAllOverlayPanels({ keepModelPicker: true });
-        setModelPicker({
+        const nextState = {
           active: true,
           models,
           selectedIndex,
           pageSize: MODEL_PAGE_SIZE,
-        });
+        };
+        modelPickerRef.current = nextState;
+        setModelPicker(nextState);
         pushSystemMessage(
           "Model picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
         );
@@ -1156,12 +1433,14 @@ export const useChatApp = ({
           pushSystemMessage("No sessions yet.");
         } else {
           closeAllOverlayPanels({ keepSessionsPanel: true });
-          setSessionsPanel({
+          const nextState = {
             active: true,
             sessions,
             selectedIndex: 0,
             pageSize: RESUME_PAGE_SIZE,
-          });
+          };
+          sessionsPanelRef.current = nextState;
+          setSessionsPanel(nextState);
           pushSystemMessage(
             "Sessions panel opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
             { kind: "system_hint", tone: "info", color: "cyan" }
@@ -1171,30 +1450,30 @@ export const useChatApp = ({
         return;
       }
 
-      if (query === "/review") {
-        const pending = mcpService.listPending();
-        if (pending.length === 0) {
-          pushSystemMessage(
-            "No pending operations.",
+        if (query === "/review") {
+          const pending = mcpService.listPending();
+          if (pending.length === 0) {
+            pushSystemMessage(
+              "No pending operations.",
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
-        } else {
-          openApprovalPanel(pending, {
-            focusLatest: true,
-            previewMode: "summary",
-          });
-          pushSystemMessage(
-            buildApprovalMessage("Approval required", undefined, [
-              `pending: ${pending.length}`,
-              "panel: opened",
-              "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
-            ]),
-            { kind: "review_status", tone: "warning", color: "yellow" }
-          );
+          } else {
+            pushSystemMessage(
+              buildApprovalMessage("Approval required", undefined, [
+                `pending: ${pending.length}`,
+                "panel: opened",
+                "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
+              ]),
+              { kind: "review_status", tone: "warning", color: "yellow" }
+            );
+            openApprovalPanel(pending, {
+              focusLatest: true,
+              previewMode: "summary",
+            });
+          }
+          setInput("");
+          return;
         }
-        setInput("");
-        return;
-      }
 
       if (query.startsWith("/review ")) {
         const id = query.slice("/review ".length).trim();
@@ -1218,10 +1497,6 @@ export const useChatApp = ({
           return;
         }
 
-        openApprovalPanel(pending, {
-          selectId: target.id,
-          previewMode: "full",
-        });
         pushSystemMessage(
           buildApprovalMessage("Approval required", target, [
             "panel: opened",
@@ -1229,6 +1504,10 @@ export const useChatApp = ({
           ]),
           { kind: "review_status", tone: "warning", color: "yellow" }
         );
+        openApprovalPanel(pending, {
+          selectId: target.id,
+          previewMode: "full",
+        });
         setInput("");
         return;
       }
@@ -1413,12 +1692,14 @@ export const useChatApp = ({
           pushSystemMessage("No sessions to resume.");
         } else {
           closeAllOverlayPanels({ keepResumePicker: true });
-          setResumePicker({
+          const nextState = {
             active: true,
             sessions,
             selectedIndex: 0,
             pageSize: RESUME_PAGE_SIZE,
-          });
+          };
+          resumePickerRef.current = nextState;
+          setResumePicker(nextState);
           pushSystemMessage(
             "Resume picker opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
             { kind: "system_hint", tone: "info", color: "cyan" }
@@ -1486,10 +1767,6 @@ export const useChatApp = ({
         onToolCall: async (toolName, toolInput) => {
           const result = await mcpService.handleToolCall(toolName, toolInput);
           if (result.pending) {
-            openApprovalPanel(mcpService.listPending(), {
-              focusLatest: true,
-              previewMode: "summary",
-            });
             const reviewMode = isHighRiskReviewAction(result.pending.request.action)
               ? "block"
               : "queue";
@@ -1501,6 +1778,10 @@ export const useChatApp = ({
                 color: reviewMode === "block" ? "red" : "yellow",
               }
             );
+            openApprovalPanel(mcpService.listPending(), {
+              focusLatest: true,
+              previewMode: "summary",
+            });
             return {
               message: `Approval required ${result.pending.id} | ${result.pending.request.action} | ${result.pending.request.path}`,
               reviewMode,
@@ -1557,7 +1838,7 @@ export const useChatApp = ({
     approvalPanel,
     activeSessionId,
     currentModel: transport.getModel(),
-    closeApprovalPanel,
+    closeApprovalPanel: () => closeApprovalPanel({ suppressCurrentQueue: true }),
     openApprovalPanel,
     approveCurrentPendingReview,
     rejectCurrentPendingReview,

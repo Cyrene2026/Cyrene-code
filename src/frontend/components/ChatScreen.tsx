@@ -34,6 +34,10 @@ type ChatScreenProps = {
     previewMode: "summary" | "full";
     previewOffset: number;
     lastOpenedAt: string | null;
+    blockedItemId: string | null;
+    blockedReason: string | null;
+    blockedAt: number | null;
+    lastAction: "approve" | "reject" | null;
   };
   activeSessionId: string | null;
   currentModel: string;
@@ -482,6 +486,8 @@ const renderApprovalPanel = (
     return null;
   }
 
+  const selectedBlocked = approvalPanel.blockedItemId === selectedPending.id;
+  const blockedReason = approvalPanel.blockedReason?.trim() ?? "";
   const previewSource =
     approvalPanel.previewMode === "full"
       ? selectedPending.previewFull
@@ -507,7 +513,7 @@ const renderApprovalPanel = (
           Code Approval
         </Text>
         <Text dimColor>
-          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
+          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${selectedBlocked ? "blocked" : "ready"}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
         </Text>
       </Box>
 
@@ -515,12 +521,23 @@ const renderApprovalPanel = (
         {`current ${selectedPending.id}  |  ${selectedPending.request.action}  |  ${selectedPending.request.path}`}
       </Text>
       <Text dimColor>{selectedPending.createdAt}</Text>
+      {selectedBlocked ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="red">
+            {`Last error: ${shortenValue(blockedReason || "approval failed", 120)}`}
+          </Text>
+          <Text dimColor>
+            approve blocked for current item  |  ↑/↓ switch  |  r/d reject  |  a retry after cooldown
+          </Text>
+        </Box>
+      ) : null}
 
       <Box marginTop={1} marginBottom={1} flexDirection="column">
         {queueItems.map((item, localIndex) => {
           const index = queueStart + localIndex;
           const selected = index === approvalPanel.selectedIndex;
           const tone = getActionTone(item.request.action);
+          const blocked = approvalPanel.blockedItemId === item.id;
           return (
             <Text key={`review-list-${item.id}`} color={selected ? "white" : "gray"}>
               <Text color={selected ? "black" : tone.badgeBg} backgroundColor={selected ? "white" : undefined}>
@@ -532,6 +549,14 @@ const renderApprovalPanel = (
               </Text>
               <Text> </Text>
               {shortenValue(item.request.path, 72)}
+              {blocked ? (
+                <>
+                  <Text> </Text>
+                  <Text color="black" backgroundColor="red">
+                    {" blocked "}
+                  </Text>
+                </>
+              ) : null}
             </Text>
           );
         })}
@@ -548,7 +573,7 @@ const renderApprovalPanel = (
       </Box>
 
       <Text dimColor>
-        Up/Down: select  Tab: summary/full  j/k or PgUp/PgDn: scroll  a: approve  r: reject  Esc: close
+        Up/Down: select  Tab: summary/full  j/k or PgUp/PgDn: scroll  a: approve/retry  r/d: reject  Esc: close
       </Text>
     </Box>
   );

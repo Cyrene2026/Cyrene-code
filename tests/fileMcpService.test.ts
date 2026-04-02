@@ -204,7 +204,7 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("v24.14.0");
   });
 
-  test("run_command rejects command outside hardcoded allowlist", async () => {
+  test("run_command allows arbitrary command names but still enters review queue", async () => {
     const { service } = await createService();
 
     const result = await service.handleToolCall("shell", {
@@ -212,7 +212,9 @@ describe("FileMcpService", () => {
       args: ["--version"],
     });
 
-    expect(result.ok).toBe(false);
-    expect(result.message).toContain("run_command only allows fixed commands");
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeDefined();
+    expect(result.pending?.request.action).toBe("run_command");
+    expect((result.pending?.request as any).command).toBe("curl");
   });
 });

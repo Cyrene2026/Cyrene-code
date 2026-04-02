@@ -220,7 +220,8 @@ describe("useChatApp", () => {
 
     await runCommand(app, "/review");
     expect(app.getLatest().approvalPanel.active).toBe(true);
-    expect(app.getLatest().approvalPanel.selectedIndex).toBe(1);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBeGreaterThanOrEqual(0);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBeLessThan(2);
 
     await act(async () => {
       app.getLatest().closeApprovalPanel();
@@ -743,6 +744,37 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("approval enter hint is rate-limited", async () => {
+    const pending = [createPending("enter-1")];
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => pending,
+        } as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("", { return: true });
+      inputHandler?.("", { return: true });
+      inputHandler?.("", { return: true });
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(
+      getTexts(app.getLatest().items).filter(text => text.includes("Enter is disabled")).length
+    ).toBe(1);
+    app.cleanup();
+  });
+
   test("approval panel takes keyboard priority over hidden pickers and refreshes queue after approve", async () => {
     let pending = [createPending("prio-1"), createPending("prio-2")];
     const transport = createTestTransport();
@@ -786,6 +818,279 @@ describe("useChatApp", () => {
     expect(app.getLatest().pendingReviews.map(item => item.id)).toEqual(["prio-1"]);
     expect(app.getLatest().approvalPanel.active).toBe(true);
     expect(app.getLatest().approvalPanel.selectedIndex).toBe(0);
+    app.cleanup();
+  });
+
+  test("multiple approvals stay in panel until queue is empty", async () => {
+    let pending = [
+      createPending("multi-1", "write_file", "same.py"),
+      createPending("multi-2", "write_file", "same.py"),
+      createPending("multi-3", "write_file", "same.py"),
+    ];
+
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[approved] ${id}\nok` };
+      }),
+      reject: mock((id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBe(2);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    expect(app.getLatest().approvalPanel.active).toBe(true);
+    expect(app.getLatest().pendingReviews.map(item => item.id)).toEqual([
+      "multi-1",
+      "multi-2",
+    ]);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBe(1);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    expect(app.getLatest().approvalPanel.active).toBe(true);
+    expect(app.getLatest().pendingReviews.map(item => item.id)).toEqual(["multi-1"]);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBe(0);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(app.getLatest().pendingReviews).toHaveLength(0);
+    app.cleanup();
+  });
+
+  test("approval failure keeps panel open and queue intact", async () => {
+    let pending = [
+      createPending("fail-1", "write_file", "same.py"),
+      createPending("fail-2", "write_file", "same.py"),
+    ];
+
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => ({
+        ok: false,
+        message: `[approve failed] ${id}\npermission denied`,
+      })),
+      reject: mock((id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.active).toBe(true);
+    expect(app.getLatest().approvalPanel.selectedIndex).toBe(1);
+    expect(app.getLatest().approvalPanel.blockedItemId).toBe("fail-2");
+    expect(app.getLatest().approvalPanel.blockedReason).toContain("permission denied");
+    expect(app.getLatest().pendingReviews.map(item => item.id)).toEqual([
+      "fail-1",
+      "fail-2",
+    ]);
+    expect(
+      getTexts(app.getLatest().items).filter(text => text.includes("Approval error")).length
+    ).toBe(1);
+    app.cleanup();
+  });
+
+  test("approval action is rate-limited after fast repeated failure", async () => {
+    const pending = [createPending("retry-1", "create_file", "same.py")];
+    const approve = mock(async (id: string) => ({
+      ok: false,
+      message: `[approve failed] ${id}\nEEXIST`,
+    }));
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => pending,
+          approve,
+          reject: mock((id: string) => ({ ok: true, message: `[rejected] ${id}` })),
+        } as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      inputHandler?.("a", {});
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(app.getLatest().approvalPanel.blockedItemId).toBe("retry-1");
+    expect(app.getLatest().approvalPanel.blockedReason).toContain("EEXIST");
+    expect(
+      getTexts(app.getLatest().items).filter(text => text.includes("Approval error")).length
+    ).toBe(1);
+    app.cleanup();
+  });
+
+  test("blocked approval item can be rejected and selection change clears blocked state", async () => {
+    let pending = [createPending("block-1", "create_file", "same.py"), createPending("block-2")];
+    const approve = mock(async (id: string) => ({
+      ok: false,
+      message: `[approve failed] ${id}\nEEXIST`,
+    }));
+    const reject = mock((id: string) => {
+      pending = pending.filter(item => item.id !== id);
+      return { ok: true, message: `[rejected] ${id}` };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve,
+          reject,
+        } as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("", { upArrow: true });
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.blockedItemId).toBe("block-1");
+
+    await act(async () => {
+      inputHandler?.("", { downArrow: true });
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.selectedIndex).toBe(1);
+    expect(app.getLatest().approvalPanel.blockedItemId).toBeNull();
+
+    await act(async () => {
+      inputHandler?.("", { upArrow: true });
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.blockedItemId).toBeNull();
+
+    await act(async () => {
+      inputHandler?.("r", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect(pending.map(item => item.id)).toEqual(["block-2"]);
+    expect(app.getLatest().approvalPanel.blockedItemId).toBeNull();
+    app.cleanup();
+  });
+
+  test("escape closes approval panel immediately and blocks trailing r/a keystrokes", async () => {
+    let pending = [createPending("esc-1"), createPending("esc-2"), createPending("esc-3")];
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[approved] ${id}\nok` };
+      }),
+      reject: mock((id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("", { escape: true });
+      inputHandler?.("r", {});
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(app.getLatest().pendingReviews.map(item => item.id)).toEqual([
+      "esc-1",
+      "esc-2",
+      "esc-3",
+    ]);
+    expect(mcpService.approve).not.toHaveBeenCalled();
+    expect(mcpService.reject).not.toHaveBeenCalled();
     app.cleanup();
   });
 

@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { basename, dirname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type {
   FileAction,
   ToolRequest,
@@ -23,21 +23,6 @@ type FileMcpServiceOptions = {
 };
 
 const READ_ONLY_ACTIONS: FileAction[] = ["read_file", "list_dir"];
-
-const ALLOWED_COMMANDS = new Set([
-  "bun",
-  "bun.exe",
-  "node",
-  "node.exe",
-  "python",
-  "python.exe",
-  "python3",
-  "python3.exe",
-  "py",
-  "py.exe",
-  "git",
-  "git.exe",
-]);
 const COMMAND_TIMEOUT_MS = 20_000;
 const MAX_COMMAND_OUTPUT_CHARS = 24_000;
 
@@ -362,9 +347,8 @@ const normalizeToolInput = (
 
 const validateRequest = (request: ToolRequest): string | null => {
   if (request.action === "run_command") {
-    const normalized = basename(request.command).toLowerCase();
-    if (!ALLOWED_COMMANDS.has(normalized)) {
-      return `run_command only allows fixed commands: ${[...ALLOWED_COMMANDS].join(", ")}.`;
+    if (!request.command.trim()) {
+      return "run_command requires `command`.";
     }
     return null;
   }

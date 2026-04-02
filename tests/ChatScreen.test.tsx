@@ -6,6 +6,15 @@ import type { PendingReviewItem } from "../src/core/tools/mcp/types";
 mock.module("ink", () => ({
   Box: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Text: ({ children }: { children?: React.ReactNode }) => <span>{children}</span>,
+  useInput: () => {},
+  useStdin: () => ({
+    stdin: {
+      on: () => {},
+      off: () => {},
+    },
+    setRawMode: () => {},
+    isRawModeSupported: false,
+  }),
 }));
 
 mock.module("ink-text-input", () => ({
@@ -46,6 +55,10 @@ const renderScreen = (approvalActive: boolean) =>
         previewMode: "summary",
         previewOffset: 0,
         lastOpenedAt: null,
+        blockedItemId: null,
+        blockedReason: null,
+        blockedAt: null,
+        lastAction: null,
       }}
       activeSessionId="session-1"
       currentModel="gpt-test"
@@ -89,6 +102,10 @@ describe("ChatScreen", () => {
           previewMode: "summary",
           previewOffset: 0,
           lastOpenedAt: null,
+          blockedItemId: null,
+          blockedReason: null,
+          blockedAt: null,
+          lastAction: null,
         }}
         activeSessionId="session-1"
         currentModel="gpt-test"
@@ -125,6 +142,10 @@ describe("ChatScreen", () => {
           previewMode: "summary",
           previewOffset: 0,
           lastOpenedAt: null,
+          blockedItemId: null,
+          blockedReason: null,
+          blockedAt: null,
+          lastAction: null,
         }}
         activeSessionId="session-1"
         currentModel="gpt-test"
@@ -141,5 +162,40 @@ describe("ChatScreen", () => {
     expect(output).toContain("value");
     expect(output).toContain("\"1\"");
     expect(output).toContain("+ added line");
+  });
+
+  test("renders blocked approval state and error hint", () => {
+    const tree = create(
+      <ChatScreen
+        items={[]}
+        status="idle"
+        input=""
+        resumePicker={{ active: false, sessions: [], selectedIndex: 0, pageSize: 8 }}
+        sessionsPanel={{ active: false, sessions: [], selectedIndex: 0, pageSize: 8 }}
+        modelPicker={{ active: false, models: [], selectedIndex: 0, pageSize: 8 }}
+        pendingReviews={pending}
+        approvalPanel={{
+          active: true,
+          selectedIndex: 0,
+          previewMode: "summary",
+          previewOffset: 0,
+          lastOpenedAt: null,
+          blockedItemId: "p1",
+          blockedReason: "EEXIST: file already exists",
+          blockedAt: Date.now(),
+          lastAction: "approve",
+        }}
+        activeSessionId="session-1"
+        currentModel="gpt-test"
+        onInputChange={() => {}}
+        onSubmit={() => {}}
+      />
+    ).toJSON();
+
+    const output = JSON.stringify(tree);
+    expect(output).toContain("Last error:");
+    expect(output).toContain("EEXIST");
+    expect(output).toContain("blocked");
+    expect(output).toContain("r/d reject");
   });
 });

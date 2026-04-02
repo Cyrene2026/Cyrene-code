@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  canRetryBlockedApproval,
+  clearApprovalBlockOnSelectionChange,
+  computeNextApprovalSelection,
   clampPreviewOffset,
   cycleSelection,
   movePagedSelection,
+  shouldKeepApprovalPanelOpen,
+  shouldBlockRepeatedApproval,
 } from "../src/application/chat/chatStateHelpers";
 
 describe("chatStateHelpers", () => {
@@ -25,5 +30,49 @@ describe("chatStateHelpers", () => {
     expect(clampPreviewOffset(preview, -10, 5)).toBe(0);
     expect(clampPreviewOffset(preview, 1, 5)).toBe(1);
     expect(clampPreviewOffset(preview, 99, 5)).toBe(3);
+  });
+
+  test("approval helpers keep focus and open state stable across queue transitions", () => {
+    expect(computeNextApprovalSelection(2, 2)).toBe(1);
+    expect(computeNextApprovalSelection(0, 0)).toBe(0);
+    expect(computeNextApprovalSelection(-1, 3)).toBe(0);
+
+    expect(shouldKeepApprovalPanelOpen(2, true)).toBe(true);
+    expect(shouldKeepApprovalPanelOpen(0, true)).toBe(false);
+    expect(shouldKeepApprovalPanelOpen(2, false)).toBe(false);
+  });
+
+  test("blocked approval helpers freeze repeated approval until cooldown or selection change", () => {
+    expect(
+      shouldBlockRepeatedApproval("item-1", "item-1", 1000, 1200, 500)
+    ).toBe(true);
+    expect(
+      shouldBlockRepeatedApproval("item-1", "item-1", 1000, 1600, 500)
+    ).toBe(false);
+    expect(
+      canRetryBlockedApproval("item-1", "item-1", 1000, 1600, 500)
+    ).toBe(true);
+    expect(
+      canRetryBlockedApproval("item-1", "item-1", 1000, 1200, 500)
+    ).toBe(false);
+
+    const cleared = clearApprovalBlockOnSelectionChange(
+      {
+        selectedIndex: 1,
+        blockedItemId: "item-1",
+        blockedReason: "EEXIST",
+        blockedAt: 1000,
+        lastAction: "approve" as const,
+      },
+      0
+    );
+
+    expect(cleared).toEqual({
+      selectedIndex: 0,
+      blockedItemId: null,
+      blockedReason: null,
+      blockedAt: null,
+      lastAction: null,
+    });
   });
 });

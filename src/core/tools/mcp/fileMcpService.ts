@@ -70,6 +70,11 @@ const normalizeAction = (raw: unknown): FileAction | null => {
     case "ls":
       return "list_dir";
     case "create":
+    case "create_dir":
+    case "mkdir":
+    case "make_dir":
+    case "new_dir":
+      return "create_dir";
     case "create_file":
     case "new":
     case "touch":
@@ -121,42 +126,80 @@ const toRecord = (input: unknown): Record<string, unknown> | null => {
   return null;
 };
 
-const normalizeToolInput = (
-  toolName: string,
-  input: unknown
-): FileToolRequest | null => {
-  const first = toRecord(input);
-  if (!first) {
-    return null;
+const WRAPPER_KEYS = [
+  "arguments",
+  "args",
+  "parameters",
+  "params",
+  "input",
+  "tool_input",
+  "payload",
+  "data",
+  "raw",
+  "function",
+  "tool_call",
+  "toolCall",
+] as const;
+
+const collectRecords = (input: unknown, maxDepth = 4): Record<string, unknown>[] => {
+  const queue: Array<{ value: unknown; depth: number }> = [{ value: input, depth: 0 }];
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<Record<string, unknown>>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+    const record = toRecord(current.value);
+    if (!record || seen.has(record)) {
+      continue;
+    }
+    seen.add(record);
+    records.push(record);
+
+    if (current.depth >= maxDepth) {
+      continue;
+    }
+
+    for (const key of WRAPPER_KEYS) {
+      if (key in record) {
+        queue.push({
+          value: record[key],
+          depth: current.depth + 1,
+        });
+      }
+    }
   }
 
-  const nestedRaw =
-    first.arguments ??
-    first.args ??
-    first.parameters ??
-    first.params ??
-    first.input;
-  const nested = toRecord(nestedRaw);
-  const obj = nested ?? first;
+  return records;
+};
 
+const normalizeFromRecord = (
+  record: Record<string, unknown>,
+  toolName: string
+): FileToolRequest | null => {
   let action =
-    normalizeAction(obj.action) ??
-    normalizeAction(obj.operation) ??
-    normalizeAction(obj.op) ??
-    normalizeAction(obj.command) ??
+    normalizeAction(record.action) ??
+    normalizeAction(record.operation) ??
+    normalizeAction(record.op) ??
+    normalizeAction(record.command) ??
+    normalizeAction(record.method) ??
+    normalizeAction(record.name) ??
     normalizeAction(toolName);
-  const path = pickString(obj, [
+  const path = pickString(record, [
     "path",
     "file",
     "file_path",
+    "filepath",
     "target",
     "dir",
     "directory",
   ]);
 
-  const content = pickString(obj, ["content", "text", "data"]);
-  const find = pickString(obj, ["find", "search", "from"]);
-  const replace = pickString(obj, ["replace", "to"]);
+  const content = pickString(record, ["content", "text", "data", "value"]);
+  const find = pickString(record, ["find", "search", "from", "old", "before"]);
+  const replace = pickString(record, ["replace", "to", "new", "after"]);
 
   // Heuristic fallback for providers that omit explicit action.
   if (!action) {
@@ -182,12 +225,63 @@ const normalizeToolInput = (
   };
 };
 
+const summarizeInput = (input: unknown) => {
+  if (typeof input === "string") {
+    return clip(input, 240);
+  }
+  if (input && typeof input === "object") {
+    const keys = Object.keys(input as Record<string, unknown>);
+    let payload = "";
+    try {
+      payload = JSON.stringify(input);
+    } catch {
+      payload = String(input);
+    }
+    return `keys=[${keys.join(", ")}] payload=${clip(payload, 240)}`;
+  }
+  return String(input);
+};
+
+const normalizeToolInput = (
+  toolName: string,
+  input: unknown
+): FileToolRequest | null => {
+  const records = collectRecords(input);
+  if (records.length === 0) {
+    return null;
+  }
+
+  let best: FileToolRequest | null = null;
+  let bestScore = -1;
+
+  for (const record of records) {
+    const normalized = normalizeFromRecord(record, toolName);
+    if (!normalized) {
+      continue;
+    }
+    const score =
+      (normalized.action ? 2 : 0) +
+      (normalized.path ? 2 : 0) +
+      (typeof normalized.content === "string" ? 1 : 0) +
+      (typeof normalized.find === "string" ? 1 : 0) +
+      (typeof normalized.replace === "string" ? 1 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = normalized;
+    }
+  }
+
+  return best;
+};
+
 const validateRequest = (request: FileToolRequest): string | null => {
   switch (request.action) {
     case "create_file":
+    case "create_dir":
+      return null;
     case "write_file":
       if (typeof request.content !== "string") {
-        return `${request.action} requires \`content\`.`;
+        return "write_file requires `content`.";
       }
       return null;
     case "edit_file":
@@ -255,6 +349,10 @@ export class FileMcpService {
       } catch {
         return "[delete preview]\nPath will be removed after approval.";
       }
+    }
+
+    if (request.action === "create_dir") {
+      return "[directory preview]\nDirectory will be created after approval.";
     }
 
     if (!writeLike(request.action)) {
@@ -349,6 +447,10 @@ export class FileMcpService {
         await writeFile(abs, request.content ?? "", { flag: "wx" });
         return `Created file: ${request.path}`;
       }
+      case "create_dir": {
+        await mkdir(abs, { recursive: true });
+        return `Created directory: ${request.path}`;
+      }
       case "write_file": {
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, request.content ?? "", "utf8");
@@ -387,18 +489,10 @@ export class FileMcpService {
 
     const request = normalizeToolInput(normalizedName, input);
     if (!request) {
-      let preview = "";
-      try {
-        preview = JSON.stringify(input);
-      } catch {
-        preview = String(input);
-      }
-      const clipped =
-        preview.length > 240 ? `${preview.slice(0, 240)}...` : preview;
       return {
         ok: false,
         message:
-          `Invalid tool input. Expected { action, path, content?, find?, replace? }. Received: ${clipped}`,
+          `Invalid tool input. Expected { action, path, content?, find?, replace? }. Received: ${summarizeInput(input)}.`,
       };
     }
     const validationError = validateRequest(request);
@@ -409,7 +503,8 @@ export class FileMcpService {
       };
     }
 
-    if (!READ_ONLY_ACTIONS.includes(request.action) &&
+    if (request.action !== "create_dir" &&
+        !READ_ONLY_ACTIONS.includes(request.action) &&
         this.rules.requireReview.includes(request.action)) {
       const id = crypto.randomUUID().slice(0, 8);
       const detailsSummary = await this.buildReviewDetails(request, "summary");
@@ -466,12 +561,12 @@ export class FileMcpService {
         message: `Pending operation not found: ${id}`,
       };
     }
-    this.pending.delete(id);
     try {
       const output = await this.execute(pending.request);
+      this.pending.delete(id);
       return {
         ok: true,
-        message: `[approved] ${id}\n${pending.previewSummary}\n${output}`,
+        message: `[approved] ${id}\n${output}`,
       };
     } catch (error) {
       return {
@@ -494,7 +589,7 @@ export class FileMcpService {
     this.pending.delete(id);
     return {
       ok: true,
-      message: `[rejected] ${id}\n${pending.previewSummary}`,
+      message: `[rejected] ${id}`,
     };
   }
 }

@@ -22,7 +22,17 @@ export const ChatCliApp = ({
   pinMaxCount,
   mcpService,
 }: ChatCliAppProps) => {
-  const { items, input, status, resumePicker, modelPicker, setInput, submit } = useChatApp({
+  const {
+    items,
+    input,
+    status,
+    resumePicker,
+    modelPicker,
+    pendingReviews,
+    approvalPanel,
+    setInput,
+    submit,
+  } = useChatApp({
     transport,
     sessionStore,
     defaultSystemPrompt,
@@ -38,6 +48,8 @@ export const ChatCliApp = ({
       status={status}
       resumePicker={resumePicker}
       modelPicker={modelPicker}
+      pendingReviews={pendingReviews}
+      approvalPanel={approvalPanel}
       onInputChange={setInput}
       onSubmit={submit}
     />

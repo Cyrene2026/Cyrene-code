@@ -29,6 +29,7 @@ const FILE_TOOL = {
           enum: [
             "read_file",
             "list_dir",
+            "create_dir",
             "create_file",
             "write_file",
             "edit_file",
@@ -50,7 +51,7 @@ const TOOL_USAGE_SYSTEM_PROMPT = [
   "{ action, path, content?, find?, replace? }.",
   "Never call file tool with empty arguments.",
   "Use one of actions:",
-  "read_file, list_dir, create_file, write_file, edit_file, delete_file.",
+  "read_file, list_dir, create_dir, create_file, write_file, edit_file, delete_file.",
 ].join(" ");
 
 const normalizeBaseUrl = (url: string) => url.replace(/\/+$/, "");

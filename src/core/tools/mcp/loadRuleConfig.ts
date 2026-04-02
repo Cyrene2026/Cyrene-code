@@ -15,6 +15,7 @@ const isFileAction = (value: string): value is FileAction =>
   [
     "read_file",
     "list_dir",
+    "create_dir",
     "create_file",
     "write_file",
     "edit_file",
@@ -78,6 +79,9 @@ export const loadRuleConfig = async (): Promise<RuleConfig> => {
     workspaceRoot,
     maxReadBytes,
     requireReview:
-      requireReview.length > 0 ? Array.from(new Set(requireReview)) : DEFAULT_RULES.requireReview,
+      (requireReview.length > 0
+        ? Array.from(new Set(requireReview))
+        : DEFAULT_RULES.requireReview
+      ).filter(action => action !== "create_dir"),
   };
 };

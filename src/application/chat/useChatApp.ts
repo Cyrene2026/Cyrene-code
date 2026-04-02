@@ -9,7 +9,7 @@ import type { QueryTransport } from "../../core/query/transport";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import type { SessionListItem, SessionRecord } from "../../core/session/types";
 import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
-import type { FileAction } from "../../core/tools/mcp/types";
+import type { FileAction, PendingReviewItem } from "../../core/tools/mcp/types";
 
 type UseChatAppParams = {
   transport: QueryTransport;
@@ -34,6 +34,15 @@ type ModelPickerState = {
   pageSize: number;
 };
 
+type ApprovalPreviewMode = "summary" | "full";
+
+type ApprovalPanelState = {
+  active: boolean;
+  selectedIndex: number;
+  previewMode: ApprovalPreviewMode;
+  lastOpenedAt: string | null;
+};
+
 const defaultSystemText =
   "Type /help to view commands. Use /resume to open session picker.";
 const RESUME_PAGE_SIZE = 1;
@@ -54,9 +63,10 @@ const HELP_TEXT = [
   "/pin <note>",
   "/pins",
   "/unpin <index>",
-  "/review",
-  "/approve [id]",
-  "/reject [id]",
+  "/review - inspect full review previews",
+  "/review <id> - inspect one pending operation",
+  "/approve [id] - approve pending operation",
+  "/reject [id] - reject pending operation",
 ].join("\n");
 
 const condenseForMemory = (text: string, max = 480) => {
@@ -90,6 +100,7 @@ const actionColor = (action?: FileAction): ChatItem["color"] => {
     return "red";
   }
   if (
+    action === "create_dir" ||
     action === "create_file" ||
     action === "write_file" ||
     action === "edit_file"
@@ -97,6 +108,111 @@ const actionColor = (action?: FileAction): ChatItem["color"] => {
     return "green";
   }
   return undefined;
+};
+
+const isHighRiskReviewAction = (action: FileAction) =>
+  action === "edit_file" || action === "delete_file";
+
+const extractMessageBody = (raw: string) => {
+  const [, ...rest] = raw.split("\n");
+  return rest.join("\n").trim();
+};
+
+const buildApprovalMessage = (
+  title: string,
+  item?: PendingReviewItem,
+  extraLines: string[] = []
+) =>
+  [
+    title,
+    ...(item
+      ? [
+          `id: ${item.id}`,
+          `action: ${item.request.action}`,
+          `path: ${item.request.path}`,
+        ]
+      : []),
+    ...extraLines.filter(Boolean),
+  ].join("\n");
+
+const condensePreview = (text: string, maxLines = 120) => {
+  const lines = text.split("\n");
+  if (lines.length <= maxLines) {
+    return text;
+  }
+  return `${lines.slice(0, maxLines).join("\n")}\n... ${lines.length - maxLines} more lines`;
+};
+
+const normalizeMcpMessage = (raw: string): {
+  text: string;
+  kind: ChatItem["kind"];
+  tone: ChatItem["tone"];
+  color: ChatItem["color"];
+} => {
+  const [header = "", ...rest] = raw.split("\n");
+  const body = rest.join("\n");
+
+  if (header.startsWith("[tool result]")) {
+    const detail = header.replace("[tool result]", "").trim();
+    return {
+      text: `Tool result: ${detail}${body ? `\n${body}` : ""}`,
+      kind: "tool_status",
+      tone: "info",
+      color: "cyan",
+    };
+  }
+  if (header.startsWith("[tool error]")) {
+    const detail = header.replace("[tool error]", "").trim();
+    return {
+      text: `Tool error: ${detail}${body ? `\n${body}` : ""}`,
+      kind: "error",
+      tone: "danger",
+      color: "red",
+    };
+  }
+  if (header.startsWith("[approved]")) {
+    const id = header.replace("[approved]", "").trim();
+    return {
+      text: `Approved ${id}${body ? `\n${body}` : ""}`,
+      kind: "review_status",
+      tone: "success",
+      color: "green",
+    };
+  }
+  if (header.startsWith("[approve failed]")) {
+    const id = header.replace("[approve failed]", "").trim();
+    return {
+      text: `Approve failed ${id}${body ? `\n${body}` : ""}`,
+      kind: "error",
+      tone: "danger",
+      color: "red",
+    };
+  }
+  if (header.startsWith("[rejected]")) {
+    const id = header.replace("[rejected]", "").trim();
+    return {
+      text: `Rejected ${id}`,
+      kind: "review_status",
+      tone: "warning",
+      color: "yellow",
+    };
+  }
+  if (raw.startsWith("Pending operation not found:")) {
+    const id = raw.replace("Pending operation not found:", "").trim();
+    return {
+      text: `Pending operation not found: ${id}`,
+      kind: "error",
+      tone: "danger",
+      color: "red",
+    };
+  }
+
+  return {
+    text: raw,
+    kind: "system_hint",
+    tone: "neutral",
+    color: "white",
+  };
 };
 
 export const useChatApp = ({
@@ -113,6 +229,9 @@ export const useChatApp = ({
     {
       role: "system",
       text: defaultSystemText,
+      kind: "system_hint",
+      tone: "neutral",
+      color: "gray",
     },
   ]);
   const [sessionState, setSessionState] = useState<QuerySessionState | null>(
@@ -132,11 +251,59 @@ export const useChatApp = ({
     selectedIndex: 0,
     pageSize: MODEL_PAGE_SIZE,
   });
+  const [pendingReviews, setPendingReviews] = useState<PendingReviewItem[]>([]);
+  const [approvalPanel, setApprovalPanel] = useState<ApprovalPanelState>({
+    active: false,
+    selectedIndex: 0,
+    previewMode: "summary",
+    lastOpenedAt: null,
+  });
 
   const queueRef = useRef(Promise.resolve());
 
-  const pushSystemMessage = (text: string, color?: ChatItem["color"]) => {
-    setItems(previous => [...previous, { role: "system", text, color }]);
+  const enqueueTask = (task: () => Promise<void> | void) => {
+    queueRef.current = queueRef.current
+      .catch(error => {
+        pushSystemMessage(
+          `Queued action failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          }
+        );
+      })
+      .then(task)
+      .catch(error => {
+        pushSystemMessage(
+          `Queued action failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          }
+        );
+      });
+  };
+
+  const pushSystemMessage = (
+    text: string,
+    options?: Pick<ChatItem, "color" | "kind" | "tone">
+  ) => {
+    setItems(previous => [
+      ...previous,
+      {
+        role: "system",
+        text,
+        color: options?.color,
+        kind: options?.kind,
+        tone: options?.tone,
+      },
+    ]);
   };
 
   const ensureActiveSession = async (titleHint?: string) => {
@@ -155,14 +322,29 @@ export const useChatApp = ({
   const appendToLastAssistant = (text: string) => {
     setItems(previous => {
       const next = [...previous];
-      const lastIndex = next.length - 1;
-      const last = next[lastIndex];
+      let lastAssistantIndex = -1;
+      for (let index = next.length - 1; index >= 0; index -= 1) {
+        if (next[index]?.role === "assistant") {
+          lastAssistantIndex = index;
+          break;
+        }
+      }
 
-      if (!last || last.role !== "assistant") {
+      if (lastAssistantIndex === -1) {
         return previous;
       }
 
-      next[lastIndex] = { role: "assistant", text: last.text + text };
+      const last = next[lastAssistantIndex];
+      if (!last) {
+        return previous;
+      }
+
+      next[lastAssistantIndex] = {
+        role: "assistant",
+        text: last.text + text,
+        kind: "transcript",
+        tone: "neutral",
+      };
       return next;
     });
   };
@@ -170,12 +352,26 @@ export const useChatApp = ({
   const applyLoadedSession = (loaded: SessionRecord) => {
     setActiveSessionId(loaded.id);
     setItems([
-      { role: "system", text: defaultSystemText },
+      {
+        role: "system",
+        text: defaultSystemText,
+        kind: "system_hint",
+        tone: "neutral",
+        color: "gray",
+      },
       ...loaded.messages.map(message => ({
         role: message.role,
         text: message.text,
+        kind: "transcript" as const,
+        tone: "neutral" as const,
       })),
-      { role: "system", text: `Resumed session: ${loaded.id}` },
+      {
+        role: "system",
+        text: `Resumed session: ${loaded.id}`,
+        kind: "system_hint",
+        tone: "info",
+        color: "cyan",
+      },
     ]);
     setResumePicker({
       active: false,
@@ -194,7 +390,193 @@ export const useChatApp = ({
     });
   };
 
-  useInput((_, key) => {
+  const updatePendingState = (
+    nextPending: PendingReviewItem[],
+    options?: {
+      open?: boolean;
+      focusLatest?: boolean;
+      selectId?: string;
+      selectedIndex?: number;
+      previewMode?: ApprovalPreviewMode;
+    }
+  ) => {
+    setPendingReviews(nextPending);
+    setApprovalPanel(previous => {
+      if (nextPending.length === 0) {
+        return {
+          active: false,
+          selectedIndex: 0,
+          previewMode: options?.previewMode ?? previous.previewMode,
+          lastOpenedAt: previous.lastOpenedAt,
+        };
+      }
+
+      let nextIndex = previous.selectedIndex;
+      if (typeof options?.selectedIndex === "number") {
+        nextIndex = options.selectedIndex;
+      } else if (options?.selectId) {
+        const matchedIndex = nextPending.findIndex(
+          item => item.id === options.selectId
+        );
+        if (matchedIndex >= 0) {
+          nextIndex = matchedIndex;
+        }
+      } else if (options?.focusLatest) {
+        nextIndex = nextPending.length - 1;
+      }
+
+      const boundedIndex = Math.max(0, Math.min(nextIndex, nextPending.length - 1));
+      const nextActive = options?.open ?? previous.active;
+
+      return {
+        active: nextActive,
+        selectedIndex: boundedIndex,
+        previewMode: options?.previewMode ?? previous.previewMode,
+        lastOpenedAt: nextActive
+          ? new Date().toISOString()
+          : previous.lastOpenedAt,
+      };
+    });
+  };
+
+  const closeApprovalPanel = () => {
+    setApprovalPanel(previous => ({
+      ...previous,
+      active: false,
+    }));
+  };
+
+  const openApprovalPanel = (
+    nextPending: PendingReviewItem[],
+    options?: {
+      focusLatest?: boolean;
+      selectId?: string;
+      selectedIndex?: number;
+      previewMode?: ApprovalPreviewMode;
+    }
+  ) => {
+    updatePendingState(nextPending, {
+      ...options,
+      open: nextPending.length > 0,
+    });
+  };
+
+  const approvePendingReview = (id: string) => {
+    enqueueTask(async () => {
+      const before = mcpService.listPending();
+      const target = before.find(item => item.id === id);
+      const currentIndex = Math.max(
+        0,
+        before.findIndex(item => item.id === id)
+      );
+      const result = await mcpService.approve(id);
+      const nextPending = mcpService.listPending();
+      updatePendingState(nextPending, {
+        open: approvalPanel.active && nextPending.length > 0,
+        selectedIndex: Math.min(currentIndex, Math.max(0, nextPending.length - 1)),
+      });
+
+      if (!target) {
+        pushSystemMessage(buildApprovalMessage("Approval error", undefined, [result.message]), {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        return;
+      }
+
+      if (!result.ok) {
+        pushSystemMessage(
+          buildApprovalMessage("Approval error", target, [
+            extractMessageBody(result.message) || result.message,
+          ]),
+          {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          }
+        );
+        return;
+      }
+
+      const output = extractMessageBody(result.message);
+      pushSystemMessage(
+        buildApprovalMessage("Approved", target, output ? [output] : []),
+        {
+          kind: "review_status",
+          tone: "success",
+          color: actionColor(target.request.action) ?? "green",
+        }
+      );
+    });
+  };
+
+  const rejectPendingReview = (id: string) => {
+    enqueueTask(async () => {
+      const before = mcpService.listPending();
+      const target = before.find(item => item.id === id);
+      const currentIndex = Math.max(
+        0,
+        before.findIndex(item => item.id === id)
+      );
+      const result = mcpService.reject(id);
+      const nextPending = mcpService.listPending();
+      updatePendingState(nextPending, {
+        open: approvalPanel.active && nextPending.length > 0,
+        selectedIndex: Math.min(currentIndex, Math.max(0, nextPending.length - 1)),
+      });
+
+      if (!target || !result.ok) {
+        pushSystemMessage(
+          buildApprovalMessage(
+            "Approval error",
+            target,
+            [extractMessageBody(result.message) || result.message]
+          ),
+          {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          }
+        );
+        return;
+      }
+
+      pushSystemMessage(buildApprovalMessage("Rejected", target), {
+        kind: "review_status",
+        tone: "warning",
+        color: "yellow",
+      });
+    });
+  };
+
+  const approveCurrentPendingReview = () => {
+    const target = pendingReviews[approvalPanel.selectedIndex];
+    if (!target) {
+      pushSystemMessage("Approval error\nNo pending operation selected.", {
+        kind: "error",
+        tone: "danger",
+        color: "red",
+      });
+      return;
+    }
+    approvePendingReview(target.id);
+  };
+
+  const rejectCurrentPendingReview = () => {
+    const target = pendingReviews[approvalPanel.selectedIndex];
+    if (!target) {
+      pushSystemMessage("Approval error\nNo pending operation selected.", {
+        kind: "error",
+        tone: "danger",
+        color: "red",
+      });
+      return;
+    }
+    rejectPendingReview(target.id);
+  };
+
+  useInput((inputValue, key) => {
     if (modelPicker.active) {
       if (key.escape) {
         closeModelPicker();
@@ -251,44 +633,101 @@ export const useChatApp = ({
       return;
     }
 
-    if (!resumePicker.active) {
+    if (resumePicker.active) {
+      if (key.escape) {
+        setResumePicker({
+          active: false,
+          sessions: [],
+          selectedIndex: 0,
+          pageSize: RESUME_PAGE_SIZE,
+        });
+        pushSystemMessage("Resume picker closed.");
+        return;
+      }
+
+      if (key.leftArrow || key.rightArrow) {
+        setResumePicker(previous => {
+          const total = previous.sessions.length;
+          if (total === 0) {
+            return previous;
+          }
+          const pageSize = previous.pageSize;
+          const currentPage = Math.floor(previous.selectedIndex / pageSize);
+          const maxPage = Math.floor((total - 1) / pageSize);
+          const offset = previous.selectedIndex % pageSize;
+          const nextPage = key.leftArrow
+            ? currentPage <= 0
+              ? maxPage
+              : currentPage - 1
+            : currentPage >= maxPage
+              ? 0
+              : currentPage + 1;
+          const nextIndex = Math.min(nextPage * pageSize + offset, total - 1);
+          return {
+            ...previous,
+            selectedIndex: nextIndex,
+          };
+        });
+      }
+      return;
+    }
+
+    if (!approvalPanel.active) {
+      return;
+    }
+
+    if (pendingReviews.length === 0) {
+      closeApprovalPanel();
       return;
     }
 
     if (key.escape) {
-      setResumePicker({
-        active: false,
-        sessions: [],
-        selectedIndex: 0,
-        pageSize: RESUME_PAGE_SIZE,
+      closeApprovalPanel();
+      pushSystemMessage("Approval panel closed.", {
+        kind: "system_hint",
+        tone: "neutral",
+        color: "gray",
       });
-      pushSystemMessage("Resume picker closed.");
       return;
     }
 
-    if (key.leftArrow || key.rightArrow) {
-      setResumePicker(previous => {
-        const total = previous.sessions.length;
-        if (total === 0) {
-          return previous;
-        }
-        const pageSize = previous.pageSize;
-        const currentPage = Math.floor(previous.selectedIndex / pageSize);
-        const maxPage = Math.floor((total - 1) / pageSize);
-        const offset = previous.selectedIndex % pageSize;
-        const nextPage = key.leftArrow
-          ? currentPage <= 0
-            ? maxPage
-            : currentPage - 1
-          : currentPage >= maxPage
+    if (key.upArrow) {
+      setApprovalPanel(previous => ({
+        ...previous,
+        selectedIndex:
+          previous.selectedIndex <= 0
+            ? pendingReviews.length - 1
+            : previous.selectedIndex - 1,
+      }));
+      return;
+    }
+
+    if (key.downArrow) {
+      setApprovalPanel(previous => ({
+        ...previous,
+        selectedIndex:
+          previous.selectedIndex >= pendingReviews.length - 1
             ? 0
-            : currentPage + 1;
-        const nextIndex = Math.min(nextPage * pageSize + offset, total - 1);
-        return {
-          ...previous,
-          selectedIndex: nextIndex,
-        };
-      });
+            : previous.selectedIndex + 1,
+      }));
+      return;
+    }
+
+    if (key.tab) {
+      setApprovalPanel(previous => ({
+        ...previous,
+        previewMode: previous.previewMode === "summary" ? "full" : "summary",
+      }));
+      return;
+    }
+
+    if (inputValue.toLowerCase() === "a") {
+      approveCurrentPendingReview();
+      return;
+    }
+
+    if (inputValue.toLowerCase() === "r") {
+      rejectCurrentPendingReview();
     }
   });
 
@@ -299,7 +738,7 @@ export const useChatApp = ({
     }
 
     if (!query && modelPicker.active) {
-      queueRef.current = queueRef.current.then(async () => {
+      enqueueTask(async () => {
         const selected = modelPicker.models[modelPicker.selectedIndex];
         if (!selected) {
           pushSystemMessage("No model selected.");
@@ -317,7 +756,7 @@ export const useChatApp = ({
     }
 
     if (!query && resumePicker.active) {
-      queueRef.current = queueRef.current.then(async () => {
+      enqueueTask(async () => {
         const selected = resumePicker.sessions[resumePicker.selectedIndex];
         if (!selected) {
           pushSystemMessage("No session selected.");
@@ -333,18 +772,31 @@ export const useChatApp = ({
       return;
     }
 
+    if (approvalPanel.active) {
+      return;
+    }
+
     if (!query) {
       return;
     }
 
     if (query === "/help") {
-      setItems(previous => [...previous, { role: "system", text: HELP_TEXT }]);
+      setItems(previous => [
+        ...previous,
+        {
+          role: "system",
+          text: HELP_TEXT,
+          kind: "system_hint",
+          tone: "neutral",
+          color: "gray",
+        },
+      ]);
       setInput("");
       return;
     }
 
     if (query === "/model") {
-      queueRef.current = queueRef.current.then(async () => {
+      enqueueTask(async () => {
         const models = await transport.listModels();
         if (models.length === 0) {
           pushSystemMessage("No models available. Try /model refresh.");
@@ -367,7 +819,7 @@ export const useChatApp = ({
     }
 
     if (query === "/model refresh") {
-      queueRef.current = queueRef.current.then(async () => {
+      enqueueTask(async () => {
         const result = await transport.refreshModels();
         if (result.ok) {
           pushSystemMessage(
@@ -383,7 +835,7 @@ export const useChatApp = ({
 
     if (query.startsWith("/model ")) {
       const nextModel = query.slice("/model ".length).trim();
-      queueRef.current = queueRef.current.then(async () => {
+      enqueueTask(async () => {
         if (!nextModel) {
           pushSystemMessage("Usage: /model <model_name>");
           return;
@@ -399,15 +851,24 @@ export const useChatApp = ({
       return;
     }
 
-    queueRef.current = queueRef.current.then(async () => {
+    enqueueTask(async () => {
       if (query === "/new") {
         const created = await sessionStore.createSession();
         setActiveSessionId(created.id);
         setItems([
-          { role: "system", text: defaultSystemText },
+          {
+            role: "system",
+            text: defaultSystemText,
+            kind: "system_hint",
+            tone: "neutral",
+            color: "gray",
+          },
           {
             role: "system",
             text: `Started new session: ${created.id}`,
+            kind: "system_hint",
+            tone: "info",
+            color: "cyan",
           },
         ]);
         setInput("");
@@ -457,13 +918,61 @@ export const useChatApp = ({
       if (query === "/review") {
         const pending = mcpService.listPending();
         if (pending.length === 0) {
-          pushSystemMessage("No pending reviewed operations.");
+          pushSystemMessage(
+            "No pending operations.",
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
         } else {
-          const lines = pending
-            .map(item => `${item.id} | ${item.createdAt}\n${item.previewFull}`)
-            .join("\n");
-          pushSystemMessage(`Pending operations:\n${lines}`);
+          openApprovalPanel(pending, {
+            focusLatest: true,
+            previewMode: "summary",
+          });
+          pushSystemMessage(
+            buildApprovalMessage("Approval required", undefined, [
+              `pending: ${pending.length}`,
+              "panel: opened",
+              "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
+            ]),
+            { kind: "review_status", tone: "warning", color: "yellow" }
+          );
         }
+        setInput("");
+        return;
+      }
+
+      if (query.startsWith("/review ")) {
+        const id = query.slice("/review ".length).trim();
+        if (!id) {
+          pushSystemMessage("Usage: /review <id>");
+          setInput("");
+          return;
+        }
+
+        const pending = mcpService.listPending();
+        const target = pending.find(item => item.id === id);
+        if (!target) {
+          pushSystemMessage(buildApprovalMessage("Approval error", undefined, [
+            `pending operation not found: ${id}`,
+          ]), {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          setInput("");
+          return;
+        }
+
+        openApprovalPanel(pending, {
+          selectId: target.id,
+          previewMode: "full",
+        });
+        pushSystemMessage(
+          buildApprovalMessage("Approval required", target, [
+            "panel: opened",
+            "preview: full",
+          ]),
+          { kind: "review_status", tone: "warning", color: "yellow" }
+        );
         setInput("");
         return;
       }
@@ -471,27 +980,34 @@ export const useChatApp = ({
       if (query === "/approve") {
         const pending = mcpService.listPending();
         if (pending.length === 0) {
-          pushSystemMessage("No pending operations to approve.");
+          pushSystemMessage(
+            "No pending operations to approve.",
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
           setInput("");
           return;
         }
         if (pending.length > 1) {
           pushSystemMessage(
-            `Multiple pending operations. Use /approve <id>.\n${pending
-              .map(item => `${item.id} | ${item.previewSummary}`)
-              .join("\n")}`
+            buildApprovalMessage("Approval required", undefined, [
+              `pending: ${pending.length}`,
+              "use: /approve <id> or the approval panel",
+            ]),
+            { kind: "review_status", tone: "warning", color: "yellow" }
           );
           setInput("");
           return;
         }
         const only = pending[0];
         if (!only) {
-          pushSystemMessage("No pending operations to approve.");
+          pushSystemMessage(
+            "No pending operations to approve.",
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
           setInput("");
           return;
         }
-        const result = await mcpService.approve(only.id);
-        pushSystemMessage(result.message, actionColor(only.request.action));
+        approvePendingReview(only.id);
         setInput("");
         return;
       }
@@ -503,9 +1019,7 @@ export const useChatApp = ({
           setInput("");
           return;
         }
-        const pending = mcpService.listPending().find(item => item.id === id);
-        const result = await mcpService.approve(id);
-        pushSystemMessage(result.message, actionColor(pending?.request.action));
+        approvePendingReview(id);
         setInput("");
         return;
       }
@@ -513,27 +1027,34 @@ export const useChatApp = ({
       if (query === "/reject") {
         const pending = mcpService.listPending();
         if (pending.length === 0) {
-          pushSystemMessage("No pending operations to reject.");
+          pushSystemMessage(
+            "No pending operations to reject.",
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
           setInput("");
           return;
         }
         if (pending.length > 1) {
           pushSystemMessage(
-            `Multiple pending operations. Use /reject <id>.\n${pending
-              .map(item => `${item.id} | ${item.previewSummary}`)
-              .join("\n")}`
+            buildApprovalMessage("Approval required", undefined, [
+              `pending: ${pending.length}`,
+              "use: /reject <id> or the approval panel",
+            ]),
+            { kind: "review_status", tone: "warning", color: "yellow" }
           );
           setInput("");
           return;
         }
         const only = pending[0];
         if (!only) {
-          pushSystemMessage("No pending operations to reject.");
+          pushSystemMessage(
+            "No pending operations to reject.",
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
           setInput("");
           return;
         }
-        const result = mcpService.reject(only.id);
-        pushSystemMessage(result.message, "yellow");
+        rejectPendingReview(only.id);
         setInput("");
         return;
       }
@@ -545,8 +1066,7 @@ export const useChatApp = ({
           setInput("");
           return;
         }
-        const result = mcpService.reject(id);
-        pushSystemMessage(result.message, "yellow");
+        rejectPendingReview(id);
         setInput("");
         return;
       }
@@ -672,8 +1192,8 @@ export const useChatApp = ({
 
       setItems(previous => [
         ...previous,
-        { role: "user", text: query },
-        { role: "assistant", text: "" },
+        { role: "user", text: query, kind: "transcript", tone: "neutral" },
+        { role: "assistant", text: "", kind: "transcript", tone: "neutral" },
       ]);
       setInput("");
 
@@ -714,30 +1234,49 @@ export const useChatApp = ({
         },
         onToolCall: async (toolName, toolInput) => {
           const result = await mcpService.handleToolCall(toolName, toolInput);
-          const color = actionColor(result.pending?.request.action);
           if (result.pending) {
-            const shortReviewMessage = [
-              `[review required] ${result.pending.id}`,
-              `action=${result.pending.request.action} | path=${result.pending.request.path}`,
-              "Full preview is available in /review. Use /approve <id> or /reject <id>.",
-            ].join("\n");
-            const line = `\n${shortReviewMessage}\n`;
-            assistantBuffer += line;
-            appendToLastAssistant(line);
+            openApprovalPanel(mcpService.listPending(), {
+              focusLatest: true,
+              previewMode: "summary",
+            });
+            const reviewMode = isHighRiskReviewAction(result.pending.request.action)
+              ? "block"
+              : "queue";
             pushSystemMessage(
-              `[review required] ${result.pending.id}\n${result.pending.previewSummary}`,
-              color
+              buildApprovalMessage("Approval required", result.pending, [
+                `mode: ${reviewMode}`,
+                "panel: opened",
+                "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
+              ]),
+              {
+              kind: "review_status",
+              tone: reviewMode === "block" ? "warning" : "info",
+              color: reviewMode === "block" ? "red" : "yellow",
+              }
             );
-            return { message: shortReviewMessage, halt: true };
+            return {
+              message: `Approval required ${result.pending.id} | ${result.pending.request.action} | ${result.pending.request.path}`,
+              reviewMode,
+            };
           }
-          const displayMessage = condenseForDisplay(result.message);
-          const line = `\n${displayMessage}\n`;
-          assistantBuffer += line;
-          appendToLastAssistant(line);
-          return { message: displayMessage };
+          const normalized = normalizeMcpMessage(result.message);
+          const displayMessage = condenseForDisplay(normalized.text);
+          pushSystemMessage(displayMessage, {
+            kind: normalized.kind,
+            tone: normalized.tone,
+            color: normalized.color,
+          });
+          return { message: result.message };
         },
         onError: message => {
-          appendToLastAssistant(`\n[error] ${message}\n`);
+          pushSystemMessage(
+            `Stream error: ${message}`,
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
         },
       });
 
@@ -752,7 +1291,8 @@ export const useChatApp = ({
         await sessionStore.updateSummary(session.id, compressed.summary);
         if (assistantBuffer.length > memoryText.length + 40) {
           pushSystemMessage(
-            "Long assistant output was compressed in session memory. Use /pin to keep human-selected key points."
+            "Long assistant output was compressed in session memory. Use /pin to keep key points.",
+            { kind: "system_hint", tone: "neutral", color: "gray" }
           );
         }
       }
@@ -766,6 +1306,12 @@ export const useChatApp = ({
     sessionState,
     resumePicker,
     modelPicker,
+    pendingReviews,
+    approvalPanel,
+    closeApprovalPanel,
+    openApprovalPanel,
+    approveCurrentPendingReview,
+    rejectCurrentPendingReview,
     setInput,
     submit,
   };

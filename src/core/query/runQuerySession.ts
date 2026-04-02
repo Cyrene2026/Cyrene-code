@@ -15,7 +15,9 @@ type RunQuerySessionParams = {
   onToolCall: (
     toolName: string,
     input: unknown
-  ) => Promise<{ message: string; halt?: boolean }> | { message: string; halt?: boolean };
+  ) =>
+    | Promise<{ message: string; reviewMode?: "queue" | "block" }>
+    | { message: string; reviewMode?: "queue" | "block" };
   onError: (message: string) => void;
 };
 
@@ -41,8 +43,6 @@ export const runQuerySession = async ({
     const maxRounds = 6;
     const repeatedToolCallCount = new Map<string, number>();
     let loopCorrection = "";
-    let needsReviewFinalization = false;
-    let reviewFinalizationUsed = false;
 
     for (let round = 0; round < maxRounds; round += 1) {
       const streamUrl = await transport.requestStreamUrl(roundPrompt);
@@ -60,13 +60,6 @@ export const runQuerySession = async ({
           }
 
           if (event.type === "tool_call") {
-            if (reviewFinalizationUsed) {
-              onTextDelta(
-                `\n[tool blocked] review is pending. Use /approve or /reject first.\n`
-              );
-              dispatch({ type: "complete" });
-              return;
-            }
             sawToolCall = true;
             const signature = `${event.toolName}:${JSON.stringify(event.input ?? {})}`;
             const seen = (repeatedToolCallCount.get(signature) ?? 0) + 1;
@@ -95,8 +88,9 @@ export const runQuerySession = async ({
             toolResults.push(
               `[tool_result] ${event.toolName}\n${toolResult.message}`.trim()
             );
-            if (toolResult.halt) {
-              needsReviewFinalization = true;
+            if (toolResult.reviewMode === "block") {
+              dispatch({ type: "complete" });
+              return;
             }
             continue;
           }
@@ -118,20 +112,6 @@ export const runQuerySession = async ({
       }
 
       const resultsBlock = toolResults.join("\n\n");
-      if (needsReviewFinalization) {
-        roundPrompt = [
-          "A file operation is pending human review.",
-          "Do not call any tools.",
-          "Briefly summarize what is pending, then ask user to run /review and /approve <id> or /reject <id>.",
-          "Then stop.",
-          "",
-          "Pending operation details:",
-          resultsBlock || "(none)",
-        ].join("\n");
-        needsReviewFinalization = false;
-        reviewFinalizationUsed = true;
-        continue;
-      }
       roundPrompt = [
         "Original user task:",
         originalTask,

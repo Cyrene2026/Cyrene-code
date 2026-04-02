@@ -1,6 +1,7 @@
 export type FileAction =
   | "read_file"
   | "list_dir"
+  | "create_dir"
   | "create_file"
   | "write_file"
   | "edit_file"

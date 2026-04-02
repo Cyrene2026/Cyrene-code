@@ -1,10 +1,12 @@
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { basename, dirname, resolve } from "node:path";
 import type {
   FileAction,
-  FileToolRequest,
+  ToolRequest,
   PendingReviewItem,
   RuleConfig,
+  CommandToolRequest,
 } from "./types";
 
 type HandleResult = {
@@ -13,10 +15,44 @@ type HandleResult = {
   pending?: PendingReviewItem;
 };
 
+type FileMcpServiceOptions = {
+  commandRunner?: (
+    request: CommandToolRequest,
+    resolvedCwd: string
+  ) => Promise<string>;
+};
+
 const READ_ONLY_ACTIONS: FileAction[] = ["read_file", "list_dir"];
 
-const formatPreview = (request: FileToolRequest) => {
+const ALLOWED_COMMANDS = new Set([
+  "bun",
+  "bun.exe",
+  "node",
+  "node.exe",
+  "python",
+  "python.exe",
+  "python3",
+  "python3.exe",
+  "py",
+  "py.exe",
+  "git",
+  "git.exe",
+]);
+const COMMAND_TIMEOUT_MS = 20_000;
+const MAX_COMMAND_OUTPUT_CHARS = 24_000;
+
+const formatPreview = (request: ToolRequest) => {
   const chunks = [`action=${request.action}`, `path=${request.path}`];
+  if (request.action === "run_command") {
+    chunks.push(`command=${request.command}`);
+    if (request.args.length > 0) {
+      chunks.push(`args=${request.args.join(" ")}`);
+    }
+    if (request.cwd) {
+      chunks.push(`cwd=${request.cwd}`);
+    }
+    return chunks.join(" | ");
+  }
   if (request.find) chunks.push(`find=${request.find}`);
   if (request.replace) chunks.push(`replace=${request.replace}`);
   if (typeof request.content === "string") {
@@ -55,7 +91,7 @@ const formatDiffLines = (
   return body.join("\n");
 };
 
-const normalizeAction = (raw: unknown): FileAction | null => {
+const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
   if (typeof raw !== "string") {
     return null;
   }
@@ -93,6 +129,13 @@ const normalizeAction = (raw: unknown): FileAction | null => {
     case "remove":
     case "rm":
       return "delete_file";
+    case "run":
+    case "run_command":
+    case "command":
+    case "exec":
+    case "terminal":
+    case "shell":
+      return "run_command";
     default:
       return null;
   }
@@ -103,6 +146,16 @@ const pickString = (obj: Record<string, unknown>, keys: string[]) => {
     const value = obj[key];
     if (typeof value === "string" && value.trim()) {
       return value;
+    }
+  }
+  return undefined;
+};
+
+const pickStringArray = (obj: Record<string, unknown>, keys: string[]) => {
+  for (const key of keys) {
+    const value = obj[key];
+    if (Array.isArray(value) && value.every(item => typeof item === "string")) {
+      return value as string[];
     }
   }
   return undefined;
@@ -141,6 +194,11 @@ const WRAPPER_KEYS = [
   "toolCall",
 ] as const;
 
+const tokenizeCommand = (raw: string) =>
+  [...raw.matchAll(/"([^"]*)"|'([^']*)'|[^\s]+/g)].map(match =>
+    match[1] ?? match[2] ?? match[0] ?? ""
+  );
+
 const collectRecords = (input: unknown, maxDepth = 4): Record<string, unknown>[] => {
   const queue: Array<{ value: unknown; depth: number }> = [{ value: input, depth: 0 }];
   const records: Record<string, unknown>[] = [];
@@ -178,7 +236,7 @@ const collectRecords = (input: unknown, maxDepth = 4): Record<string, unknown>[]
 const normalizeFromRecord = (
   record: Record<string, unknown>,
   toolName: string
-): FileToolRequest | null => {
+): ToolRequest | null => {
   let action =
     normalizeAction(record.action) ??
     normalizeAction(record.operation) ??
@@ -200,6 +258,26 @@ const normalizeFromRecord = (
   const content = pickString(record, ["content", "text", "data", "value"]);
   const find = pickString(record, ["find", "search", "from", "old", "before"]);
   const replace = pickString(record, ["replace", "to", "new", "after"]);
+  const cwd = pickString(record, ["cwd", "working_directory", "workdir", "directory"]);
+  const rawArgs = pickStringArray(record, ["args", "argv", "arguments"]);
+  const rawCommand = pickString(record, ["command", "cmd", "program", "executable"]);
+
+  if (action === "run_command" || ["shell", "terminal", "command", "mcp.shell"].includes(toolName)) {
+    const tokens = rawCommand ? tokenizeCommand(rawCommand) : [];
+    const command = tokens[0];
+    const args = rawArgs ?? tokens.slice(1);
+    if (!command) {
+      return null;
+    }
+    const display = [command, ...args].join(" ").trim();
+    return {
+      action: "run_command",
+      command,
+      args,
+      cwd,
+      path: display || command,
+    };
+  }
 
   // Heuristic fallback for providers that omit explicit action.
   if (!action) {
@@ -245,13 +323,13 @@ const summarizeInput = (input: unknown) => {
 const normalizeToolInput = (
   toolName: string,
   input: unknown
-): FileToolRequest | null => {
+): ToolRequest | null => {
   const records = collectRecords(input);
   if (records.length === 0) {
     return null;
   }
 
-  let best: FileToolRequest | null = null;
+  let best: ToolRequest | null = null;
   let bestScore = -1;
 
   for (const record of records) {
@@ -259,12 +337,20 @@ const normalizeToolInput = (
     if (!normalized) {
       continue;
     }
+    const commandScore =
+      normalized.action === "run_command"
+        ? 2 +
+          (normalized.command ? 2 : 0) +
+          normalized.args.length
+        : 0;
     const score =
-      (normalized.action ? 2 : 0) +
-      (normalized.path ? 2 : 0) +
-      (typeof normalized.content === "string" ? 1 : 0) +
-      (typeof normalized.find === "string" ? 1 : 0) +
-      (typeof normalized.replace === "string" ? 1 : 0);
+      normalized.action === "run_command"
+        ? commandScore
+        : (normalized.action ? 2 : 0) +
+          (normalized.path ? 2 : 0) +
+          (typeof normalized.content === "string" ? 1 : 0) +
+          (typeof normalized.find === "string" ? 1 : 0) +
+          (typeof normalized.replace === "string" ? 1 : 0);
     if (score > bestScore) {
       bestScore = score;
       best = normalized;
@@ -274,7 +360,15 @@ const normalizeToolInput = (
   return best;
 };
 
-const validateRequest = (request: FileToolRequest): string | null => {
+const validateRequest = (request: ToolRequest): string | null => {
+  if (request.action === "run_command") {
+    const normalized = basename(request.command).toLowerCase();
+    if (!ALLOWED_COMMANDS.has(normalized)) {
+      return `run_command only allows fixed commands: ${[...ALLOWED_COMMANDS].join(", ")}.`;
+    }
+    return null;
+  }
+
   switch (request.action) {
     case "create_file":
     case "create_dir":
@@ -302,7 +396,10 @@ const validateRequest = (request: FileToolRequest): string | null => {
 export class FileMcpService {
   private pending = new Map<string, PendingReviewItem>();
 
-  constructor(private readonly rules: RuleConfig) {}
+  constructor(
+    private readonly rules: RuleConfig,
+    private readonly options: FileMcpServiceOptions = {}
+  ) {}
 
   private toWorkspaceRelativePath(inputPath: string) {
     const raw = inputPath.trim();
@@ -333,9 +430,21 @@ export class FileMcpService {
   }
 
   private async buildReviewDetails(
-    request: FileToolRequest,
+    request: ToolRequest,
     mode: "summary" | "full"
   ): Promise<string> {
+    if (request.action === "run_command") {
+      return [
+        "[command preview]",
+        `command: ${request.command}`,
+        request.args.length > 0 ? `args: ${request.args.join(" ")}` : "",
+        `cwd: ${request.cwd ?? "."}`,
+        `mode: ${mode}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     const abs = this.resolvePath(request.path);
     const maxLines =
       mode === "summary" ? MAX_PREVIEW_SUMMARY_LINES : undefined;
@@ -419,7 +528,76 @@ export class FileMcpService {
     return "";
   }
 
-  private async execute(request: FileToolRequest): Promise<string> {
+  private async executeCommand(request: CommandToolRequest): Promise<string> {
+    const cwd = request.cwd
+      ? this.resolvePath(request.cwd)
+      : resolve(this.rules.workspaceRoot);
+
+    if (this.options.commandRunner) {
+      return this.options.commandRunner(request, cwd);
+    }
+
+    return await new Promise<string>((resolvePromise, rejectPromise) => {
+      const child = spawn(request.command, request.args, {
+        cwd,
+        shell: false,
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        child.kill("SIGTERM");
+        rejectPromise(new Error(`Command timed out after ${COMMAND_TIMEOUT_MS}ms.`));
+      }, COMMAND_TIMEOUT_MS);
+
+      const appendChunk = (target: "stdout" | "stderr", chunk: Buffer | string) => {
+        const text = chunk.toString();
+        if (target === "stdout") {
+          stdout = `${stdout}${text}`.slice(-MAX_COMMAND_OUTPUT_CHARS);
+        } else {
+          stderr = `${stderr}${text}`.slice(-MAX_COMMAND_OUTPUT_CHARS);
+        }
+      };
+
+      child.stdout.on("data", chunk => appendChunk("stdout", chunk));
+      child.stderr.on("data", chunk => appendChunk("stderr", chunk));
+      child.on("error", error => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        rejectPromise(error);
+      });
+      child.on("close", code => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+        if (code === 0) {
+          resolvePromise(output || "(command completed with no output)");
+          return;
+        }
+        rejectPromise(
+          new Error(output || `Command exited with code ${code ?? "unknown"}.`)
+        );
+      });
+    });
+  }
+
+  private async execute(request: ToolRequest): Promise<string> {
+    if (request.action === "run_command") {
+      return this.executeCommand(request);
+    }
+
     const abs = this.resolvePath(request.path);
 
     switch (request.action) {
@@ -480,7 +658,17 @@ export class FileMcpService {
 
   async handleToolCall(toolName: string, input: unknown): Promise<HandleResult> {
     const normalizedName = toolName.trim().toLowerCase();
-    if (!["file", "fs", "mcp.file"].includes(normalizedName)) {
+    if (
+      ![
+        "file",
+        "fs",
+        "mcp.file",
+        "shell",
+        "terminal",
+        "command",
+        "mcp.shell",
+      ].includes(normalizedName)
+    ) {
       return {
         ok: false,
         message: `Unsupported tool: ${toolName}`,
@@ -503,9 +691,12 @@ export class FileMcpService {
       };
     }
 
-    if (request.action !== "create_dir" &&
-        !READ_ONLY_ACTIONS.includes(request.action) &&
-        this.rules.requireReview.includes(request.action)) {
+    if (
+      request.action === "run_command" ||
+      (request.action !== "create_dir" &&
+        !READ_ONLY_ACTIONS.includes(request.action as FileAction) &&
+        this.rules.requireReview.includes(request.action))
+    ) {
       const id = crypto.randomUUID().slice(0, 8);
       const detailsSummary = await this.buildReviewDetails(request, "summary");
       const detailsFull = await this.buildReviewDetails(request, "full");

@@ -1,17 +1,23 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { FileAction, RuleConfig } from "./types";
+import type { MpcAction, RuleConfig } from "./types";
 
 const DEFAULT_RULES: RuleConfig = {
   workspaceRoot: process.cwd(),
   maxReadBytes: 120_000,
-  requireReview: ["create_file", "write_file", "edit_file", "delete_file"],
+  requireReview: [
+    "create_file",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "run_command",
+  ],
 };
 
 const parseScalar = (value: string) =>
   value.replace(/^["']/, "").replace(/["']$/, "").trim();
 
-const isFileAction = (value: string): value is FileAction =>
+const isMpcAction = (value: string): value is MpcAction =>
   [
     "read_file",
     "list_dir",
@@ -20,6 +26,7 @@ const isFileAction = (value: string): value is FileAction =>
     "write_file",
     "edit_file",
     "delete_file",
+    "run_command",
   ].includes(value);
 
 export const loadRuleConfig = async (): Promise<RuleConfig> => {
@@ -33,7 +40,7 @@ export const loadRuleConfig = async (): Promise<RuleConfig> => {
 
   let workspaceRoot = DEFAULT_RULES.workspaceRoot;
   let maxReadBytes = DEFAULT_RULES.maxReadBytes;
-  const requireReview: FileAction[] = [];
+  const requireReview: MpcAction[] = [];
   let inRequireReview = false;
 
   for (const raw of content.split(/\r?\n/)) {
@@ -66,7 +73,7 @@ export const loadRuleConfig = async (): Promise<RuleConfig> => {
 
     if (inRequireReview && line.startsWith("-")) {
       const action = parseScalar(line.slice(1));
-      if (isFileAction(action)) {
+      if (isMpcAction(action)) {
         requireReview.push(action);
       }
       continue;

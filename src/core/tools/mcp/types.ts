@@ -7,6 +7,10 @@ export type FileAction =
   | "edit_file"
   | "delete_file";
 
+export type CommandAction = "run_command";
+
+export type MpcAction = FileAction | CommandAction;
+
 export type FileToolRequest = {
   action: FileAction;
   path: string;
@@ -15,9 +19,19 @@ export type FileToolRequest = {
   replace?: string;
 };
 
+export type CommandToolRequest = {
+  action: CommandAction;
+  path: string;
+  command: string;
+  args: string[];
+  cwd?: string;
+};
+
+export type ToolRequest = FileToolRequest | CommandToolRequest;
+
 export type PendingReviewItem = {
   id: string;
-  request: FileToolRequest;
+  request: ToolRequest;
   preview: string;
   previewSummary: string;
   previewFull: string;
@@ -27,5 +41,5 @@ export type PendingReviewItem = {
 export type RuleConfig = {
   workspaceRoot: string;
   maxReadBytes: number;
-  requireReview: FileAction[];
+  requireReview: MpcAction[];
 };

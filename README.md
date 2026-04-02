@@ -40,8 +40,14 @@ Current request shape:
 ```
 
 Model switch:
-- `/model` shows current model.
-- `/model <name>` switches model at runtime.
+- `/model` opens model picker (Up/Down select, Left/Right page, Enter switch).
+- `/model refresh` pulls model list immediately and overwrites `.cyrene/model.yaml`.
+- `/model <name>` switches immediately only if model exists in `.cyrene/model.yaml`; otherwise it fails.
+
+Model source priority:
+1. `.cyrene/model.yaml`
+2. If missing/invalid, fetch from `GET /v1/models`
+3. If fetch fails, model initialization fails (and refresh reports failure)
 
 Prompt priority and customization:
 - Priority is fixed as: `system prompt > .cyrene/.cyrene.md > pins`.
@@ -57,8 +63,10 @@ Prompt priority and customization:
 
 Session and context:
 - Sessions are persisted under `.cyrene/session` as JSON files.
+- `/help` shows the command reference.
 - `/sessions` lists sessions by latest update time.
 - `/resume <session_id>` restores a previous session.
+- `/resume` opens keyboard picker (Left/Right page, Enter resume, Esc cancel).
 - `/new` starts a fresh session.
 - `/pin <note>` stores human-selected key context.
 - `/pins` shows pinned key context.

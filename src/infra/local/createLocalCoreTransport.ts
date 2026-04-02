@@ -31,9 +31,32 @@ export const createLocalCoreTransport = (): QueryTransport => {
 
   return {
     getModel: () => currentModel,
-    setModel: (model: string) => {
-      currentModel = model.trim() || "local-core";
+    setModel: async (model: string) => {
+      const next = model.trim();
+      if (!next) {
+        return {
+          ok: false,
+          message: "Model name cannot be empty.",
+        };
+      }
+      if (next !== "local-core") {
+        return {
+          ok: false,
+          message: `Model "${next}" is not in model catalog.`,
+        };
+      }
+      currentModel = next;
+      return {
+        ok: true,
+        message: `Model switched to: ${currentModel}`,
+      };
     },
+    listModels: async () => ["local-core"],
+    refreshModels: async () => ({
+      ok: true,
+      message: "Local transport uses static model; nothing to refresh.",
+      models: [currentModel],
+    }),
     requestStreamUrl: async (query: string) => {
       const id = crypto.randomUUID();
       sessionQueries.set(id, query);

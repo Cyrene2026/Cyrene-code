@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { runQuerySession } from "../../core/query/runQuerySession";
+import {
+  runQuerySession,
+  type RunQuerySessionResult,
+} from "../../core/query/runQuerySession";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
-import { compressContext } from "../../core/session/contextCompression";
+import type { SessionMemoryInput } from "../../core/session/memoryIndex";
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type { QueryTransport } from "../../core/query/transport";
@@ -67,6 +70,15 @@ type ApprovalPanelState = {
   blockedReason: string | null;
   blockedAt: number | null;
   lastAction: ApprovalActionKind | null;
+  inFlightId: string | null;
+  actionState: ApprovalActionKind | null;
+  resumePending: boolean;
+};
+
+type SuspendedTaskState = {
+  sessionId: string;
+  assistantBufferRef: { current: string };
+  resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
 };
 
 const defaultSystemText =
@@ -151,6 +163,20 @@ const buildApprovalMessage = (
     ...extraLines.filter(Boolean),
   ].join("\n");
 
+const parseToolDetail = (raw: string) => {
+  const [header = ""] = raw.split("\n");
+  const detail = header
+    .replace("[tool result]", "")
+    .replace("[tool error]", "")
+    .trim();
+  const [action = "", path = ""] = detail.split(/\s+/, 2);
+  return {
+    detail,
+    action: action || undefined,
+    path: path || undefined,
+  };
+};
+
 const condensePreview = (text: string, maxLines = 120) => {
   const lines = text.split("\n");
   if (lines.length <= maxLines) {
@@ -229,6 +255,9 @@ export const useChatApp = ({
     blockedReason: null,
     blockedAt: null,
     lastAction: null,
+    inFlightId: null,
+    actionState: null,
+    resumePending: false,
   });
 
   const queueRef = useRef(Promise.resolve());
@@ -241,6 +270,7 @@ export const useChatApp = ({
   const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
+  const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
@@ -340,6 +370,15 @@ export const useChatApp = ({
     lastAction: null,
   });
 
+  const clearApprovalInFlight = (
+    state: ApprovalPanelState
+  ): ApprovalPanelState => ({
+    ...state,
+    inFlightId: null,
+    actionState: null,
+    resumePending: false,
+  });
+
   const syncApprovalBlockToQueue = (
     state: ApprovalPanelState,
     pending: PendingReviewItem[]
@@ -352,6 +391,89 @@ export const useChatApp = ({
     }
 
     return clearApprovalBlock(state);
+  };
+
+  const recordSessionMemories = async (
+    sessionId: string | null,
+    entries: SessionMemoryInput[]
+  ) => {
+    if (!sessionId || entries.length === 0) {
+      return;
+    }
+    try {
+      await sessionStore.recordMemories(sessionId, entries);
+    } catch {
+      // Memory indexing should not break the interactive chat flow.
+    }
+  };
+
+  const recordSessionMemory = async (
+    sessionId: string | null,
+    entry: SessionMemoryInput
+  ) => recordSessionMemories(sessionId, [entry]);
+
+  const getMemorySessionId = () =>
+    suspendedTaskRef.current?.sessionId ?? activeSessionId;
+
+  const finalizeAssistantBuffer = async (
+    sessionId: string,
+    assistantBuffer: string
+  ) => {
+    if (!assistantBuffer.trim()) {
+      return;
+    }
+
+    const memoryText = condenseForMemory(assistantBuffer);
+    await sessionStore.appendMessage(sessionId, {
+      role: "assistant",
+      text: memoryText,
+      createdAt: new Date().toISOString(),
+    });
+    if (assistantBuffer.length > memoryText.length + 40) {
+      pushSystemMessage(
+        "Long assistant output was compressed in session memory. Use /pin to keep key points.",
+        { kind: "system_hint", tone: "neutral", color: "gray" }
+      );
+    }
+  };
+
+  const consumeQueryRunResult = async (
+    sessionId: string,
+    assistantBufferRef: { current: string },
+    result: RunQuerySessionResult | void
+  ) => {
+    if (!result || result.status === "completed") {
+      suspendedTaskRef.current = null;
+      await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
+      return;
+    }
+
+    suspendedTaskRef.current = {
+      sessionId,
+      assistantBufferRef,
+      resume: result.resume,
+    };
+  };
+
+  const resumeSuspendedTask = (toolResultMessage: string) => {
+    const suspended = suspendedTaskRef.current;
+    if (!suspended) {
+      return;
+    }
+
+    enqueueTask(async () => {
+      const current = suspendedTaskRef.current;
+      if (!current || current.sessionId !== suspended.sessionId) {
+        return;
+      }
+      suspendedTaskRef.current = null;
+      const result = await current.resume(toolResultMessage);
+      await consumeQueryRunResult(
+        current.sessionId,
+        current.assistantBufferRef,
+        result
+      );
+    });
   };
 
   const ensureActiveSession = async (titleHint?: string) => {
@@ -602,6 +724,9 @@ export const useChatApp = ({
         blockedReason: null,
         blockedAt: null,
         lastAction: null,
+        inFlightId: null,
+        actionState: null,
+        resumePending: false,
       };
     }
 
@@ -638,6 +763,9 @@ export const useChatApp = ({
       blockedReason: previous.blockedReason,
       blockedAt: previous.blockedAt,
       lastAction: previous.lastAction,
+      inFlightId: previous.inFlightId,
+      actionState: previous.actionState,
+      resumePending: previous.resumePending,
     };
 
     if (options?.clearBlocked) {
@@ -696,11 +824,17 @@ export const useChatApp = ({
       ...approvalPanelRef.current,
       active: false,
       previewOffset: 0,
+      inFlightId: null,
+      actionState: null,
+      resumePending: false,
     };
     setApprovalPanel(previous => ({
       ...previous,
       active: false,
       previewOffset: 0,
+      inFlightId: null,
+      actionState: null,
+      resumePending: false,
     }));
   };
 
@@ -760,6 +894,19 @@ export const useChatApp = ({
       APPROVAL_BLOCK_RETRY_MS
     );
 
+  const markApprovalInFlight = (
+    id: string,
+    action: ApprovalActionKind,
+    resumePending = false
+  ) => {
+    syncApprovalPanelState(previous => ({
+      ...previous,
+      inFlightId: id,
+      actionState: action,
+      resumePending,
+    }));
+  };
+
   const approvePendingReview = (id: string) => {
     if (isBlockedApprovalAttempt(id)) {
       return;
@@ -792,6 +939,14 @@ export const useChatApp = ({
             tone: "danger",
             color: "red",
           });
+          await recordSessionMemory(getMemorySessionId(), {
+            kind: "error",
+            text: buildApprovalMessage("Approval error", undefined, [result.message]),
+            priority: 85,
+            entities: {
+              status: ["error"],
+            },
+          });
           return;
         }
 
@@ -819,6 +974,18 @@ export const useChatApp = ({
               color: "red",
             }
           );
+          await recordSessionMemory(getMemorySessionId(), {
+            kind: "error",
+            text: buildApprovalMessage("Approval error", target, [
+              extractMessageBody(result.message) || result.message,
+            ]),
+            priority: 90,
+            entities: {
+              path: [target.request.path],
+              action: [target.request.action],
+              status: ["error"],
+            },
+          });
           return;
         }
 
@@ -840,7 +1007,19 @@ export const useChatApp = ({
             color: actionColor(target.request.action) ?? "green",
           }
         );
+        await recordSessionMemory(getMemorySessionId(), {
+          kind: "approval",
+          text: buildApprovalMessage("Approved", target, output ? [output] : []),
+          priority: 80,
+          entities: {
+            path: [target.request.path],
+            action: [target.request.action],
+            status: ["approved"],
+          },
+        });
+        resumeSuspendedTask(result.message);
       } finally {
+        syncApprovalPanelState(previous => clearApprovalInFlight(previous));
         approvalActionRef.current.release();
       }
     });
@@ -881,6 +1060,20 @@ export const useChatApp = ({
               color: "red",
             }
           );
+          await recordSessionMemory(getMemorySessionId(), {
+            kind: "error",
+            text: buildApprovalMessage(
+              "Approval error",
+              target,
+              [extractMessageBody(result.message) || result.message]
+            ),
+            priority: 85,
+            entities: {
+              path: target?.request.path ? [target.request.path] : undefined,
+              action: target?.request.action ? [target.request.action] : undefined,
+              status: ["error"],
+            },
+          });
           return;
         }
 
@@ -898,7 +1091,19 @@ export const useChatApp = ({
           tone: "warning",
           color: "yellow",
         });
+        await recordSessionMemory(getMemorySessionId(), {
+          kind: "approval",
+          text: buildApprovalMessage("Rejected", target),
+          priority: 78,
+          entities: {
+            path: [target.request.path],
+            action: [target.request.action],
+            status: ["rejected"],
+          },
+        });
+        resumeSuspendedTask(result.message);
       } finally {
+        syncApprovalPanelState(previous => clearApprovalInFlight(previous));
         approvalActionRef.current.release();
       }
     });
@@ -938,6 +1143,11 @@ export const useChatApp = ({
     ) {
       return;
     }
+    markApprovalInFlight(
+      target.id,
+      "approve",
+      Boolean(suspendedTaskRef.current)
+    );
     pushSystemMessage(`Approving ${target.id}...`, {
       kind: "system_hint",
       tone: "info",
@@ -968,6 +1178,11 @@ export const useChatApp = ({
     ) {
       return;
     }
+    markApprovalInFlight(
+      target.id,
+      "reject",
+      Boolean(suspendedTaskRef.current)
+    );
     pushSystemMessage(`Rejecting ${target.id}...`, {
       kind: "system_hint",
       tone: "info",
@@ -1154,11 +1369,15 @@ export const useChatApp = ({
       return;
     }
 
-      if (key.escape) {
-        closeApprovalPanel({ suppressCurrentQueue: true });
-        pushSystemMessage("Approval panel closed.", {
-          kind: "system_hint",
-          tone: "neutral",
+    if (approvalPanelRef.current.inFlightId) {
+      return;
+    }
+
+    if (key.escape) {
+      closeApprovalPanel({ suppressCurrentQueue: true });
+      pushSystemMessage("Approval panel closed.", {
+        kind: "system_hint",
+        tone: "neutral",
         color: "gray",
       });
       return;
@@ -1731,37 +1950,32 @@ export const useChatApp = ({
 
       const session = await ensureActiveSession(query);
       const now = new Date().toISOString();
-      let persisted: SessionRecord = await sessionStore.appendMessage(session.id, {
+      await sessionStore.appendMessage(session.id, {
         role: "user",
         text: query,
         createdAt: now,
       });
 
-      const compressedForQuery = compressContext(persisted.messages);
-      persisted = await sessionStore.updateSummary(
-        session.id,
-        compressedForQuery.summary
-      );
+      const promptContext = await sessionStore.getPromptContext(session.id, query);
 
       const prompt = buildPromptWithContext(
         query,
         systemPrompt,
         projectPrompt,
-        persisted.summary,
-        persisted.focus,
-        compressedForQuery.recent
+        promptContext
       );
-      let assistantBuffer = "";
+      const assistantBufferRef = { current: "" };
 
-      await runQuerySessionImpl({
+      const runResult = await runQuerySessionImpl({
         query: prompt,
+        originalTask: query,
         transport,
         onState: next => {
           setSessionState(next);
           setStatus(next.status as ChatStatus);
         },
         onTextDelta: text => {
-          assistantBuffer += text;
+          assistantBufferRef.current += text;
           appendToLastAssistant(text);
         },
         onToolCall: async (toolName, toolInput) => {
@@ -1793,9 +2007,21 @@ export const useChatApp = ({
             tone: summarized.tone,
             color: summarized.color,
           });
+          const detail = parseToolDetail(result.message);
+          await recordSessionMemory(session.id, {
+            kind: result.ok ? "tool_result" : "error",
+            text: summarized.text,
+            priority: result.ok ? 72 : 88,
+            entities: {
+              path: detail.path ? [detail.path] : undefined,
+              toolName: detail.action ? [detail.action] : toolName ? [toolName] : undefined,
+              action: detail.action ? [detail.action] : undefined,
+              status: [result.ok ? "ok" : "error"],
+            },
+          });
           return { message: result.message };
         },
-        onError: message => {
+        onError: async message => {
           pushStreamingSystemMessage(
             `Stream error: ${message}`,
             {
@@ -1804,25 +2030,18 @@ export const useChatApp = ({
               color: "red",
             }
           );
+          await recordSessionMemory(session.id, {
+            kind: "error",
+            text: `Stream error: ${message}`,
+            priority: 92,
+            entities: {
+              status: ["error"],
+              queryTerms: [query],
+            },
+          });
         },
       });
-
-      if (assistantBuffer.trim()) {
-        const memoryText = condenseForMemory(assistantBuffer);
-        const withAssistant = await sessionStore.appendMessage(session.id, {
-          role: "assistant",
-          text: memoryText,
-          createdAt: new Date().toISOString(),
-        });
-        const compressed = compressContext(withAssistant.messages);
-        await sessionStore.updateSummary(session.id, compressed.summary);
-        if (assistantBuffer.length > memoryText.length + 40) {
-          pushSystemMessage(
-            "Long assistant output was compressed in session memory. Use /pin to keep key points.",
-            { kind: "system_hint", tone: "neutral", color: "gray" }
-          );
-        }
-      }
+      await consumeQueryRunResult(session.id, assistantBufferRef, runResult);
     });
   };
 

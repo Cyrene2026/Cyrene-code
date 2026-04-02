@@ -9,6 +9,7 @@ import type { QueryTransport } from "./transport";
 
 type RunQuerySessionParams = {
   query: string;
+  originalTask?: string;
   transport: QueryTransport;
   onState: (state: QuerySessionState) => void;
   onTextDelta: (text: string) => void;
@@ -21,30 +22,58 @@ type RunQuerySessionParams = {
   onError: (message: string) => void;
 };
 
+export type RunQuerySessionResult =
+  | { status: "completed" }
+  | {
+      status: "suspended";
+      resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
+    };
+
+const buildRoundPrompt = (
+  originalTask: string,
+  toolResults: string[],
+  loopCorrection: string
+) =>
+  [
+    "Original user task:",
+    originalTask,
+    "",
+    "Continue based on tool results while staying strictly on the original task.",
+    "Do not inspect unrelated files unless required for the task.",
+    loopCorrection ? `\n${loopCorrection}\n` : "",
+    "Tool results:",
+    toolResults.join("\n\n") || "(none)",
+    "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+  ].join("\n\n");
+
 export const runQuerySession = async ({
   query,
+  originalTask,
   transport,
   onState,
   onTextDelta,
   onToolCall,
   onError,
-}: RunQuerySessionParams) => {
+}: RunQuerySessionParams): Promise<RunQuerySessionResult> => {
   let state = createQuerySessionState();
-  const originalTask = query;
+  const task = originalTask ?? query;
   const dispatch: QuerySessionDispatch = event => {
     state = querySessionReducer(state, event);
     onState(state);
   };
 
-  dispatch({ type: "start" });
+  const maxRounds = 6;
 
-  try {
-    let roundPrompt = query;
-    const maxRounds = 6;
-    const repeatedToolCallCount = new Map<string, number>();
-    let loopCorrection = "";
+  const runRounds = async (
+    roundPrompt: string,
+    roundStart: number,
+    repeatedToolCallCount: Map<string, number>,
+    loopCorrection: string,
+    accumulatedToolResults: string[]
+  ): Promise<RunQuerySessionResult> => {
+    dispatch({ type: "start" });
 
-    for (let round = 0; round < maxRounds; round += 1) {
+    for (let round = roundStart; round < maxRounds; round += 1) {
       const streamUrl = await transport.requestStreamUrl(roundPrompt);
       let completed = false;
       let sawToolCall = false;
@@ -77,7 +106,7 @@ export const runQuerySession = async ({
                 `\n[tool loop detected] ${event.toolName} was called repeatedly with same input. Stopping to prevent infinite loop.\n`
               );
               dispatch({ type: "complete" });
-              return;
+              return { status: "completed" };
             }
             dispatch({
               type: "tool_call",
@@ -85,13 +114,34 @@ export const runQuerySession = async ({
               input: event.input,
             });
             const toolResult = await onToolCall(event.toolName, event.input);
+            if (toolResult.reviewMode) {
+              dispatch({ type: "suspended" });
+              return {
+                status: "suspended",
+                resume: async (toolResultMessage: string) => {
+                  const nextToolResults = [
+                    ...accumulatedToolResults,
+                    ...toolResults,
+                    `[tool_result] ${event.toolName}\n${toolResultMessage}`.trim(),
+                  ];
+                  const nextPrompt = buildRoundPrompt(
+                    task,
+                    nextToolResults,
+                    loopCorrection
+                  );
+                  return runRounds(
+                    nextPrompt,
+                    round + 1,
+                    repeatedToolCallCount,
+                    loopCorrection,
+                    nextToolResults
+                  );
+                },
+              };
+            }
             toolResults.push(
               `[tool_result] ${event.toolName}\n${toolResult.message}`.trim()
             );
-            if (toolResult.reviewMode === "block") {
-              dispatch({ type: "complete" });
-              return;
-            }
             continue;
           }
 
@@ -108,27 +158,23 @@ export const runQuerySession = async ({
 
       if (!sawToolCall) {
         dispatch({ type: "complete" });
-        return;
+        return { status: "completed" };
       }
 
-      const resultsBlock = toolResults.join("\n\n");
-      roundPrompt = [
-        "Original user task:",
-        originalTask,
-        "",
-        "Continue based on tool results while staying strictly on the original task.",
-        "Do not inspect unrelated files unless required for the task.",
-        loopCorrection ? `\n${loopCorrection}\n` : "",
-        "Tool results:",
-        resultsBlock || "(none)",
-        "If more tool usage is needed, call tools again. Otherwise provide final answer.",
-      ].join("\n\n");
+      accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
+      roundPrompt = buildRoundPrompt(task, accumulatedToolResults, loopCorrection);
     }
 
     dispatch({ type: "complete" });
+    return { status: "completed" };
+  };
+
+  try {
+    return await runRounds(query, 0, new Map<string, number>(), "", []);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     dispatch({ type: "fail", message });
     onError(message);
+    return { status: "completed" };
   }
 };

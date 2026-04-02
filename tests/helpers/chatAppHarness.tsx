@@ -1,5 +1,18 @@
 import React from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
+import { compressContext } from "../../src/core/session/contextCompression";
+import {
+  buildSummaryCacheFromMemoryIndex,
+  createEmptyMemoryIndex,
+  createMessageMemoryInputs,
+  deriveFocusFromMemoryIndex,
+  getPromptContextFromMemoryIndex,
+  rebuildMemoryLookup,
+  removePinMemoryEntry,
+  upsertMemoryEntries,
+  type SessionMemoryIndex,
+  type SessionMemoryInput,
+} from "../../src/core/session/memoryIndex";
 import type { SessionStore } from "../../src/core/session/store";
 import type {
   SessionListItem,
@@ -22,6 +35,7 @@ export type ChatAppHarnessResult<T> = {
 export type TestSessionStore = SessionStore & {
   __getRecord: (id: string) => SessionRecord | undefined;
   __listRecords: () => SessionRecord[];
+  __getMemoryIndex: (id: string) => SessionMemoryIndex | undefined;
 };
 
 export const flushMicrotasks = async () => {
@@ -88,6 +102,7 @@ export const createSessionRecord = (
 
 export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionStore => {
   const records = new Map(seed.map(record => [record.id, cloneRecord(record)]));
+  const memory = new Map<string, SessionMemoryIndex>();
   let counter = seed.length + 1;
 
   const toListItem = (record: SessionRecord): SessionListItem => ({
@@ -96,20 +111,55 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
     updatedAt: record.updatedAt,
   });
 
+  const syncRecordWithIndex = (record: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
+    const compressed = compressContext(record.messages);
+    return {
+      ...record,
+      summary: buildSummaryCacheFromMemoryIndex(index) || compressed.summary,
+      focus: deriveFocusFromMemoryIndex(index),
+    };
+  };
+
+  const ensureIndex = (record: SessionRecord) => {
+    const existing = memory.get(record.id);
+    if (existing) {
+      return existing;
+    }
+    const rebuilt = upsertMemoryEntries(
+      createEmptyMemoryIndex(record.id),
+      createMessageMemoryInputs(record.id, record.messages, record.focus)
+    );
+    memory.set(record.id, rebuilt);
+    const nextRecord = syncRecordWithIndex(record, rebuilt);
+    records.set(record.id, nextRecord);
+    return rebuilt;
+  };
+
   return {
     createSession: async (title?: string) => {
       const id = `session-${counter++}`;
       const record = createSessionRecord(id, { title: title ?? id });
       records.set(id, record);
+      memory.set(id, createEmptyMemoryIndex(id, record.updatedAt));
       return cloneRecord(record);
     },
     listSessions: async () =>
       [...records.values()]
+        .map(record => {
+          const index = ensureIndex(record);
+          return syncRecordWithIndex(record, index);
+        })
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
         .map(toListItem),
     loadSession: async id => {
       const record = records.get(id);
-      return record ? cloneRecord(record) : null;
+      if (!record) {
+        return null;
+      }
+      const index = ensureIndex(record);
+      const next = syncRecordWithIndex(record, index);
+      records.set(id, next);
+      return cloneRecord(next);
     },
     appendMessage: async (id: string, message: SessionMessage) => {
       const record = records.get(id);
@@ -121,8 +171,24 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
         messages: [...record.messages, { ...message }],
         updatedAt: message.createdAt,
       };
-      records.set(id, next);
-      return cloneRecord(next);
+      const inputs =
+        message.role === "system"
+          ? []
+          : createMessageMemoryInputs(id, [{ ...message }]).map(input => ({
+              ...input,
+              sourceMessageRange: {
+                start: next.messages.length - 1,
+                end: next.messages.length - 1,
+              },
+            }));
+      const nextIndex =
+        inputs.length > 0
+          ? upsertMemoryEntries(ensureIndex(record), inputs)
+          : ensureIndex(record);
+      memory.set(id, nextIndex);
+      const synced = syncRecordWithIndex(next, nextIndex);
+      records.set(id, synced);
+      return cloneRecord(synced);
     },
     updateSummary: async (id, summary) => {
       const record = records.get(id);
@@ -138,7 +204,16 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       if (!record) {
         throw new Error(`Missing session ${id}`);
       }
-      const next = { ...record, focus: [...record.focus, note], updatedAt: now() };
+      const nextIndex = upsertMemoryEntries(ensureIndex(record), [
+        {
+          kind: "pin",
+          text: note,
+          priority: 100,
+          dedupeKey: `pin:${note.trim().toLowerCase()}`,
+        },
+      ]);
+      memory.set(id, nextIndex);
+      const next = syncRecordWithIndex({ ...record, updatedAt: now() }, nextIndex);
       records.set(id, next);
       return cloneRecord(next);
     },
@@ -147,17 +222,73 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       if (!record) {
         throw new Error(`Missing session ${id}`);
       }
-      const nextFocus = [...record.focus];
-      nextFocus.splice(index, 1);
-      const next = { ...record, focus: nextFocus, updatedAt: now() };
+      const currentIndex = ensureIndex(record);
+      const currentFocus = deriveFocusFromMemoryIndex(currentIndex);
+      const target = currentFocus[index];
+      const nextIndex = target ? removePinMemoryEntry(currentIndex, target) : currentIndex;
+      memory.set(id, nextIndex);
+      const next = syncRecordWithIndex({ ...record, updatedAt: now() }, nextIndex);
       records.set(id, next);
       return cloneRecord(next);
+    },
+    getMemoryIndex: async id => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      return ensureIndex(record);
+    },
+    recordMemory: async (id, entry: SessionMemoryInput) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const nextIndex = upsertMemoryEntries(ensureIndex(record), [entry]);
+      memory.set(id, nextIndex);
+      const next = syncRecordWithIndex({ ...record, updatedAt: now() }, nextIndex);
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    recordMemories: async (id, entries: SessionMemoryInput[]) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const nextIndex = upsertMemoryEntries(ensureIndex(record), entries);
+      memory.set(id, nextIndex);
+      const next = syncRecordWithIndex({ ...record, updatedAt: now() }, nextIndex);
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    rebuildMemoryIndex: async id => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const rebuilt = upsertMemoryEntries(
+        createEmptyMemoryIndex(id),
+        createMessageMemoryInputs(id, record.messages, record.focus)
+      );
+      memory.set(id, rebuilt);
+      const next = syncRecordWithIndex({ ...record, updatedAt: now() }, rebuilt);
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    getPromptContext: async (id, query) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const index = ensureIndex(record);
+      const compressed = compressContext(record.messages);
+      return getPromptContextFromMemoryIndex(index, query, compressed.recent, record.summary);
     },
     __getRecord: (id: string) => {
       const record = records.get(id);
       return record ? cloneRecord(record) : undefined;
     },
     __listRecords: () => [...records.values()].map(cloneRecord),
+    __getMemoryIndex: (id: string) => memory.get(id),
   };
 };
 

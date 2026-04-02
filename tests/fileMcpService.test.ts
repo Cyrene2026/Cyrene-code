@@ -70,20 +70,15 @@ describe("FileMcpService", () => {
     await mkdir(join(root, "test_files"), { recursive: true });
     await writeFile(join(root, "test_files", "u4.py"), "print('existing')\n", "utf8");
 
-    const queued = await service.handleToolCall("file", {
+    const result = await service.handleToolCall("file", {
       action: "create_file",
       path: "test_files/u4.py",
       content: "print('new')\n",
     });
 
-    expect(queued.pending).toBeDefined();
-
-    const approved = await service.approve(queued.pending!.id);
-
-    expect(approved.ok).toBe(false);
-    expect(approved.message).toContain("[approve failed]");
-    expect(approved.message).toContain("EEXIST");
-    expect(service.listPending()).toHaveLength(1);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("create_file target already exists");
+    expect(service.listPending()).toHaveLength(0);
 
     const content = await readFile(join(root, "test_files", "u4.py"), "utf8");
     expect(content).toBe("print('existing')\n");
@@ -124,23 +119,20 @@ describe("FileMcpService", () => {
     await expect(readFile(join(root, "remove-me.txt"), "utf8")).rejects.toThrow();
   });
 
-  test("edit_file approve fails when find text does not exist", async () => {
+  test("edit_file rejects before queue when find text does not exist", async () => {
     const { root, service } = await createService();
     await writeFile(join(root, "edit.txt"), "hello world", "utf8");
 
-    const queued = await service.handleToolCall("file", {
+    const result = await service.handleToolCall("file", {
       action: "edit_file",
       path: "edit.txt",
       find: "missing",
       replace: "patched",
     });
 
-    expect(queued.pending).toBeDefined();
-
-    const approved = await service.approve(queued.pending!.id);
-
-    expect(approved.ok).toBe(false);
-    expect(approved.message).toContain("find text not found");
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("edit_file find text not found");
+    expect(service.listPending()).toHaveLength(0);
   });
 
   test("rejects unsupported tool name", async () => {
@@ -176,6 +168,146 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Path escapes workspace root");
+  });
+
+  test("rejects duplicate pending create_file for same path", async () => {
+    const { service } = await createService();
+
+    const first = await service.handleToolCall("file", {
+      action: "create_file",
+      path: "test_files/file1.py",
+      content: "print('one')\n",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "create_file",
+      path: ".\\test_files\\file1.py",
+      content: "print('two')\n",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.message).toContain(
+      "Pending conflict: create_file test_files/file1.py is already queued."
+    );
+    expect(service.listPending()).toHaveLength(1);
+  });
+
+  test("rejects mixed pending write conflict for same path", async () => {
+    const { service } = await createService();
+
+    const first = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "test_files/conflict.py",
+      content: "print('one')\n",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "edit_file",
+      path: "test_files/conflict.py",
+      find: "one",
+      replace: "two",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.message).toContain(
+      "Pending conflict: write_file test_files/conflict.py is already queued."
+    );
+    expect(service.listPending()).toHaveLength(1);
+  });
+
+  test("rejects delete_file when a write operation for same path is already queued", async () => {
+    const { service } = await createService();
+
+    const first = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "test_files/delete-conflict.py",
+      content: "print('one')\n",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "delete_file",
+      path: "test_files/delete-conflict.py",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.message).toContain(
+      "Pending conflict: write_file test_files/delete-conflict.py is already queued."
+    );
+  });
+
+  test("delete_file rejects before queue when target does not exist", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "delete_file",
+      path: "missing.txt",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("delete_file target does not exist");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("write_file preview shows overwrite diff for existing target", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "overwrite.txt"), "old line\n", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "overwrite.txt",
+      content: "new line\n",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[write preview | overwrite]");
+    expect(queued.pending?.previewSummary).toContain("[old - to be overwritten]");
+    expect(queued.pending?.previewSummary).toContain("[new + to be written]");
+  });
+
+  test("write_file allows missing target and creates file after approval", async () => {
+    const { root, service } = await createService();
+
+    const queued = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "new-write.txt",
+      content: "written\n",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[write preview | new file]");
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(await readFile(join(root, "new-write.txt"), "utf8")).toBe("written\n");
+  });
+
+  test("create_file preview marks new-only semantics", async () => {
+    const { service } = await createService();
+
+    const queued = await service.handleToolCall("file", {
+      action: "create_file",
+      path: "brand_new.py",
+      content: "print('new')\n",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[create preview | new only]");
+  });
+
+  test("edit_file rejects before queue when target does not exist", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "edit_file",
+      path: "missing-edit.txt",
+      find: "old",
+      replace: "new",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("edit_file target does not exist");
+    expect(service.listPending()).toHaveLength(0);
   });
 
   test("run_command enters review queue and executes allowed command on approve", async () => {

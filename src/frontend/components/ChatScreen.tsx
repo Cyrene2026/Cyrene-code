@@ -38,6 +38,9 @@ type ChatScreenProps = {
     blockedReason: string | null;
     blockedAt: number | null;
     lastAction: "approve" | "reject" | null;
+    inFlightId?: string | null;
+    actionState?: "approve" | "reject" | null;
+    resumePending?: boolean;
   };
   activeSessionId: string | null;
   currentModel: string;
@@ -105,6 +108,46 @@ const resolveItemColor = (item: ChatItem) => {
 
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
+
+const getStatusBadge = (status: ChatStatus, spinner: string) => {
+  if (status === "streaming") {
+    return {
+      textColor: "black" as const,
+      backgroundColor: "yellow" as const,
+      headerLabel: `${spinner} WORKING`,
+      inputLabel: `${spinner} Thinking`,
+      inputColor: "yellow" as const,
+    };
+  }
+
+  if (status === "awaiting_review") {
+    return {
+      textColor: "black" as const,
+      backgroundColor: "magenta" as const,
+      headerLabel: "REVIEW",
+      inputLabel: "Awaiting review",
+      inputColor: "magenta" as const,
+    };
+  }
+
+  if (status === "error") {
+    return {
+      textColor: "black" as const,
+      backgroundColor: "red" as const,
+      headerLabel: "ERROR",
+      inputLabel: "Error",
+      inputColor: "red" as const,
+    };
+  }
+
+  return {
+    textColor: "black" as const,
+    backgroundColor: "green" as const,
+    headerLabel: "READY",
+    inputLabel: "Ready",
+    inputColor: "green" as const,
+  };
+};
 
 const formatPaged = <T,>(items: T[], selectedIndex: number, pageSize: number): PagedResult<T> => {
   const total = items.length;
@@ -336,37 +379,44 @@ const renderShellHeader = (
   pendingCount: number,
   activePanel: string,
   spinner: string
-) => (
-  <Box
-    marginBottom={SECTION_GAP}
-    flexDirection="column"
-    borderStyle="round"
-    borderColor="cyan"
-    paddingX={1}
-    paddingY={1}
-  >
-    <Box justifyContent="space-between" flexWrap="wrap">
-      <Box flexDirection="column">
-        <Text bold color="cyan">
-          {BRAND_NAME}
-        </Text>
-        <Text dimColor>coding console · review-aware shell</Text>
+) => {
+  const statusBadge = getStatusBadge(status, spinner);
+
+  return (
+    <Box
+      marginBottom={SECTION_GAP}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      paddingX={1}
+      paddingY={1}
+    >
+      <Box justifyContent="space-between" flexWrap="wrap">
+        <Box flexDirection="column">
+          <Text bold color="cyan">
+            {BRAND_NAME}
+          </Text>
+          <Text dimColor>coding console · review-aware shell</Text>
+        </Box>
+        <Box flexDirection="column" alignItems="flex-end">
+          <Text
+            color={statusBadge.textColor}
+            backgroundColor={statusBadge.backgroundColor}
+          >
+            {` ${statusBadge.headerLabel} `}
+          </Text>
+          <Text dimColor>{`panel ${activePanel} | approvals ${pendingCount}`}</Text>
+        </Box>
       </Box>
-      <Box flexDirection="column" alignItems="flex-end">
-        <Text color="black" backgroundColor={status === "streaming" ? "yellow" : "green"}>
-          {` ${status === "streaming" ? `${spinner} WORKING` : "READY"} `}
-        </Text>
-        <Text dimColor>{`panel ${activePanel} | approvals ${pendingCount}`}</Text>
+      <Box marginTop={1} flexWrap="wrap">
+        {renderMetric("Session", shortenValue(activeSessionId ?? "none", 26), "cyan")}
+        {renderMetric("Model", shortenValue(currentModel || "none", 26))}
+        {renderMetric("Panel", activePanel, activePanel === "idle" ? "green" : "yellow")}
+        {renderMetric("Queue", String(pendingCount), pendingCount > 0 ? "yellow" : "green")}
       </Box>
     </Box>
-    <Box marginTop={1} flexWrap="wrap">
-      {renderMetric("Session", shortenValue(activeSessionId ?? "none", 26), "cyan")}
-      {renderMetric("Model", shortenValue(currentModel || "none", 26))}
-      {renderMetric("Panel", activePanel, activePanel === "idle" ? "green" : "yellow")}
-      {renderMetric("Queue", String(pendingCount), pendingCount > 0 ? "yellow" : "green")}
-    </Box>
-  </Box>
-);
+  );
+};
 
 const renderSubtleHeader = (title: string, detail?: string) => (
   <Box justifyContent="space-between" marginBottom={1} flexWrap="wrap">
@@ -487,6 +537,7 @@ const renderApprovalPanel = (
   }
 
   const selectedBlocked = approvalPanel.blockedItemId === selectedPending.id;
+  const selectedInFlight = approvalPanel.inFlightId === selectedPending.id;
   const blockedReason = approvalPanel.blockedReason?.trim() ?? "";
   const previewSource =
     approvalPanel.previewMode === "full"
@@ -513,7 +564,7 @@ const renderApprovalPanel = (
           Code Approval
         </Text>
         <Text dimColor>
-          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${selectedBlocked ? "blocked" : "ready"}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
+          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${selectedInFlight ? `${approvalPanel.actionState ?? "approve"}...` : selectedBlocked ? "blocked" : "ready"}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
         </Text>
       </Box>
 
@@ -521,6 +572,14 @@ const renderApprovalPanel = (
         {`current ${selectedPending.id}  |  ${selectedPending.request.action}  |  ${selectedPending.request.path}`}
       </Text>
       <Text dimColor>{selectedPending.createdAt}</Text>
+      {selectedInFlight ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="cyan">
+            {`${approvalPanel.actionState === "reject" ? "Rejecting" : "Approving"} current item...`}
+          </Text>
+          <Text dimColor>hotkeys locked until the current approval action finishes</Text>
+        </Box>
+      ) : null}
       {selectedBlocked ? (
         <Box marginTop={1} flexDirection="column">
           <Text color="red">
@@ -538,6 +597,7 @@ const renderApprovalPanel = (
           const selected = index === approvalPanel.selectedIndex;
           const tone = getActionTone(item.request.action);
           const blocked = approvalPanel.blockedItemId === item.id;
+          const inFlight = approvalPanel.inFlightId === item.id;
           return (
             <Text key={`review-list-${item.id}`} color={selected ? "white" : "gray"}>
               <Text color={selected ? "black" : tone.badgeBg} backgroundColor={selected ? "white" : undefined}>
@@ -554,6 +614,14 @@ const renderApprovalPanel = (
                   <Text> </Text>
                   <Text color="black" backgroundColor="red">
                     {" blocked "}
+                  </Text>
+                </>
+              ) : null}
+              {inFlight ? (
+                <>
+                  <Text> </Text>
+                  <Text color="black" backgroundColor="cyan">
+                    {` ${approvalPanel.actionState ?? "busy"} `}
                   </Text>
                 </>
               ) : null}
@@ -664,6 +732,7 @@ export const ChatScreen = ({
   );
 
   const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length] || "·";
+  const statusBadge = getStatusBadge(status, spinner);
 
   if (approvalModeActive) {
     return (
@@ -822,8 +891,8 @@ export const ChatScreen = ({
           isPanelActive ? "panel lock active" : "type and press Enter"
         )}
         <Box marginTop={1}>
-          <Text color={status === "streaming" ? "yellow" : "green"}>
-            {`${status === "streaming" ? `${spinner} Thinking` : "Ready"}`.padEnd(18, " ")}
+          <Text color={statusBadge.inputColor}>
+            {statusBadge.inputLabel.padEnd(18, " ")}
           </Text>
           <TextInput
             value={input}

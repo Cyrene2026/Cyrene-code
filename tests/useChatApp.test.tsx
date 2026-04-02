@@ -369,6 +369,7 @@ describe("useChatApp", () => {
       await onToolCall("file", "error");
       onError("boom");
       onState({ status: "idle" });
+      return { status: "completed" as const };
     });
 
     const app = renderHookHarness(() =>
@@ -392,6 +393,45 @@ describe("useChatApp", () => {
     expect(texts.some(text => text.includes("Tool error: write_file src/a.ts | permission denied"))).toBe(true);
     expect(texts.some(text => text.includes("Stream error: boom"))).toBe(true);
     expect(app.getLatest().approvalPanel.active).toBe(true);
+    app.cleanup();
+  });
+
+  test("tool results are indexed into session memory for later retrieval", async () => {
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    const mcpService = {
+      listPending: () => [],
+      handleToolCall: mock(async () => ({
+        ok: true,
+        message: "[tool result] write_file test_files/u4.py\nWrote file: test_files/u4.py",
+      })),
+    };
+
+    const runQuerySessionImpl = mock(async ({ onState, onToolCall }: any) => {
+      onState({ status: "streaming" });
+      await onToolCall("file", { action: "write_file", path: "test_files/u4.py" });
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "write u4");
+    await flushMicrotasks();
+
+    const activeSessionId = app.getLatest().activeSessionId!;
+    const memoryIndex = sessionStore.__getMemoryIndex(activeSessionId);
+    expect(memoryIndex?.entries.some(entry => entry.kind === "tool_result")).toBe(true);
+    expect(memoryIndex?.entries.some(entry => entry.text.includes("test_files/u4.py"))).toBe(true);
     app.cleanup();
   });
 
@@ -670,6 +710,7 @@ describe("useChatApp", () => {
       onState({ status: "streaming" });
       onTextDelta(longOutput);
       onState({ status: "idle" });
+      return { status: "completed" as const };
     });
 
     const app = renderHookHarness(() =>
@@ -741,6 +782,60 @@ describe("useChatApp", () => {
     await flushMicrotasks();
     await flushMicrotasks();
     expect(pending).toHaveLength(0);
+    app.cleanup();
+  });
+
+  test("approval in-flight ignores trailing enter and escape after first approve", async () => {
+    let pending = [createPending("trail-1")];
+    let resolver: (() => void) | null = null;
+    const approve = mock(
+      () =>
+        new Promise<{ ok: boolean; message: string }>(resolve => {
+          resolver = () => {
+            pending = [];
+            resolve({ ok: true, message: "[approved] trail-1\nok" });
+          };
+        })
+    );
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve,
+          reject: mock((id: string) => ({ ok: true, message: `[rejected] ${id}` })),
+        } as any,
+      })
+    );
+
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      inputHandler?.("", { return: true });
+      inputHandler?.("", { escape: true });
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(app.getLatest().approvalPanel.inFlightId).toBe("trail-1");
+    expect(getTexts(app.getLatest().items).some(text => text.includes("Approval panel closed."))).toBe(
+      false
+    );
+    expect(getTexts(app.getLatest().items).filter(text => text.includes("Enter is disabled")).length).toBe(0);
+
+    expect(resolver).not.toBeNull();
+    const runResolve = resolver as unknown as () => void;
+    runResolve();
+    await flushMicrotasks();
+
+    expect(app.getLatest().approvalPanel.active).toBe(false);
     app.cleanup();
   });
 
@@ -1091,6 +1186,94 @@ describe("useChatApp", () => {
     ]);
     expect(mcpService.approve).not.toHaveBeenCalled();
     expect(mcpService.reject).not.toHaveBeenCalled();
+    app.cleanup();
+  });
+
+  test("approval success resumes suspended task automatically", async () => {
+    let pending = [createPending("resume-approve")];
+    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "awaiting_review" });
+      onTextDelta("draft ");
+      return { status: "suspended" as const, resume };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve: mock(async (id: string) => {
+            pending = [];
+            return { ok: true, message: `[approved] ${id}\nCreated file: ok` };
+          }),
+          reject: mock((id: string) => ({ ok: true, message: `[rejected] ${id}` })),
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "create one file");
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledWith("[approved] resume-approve\nCreated file: ok");
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    app.cleanup();
+  });
+
+  test("reject success resumes suspended task automatically", async () => {
+    let pending = [createPending("resume-reject")];
+    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "awaiting_review" });
+      onTextDelta("draft ");
+      return { status: "suspended" as const, resume };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve: mock(async (id: string) => ({ ok: true, message: `[approved] ${id}\nok` })),
+          reject: mock((id: string) => {
+            pending = [];
+            return { ok: true, message: `[rejected] ${id}` };
+          }),
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "reject path");
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("r", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledWith("[rejected] resume-reject");
+    expect(app.getLatest().approvalPanel.active).toBe(false);
     app.cleanup();
   });
 

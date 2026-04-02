@@ -25,4 +25,4 @@ export type ChatItem = {
     | "magenta";
 };
 
-export type ChatStatus = "idle" | "streaming" | "error";
+export type ChatStatus = "idle" | "streaming" | "awaiting_review" | "error";

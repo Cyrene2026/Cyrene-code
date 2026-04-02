@@ -1,4 +1,4 @@
-export type QuerySessionStatus = "idle" | "streaming" | "error";
+export type QuerySessionStatus = "idle" | "streaming" | "awaiting_review" | "error";
 
 export type ToolCallLog = {
   toolName: string;
@@ -16,6 +16,7 @@ type QuerySessionEvent =
   | { type: "start" }
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
+  | { type: "suspended" }
   | { type: "complete" }
   | { type: "fail"; message: string };
 
@@ -51,6 +52,11 @@ export const querySessionReducer = (
           { toolName: event.toolName, input: event.input },
         ],
       };
+    case "suspended":
+      return {
+        ...state,
+        status: "awaiting_review",
+      };
     case "complete":
       return {
         ...state,
@@ -66,4 +72,3 @@ export const querySessionReducer = (
 };
 
 export type QuerySessionDispatch = (event: QuerySessionEvent) => void;
-

@@ -1,16 +1,22 @@
-import type { SessionMessage } from "./types";
+import type { SessionPromptContext } from "./memoryIndex";
 
 export const buildPromptWithContext = (
   query: string,
   systemPrompt: string,
   projectPrompt: string,
-  summary: string,
-  focus: string[],
-  recent: SessionMessage[]
+  promptContext: SessionPromptContext
 ) => {
-  const recentLines = recent
+  const recentLines = promptContext.recent
     .filter(message => message.role !== "system")
     .map(message => `${message.role.toUpperCase()}: ${message.text}`)
+    .join("\n");
+
+  const relevantLines = promptContext.relevantMemories
+    .map(item => `- ${item}`)
+    .join("\n");
+
+  const pinLines = promptContext.pins
+    .map(item => `- ${item}`)
     .join("\n");
 
   const sections = [
@@ -19,12 +25,12 @@ export const buildPromptWithContext = (
     ".CYRENE.MD POLICY (second priority):",
     projectPrompt || "(none)",
     "CONVERSATION CONTEXT:",
-    focus.length > 0
-      ? `Pinned focus (third priority):\n${focus
-          .map(item => `- ${item}`)
-          .join("\n")}`
-      : "Human-selected focus:\n(none)",
-    summary ? `Summary:\n${summary}` : "Summary:\n(none)",
+    pinLines ? `Pinned memory (third priority):\n${pinLines}` : "Pinned memory:\n(none)",
+    relevantLines
+      ? `Relevant indexed memory:\n${relevantLines}`
+      : promptContext.summaryFallback
+        ? `Fallback summary:\n${promptContext.summaryFallback}`
+        : "Relevant indexed memory:\n(none)",
     recentLines ? `Recent messages:\n${recentLines}` : "Recent messages:\n(none)",
     `Current user query:\n${query}`,
   ];

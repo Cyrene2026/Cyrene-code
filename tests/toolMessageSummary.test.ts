@@ -46,4 +46,23 @@ describe("toolMessageSummary", () => {
     expect(result.tone).toBe("warning");
     expect(result.text).toBe("Rejected abc123");
   });
+
+  test("summarizes list_dir with visible entries and total count", () => {
+    const result = summarizeToolMessage(
+      [
+        "[tool result] list_dir .",
+        "[D] .cyrene",
+        "[D] test_files",
+        "[F] package.json",
+        "[F] README.md",
+        "[F] bun.lock",
+      ].join("\n")
+    );
+
+    expect(result.text).toContain("Tool: list_dir . |");
+    expect(result.text).toContain("[D] .cyrene");
+    expect(result.text).toContain("[D] test_files");
+    expect(result.text).toContain("5 items");
+    expect(result.text).toContain("+1 more");
+  });
 });

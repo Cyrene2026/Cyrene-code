@@ -72,6 +72,25 @@ export const normalizeMcpMessage = (raw: string): {
   };
 };
 
+const summarizeListDirBody = (body: string, maxItems = 4) => {
+  const lines = body
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return "(empty directory)";
+  }
+
+  if (lines.length === 1) {
+    return lines[0] ?? "(empty directory)";
+  }
+
+  const visible = lines.slice(0, maxItems).join(", ");
+  const more = lines.length - Math.min(lines.length, maxItems);
+  return `${visible} (${lines.length} items${more > 0 ? `, +${more} more` : ""})`;
+};
+
 export const summarizeToolMessage = (raw: string): {
   text: string;
   kind: ChatItem["kind"];
@@ -85,6 +104,12 @@ export const summarizeToolMessage = (raw: string): {
 
   if (firstLine.startsWith("Tool result:")) {
     const detail = firstLine.replace("Tool result:", "").trim();
+    if (detail.startsWith("list_dir ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeListDirBody(body)}`,
+      };
+    }
     let summary = `Tool: ${detail}`;
     if (body) {
       const bodyLine =

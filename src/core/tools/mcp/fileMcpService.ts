@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import type {
   FileAction,
   ToolRequest,
@@ -25,6 +25,12 @@ type FileMcpServiceOptions = {
 const READ_ONLY_ACTIONS: FileAction[] = ["read_file", "list_dir"];
 const COMMAND_TIMEOUT_MS = 20_000;
 const MAX_COMMAND_OUTPUT_CHARS = 24_000;
+const PENDING_CONFLICT_ACTIONS: FileAction[] = [
+  "create_file",
+  "write_file",
+  "edit_file",
+  "delete_file",
+];
 
 const formatPreview = (request: ToolRequest) => {
   const chunks = [`action=${request.action}`, `path=${request.path}`];
@@ -377,6 +383,9 @@ const validateRequest = (request: ToolRequest): string | null => {
   }
 };
 
+const isPendingConflictAction = (action: FileAction) =>
+  PENDING_CONFLICT_ACTIONS.includes(action);
+
 export class FileMcpService {
   private pending = new Map<string, PendingReviewItem>();
 
@@ -411,6 +420,102 @@ export class FileMcpService {
       );
     }
     return absolute;
+  }
+
+  private normalizeWorkspacePath(inputPath: string) {
+    const absolute = this.resolvePath(inputPath);
+    const normalized = relative(resolve(this.rules.workspaceRoot), absolute)
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/g, "");
+    return normalized || ".";
+  }
+
+  private async pathExists(inputPath: string) {
+    try {
+      await stat(this.resolvePath(inputPath));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private getPendingConflict(request: ToolRequest) {
+    if (
+      request.action === "run_command" ||
+      request.action === "create_dir" ||
+      READ_ONLY_ACTIONS.includes(request.action)
+    ) {
+      return null;
+    }
+
+    if (!isPendingConflictAction(request.action)) {
+      return null;
+    }
+
+    const normalizedPath = this.normalizeWorkspacePath(request.path);
+    for (const item of this.pending.values()) {
+      if (
+        item.request.action === "run_command" ||
+        item.request.action === "create_dir" ||
+        READ_ONLY_ACTIONS.includes(item.request.action)
+      ) {
+        continue;
+      }
+      if (!isPendingConflictAction(item.request.action)) {
+        continue;
+      }
+      if (this.normalizeWorkspacePath(item.request.path) !== normalizedPath) {
+        continue;
+      }
+      return {
+        action: item.request.action,
+        path: normalizedPath,
+      };
+    }
+
+    return null;
+  }
+
+  private async validatePendingRequest(request: ToolRequest): Promise<string | null> {
+    if (request.action === "run_command" || request.action === "create_dir") {
+      return null;
+    }
+
+    if (READ_ONLY_ACTIONS.includes(request.action)) {
+      return null;
+    }
+
+    const normalizedPath = this.normalizeWorkspacePath(request.path);
+
+    switch (request.action) {
+      case "create_file":
+        if (await this.pathExists(request.path)) {
+          return `create_file target already exists: ${normalizedPath}`;
+        }
+        return null;
+      case "write_file":
+        return null;
+      case "edit_file": {
+        if (!(await this.pathExists(request.path))) {
+          return `edit_file target does not exist: ${normalizedPath}`;
+        }
+        const before = await readFile(this.resolvePath(request.path), "utf8");
+        if (!request.find || !before.includes(request.find)) {
+          return `edit_file find text not found: ${normalizedPath}`;
+        }
+        return null;
+      }
+      case "delete_file":
+        if (!(await this.pathExists(request.path))) {
+          return `delete_file target does not exist: ${normalizedPath}`;
+        }
+        return null;
+    }
+
+    return null;
   }
 
   private async buildReviewDetails(
@@ -452,9 +557,9 @@ export class FileMcpService {
       return "";
     }
 
-    if (request.action === "create_file" || request.action === "write_file") {
+    if (request.action === "create_file") {
       return [
-        "[write preview]",
+        "[create preview | new only]",
         formatDiffLines(
           "+",
           mode === "summary" ? clip(request.content ?? "", 6000) : request.content ?? "",
@@ -462,6 +567,29 @@ export class FileMcpService {
           maxLines
         ),
       ].join("\n");
+    }
+
+    if (request.action === "write_file") {
+      const nextContent =
+        mode === "summary" ? clip(request.content ?? "", 6000) : request.content ?? "";
+      try {
+        const before = await readFile(abs, "utf8");
+        return [
+          "[write preview | overwrite]",
+          "[old - to be overwritten]",
+          formatDiffLines("-", mode === "summary" ? clip(before, 6000) : before, 1, maxLines),
+          "[new + to be written]",
+          formatDiffLines("+", nextContent, 1, maxLines),
+        ].join("\n");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+        return [
+          "[write preview | new file]",
+          formatDiffLines("+", nextContent, 1, maxLines),
+        ].join("\n");
+      }
     }
 
     if (request.action === "edit_file") {
@@ -673,6 +801,32 @@ export class FileMcpService {
         ok: false,
         message: `Invalid tool input for ${request.action}: ${validationError}`,
       };
+    }
+
+    if (request.action !== "run_command") {
+      try {
+        const conflict = this.getPendingConflict(request);
+        if (conflict) {
+          return {
+            ok: false,
+            message: `Pending conflict: ${conflict.action} ${conflict.path} is already queued.`,
+          };
+        }
+
+        const pendingValidationError = await this.validatePendingRequest(request);
+        if (pendingValidationError) {
+          return {
+            ok: false,
+            message: pendingValidationError,
+          };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          message:
+            error instanceof Error ? error.message : String(error),
+        };
+      }
     }
 
     if (

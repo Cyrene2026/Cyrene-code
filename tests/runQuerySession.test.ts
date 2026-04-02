@@ -36,6 +36,32 @@ const createTransport = (): QueryTransport => {
   };
 };
 
+const createToolLoopTransport = (toolCallsPerStream: number[]): QueryTransport => {
+  let streamCount = 0;
+  return {
+    getModel: () => "gpt-test",
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["gpt-test"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+    requestStreamUrl: async () => `stream://${++streamCount}`,
+    stream: async function* (streamUrl: string) {
+      const index = Number(streamUrl.replace("stream://", "")) - 1;
+      const count = toolCallsPerStream[index] ?? 0;
+      for (let call = 0; call < count; call += 1) {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "list_dir",
+          input: { path: `test_files/${index}-${call}` },
+        });
+      }
+      if (count === 0) {
+        yield JSON.stringify({ type: "text_delta", text: "done" });
+      }
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+};
+
 describe("runQuerySession", () => {
   test("suspends on pending review and resumes same task with approval result", async () => {
     const transport = createTransport();
@@ -78,5 +104,92 @@ describe("runQuerySession", () => {
     expect(resumed.status).toBe("completed");
     expect(toolCalls).toEqual(["create_file"]);
     expect(textDeltas).toEqual(["done"]);
+  });
+
+  test("allows more than 6 tool steps before completion", async () => {
+    const transport = createToolLoopTransport([7, 0]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "scan files",
+      queryMaxToolSteps: 24,
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (toolName: string) => {
+        toolCalls.push(toolName);
+        return { message: "ok" };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toHaveLength(7);
+  });
+
+  test("stops with explicit message when tool budget is exhausted", async () => {
+    const transport = createToolLoopTransport([3, 3, 0]);
+    const textDeltas: string[] = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "scan files",
+      queryMaxToolSteps: 5,
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => {
+        toolCallCount += 1;
+        return { message: "ok" };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCallCount).toBe(5);
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
+    expect(textDeltas.join("")).toContain("5/5");
+  });
+
+  test("preserves tool budget across suspend and resume", async () => {
+    const transport = createToolLoopTransport([1, 4, 1, 0]);
+    const textDeltas: string[] = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "review then continue",
+      queryMaxToolSteps: 5,
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => {
+        toolCallCount += 1;
+        if (toolCallCount === 1) {
+          return {
+            message: "review me",
+            reviewMode: "queue" as const,
+          };
+        }
+        return { message: "ok" };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("suspended");
+    if (result.status !== "suspended") {
+      throw new Error("expected suspended result");
+    }
+
+    const resumed = await result.resume("[approved] review-1");
+    expect(resumed.status).toBe("completed");
+    expect(toolCallCount).toBe(5);
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
   });
 });

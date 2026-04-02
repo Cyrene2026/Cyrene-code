@@ -1,12 +1,24 @@
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  cp,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { dirname, relative, resolve } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 import type {
+  CommandToolRequest,
   FileAction,
-  ToolRequest,
+  FindFilesToolRequest,
   PendingReviewItem,
   RuleConfig,
-  CommandToolRequest,
+  SearchTextToolRequest,
+  ToolRequest,
 } from "./types";
 
 type HandleResult = {
@@ -22,44 +34,42 @@ type FileMcpServiceOptions = {
   ) => Promise<string>;
 };
 
-const READ_ONLY_ACTIONS: FileAction[] = ["read_file", "list_dir"];
+type SearchableFile = {
+  absolutePath: string;
+  workspacePath: string;
+  relativeToStart: string;
+};
+
+type PathConflict = {
+  action: ToolRequest["action"];
+  path: string;
+};
+
+const READ_ONLY_ACTIONS: FileAction[] = [
+  "read_file",
+  "list_dir",
+  "stat_path",
+  "find_files",
+  "search_text",
+];
 const COMMAND_TIMEOUT_MS = 20_000;
 const MAX_COMMAND_OUTPUT_CHARS = 24_000;
+const DEFAULT_SEARCH_RESULTS = 50;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_SEARCH_SNIPPET_CHARS = 160;
 const PENDING_CONFLICT_ACTIONS: FileAction[] = [
   "create_file",
   "write_file",
   "edit_file",
   "delete_file",
+  "copy_path",
+  "move_path",
 ];
-
-const formatPreview = (request: ToolRequest) => {
-  const chunks = [`action=${request.action}`, `path=${request.path}`];
-  if (request.action === "run_command") {
-    chunks.push(`command=${request.command}`);
-    if (request.args.length > 0) {
-      chunks.push(`args=${request.args.join(" ")}`);
-    }
-    if (request.cwd) {
-      chunks.push(`cwd=${request.cwd}`);
-    }
-    return chunks.join(" | ");
-  }
-  if (request.find) chunks.push(`find=${request.find}`);
-  if (request.replace) chunks.push(`replace=${request.replace}`);
-  if (typeof request.content === "string") {
-    chunks.push(`content_bytes=${Buffer.byteLength(request.content, "utf8")}`);
-  }
-  return chunks.join(" | ");
-};
+const MAX_PREVIEW_SUMMARY_LINES = 24;
+const lineNoWidth = 4;
 
 const clip = (text: string, max = 320) =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
-
-const writeLike = (action: FileAction) =>
-  action === "create_file" || action === "write_file" || action === "edit_file";
-
-const MAX_PREVIEW_SUMMARY_LINES = 24;
-const lineNoWidth = 4;
 
 const lineNumberAtIndex = (text: string, index: number) =>
   text.slice(0, Math.max(0, index)).split("\n").length;
@@ -120,6 +130,27 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "remove":
     case "rm":
       return "delete_file";
+    case "stat":
+    case "stat_path":
+    case "info":
+      return "stat_path";
+    case "find":
+    case "find_files":
+    case "glob":
+      return "find_files";
+    case "search":
+    case "search_text":
+    case "grep":
+      return "search_text";
+    case "copy":
+    case "copy_path":
+    case "cp":
+      return "copy_path";
+    case "move":
+    case "move_path":
+    case "mv":
+    case "rename":
+      return "move_path";
     case "run":
     case "run_command":
     case "command":
@@ -150,6 +181,47 @@ const pickStringArray = (obj: Record<string, unknown>, keys: string[]) => {
     }
   }
   return undefined;
+};
+
+const pickNumber = (obj: Record<string, unknown>, keys: string[]) => {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+};
+
+const pickBoolean = (obj: Record<string, unknown>, keys: string[]) => {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      if (value.trim().toLowerCase() === "true") {
+        return true;
+      }
+      if (value.trim().toLowerCase() === "false") {
+        return false;
+      }
+    }
+  }
+  return undefined;
+};
+
+const normalizeSearchLimit = (value: number | undefined) => {
+  if (!Number.isFinite(value) || !value || value <= 0) {
+    return DEFAULT_SEARCH_RESULTS;
+  }
+  return Math.min(MAX_SEARCH_RESULTS, Math.max(1, Math.floor(value)));
 };
 
 const toRecord = (input: unknown): Record<string, unknown> | null => {
@@ -224,6 +296,75 @@ const collectRecords = (input: unknown, maxDepth = 4): Record<string, unknown>[]
   return records;
 };
 
+const buildNormalizedFileRequest = (
+  action: FileAction,
+  record: Record<string, unknown>,
+  path: string,
+  content: string | undefined,
+  find: string | undefined,
+  replace: string | undefined
+): ToolRequest | null => {
+  const destination = pickString(record, ["destination", "dest", "to", "target_path"]);
+  const pattern = pickString(record, ["pattern", "glob"]);
+  const query = pickString(record, ["query", "needle"]);
+  const maxResults = normalizeSearchLimit(
+    pickNumber(record, ["maxResults", "max_results", "limit"])
+  );
+  const caseSensitive = pickBoolean(record, ["caseSensitive", "case_sensitive"]);
+
+  switch (action) {
+    case "read_file":
+    case "list_dir":
+    case "create_dir":
+    case "delete_file":
+    case "stat_path":
+      return { action, path };
+    case "create_file":
+      return { action, path, content };
+    case "write_file":
+      return { action, path, content };
+    case "edit_file":
+      return {
+        action,
+        path,
+        find,
+        replace,
+      };
+    case "find_files":
+      if (!pattern) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        pattern,
+        maxResults,
+        caseSensitive,
+      };
+    case "search_text":
+      if (!query) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        query,
+        maxResults,
+        caseSensitive,
+      };
+    case "copy_path":
+    case "move_path":
+      if (!destination) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        destination,
+      };
+  }
+};
+
 const normalizeFromRecord = (
   record: Record<string, unknown>,
   toolName: string
@@ -246,10 +387,10 @@ const normalizeFromRecord = (
     "directory",
   ]);
 
-  const content = pickString(record, ["content", "text", "data", "value"]);
-  const find = pickString(record, ["find", "search", "from", "old", "before"]);
-  const replace = pickString(record, ["replace", "to", "new", "after"]);
-  const cwd = pickString(record, ["cwd", "working_directory", "workdir", "directory"]);
+  const content = pickString(record, ["content", "value", "data"]);
+  const find = pickString(record, ["find", "from", "old", "before"]);
+  const replace = pickString(record, ["replace", "new", "after"]);
+  const cwd = pickString(record, ["cwd", "working_directory", "workdir"]);
   const rawArgs = pickStringArray(record, ["args", "argv", "arguments"]);
   const rawCommand = pickString(record, ["command", "cmd", "program", "executable"]);
 
@@ -266,13 +407,18 @@ const normalizeFromRecord = (
       command,
       args,
       cwd,
-      path: display || command,
+      path: path ?? (display || command),
     };
   }
 
-  // Heuristic fallback for providers that omit explicit action.
   if (!action) {
-    if (path && find && typeof replace === "string") {
+    if (path && pickString(record, ["destination", "dest", "to", "target_path"])) {
+      action = "move_path";
+    } else if (path && pickString(record, ["pattern", "glob"])) {
+      action = "find_files";
+    } else if (path && pickString(record, ["query", "needle"])) {
+      action = "search_text";
+    } else if (path && find && typeof replace === "string") {
       action = "edit_file";
     } else if (path && typeof content === "string") {
       action = "write_file";
@@ -285,13 +431,7 @@ const normalizeFromRecord = (
     return null;
   }
 
-  return {
-    action,
-    path,
-    content,
-    find,
-    replace,
-  };
+  return buildNormalizedFileRequest(action, record, path, content, find, replace);
 };
 
 const summarizeInput = (input: unknown) => {
@@ -328,20 +468,17 @@ const normalizeToolInput = (
     if (!normalized) {
       continue;
     }
-    const commandScore =
-      normalized.action === "run_command"
-        ? 2 +
-          (normalized.command ? 2 : 0) +
-          normalized.args.length
-        : 0;
     const score =
       normalized.action === "run_command"
-        ? commandScore
-        : (normalized.action ? 2 : 0) +
+        ? 4 + normalized.args.length + (normalized.cwd ? 1 : 0)
+        : 2 +
           (normalized.path ? 2 : 0) +
-          (typeof normalized.content === "string" ? 1 : 0) +
-          (typeof normalized.find === "string" ? 1 : 0) +
-          (typeof normalized.replace === "string" ? 1 : 0);
+          ("content" in normalized ? 1 : 0) +
+          ("find" in normalized ? 1 : 0) +
+          ("replace" in normalized ? 1 : 0) +
+          ("destination" in normalized ? 2 : 0) +
+          ("pattern" in normalized ? 2 : 0) +
+          ("query" in normalized ? 2 : 0);
     if (score > bestScore) {
       bestScore = score;
       best = normalized;
@@ -362,6 +499,10 @@ const validateRequest = (request: ToolRequest): string | null => {
   switch (request.action) {
     case "create_file":
     case "create_dir":
+    case "read_file":
+    case "list_dir":
+    case "delete_file":
+    case "stat_path":
       return null;
     case "write_file":
       if (typeof request.content !== "string") {
@@ -376,15 +517,59 @@ const validateRequest = (request: ToolRequest): string | null => {
         return "edit_file requires `replace`.";
       }
       return null;
-    case "read_file":
-    case "list_dir":
-    case "delete_file":
+    case "find_files":
+      if (!request.pattern.trim()) {
+        return "find_files requires `pattern`.";
+      }
+      return null;
+    case "search_text":
+      if (!request.query.trim()) {
+        return "search_text requires `query`.";
+      }
+      return null;
+    case "copy_path":
+    case "move_path":
+      if (!request.destination.trim()) {
+        return `${request.action} requires \`destination\`.`;
+      }
       return null;
   }
 };
 
 const isPendingConflictAction = (action: FileAction) =>
   PENDING_CONFLICT_ACTIONS.includes(action);
+
+const clipSnippet = (text: string) => {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return clip(normalized, MAX_SEARCH_SNIPPET_CHARS);
+};
+
+const globToRegExp = (pattern: string, caseSensitive: boolean) => {
+  const normalized = pattern.replace(/\\/g, "/");
+  let source = "^";
+
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index] ?? "";
+    const next = normalized[index + 1] ?? "";
+    if (char === "*" && next === "*") {
+      source += ".*";
+      index += 1;
+      continue;
+    }
+    if (char === "*") {
+      source += "[^/]*";
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += /[\\^$+?.()|{}\[\]]/.test(char) ? `\\${char}` : char;
+  }
+
+  source += "$";
+  return new RegExp(source, caseSensitive ? "" : "i");
+};
 
 export class FileMcpService {
   private pending = new Map<string, PendingReviewItem>();
@@ -426,7 +611,7 @@ export class FileMcpService {
     const absolute = this.resolvePath(inputPath);
     const normalized = relative(resolve(this.rules.workspaceRoot), absolute)
       .replace(/\\/g, "/")
-      .replace(/^\.\/+/g, "");
+      .replace(/^\.\/+/, "");
     return normalized || ".";
   }
 
@@ -442,37 +627,43 @@ export class FileMcpService {
     }
   }
 
-  private getPendingConflict(request: ToolRequest) {
+  private getConflictKeys(request: ToolRequest) {
     if (
       request.action === "run_command" ||
       request.action === "create_dir" ||
       READ_ONLY_ACTIONS.includes(request.action)
     ) {
-      return null;
+      return [];
     }
 
     if (!isPendingConflictAction(request.action)) {
+      return [];
+    }
+
+    const keys = new Set([this.normalizeWorkspacePath(request.path)]);
+    if ("destination" in request) {
+      keys.add(this.normalizeWorkspacePath(request.destination));
+    }
+    return [...keys];
+  }
+
+  private getPendingConflict(request: ToolRequest): PathConflict | null {
+    const requestKeys = this.getConflictKeys(request);
+    if (requestKeys.length === 0) {
       return null;
     }
 
-    const normalizedPath = this.normalizeWorkspacePath(request.path);
     for (const item of this.pending.values()) {
-      if (
-        item.request.action === "run_command" ||
-        item.request.action === "create_dir" ||
-        READ_ONLY_ACTIONS.includes(item.request.action)
-      ) {
+      const itemKeys = this.getConflictKeys(item.request);
+      if (itemKeys.length === 0) {
         continue;
       }
-      if (!isPendingConflictAction(item.request.action)) {
-        continue;
-      }
-      if (this.normalizeWorkspacePath(item.request.path) !== normalizedPath) {
+      if (!itemKeys.some(key => requestKeys.includes(key))) {
         continue;
       }
       return {
         action: item.request.action,
-        path: normalizedPath,
+        path: this.normalizeWorkspacePath(item.request.path),
       };
     }
 
@@ -513,6 +704,20 @@ export class FileMcpService {
           return `delete_file target does not exist: ${normalizedPath}`;
         }
         return null;
+      case "copy_path":
+      case "move_path": {
+        const destinationPath = this.normalizeWorkspacePath(request.destination);
+        if (normalizedPath === destinationPath) {
+          return `${request.action} destination must differ from source: ${normalizedPath}`;
+        }
+        if (!(await this.pathExists(request.path))) {
+          return `${request.action} source does not exist: ${normalizedPath}`;
+        }
+        if (await this.pathExists(request.destination)) {
+          return `${request.action} destination already exists: ${destinationPath}`;
+        }
+        return null;
+      }
     }
 
     return null;
@@ -534,9 +739,16 @@ export class FileMcpService {
         .join("\n");
     }
 
+    if (request.action === "copy_path" || request.action === "move_path") {
+      return [
+        `[${request.action === "copy_path" ? "copy" : "move"} preview]`,
+        `source: ${request.path}`,
+        `destination: ${request.destination}`,
+      ].join("\n");
+    }
+
     const abs = this.resolvePath(request.path);
-    const maxLines =
-      mode === "summary" ? MAX_PREVIEW_SUMMARY_LINES : undefined;
+    const maxLines = mode === "summary" ? MAX_PREVIEW_SUMMARY_LINES : undefined;
     if (request.action === "delete_file") {
       try {
         const before = await readFile(abs, "utf8");
@@ -553,7 +765,11 @@ export class FileMcpService {
       return "[directory preview]\nDirectory will be created after approval.";
     }
 
-    if (!writeLike(request.action)) {
+    if (
+      request.action !== "create_file" &&
+      request.action !== "write_file" &&
+      request.action !== "edit_file"
+    ) {
       return "";
     }
 
@@ -592,52 +808,89 @@ export class FileMcpService {
       }
     }
 
-    if (request.action === "edit_file") {
-      const find = request.find ?? "";
-      const replace = request.replace ?? "";
-      try {
-        const before = await readFile(abs, "utf8");
-        const hit = before.indexOf(find);
-        const startLine = hit >= 0 ? lineNumberAtIndex(before, hit) : 1;
-        return [
-          "[edit preview]",
-          "[old - to be removed]",
-          formatDiffLines(
-            "-",
-            mode === "summary" ? clip(find, 3000) : find,
-            startLine,
-            maxLines
-          ),
-          "[new + to be written]",
-          formatDiffLines(
-            "+",
-            mode === "summary" ? clip(replace, 3000) : replace,
-            startLine,
-            maxLines
-          ),
-        ].join("\n");
-      } catch {
-        return [
-          "[edit preview]",
-          "[old - to be removed]",
-          formatDiffLines(
-            "-",
-            mode === "summary" ? clip(find, 3000) : find,
-            1,
-            maxLines
-          ),
-          "[new + to be written]",
-          formatDiffLines(
-            "+",
-            mode === "summary" ? clip(replace, 3000) : replace,
-            1,
-            maxLines
-          ),
-        ].join("\n");
+    const find = request.find ?? "";
+    const replace = request.replace ?? "";
+    try {
+      const before = await readFile(abs, "utf8");
+      const hit = before.indexOf(find);
+      const startLine = hit >= 0 ? lineNumberAtIndex(before, hit) : 1;
+      return [
+        "[edit preview]",
+        "[old - to be removed]",
+        formatDiffLines(
+          "-",
+          mode === "summary" ? clip(find, 3000) : find,
+          startLine,
+          maxLines
+        ),
+        "[new + to be written]",
+        formatDiffLines(
+          "+",
+          mode === "summary" ? clip(replace, 3000) : replace,
+          startLine,
+          maxLines
+        ),
+      ].join("\n");
+    } catch {
+      return [
+        "[edit preview]",
+        "[old - to be removed]",
+        formatDiffLines(
+          "-",
+          mode === "summary" ? clip(find, 3000) : find,
+          1,
+          maxLines
+        ),
+        "[new + to be written]",
+        formatDiffLines(
+          "+",
+          mode === "summary" ? clip(replace, 3000) : replace,
+          1,
+          maxLines
+        ),
+      ].join("\n");
+    }
+  }
+
+  private formatPreview(request: ToolRequest) {
+    const chunks = [`action=${request.action}`, `path=${request.path}`];
+    if (request.action === "run_command") {
+      chunks.push(`command=${request.command}`);
+      if (request.args.length > 0) {
+        chunks.push(`args=${request.args.join(" ")}`);
+      }
+      if (request.cwd) {
+        chunks.push(`cwd=${request.cwd}`);
+      }
+      return chunks.join(" | ");
+    }
+    if ("destination" in request) {
+      chunks.push(`destination=${request.destination}`);
+    }
+    if ("pattern" in request) {
+      chunks.push(`pattern=${request.pattern}`);
+      chunks.push(`maxResults=${request.maxResults ?? DEFAULT_SEARCH_RESULTS}`);
+      if (typeof request.caseSensitive === "boolean") {
+        chunks.push(`caseSensitive=${request.caseSensitive}`);
       }
     }
-
-    return "";
+    if ("query" in request) {
+      chunks.push(`query=${clip(request.query, 80)}`);
+      chunks.push(`maxResults=${request.maxResults ?? DEFAULT_SEARCH_RESULTS}`);
+      if (typeof request.caseSensitive === "boolean") {
+        chunks.push(`caseSensitive=${request.caseSensitive}`);
+      }
+    }
+    if ("find" in request && request.find) {
+      chunks.push(`find=${request.find}`);
+    }
+    if ("replace" in request && typeof request.replace === "string") {
+      chunks.push(`replace=${request.replace}`);
+    }
+    if ("content" in request && typeof request.content === "string") {
+      chunks.push(`content_bytes=${Buffer.byteLength(request.content, "utf8")}`);
+    }
+    return chunks.join(" | ");
   }
 
   private async executeCommand(request: CommandToolRequest): Promise<string> {
@@ -705,6 +958,136 @@ export class FileMcpService {
     });
   }
 
+  private async walkFiles(startPath: string): Promise<SearchableFile[]> {
+    const startAbsolute = this.resolvePath(startPath);
+    const startWorkspace = this.normalizeWorkspacePath(startPath);
+    const info = await stat(startAbsolute);
+
+    if (!info.isDirectory()) {
+      return [{
+        absolutePath: startAbsolute,
+        workspacePath: startWorkspace,
+        relativeToStart: basename(startAbsolute).replace(/\\/g, "/"),
+      }];
+    }
+
+    const files: SearchableFile[] = [];
+    const queue: Array<{ absolutePath: string }> = [{ absolutePath: startAbsolute }];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) {
+        continue;
+      }
+      const entries = await readdir(current.absolutePath, { withFileTypes: true });
+      for (const entry of entries) {
+        const absolutePath = resolve(current.absolutePath, entry.name);
+        const workspacePath = relative(resolve(this.rules.workspaceRoot), absolutePath)
+          .replace(/\\/g, "/")
+          .replace(/^\.\/+/, "") || ".";
+        if (entry.isDirectory()) {
+          queue.push({ absolutePath });
+          continue;
+        }
+        files.push({
+          absolutePath,
+          workspacePath,
+          relativeToStart:
+            relative(startAbsolute, absolutePath).replace(/\\/g, "/") || entry.name,
+        });
+      }
+    }
+
+    return files;
+  }
+
+  private async executeFindFiles(request: FindFilesToolRequest): Promise<string> {
+    const files = await this.walkFiles(request.path);
+    const matcher = globToRegExp(request.pattern, request.caseSensitive ?? false);
+    const matches = files
+      .filter(file => matcher.test(file.relativeToStart) || matcher.test(file.workspacePath))
+      .slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS)
+      .map(file => file.workspacePath);
+
+    if (matches.length === 0) {
+      return `(no matches for pattern: ${request.pattern})`;
+    }
+
+    return [`Found ${matches.length} file(s):`, ...matches].join("\n");
+  }
+
+  private async executeSearchText(request: SearchTextToolRequest): Promise<string> {
+    const files = await this.walkFiles(request.path);
+    const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
+    const caseSensitive = request.caseSensitive ?? false;
+    const query = caseSensitive ? request.query : request.query.toLowerCase();
+    const matches: string[] = [];
+
+    for (const file of files) {
+      const info = await stat(file.absolutePath);
+      if (info.size > this.rules.maxReadBytes) {
+        continue;
+      }
+      const content = await readFile(file.absolutePath, "utf8");
+      const lines = content.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? "";
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        if (!haystack.includes(query)) {
+          continue;
+        }
+        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(line)}`);
+        if (matches.length >= limit) {
+          return [`Found ${matches.length} match(es):`, ...matches].join("\n");
+        }
+      }
+    }
+
+    if (matches.length === 0) {
+      return `(no text matches for query: ${request.query})`;
+    }
+
+    return [`Found ${matches.length} match(es):`, ...matches].join("\n");
+  }
+
+  private async executeMovePath(request: Extract<ToolRequest, { action: "move_path" }>) {
+    const source = this.resolvePath(request.path);
+    const destination = this.resolvePath(request.destination);
+    await mkdir(dirname(destination), { recursive: true });
+
+    try {
+      await rename(source, destination);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "EXDEV") {
+        throw error;
+      }
+      const info = await stat(source);
+      if (info.isDirectory()) {
+        await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
+        await rm(source, { recursive: true, force: false });
+      } else {
+        await copyFile(source, destination);
+        await rm(source, { recursive: false, force: false });
+      }
+    }
+
+    return `Moved path: ${request.path} -> ${request.destination}`;
+  }
+
+  private async executeCopyPath(request: Extract<ToolRequest, { action: "copy_path" }>) {
+    const source = this.resolvePath(request.path);
+    const destination = this.resolvePath(request.destination);
+    const info = await stat(source);
+    await mkdir(dirname(destination), { recursive: true });
+    if (info.isDirectory()) {
+      await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
+    } else {
+      await copyFile(source, destination);
+    }
+    return `Copied path: ${request.path} -> ${request.destination}`;
+  }
+
   private async execute(request: ToolRequest): Promise<string> {
     if (request.action === "run_command") {
       return this.executeCommand(request);
@@ -732,6 +1115,20 @@ export class FileMcpService {
           .map(entry => `${entry.isDirectory() ? "[D]" : "[F]"} ${entry.name}`)
           .join("\n");
       }
+      case "stat_path": {
+        const info = await stat(abs);
+        const kind = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
+        return [
+          `path: ${request.path}`,
+          `kind: ${kind}`,
+          `size: ${info.size}`,
+          `mtime: ${info.mtime.toISOString()}`,
+        ].join("\n");
+      }
+      case "find_files":
+        return this.executeFindFiles(request);
+      case "search_text":
+        return this.executeSearchText(request);
       case "create_file": {
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, request.content ?? "", { flag: "wx" });
@@ -765,6 +1162,10 @@ export class FileMcpService {
         await rm(abs, { force: false, recursive: false });
         return `Deleted file: ${request.path}`;
       }
+      case "copy_path":
+        return this.executeCopyPath(request);
+      case "move_path":
+        return this.executeMovePath(request);
     }
   }
 
@@ -792,7 +1193,7 @@ export class FileMcpService {
       return {
         ok: false,
         message:
-          `Invalid tool input. Expected { action, path, content?, find?, replace? }. Received: ${summarizeInput(input)}.`,
+          `Invalid tool input. Expected { action, path, content?, find?, replace?, pattern?, query?, maxResults?, caseSensitive?, destination?, command?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
       };
     }
     const validationError = validateRequest(request);
@@ -832,16 +1233,16 @@ export class FileMcpService {
     if (
       request.action === "run_command" ||
       (request.action !== "create_dir" &&
-        !READ_ONLY_ACTIONS.includes(request.action as FileAction) &&
+        !READ_ONLY_ACTIONS.includes(request.action) &&
         this.rules.requireReview.includes(request.action))
     ) {
       const id = crypto.randomUUID().slice(0, 8);
       const detailsSummary = await this.buildReviewDetails(request, "summary");
       const detailsFull = await this.buildReviewDetails(request, "full");
-      const previewSummary = [formatPreview(request), detailsSummary]
+      const previewSummary = [this.formatPreview(request), detailsSummary]
         .filter(Boolean)
         .join("\n");
-      const previewFull = [formatPreview(request), detailsFull]
+      const previewFull = [this.formatPreview(request), detailsFull]
         .filter(Boolean)
         .join("\n");
       const pending: PendingReviewItem = {
@@ -922,3 +1323,4 @@ export class FileMcpService {
     };
   }
 }
+

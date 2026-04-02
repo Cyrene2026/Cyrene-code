@@ -14,12 +14,12 @@ const parseSseEventData = (rawEvent: string): string[] => {
     .filter(line => line.startsWith("data:"))
     .map(line => line.replace(/^data:\s?/, ""));
 };
-const FILE_TOOL = {
+export const FILE_TOOL = {
   type: "function",
   function: {
     name: "file",
     description:
-      "Operate files inside workspace. Use action+path. Write actions require review.",
+      "Operate files and shell actions inside workspace. Use action-based JSON. Write, move, copy, and command actions require review.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -34,24 +34,44 @@ const FILE_TOOL = {
             "write_file",
             "edit_file",
             "delete_file",
+            "stat_path",
+            "find_files",
+            "search_text",
+            "copy_path",
+            "move_path",
+            "run_command",
           ],
         },
         path: { type: "string" },
         content: { type: "string" },
         find: { type: "string" },
         replace: { type: "string" },
+        pattern: { type: "string" },
+        query: { type: "string" },
+        maxResults: { type: "integer", minimum: 1, maximum: 200 },
+        caseSensitive: { type: "boolean" },
+        destination: { type: "string" },
+        command: { type: "string" },
+        args: {
+          type: "array",
+          items: { type: "string" },
+        },
+        cwd: { type: "string" },
       },
       required: ["action", "path"],
     },
   },
 } as const;
-const TOOL_USAGE_SYSTEM_PROMPT = [
+export const TOOL_USAGE_SYSTEM_PROMPT = [
   "When you need filesystem operations, you MUST call function `file`.",
   "Function arguments must be valid JSON and include required fields:",
-  "{ action, path, content?, find?, replace? }.",
+  "{ action, path, content?, find?, replace?, pattern?, query?, maxResults?, caseSensitive?, destination?, command?, args?, cwd? }.",
   "Never call file tool with empty arguments.",
   "Use one of actions:",
-  "read_file, list_dir, create_dir, create_file, write_file, edit_file, delete_file.",
+  "read_file, list_dir, create_dir, create_file, write_file, edit_file, delete_file, stat_path, find_files, search_text, copy_path, move_path, run_command.",
+  "Prefer find_files for file discovery, search_text for content search, and stat_path for metadata.",
+  "Use run_command when terminal execution is necessary. For run_command, set path to a relevant workspace path such as '.'.",
+  "Avoid repetitive list_dir/read_file probing when search_text or find_files can answer directly.",
 ].join(" ");
 
 const normalizeBaseUrl = (url: string) => url.replace(/\/+$/, "");

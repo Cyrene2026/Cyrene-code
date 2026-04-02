@@ -10,6 +10,8 @@ const DEFAULT_RULES: RuleConfig = {
     "write_file",
     "edit_file",
     "delete_file",
+    "copy_path",
+    "move_path",
     "run_command",
   ],
 };
@@ -26,15 +28,27 @@ const isMpcAction = (value: string): value is MpcAction =>
     "write_file",
     "edit_file",
     "delete_file",
+    "stat_path",
+    "find_files",
+    "search_text",
+    "copy_path",
+    "move_path",
     "run_command",
   ].includes(value);
 
-export const loadRuleConfig = async (): Promise<RuleConfig> => {
-  const path = join(process.cwd(), ".cyrene", "rule.yaml");
-  let content = "";
+const readConfigFile = async (path: string) => {
   try {
-    content = await readFile(path, "utf8");
+    return await readFile(path, "utf8");
   } catch {
+    return "";
+  }
+};
+
+export const loadRuleConfig = async (): Promise<RuleConfig> => {
+  const configPath = join(process.cwd(), ".cyrene", "config.yaml");
+  const rulePath = join(process.cwd(), ".cyrene", "rule.yaml");
+  const content = (await readConfigFile(configPath)) || (await readConfigFile(rulePath));
+  if (!content) {
     return DEFAULT_RULES;
   }
 

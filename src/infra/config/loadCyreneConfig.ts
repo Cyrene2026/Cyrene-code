@@ -3,11 +3,13 @@ import { join } from "node:path";
 
 export type CyreneConfig = {
   pinMaxCount: number;
+  queryMaxToolSteps: number;
   systemPrompt?: string;
 };
 
 const DEFAULT_CONFIG: CyreneConfig = {
   pinMaxCount: 6,
+  queryMaxToolSteps: 24,
 };
 
 const parseValue = (raw: string): string | number => {
@@ -50,6 +52,12 @@ export const loadCyreneConfig = async (): Promise<CyreneConfig> => {
   const pinMaxCount =
     typeof pinRaw === "number" && pinRaw > 0 ? Math.floor(pinRaw) : 6;
 
+  const queryMaxToolStepsRaw = map.get("query_max_tool_steps");
+  const queryMaxToolSteps =
+    typeof queryMaxToolStepsRaw === "number" && queryMaxToolStepsRaw > 0
+      ? Math.floor(queryMaxToolStepsRaw)
+      : DEFAULT_CONFIG.queryMaxToolSteps;
+
   const systemRaw = map.get("system_prompt");
   const systemPrompt =
     typeof systemRaw === "string" && systemRaw.trim()
@@ -58,6 +66,7 @@ export const loadCyreneConfig = async (): Promise<CyreneConfig> => {
 
   return {
     pinMaxCount,
+    queryMaxToolSteps,
     systemPrompt,
   };
 };

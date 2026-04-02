@@ -26,6 +26,7 @@ render(
     defaultSystemPrompt={promptPolicy.systemPrompt}
     projectPrompt={promptPolicy.projectPrompt}
     pinMaxCount={cyreneConfig.pinMaxCount}
+    queryMaxToolSteps={cyreneConfig.queryMaxToolSteps}
     mcpService={mcpService}
   />
 );

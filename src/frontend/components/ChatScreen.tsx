@@ -9,6 +9,16 @@ type ChatScreenProps = {
   items: ChatItem[];
   status: ChatStatus;
   input: string;
+  inputCommandState: {
+    active: boolean;
+    currentCommand: string | null;
+    suggestions: Array<{
+      command: string;
+      description: string;
+    }>;
+    historyPosition: number | null;
+    historySize: number;
+  };
   resumePicker: {
     active: boolean;
     sessions: SessionListItem[];
@@ -59,6 +69,16 @@ type PagedResult<T> = {
 type CodeSegment = {
   text: string;
   color?: ChatItem["color"];
+};
+
+type ApprovalPreviewLine = {
+  kind: "section" | "hunk" | "add" | "remove" | "kv" | "context" | "blank";
+  raw: string;
+  label?: string;
+  key?: string;
+  value?: string;
+  lineNumber?: string;
+  content?: string;
 };
 
 const BRAND_NAME = "CYRENE";
@@ -495,33 +515,227 @@ const getActionTone = (action: PendingReviewItem["request"]["action"]) => {
   if (action === "edit_file") {
     return { border: "yellow", badgeBg: "yellow", badgeFg: "black" } as const;
   }
-  if (action === "create_file" || action === "write_file" || action === "create_dir") {
+  if (
+    action === "create_file" ||
+    action === "write_file" ||
+    action === "create_dir" ||
+    action === "copy_path" ||
+    action === "move_path"
+  ) {
     return { border: "cyan", badgeBg: "cyan", badgeFg: "black" } as const;
   }
   return { border: "gray", badgeBg: "gray", badgeFg: "white" } as const;
 };
 
-const renderApprovalLine = (line: string, index: number) => {
-  if (line.startsWith("+") || line.startsWith("-") || line.startsWith("@@")) {
+const getApprovalPreviewHeading = (action: PendingReviewItem["request"]["action"]) => {
+  switch (action) {
+    case "create_file":
+      return "Diff preview · new file";
+    case "write_file":
+      return "Diff preview · write";
+    case "edit_file":
+      return "Diff preview · edit";
+    case "delete_file":
+      return "Diff preview · delete";
+    case "copy_path":
+      return "Path preview · copy";
+    case "move_path":
+      return "Path preview · move";
+    case "run_command":
+      return "Command preview";
+    case "create_dir":
+      return "Directory preview";
+    default:
+      return "Preview";
+  }
+};
+
+const describeApprovalAction = (action: PendingReviewItem["request"]["action"]) => {
+  switch (action) {
+    case "create_file":
+      return "new file";
+    case "write_file":
+      return "overwrite / write";
+    case "edit_file":
+      return "targeted edit";
+    case "delete_file":
+      return "delete";
+    case "copy_path":
+      return "copy path";
+    case "move_path":
+      return "move path";
+    case "run_command":
+      return "command";
+    case "create_dir":
+      return "new directory";
+    default:
+      return action;
+  }
+};
+
+const formatApprovalLabel = (label: string) =>
+  label
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map(part => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+
+const classifyApprovalPreviewLine = (line: string): ApprovalPreviewLine => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return { kind: "blank", raw: line };
+  }
+
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return {
+      kind: "section",
+      raw: line,
+      label: trimmed.slice(1, -1),
+    };
+  }
+
+  if (line.startsWith("@@")) {
+    return { kind: "hunk", raw: line };
+  }
+
+  const diffMatch = /^([+-])\s*(\d+)?\s*\|\s?(.*)$/.exec(line);
+  if (diffMatch) {
+    return {
+      kind: diffMatch[1] === "+" ? "add" : "remove",
+      raw: line,
+      lineNumber: diffMatch[2],
+      content: diffMatch[3] ?? "",
+    };
+  }
+
+  if (line.startsWith("+")) {
+    return { kind: "add", raw: line, content: line.slice(1).trimStart() };
+  }
+
+  if (line.startsWith("-")) {
+    return { kind: "remove", raw: line, content: line.slice(1).trimStart() };
+  }
+
+  const metaMatch = /^([a-z][a-z0-9_ ]*):\s*(.*)$/i.exec(trimmed);
+  if (metaMatch) {
+    const [, key = "", value = ""] = metaMatch;
+    return {
+      kind: "kv",
+      raw: line,
+      key: key.trim(),
+      value,
+    };
+  }
+
+  return { kind: "context", raw: line };
+};
+
+const renderApprovalSummaryRow = (
+  label: string,
+  value: string,
+  accent?: "cyan" | "yellow" | "red" | "green" | "magenta" | "white"
+) => (
+  <Box marginTop={1}>
+    <Text dimColor>{`${label.padEnd(12, " ")} `}</Text>
+    <Text color={accent ?? "white"}>{value}</Text>
+  </Box>
+);
+
+const renderApprovalLine = (
+  line: string,
+  index: number,
+  action: PendingReviewItem["request"]["action"]
+) => {
+  const parsed = classifyApprovalPreviewLine(line);
+
+  if (parsed.kind === "blank") {
+    return <Text key={`approval-line-${index}`}> </Text>;
+  }
+
+  if (parsed.kind === "section") {
     return (
-      <Box key={`approval-diff-${index}`}>
-        {renderSegments(tokenizeCodeLine(line), `approval-token-${index}`)}
+      <Box
+        key={`approval-section-${index}`}
+        borderStyle="round"
+        borderColor="cyan"
+        paddingX={1}
+        marginTop={1}
+      >
+        <Text color="cyan" bold>
+          {` Section  ${parsed.label ?? "preview"} `}
+        </Text>
       </Box>
     );
   }
 
-  if (line.trim().startsWith("[") && line.trim().endsWith("]")) {
+  if (parsed.kind === "hunk") {
     return (
-      <Text key={`approval-label-${index}`} color="cyan" bold>
-        {line}
-      </Text>
+      <Box
+        key={`approval-hunk-${index}`}
+        borderStyle="round"
+        borderColor="cyan"
+        paddingX={1}
+        marginTop={1}
+      >
+        <Text color="cyan" bold>
+          {` Hunk  ${parsed.raw} `}
+        </Text>
+      </Box>
+    );
+  }
+
+  if (parsed.kind === "add" || parsed.kind === "remove") {
+    const tone = parsed.kind === "add" ? "green" : "red";
+    return (
+      <Box
+        key={`approval-diff-${index}`}
+        borderStyle="single"
+        borderColor={tone}
+        paddingX={1}
+        marginTop={1}
+      >
+        <Text color={tone}>{parsed.kind === "add" ? " + " : " - "}</Text>
+        <Text dimColor>{parsed.lineNumber ? `${parsed.lineNumber.padStart(4, " ")} │ ` : "   │ "}</Text>
+        {renderSegments(tokenizeCodeLine(parsed.content ?? ""), `approval-token-${index}`)}
+      </Box>
+    );
+  }
+
+  if (parsed.kind === "kv") {
+    const key = parsed.key ?? "value";
+    const keyTone =
+      key === "command"
+        ? "yellow"
+        : key === "source" || key === "destination"
+          ? "cyan"
+          : key === "cwd"
+            ? "magenta"
+            : "white";
+    const borderColor =
+      action === "run_command"
+        ? "red"
+        : key === "source" || key === "destination"
+          ? "cyan"
+          : "gray";
+    return (
+      <Box
+        key={`approval-kv-${index}`}
+        borderStyle="round"
+        borderColor={borderColor}
+        paddingX={1}
+        marginTop={1}
+      >
+        <Text dimColor>{`${formatApprovalLabel(key)} `}</Text>
+        <Text color={keyTone}>{parsed.value || "(empty)"}</Text>
+      </Box>
     );
   }
 
   return (
-    <Text key={`approval-line-${index}`} color="white">
-      {line || " "}
-    </Text>
+    <Box key={`approval-context-${index}`} marginTop={1}>
+      <Text dimColor> │ </Text>
+      <Text color="gray">{parsed.raw}</Text>
+    </Box>
   );
 };
 
@@ -539,6 +753,12 @@ const renderApprovalPanel = (
   const selectedBlocked = approvalPanel.blockedItemId === selectedPending.id;
   const selectedInFlight = approvalPanel.inFlightId === selectedPending.id;
   const blockedReason = approvalPanel.blockedReason?.trim() ?? "";
+  const tone = getActionTone(selectedPending.request.action);
+  const approvalState = selectedInFlight
+    ? `${approvalPanel.actionState ?? "approve"}...`
+    : selectedBlocked
+      ? "blocked"
+      : "ready";
   const previewSource =
     approvalPanel.previewMode === "full"
       ? selectedPending.previewFull
@@ -564,7 +784,7 @@ const renderApprovalPanel = (
           Code Approval
         </Text>
         <Text dimColor>
-          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${selectedInFlight ? `${approvalPanel.actionState ?? "approve"}...` : selectedBlocked ? "blocked" : "ready"}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
+          {`focus ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${approvalState}  |  session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
         </Text>
       </Box>
 
@@ -630,14 +850,60 @@ const renderApprovalPanel = (
         })}
       </Box>
 
+      <Text color="cyan">Action summary</Text>
+      <Box
+        marginTop={1}
+        marginBottom={1}
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={tone.border}
+        paddingX={1}
+        paddingY={1}
+      >
+        <Box justifyContent="space-between" flexWrap="wrap">
+          <Text color={tone.badgeFg} backgroundColor={tone.badgeBg}>
+            {` ${selectedPending.request.action} `}
+          </Text>
+          <Text dimColor>{describeApprovalAction(selectedPending.request.action)}</Text>
+        </Box>
+        {renderApprovalSummaryRow("Path", selectedPending.request.path, "white")}
+        {"destination" in selectedPending.request ? (
+          renderApprovalSummaryRow("Destination", selectedPending.request.destination, "cyan")
+        ) : null}
+        {"command" in selectedPending.request ? (
+          <>
+            {renderApprovalSummaryRow("Command", selectedPending.request.command, "yellow")}
+            {selectedPending.request.args.length > 0
+              ? renderApprovalSummaryRow("Args", selectedPending.request.args.join(" "), "white")
+              : null}
+            {renderApprovalSummaryRow("Cwd", selectedPending.request.cwd ?? ".", "magenta")}
+          </>
+        ) : null}
+        {renderApprovalSummaryRow("Preview mode", approvalPanel.previewMode, "cyan")}
+        {renderApprovalSummaryRow(
+          "State",
+          approvalState,
+          selectedBlocked ? "red" : selectedInFlight ? "yellow" : "green"
+        )}
+      </Box>
+
       <Text color="cyan">
-        {`Preview  ${previewWindow.safeOffset + 1}-${Math.min(
+        {`${getApprovalPreviewHeading(selectedPending.request.action)}  ${previewWindow.safeOffset + 1}-${Math.min(
           previewWindow.safeOffset + previewWindow.pageLines.length,
           previewWindow.totalLines
         )}/${previewWindow.totalLines}`}
       </Text>
-      <Box marginTop={1} flexDirection="column">
-        {previewWindow.pageLines.map((line, index) => renderApprovalLine(line, index))}
+      <Box
+        marginTop={1}
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={tone.border}
+        paddingX={1}
+        paddingY={1}
+      >
+        {previewWindow.pageLines.map((line, index) =>
+          renderApprovalLine(line, index, selectedPending.request.action)
+        )}
       </Box>
 
       <Text dimColor>
@@ -674,6 +940,7 @@ export const ChatScreen = ({
   items,
   status,
   input,
+  inputCommandState,
   resumePicker,
   sessionsPanel,
   modelPicker,
@@ -902,6 +1169,27 @@ export const ChatScreen = ({
             placeholder={isPanelActive ? "Panel active..." : "Ask something..."}
           />
         </Box>
+        {!isPanelActive && (inputCommandState.active || inputCommandState.historyPosition !== null) ? (
+          <Box marginTop={1} flexDirection="column">
+            {inputCommandState.active ? (
+              <>
+                <Text dimColor>
+                  {`Slash commands${inputCommandState.currentCommand ? `  |  current ${inputCommandState.currentCommand}` : ""}`}
+                </Text>
+                {inputCommandState.suggestions.map((suggestion, index) => (
+                  <Text key={`command-suggestion-${suggestion.command}-${index}`} color={index === 0 ? "cyan" : "gray"}>
+                    {`${suggestion.command}  |  ${suggestion.description}`}
+                  </Text>
+                ))}
+              </>
+            ) : null}
+            {inputCommandState.historyPosition !== null ? (
+              <Text dimColor>
+                {`History ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  Up/Down recall input`}
+              </Text>
+            ) : null}
+          </Box>
+        ) : null}
       </Box>
     </Box>
   );

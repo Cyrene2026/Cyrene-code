@@ -5,19 +5,102 @@ export type FileAction =
   | "create_file"
   | "write_file"
   | "edit_file"
-  | "delete_file";
+  | "delete_file"
+  | "stat_path"
+  | "find_files"
+  | "search_text"
+  | "copy_path"
+  | "move_path";
 
 export type CommandAction = "run_command";
 
 export type MpcAction = FileAction | CommandAction;
 
-export type FileToolRequest = {
-  action: FileAction;
+export type ReadFileToolRequest = {
+  action: "read_file";
+  path: string;
+};
+
+export type ListDirToolRequest = {
+  action: "list_dir";
+  path: string;
+};
+
+export type CreateDirToolRequest = {
+  action: "create_dir";
+  path: string;
+};
+
+export type CreateFileToolRequest = {
+  action: "create_file";
   path: string;
   content?: string;
+};
+
+export type WriteFileToolRequest = {
+  action: "write_file";
+  path: string;
+  content?: string;
+};
+
+export type EditFileToolRequest = {
+  action: "edit_file";
+  path: string;
   find?: string;
   replace?: string;
 };
+
+export type DeleteFileToolRequest = {
+  action: "delete_file";
+  path: string;
+};
+
+export type StatPathToolRequest = {
+  action: "stat_path";
+  path: string;
+};
+
+export type FindFilesToolRequest = {
+  action: "find_files";
+  path: string;
+  pattern: string;
+  maxResults?: number;
+  caseSensitive?: boolean;
+};
+
+export type SearchTextToolRequest = {
+  action: "search_text";
+  path: string;
+  query: string;
+  maxResults?: number;
+  caseSensitive?: boolean;
+};
+
+export type CopyPathToolRequest = {
+  action: "copy_path";
+  path: string;
+  destination: string;
+};
+
+export type MovePathToolRequest = {
+  action: "move_path";
+  path: string;
+  destination: string;
+};
+
+export type FileToolRequest =
+  | ReadFileToolRequest
+  | ListDirToolRequest
+  | CreateDirToolRequest
+  | CreateFileToolRequest
+  | WriteFileToolRequest
+  | EditFileToolRequest
+  | DeleteFileToolRequest
+  | StatPathToolRequest
+  | FindFilesToolRequest
+  | SearchTextToolRequest
+  | CopyPathToolRequest
+  | MovePathToolRequest;
 
 export type CommandToolRequest = {
   action: CommandAction;

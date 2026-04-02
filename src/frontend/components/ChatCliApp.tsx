@@ -11,6 +11,7 @@ type ChatCliAppProps = {
   defaultSystemPrompt: string;
   projectPrompt: string;
   pinMaxCount: number;
+  queryMaxToolSteps?: number;
   mcpService: FileMcpService;
 };
 
@@ -20,11 +21,13 @@ export const ChatCliApp = ({
   defaultSystemPrompt,
   projectPrompt,
   pinMaxCount,
+  queryMaxToolSteps,
   mcpService,
 }: ChatCliAppProps) => {
   const {
     items,
     input,
+    inputCommandState,
     status,
     resumePicker,
     sessionsPanel,
@@ -41,6 +44,7 @@ export const ChatCliApp = ({
     defaultSystemPrompt,
     projectPrompt,
     pinMaxCount,
+    queryMaxToolSteps,
     mcpService,
   });
 
@@ -48,6 +52,7 @@ export const ChatCliApp = ({
     <ChatScreen
       items={items}
       input={input}
+      inputCommandState={inputCommandState}
       status={status}
       resumePicker={resumePicker}
       sessionsPanel={sessionsPanel}

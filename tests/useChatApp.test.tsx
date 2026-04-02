@@ -35,6 +35,24 @@ const createPending = (
           find: "before",
           replace: "after",
         }
+      : action === "find_files"
+        ? {
+            action,
+            path,
+            pattern: "*.py",
+          }
+        : action === "search_text"
+          ? {
+              action,
+              path,
+              query: "needle",
+            }
+          : action === "copy_path" || action === "move_path"
+            ? {
+                action,
+                path,
+                destination: "next.py",
+              }
       : action === "delete_file" || action === "read_file" || action === "list_dir" || action === "create_dir"
         ? {
             action,
@@ -114,6 +132,85 @@ describe("useChatApp", () => {
     await runCommand(app, "/help");
 
     expect(getTexts(app.getLatest().items).some(text => text.includes("Commands:"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("free input supports terminal-style history with up/down arrows", async () => {
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "first command");
+    await runCommand(app, "second command");
+
+    await act(async () => {
+      app.getLatest().setInput("draft");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("", { upArrow: true } as any);
+      await Promise.resolve();
+    });
+    expect(app.getLatest().input).toBe("second command");
+    expect(app.getLatest().inputCommandState.historyPosition).toBe(2);
+
+    await act(async () => {
+      inputHandler?.("", { upArrow: true } as any);
+      await Promise.resolve();
+    });
+    expect(app.getLatest().input).toBe("first command");
+    expect(app.getLatest().inputCommandState.historyPosition).toBe(1);
+
+    await act(async () => {
+      inputHandler?.("", { downArrow: true } as any);
+      await Promise.resolve();
+    });
+    expect(app.getLatest().input).toBe("second command");
+
+    await act(async () => {
+      inputHandler?.("", { downArrow: true } as any);
+      await Promise.resolve();
+    });
+    expect(app.getLatest().input).toBe("draft");
+    expect(app.getLatest().inputCommandState.historyPosition).toBeNull();
+
+    app.cleanup();
+  });
+
+  test("slash command suggestions prefer the most specific matching command", async () => {
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("/model refresh");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCommandState.currentCommand).toBe("/model refresh");
+    expect(app.getLatest().inputCommandState.suggestions[0]?.command).toBe("/model refresh");
+
     app.cleanup();
   });
 

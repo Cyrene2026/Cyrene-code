@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   runQuerySession,
   type RunQuerySessionResult,
@@ -32,6 +32,7 @@ type UseChatAppParams = {
   defaultSystemPrompt: string;
   projectPrompt: string;
   pinMaxCount: number;
+  queryMaxToolSteps?: number;
   mcpService: FileMcpService;
   runQuerySessionImpl?: typeof runQuerySession;
 };
@@ -81,31 +82,96 @@ type SuspendedTaskState = {
   resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
 };
 
+type CommandSpec = {
+  command: string;
+  description: string;
+};
+
+type InputCommandState = {
+  active: boolean;
+  currentCommand: string | null;
+  suggestions: CommandSpec[];
+  historyPosition: number | null;
+  historySize: number;
+};
+
 const defaultSystemText =
   "Type /help to view commands. Use /resume to open session picker.";
 const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
+const INPUT_HISTORY_LIMIT = 100;
+const COMMAND_SPECS: CommandSpec[] = [
+  { command: "/help", description: "show command list" },
+  { command: "/model", description: "open model picker" },
+  { command: "/model refresh", description: "refresh available models" },
+  { command: "/model <name>", description: "switch model directly" },
+  { command: "/system", description: "show current system prompt" },
+  { command: "/system <text>", description: "set system prompt for this runtime" },
+  { command: "/system reset", description: "restore default system prompt" },
+  { command: "/sessions", description: "open sessions panel" },
+  { command: "/resume", description: "open session resume picker" },
+  { command: "/resume <id>", description: "resume a session by id" },
+  { command: "/new", description: "start a fresh session" },
+  { command: "/pin <note>", description: "pin important context" },
+  { command: "/pins", description: "list pinned context" },
+  { command: "/unpin <index>", description: "remove a pin" },
+  { command: "/review", description: "open approval queue" },
+  { command: "/review <id>", description: "inspect one pending operation" },
+  { command: "/approve [id]", description: "approve pending operation(s)" },
+  { command: "/reject [id]", description: "reject pending operation(s)" },
+];
 const HELP_TEXT = [
   "Commands:",
-  "/help",
-  "/model",
-  "/model refresh",
-  "/model <name>",
-  "/system",
-  "/system <text>",
-  "/system reset",
-  "/sessions",
-  "/resume",
-  "/resume <id>",
-  "/new",
-  "/pin <note>",
-  "/pins",
-  "/unpin <index>",
-  "/review - inspect full review previews",
-  "/review <id> - inspect one pending operation",
-  "/approve [id] - approve pending operation",
-  "/reject [id] - reject pending operation",
+  ...COMMAND_SPECS.map(spec => `${spec.command} - ${spec.description}`),
 ].join("\n");
+
+const getSlashSuggestions = (rawInput: string) => {
+  const value = rawInput.trimStart();
+  if (!value.startsWith("/")) {
+    return [];
+  }
+
+  const normalized = value.toLowerCase();
+  const primaryToken = normalized.split(/\s+/, 1)[0] ?? normalized;
+
+  const matches = COMMAND_SPECS
+    .filter(spec => {
+      const specNormalized = spec.command.toLowerCase();
+      return (
+        specNormalized.startsWith(normalized) ||
+        specNormalized.startsWith(primaryToken) ||
+        normalized.startsWith(specNormalized.replace(/\s+<.*$/, ""))
+      );
+    })
+    .sort((left, right) => {
+      const leftNormalized = left.command.toLowerCase();
+      const rightNormalized = right.command.toLowerCase();
+      const leftExact = leftNormalized === normalized ? 3 : 0;
+      const rightExact = rightNormalized === normalized ? 3 : 0;
+      const leftPrefix = leftNormalized.startsWith(normalized) ? 2 : 0;
+      const rightPrefix = rightNormalized.startsWith(normalized) ? 2 : 0;
+      const leftToken = leftNormalized.startsWith(primaryToken) ? 1 : 0;
+      const rightToken = rightNormalized.startsWith(primaryToken) ? 1 : 0;
+      const leftScore = leftExact + leftPrefix + leftToken;
+      const rightScore = rightExact + rightPrefix + rightToken;
+
+      if (leftScore !== rightScore) {
+        return rightScore - leftScore;
+      }
+
+      if (leftNormalized.includes(" ") !== rightNormalized.includes(" ")) {
+        return leftNormalized.includes(" ") ? -1 : 1;
+      }
+
+      if (leftNormalized.length !== rightNormalized.length) {
+        return rightNormalized.length - leftNormalized.length;
+      }
+
+      return leftNormalized.localeCompare(rightNormalized);
+    });
+
+  return matches.slice(0, 6);
+};
 
 const condenseForMemory = (text: string, max = 480) => {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -131,7 +197,9 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
     action === "create_dir" ||
     action === "create_file" ||
     action === "write_file" ||
-    action === "edit_file"
+    action === "edit_file" ||
+    action === "copy_path" ||
+    action === "move_path"
   ) {
     return "green";
   }
@@ -207,6 +275,7 @@ export const useChatApp = ({
   defaultSystemPrompt,
   projectPrompt,
   pinMaxCount,
+  queryMaxToolSteps = 24,
   mcpService,
   runQuerySessionImpl = runQuerySession,
 }: UseChatAppParams) => {
@@ -224,6 +293,8 @@ export const useChatApp = ({
   const [sessionState, setSessionState] = useState<QuerySessionState | null>(
     null
   );
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [historyCursor, setHistoryCursor] = useState(-1);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState(defaultSystemPrompt);
   const [resumePicker, setResumePicker] = useState<ResumePickerState>({
@@ -271,12 +342,17 @@ export const useChatApp = ({
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
+  const inputHistoryRef = useRef<string[]>([]);
+  const historyCursorRef = useRef(-1);
+  const inputDraftRef = useRef("");
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
   modelPickerRef.current = modelPicker;
   approvalPanelRef.current = approvalPanel;
   pendingReviewsRef.current = pendingReviews;
+  inputHistoryRef.current = inputHistory;
+  historyCursorRef.current = historyCursor;
 
   const enqueueTask = (task: () => Promise<void> | void) => {
     queueRef.current = queueRef.current
@@ -305,6 +381,70 @@ export const useChatApp = ({
           }
         );
       });
+  };
+
+  const setInputValue = (next: string) => {
+    inputDraftRef.current = next;
+    if (historyCursorRef.current !== -1) {
+      historyCursorRef.current = -1;
+      setHistoryCursor(-1);
+    }
+    setInput(next);
+  };
+
+  const pushInputHistory = (query: string) => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      return;
+    }
+    setInputHistory(previous => {
+      const next =
+        previous[previous.length - 1] === trimmed
+          ? previous
+          : [...previous, trimmed].slice(-INPUT_HISTORY_LIMIT);
+      inputHistoryRef.current = next;
+      return next;
+    });
+    historyCursorRef.current = -1;
+    setHistoryCursor(-1);
+    inputDraftRef.current = "";
+  };
+
+  const recallInputHistory = (direction: "up" | "down") => {
+    const history = inputHistoryRef.current;
+    if (history.length === 0) {
+      return;
+    }
+
+    if (direction === "up") {
+      if (historyCursorRef.current === -1) {
+        inputDraftRef.current = input;
+        const nextIndex = history.length - 1;
+        historyCursorRef.current = nextIndex;
+        setHistoryCursor(nextIndex);
+        setInput(history[nextIndex] ?? "");
+        return;
+      }
+      const nextIndex = Math.max(0, historyCursorRef.current - 1);
+      historyCursorRef.current = nextIndex;
+      setHistoryCursor(nextIndex);
+      setInput(history[nextIndex] ?? "");
+      return;
+    }
+
+    if (historyCursorRef.current === -1) {
+      return;
+    }
+    if (historyCursorRef.current >= history.length - 1) {
+      historyCursorRef.current = -1;
+      setHistoryCursor(-1);
+      setInput(inputDraftRef.current);
+      return;
+    }
+    const nextIndex = historyCursorRef.current + 1;
+    historyCursorRef.current = nextIndex;
+    setHistoryCursor(nextIndex);
+    setInput(history[nextIndex] ?? "");
   };
 
   const pushSystemMessage = (
@@ -1361,6 +1501,18 @@ export const useChatApp = ({
     }
 
     if (!approvalPanelRef.current.active) {
+      if (key.upArrow) {
+        recallInputHistory("up");
+        return;
+      }
+
+      if (key.downArrow) {
+        recallInputHistory("down");
+        return;
+      }
+    }
+
+    if (!approvalPanelRef.current.active) {
       return;
     }
 
@@ -1521,6 +1673,8 @@ export const useChatApp = ({
     if (!query) {
       return;
     }
+
+    pushInputHistory(query);
 
     if (query === "/help") {
       setItems(previous => [
@@ -1969,6 +2123,7 @@ export const useChatApp = ({
       const runResult = await runQuerySessionImpl({
         query: prompt,
         originalTask: query,
+        queryMaxToolSteps,
         transport,
         onState: next => {
           setSessionState(next);
@@ -2045,8 +2200,23 @@ export const useChatApp = ({
     });
   };
 
+  const inputCommandState: InputCommandState = useMemo(() => {
+    const suggestions = getSlashSuggestions(input);
+    return {
+      active: suggestions.length > 0,
+      currentCommand: suggestions[0]?.command ?? null,
+      suggestions,
+      historyPosition:
+        historyCursor >= 0 && inputHistory.length > 0
+          ? historyCursor + 1
+          : null,
+      historySize: inputHistory.length,
+    };
+  }, [historyCursor, input, inputHistory.length]);
+
   return {
     input,
+    inputCommandState,
     items,
     status,
     sessionState,
@@ -2061,7 +2231,7 @@ export const useChatApp = ({
     openApprovalPanel,
     approveCurrentPendingReview,
     rejectCurrentPendingReview,
-    setInput,
+    setInput: setInputValue,
     submit,
   };
 };

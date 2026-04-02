@@ -105,7 +105,7 @@ const collectToolNames = (text: string) =>
     new Set(
       (
         text.match(
-          /\b(read_file|list_dir|create_dir|create_file|write_file|edit_file|delete_file|run_command)\b/gi
+          /\b(read_file|list_dir|create_dir|create_file|write_file|edit_file|delete_file|stat_path|find_files|search_text|copy_path|move_path|run_command)\b/gi
         ) ?? []
       ).map(token => token.toLowerCase())
     )

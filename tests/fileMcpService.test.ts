@@ -12,7 +12,14 @@ const createService = async (options?: ConstructorParameters<typeof FileMcpServi
   const service = new FileMcpService({
     workspaceRoot: root,
     maxReadBytes: 1024 * 1024,
-    requireReview: ["create_file", "write_file", "edit_file", "delete_file"],
+    requireReview: [
+      "create_file",
+      "write_file",
+      "edit_file",
+      "delete_file",
+      "copy_path",
+      "move_path",
+    ],
   }, options);
   return { root, service };
 };
@@ -308,6 +315,147 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toContain("edit_file target does not exist");
     expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("stat_path executes immediately and returns stable metadata", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "meta.txt"), "hello", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "stat_path",
+      path: "meta.txt",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] stat_path meta.txt");
+    expect(result.message).toContain("kind: file");
+    expect(result.message).toContain("size: 5");
+  });
+
+  test("find_files executes immediately and returns matching workspace-relative paths", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "test_files"), { recursive: true });
+    await writeFile(join(root, "test_files", "u1.py"), "print('one')\n", "utf8");
+    await writeFile(join(root, "test_files", "u2.ts"), "export const two = 2;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "find_files",
+      path: "test_files",
+      pattern: "*.py",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 file(s):");
+    expect(result.message).toContain("test_files/u1.py");
+    expect(result.message).not.toContain("test_files/u2.ts");
+  });
+
+  test("search_text executes immediately and returns line-level matches", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "docs"), { recursive: true });
+    await writeFile(join(root, "docs", "a.txt"), "alpha\nneedle here\nomega\n", "utf8");
+    await writeFile(join(root, "docs", "b.txt"), "another needle hit\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: "docs",
+      query: "needle",
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("docs/");
+    expect(result.message).toContain("needle");
+  });
+
+  test("copy_path enters review queue and copies file on approve", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "original.txt"), "copy me", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "copy_path",
+      path: "src/original.txt",
+      destination: "dest/copied.txt",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("destination=dest/copied.txt");
+    expect(queued.pending?.previewSummary).toContain("[copy preview]");
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(await readFile(join(root, "dest", "copied.txt"), "utf8")).toBe("copy me");
+    expect(await readFile(join(root, "src", "original.txt"), "utf8")).toBe("copy me");
+  });
+
+  test("move_path enters review queue and moves file on approve", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "move-me.txt"), "move me", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "move_path",
+      path: "src/move-me.txt",
+      destination: "dest/moved.txt",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[move preview]");
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(await readFile(join(root, "dest", "moved.txt"), "utf8")).toBe("move me");
+    await expect(readFile(join(root, "src", "move-me.txt"), "utf8")).rejects.toThrow();
+  });
+
+  test("copy_path rejects before queue when destination already exists", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "dest"), { recursive: true });
+    await writeFile(join(root, "src", "original.txt"), "copy me", "utf8");
+    await writeFile(join(root, "dest", "copied.txt"), "existing", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "copy_path",
+      path: "src/original.txt",
+      destination: "dest/copied.txt",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("copy_path destination already exists");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("move_path conflicts on source or destination path already queued", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "other"), { recursive: true });
+    await writeFile(join(root, "src", "a.txt"), "a", "utf8");
+    await writeFile(join(root, "other", "b.txt"), "b", "utf8");
+
+    const first = await service.handleToolCall("file", {
+      action: "move_path",
+      path: "src/a.txt",
+      destination: "dest/shared.txt",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "copy_path",
+      path: "other/b.txt",
+      destination: "dest/shared.txt",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.message).toContain(
+      "Pending conflict: move_path src/a.txt is already queued."
+    );
   });
 
   test("run_command enters review queue and executes allowed command on approve", async () => {

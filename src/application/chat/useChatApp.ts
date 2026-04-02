@@ -27,6 +27,13 @@ type ResumePickerState = {
   pageSize: number;
 };
 
+type SessionsPanelState = {
+  active: boolean;
+  sessions: SessionListItem[];
+  selectedIndex: number;
+  pageSize: number;
+};
+
 type ModelPickerState = {
   active: boolean;
   models: string[];
@@ -45,7 +52,7 @@ type ApprovalPanelState = {
 
 const defaultSystemText =
   "Type /help to view commands. Use /resume to open session picker.";
-const RESUME_PAGE_SIZE = 1;
+const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const HELP_TEXT = [
   "Commands:",
@@ -245,6 +252,12 @@ export const useChatApp = ({
     selectedIndex: 0,
     pageSize: RESUME_PAGE_SIZE,
   });
+  const [sessionsPanel, setSessionsPanel] = useState<SessionsPanelState>({
+    active: false,
+    sessions: [],
+    selectedIndex: 0,
+    pageSize: RESUME_PAGE_SIZE,
+  });
   const [modelPicker, setModelPicker] = useState<ModelPickerState>({
     active: false,
     models: [],
@@ -379,6 +392,12 @@ export const useChatApp = ({
       selectedIndex: 0,
       pageSize: RESUME_PAGE_SIZE,
     });
+    setSessionsPanel({
+      active: false,
+      sessions: [],
+      selectedIndex: 0,
+      pageSize: RESUME_PAGE_SIZE,
+    });
   };
 
   const closeModelPicker = () => {
@@ -387,6 +406,96 @@ export const useChatApp = ({
       models: [],
       selectedIndex: 0,
       pageSize: MODEL_PAGE_SIZE,
+    });
+  };
+
+  const closeResumePicker = () => {
+    setResumePicker({
+      active: false,
+      sessions: [],
+      selectedIndex: 0,
+      pageSize: RESUME_PAGE_SIZE,
+    });
+  };
+
+  const closeSessionsPanel = () => {
+    setSessionsPanel({
+      active: false,
+      sessions: [],
+      selectedIndex: 0,
+      pageSize: RESUME_PAGE_SIZE,
+    });
+  };
+
+  const loadSessionIntoChat = async (sessionId: string) => {
+    const loaded = await sessionStore.loadSession(sessionId);
+    if (!loaded) {
+      pushSystemMessage(`Session not found: ${sessionId}`, {
+        kind: "error",
+        tone: "danger",
+        color: "red",
+      });
+      return;
+    }
+    applyLoadedSession(loaded);
+  };
+
+  const confirmModelPickerSelection = () => {
+    enqueueTask(async () => {
+      const selected = modelPicker.models[modelPicker.selectedIndex];
+      if (!selected) {
+        pushSystemMessage("No model selected.", {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        return;
+      }
+      const result = await transport.setModel(selected);
+      if (result.ok) {
+        pushSystemMessage(result.message, {
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        });
+        closeModelPicker();
+      } else {
+        pushSystemMessage(`[model switch failed] ${result.message}`, {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+      }
+    });
+  };
+
+  const confirmResumePickerSelection = () => {
+    enqueueTask(async () => {
+      const selected = resumePicker.sessions[resumePicker.selectedIndex];
+      if (!selected) {
+        pushSystemMessage("No session selected.", {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        return;
+      }
+      await loadSessionIntoChat(selected.id);
+    });
+  };
+
+  const confirmSessionsPanelSelection = () => {
+    enqueueTask(async () => {
+      const selected = sessionsPanel.sessions[sessionsPanel.selectedIndex];
+      if (!selected) {
+        pushSystemMessage("No session selected.", {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        return;
+      }
+      await loadSessionIntoChat(selected.id);
     });
   };
 
@@ -629,19 +738,41 @@ export const useChatApp = ({
             selectedIndex: nextIndex,
           };
         });
+        return;
+      }
+
+      if (key.return) {
+        confirmModelPickerSelection();
       }
       return;
     }
 
     if (resumePicker.active) {
       if (key.escape) {
-        setResumePicker({
-          active: false,
-          sessions: [],
-          selectedIndex: 0,
-          pageSize: RESUME_PAGE_SIZE,
-        });
+        closeResumePicker();
         pushSystemMessage("Resume picker closed.");
+        return;
+      }
+
+      if (key.upArrow) {
+        setResumePicker(previous => ({
+          ...previous,
+          selectedIndex:
+            previous.selectedIndex <= 0
+              ? previous.sessions.length - 1
+              : previous.selectedIndex - 1,
+        }));
+        return;
+      }
+
+      if (key.downArrow) {
+        setResumePicker(previous => ({
+          ...previous,
+          selectedIndex:
+            previous.selectedIndex >= previous.sessions.length - 1
+              ? 0
+              : previous.selectedIndex + 1,
+        }));
         return;
       }
 
@@ -668,6 +799,72 @@ export const useChatApp = ({
             selectedIndex: nextIndex,
           };
         });
+        return;
+      }
+
+      if (key.return) {
+        confirmResumePickerSelection();
+      }
+      return;
+    }
+
+    if (sessionsPanel.active) {
+      if (key.escape) {
+        closeSessionsPanel();
+        pushSystemMessage("Sessions panel closed.");
+        return;
+      }
+
+      if (key.upArrow) {
+        setSessionsPanel(previous => ({
+          ...previous,
+          selectedIndex:
+            previous.selectedIndex <= 0
+              ? previous.sessions.length - 1
+              : previous.selectedIndex - 1,
+        }));
+        return;
+      }
+
+      if (key.downArrow) {
+        setSessionsPanel(previous => ({
+          ...previous,
+          selectedIndex:
+            previous.selectedIndex >= previous.sessions.length - 1
+              ? 0
+              : previous.selectedIndex + 1,
+        }));
+        return;
+      }
+
+      if (key.leftArrow || key.rightArrow) {
+        setSessionsPanel(previous => {
+          const total = previous.sessions.length;
+          if (total === 0) {
+            return previous;
+          }
+          const pageSize = previous.pageSize;
+          const currentPage = Math.floor(previous.selectedIndex / pageSize);
+          const maxPage = Math.floor((total - 1) / pageSize);
+          const offset = previous.selectedIndex % pageSize;
+          const nextPage = key.leftArrow
+            ? currentPage <= 0
+              ? maxPage
+              : currentPage - 1
+            : currentPage >= maxPage
+              ? 0
+              : currentPage + 1;
+          const nextIndex = Math.min(nextPage * pageSize + offset, total - 1);
+          return {
+            ...previous,
+            selectedIndex: nextIndex,
+          };
+        });
+        return;
+      }
+
+      if (key.return) {
+        confirmSessionsPanelSelection();
       }
       return;
     }
@@ -726,6 +923,18 @@ export const useChatApp = ({
       return;
     }
 
+    if (key.return) {
+      pushSystemMessage(
+        "Approval panel uses a to approve and r to reject. Enter is disabled to avoid accidental approval.",
+        {
+          kind: "system_hint",
+          tone: "neutral",
+          color: "gray",
+        }
+      );
+      return;
+    }
+
     if (inputValue.toLowerCase() === "r") {
       rejectCurrentPendingReview();
     }
@@ -738,41 +947,26 @@ export const useChatApp = ({
     }
 
     if (!query && modelPicker.active) {
-      enqueueTask(async () => {
-        const selected = modelPicker.models[modelPicker.selectedIndex];
-        if (!selected) {
-          pushSystemMessage("No model selected.");
-          return;
-        }
-        const result = await transport.setModel(selected);
-        if (result.ok) {
-          pushSystemMessage(result.message);
-          closeModelPicker();
-        } else {
-          pushSystemMessage(`[model switch failed] ${result.message}`);
-        }
-      });
+      confirmModelPickerSelection();
       return;
     }
 
     if (!query && resumePicker.active) {
-      enqueueTask(async () => {
-        const selected = resumePicker.sessions[resumePicker.selectedIndex];
-        if (!selected) {
-          pushSystemMessage("No session selected.");
-          return;
-        }
-        const loaded = await sessionStore.loadSession(selected.id);
-        if (!loaded) {
-          pushSystemMessage(`Session not found: ${selected.id}`);
-          return;
-        }
-        applyLoadedSession(loaded);
-      });
+      confirmResumePickerSelection();
       return;
     }
 
-    if (approvalPanel.active) {
+    if (!query && sessionsPanel.active) {
+      confirmSessionsPanelSelection();
+      return;
+    }
+
+    if (
+      modelPicker.active ||
+      resumePicker.active ||
+      sessionsPanel.active ||
+      approvalPanel.active
+    ) {
       return;
     }
 
@@ -906,10 +1100,16 @@ export const useChatApp = ({
         if (sessions.length === 0) {
           pushSystemMessage("No sessions yet.");
         } else {
-          const lines = sessions
-            .map(session => `${session.id} | ${session.updatedAt} | ${session.title}`)
-            .join("\n");
-          pushSystemMessage(`Sessions:\n${lines}`);
+          setSessionsPanel({
+            active: true,
+            sessions,
+            selectedIndex: 0,
+            pageSize: RESUME_PAGE_SIZE,
+          });
+          pushSystemMessage(
+            "Sessions panel opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
+            { kind: "system_hint", tone: "info", color: "cyan" }
+          );
         }
         setInput("");
         return;
@@ -1163,7 +1363,8 @@ export const useChatApp = ({
             pageSize: RESUME_PAGE_SIZE,
           });
           pushSystemMessage(
-            "Resume picker opened: use Left/Right to page, Enter to resume, Esc to cancel."
+            "Resume picker opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
+            { kind: "system_hint", tone: "info", color: "cyan" }
           );
         }
         setInput("");
@@ -1178,14 +1379,7 @@ export const useChatApp = ({
           return;
         }
 
-        const loaded = await sessionStore.loadSession(targetId);
-        if (!loaded) {
-          pushSystemMessage(`Session not found: ${targetId}`);
-          setInput("");
-          return;
-        }
-
-        applyLoadedSession(loaded);
+        await loadSessionIntoChat(targetId);
         setInput("");
         return;
       }
@@ -1305,9 +1499,12 @@ export const useChatApp = ({
     status,
     sessionState,
     resumePicker,
+    sessionsPanel,
     modelPicker,
     pendingReviews,
     approvalPanel,
+    activeSessionId,
+    currentModel: transport.getModel(),
     closeApprovalPanel,
     openApprovalPanel,
     approveCurrentPendingReview,

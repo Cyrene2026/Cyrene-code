@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import {
   runQuerySession,
   type RunQuerySessionResult,
 } from "../../core/query/runQuerySession";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
+import { compressContext } from "../../core/session/contextCompression";
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
@@ -100,6 +101,11 @@ const defaultSystemText =
 const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
+const SUMMARY_RECENT_KEEP = 8;
+const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
+const SUMMARY_TRIGGER_CHAR_THRESHOLD = 1200;
+const SUMMARY_RECENT_MESSAGE_LIMIT = 16;
+const SUMMARY_RECENT_CHAR_BUDGET = 12000;
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
   { command: "/model", description: "open model picker" },
@@ -173,21 +179,106 @@ const getSlashSuggestions = (rawInput: string) => {
   return matches.slice(0, 6);
 };
 
-const condenseForMemory = (text: string, max = 480) => {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (normalized.length <= max) {
-    return normalized;
+const shouldRefreshSessionSummary = (session: SessionRecord) => {
+  if (session.summary.trim()) {
+    return false;
   }
-  const head = normalized.slice(0, 320);
-  const tail = normalized.slice(-120);
-  return `${head} ... ${tail}`;
+
+  const nonSystemMessages = session.messages.filter(message => message.role !== "system");
+  if (nonSystemMessages.length >= SUMMARY_TRIGGER_MESSAGE_COUNT) {
+    return true;
+  }
+
+  const totalChars = nonSystemMessages.reduce(
+    (count, message) => count + message.text.length,
+    0
+  );
+  return totalChars >= SUMMARY_TRIGGER_CHAR_THRESHOLD;
 };
+
+const buildSummaryPrompt = (session: SessionRecord) => {
+  const compressed = compressContext(session.messages, SUMMARY_RECENT_KEEP, 6);
+  const recentMessages = session.messages
+    .filter(message => message.role !== "system")
+    .slice(-SUMMARY_RECENT_MESSAGE_LIMIT);
+  const recentLines: string[] = [];
+  let charBudget = 0;
+
+  for (const message of recentMessages) {
+    const normalized = message.text.trim();
+    if (!normalized) {
+      continue;
+    }
+    const line = `${message.role.toUpperCase()}: ${normalized}`;
+    if (
+      recentLines.length > 0 &&
+      charBudget + line.length > SUMMARY_RECENT_CHAR_BUDGET
+    ) {
+      break;
+    }
+    recentLines.push(line);
+    charBudget += line.length;
+  }
+
+  return [
+    "Summarize the prior conversation into 4-6 short Markdown bullet points.",
+    "Keep only the task goal, confirmed facts, constraints, key decisions, and unfinished work.",
+    "Do not add headings, prose paragraphs, code fences, speculation, or any new information.",
+    "Prefer concrete nouns and file/tool names when they were explicitly mentioned.",
+    "",
+    "Deterministic fallback summary:",
+    compressed.summary || "(none)",
+    "",
+    "Recent conversation:",
+    recentLines.join("\n") || "(none)",
+  ].join("\n");
+};
+
+const buildSummaryUsageHint = (
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  } | null
+) =>
+  usage
+    ? `summary updated | prompt ${usage.promptTokens} | completion ${usage.completionTokens} | total ${usage.totalTokens}`
+    : "summary updated";
+
+const isLikelyLegacyCompressedMarkdown = (text: string) => {
+  if (text.includes("\n")) {
+    return false;
+  }
+
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const signalCount = [
+    /(^|\s)#{1,6}\s+\S/.test(normalized),
+    /```/.test(normalized),
+    /\*\*[^*]+\*\*/.test(normalized),
+    /(?:^|\s)(?:-|\*|\d+\.)\s+\S/.test(normalized),
+    /(?:---|\*\*\*|___)/.test(normalized),
+    /\s\.\.\.\s/.test(normalized),
+  ].filter(Boolean).length;
+
+  return signalCount >= 2;
+};
+
+const hasLegacyCompressedMarkdown = (session: SessionRecord) =>
+  session.messages.some(
+    message =>
+      message.role === "assistant" &&
+      isLikelyLegacyCompressedMarkdown(message.text)
+  );
 
 const actionColor = (action?: MpcAction): ChatItem["color"] => {
   if (!action) {
     return undefined;
   }
-  if (action === "run_command") {
+  if (action === "run_command" || action === "run_shell") {
     return "red";
   }
   if (action === "delete_file") {
@@ -207,7 +298,10 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
 };
 
 const isHighRiskReviewAction = (action: MpcAction) =>
-  action === "edit_file" || action === "delete_file" || action === "run_command";
+  action === "edit_file" ||
+  action === "delete_file" ||
+  action === "run_command" ||
+  action === "run_shell";
 
 const extractMessageBody = (raw: string) => {
   const [, ...rest] = raw.split("\n");
@@ -290,9 +384,11 @@ export const useChatApp = ({
       color: "gray",
     },
   ]);
+  const [liveAssistantText, setLiveAssistantText] = useState("");
   const [sessionState, setSessionState] = useState<QuerySessionState | null>(
     null
   );
+  const [currentModel, setCurrentModel] = useState(() => transport.getModel());
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -345,6 +441,7 @@ export const useChatApp = ({
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
   const inputDraftRef = useRef("");
+  const liveAssistantTextRef = useRef("");
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
@@ -353,6 +450,28 @@ export const useChatApp = ({
   pendingReviewsRef.current = pendingReviews;
   inputHistoryRef.current = inputHistory;
   historyCursorRef.current = historyCursor;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncCurrentModel = () => {
+      if (!cancelled) {
+        setCurrentModel(transport.getModel());
+      }
+    };
+
+    syncCurrentModel();
+    void transport
+      .listModels()
+      .catch(() => {})
+      .then(() => {
+        syncCurrentModel();
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [transport]);
 
   const enqueueTask = (task: () => Promise<void> | void) => {
     queueRef.current = queueRef.current
@@ -463,12 +582,32 @@ export const useChatApp = ({
     ]);
   };
 
+  const setLiveAssistantSegment = (next: string) => {
+    liveAssistantTextRef.current = next;
+    startTransition(() => {
+      setLiveAssistantText(next);
+    });
+  };
+
+  const clearLiveAssistantSegment = () => {
+    liveAssistantTextRef.current = "";
+    setLiveAssistantText("");
+  };
+
   const pushStreamingSystemMessage = (
     text: string,
     options?: Pick<ChatItem, "color" | "kind" | "tone">
   ) => {
     setItems(previous => {
       const next = [...previous];
+      if (liveAssistantTextRef.current) {
+        next.push({
+          role: "assistant",
+          text: liveAssistantTextRef.current,
+          kind: "transcript",
+          tone: "neutral",
+        });
+      }
       next.push({
         role: "system",
         text,
@@ -476,14 +615,9 @@ export const useChatApp = ({
         kind: options?.kind,
         tone: options?.tone,
       });
-      next.push({
-        role: "assistant",
-        text: "",
-        kind: "transcript",
-        tone: "neutral",
-      });
       return next;
     });
+    clearLiveAssistantSegment();
   };
 
   const isRepeatedApprovalInteraction = (
@@ -563,18 +697,11 @@ export const useChatApp = ({
       return;
     }
 
-    const memoryText = condenseForMemory(assistantBuffer);
     await sessionStore.appendMessage(sessionId, {
       role: "assistant",
-      text: memoryText,
+      text: assistantBuffer,
       createdAt: new Date().toISOString(),
     });
-    if (assistantBuffer.length > memoryText.length + 40) {
-      pushSystemMessage(
-        "Long assistant output was compressed in session memory. Use /pin to keep key points.",
-        { kind: "system_hint", tone: "neutral", color: "gray" }
-      );
-    }
   };
 
   const consumeQueryRunResult = async (
@@ -584,6 +711,18 @@ export const useChatApp = ({
   ) => {
     if (!result || result.status === "completed") {
       suspendedTaskRef.current = null;
+      if (liveAssistantTextRef.current) {
+        setItems(previous => [
+          ...previous,
+          {
+            role: "assistant",
+            text: liveAssistantTextRef.current,
+            kind: "transcript",
+            tone: "neutral",
+          },
+        ]);
+        clearLiveAssistantSegment();
+      }
       await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
       return;
     }
@@ -629,37 +768,35 @@ export const useChatApp = ({
     return created;
   };
 
-  const appendToLastAssistant = (text: string) => {
-    setItems(previous => {
-      const next = [...previous];
-      let lastAssistantIndex = -1;
-      for (let index = next.length - 1; index >= 0; index -= 1) {
-        if (next[index]?.role === "assistant") {
-          lastAssistantIndex = index;
-          break;
-        }
-      }
+  const maybeRefreshSessionSummary = async (session: SessionRecord) => {
+    if (!transport.summarizeText || !shouldRefreshSessionSummary(session)) {
+      return session;
+    }
 
-      if (lastAssistantIndex === -1) {
-        return previous;
-      }
+    const summaryResult = await transport.summarizeText(buildSummaryPrompt(session));
+    if (!summaryResult.ok || !summaryResult.text?.trim()) {
+      return session;
+    }
 
-      const last = next[lastAssistantIndex];
-      if (!last) {
-        return previous;
-      }
-
-      next[lastAssistantIndex] = {
-        role: "assistant",
-        text: last.text + text,
-        kind: "transcript",
-        tone: "neutral",
-      };
-      return next;
+    const updated = await sessionStore.updateSummary(
+      session.id,
+      summaryResult.text.trim()
+    );
+    pushSystemMessage(buildSummaryUsageHint(summaryResult.usage), {
+      kind: "system_hint",
+      tone: "neutral",
+      color: "gray",
     });
+    return updated;
+  };
+
+  const appendToLiveAssistant = (text: string) => {
+    setLiveAssistantSegment(liveAssistantTextRef.current + text);
   };
 
   const applyLoadedSession = (loaded: SessionRecord) => {
+    const shouldShowLegacyHint = hasLegacyCompressedMarkdown(loaded);
+    clearLiveAssistantSegment();
     setActiveSessionId(loaded.id);
     setItems([
       {
@@ -682,6 +819,18 @@ export const useChatApp = ({
         tone: "info",
         color: "cyan",
       },
+      ...(shouldShowLegacyHint
+        ? [
+            {
+              role: "system" as const,
+              text:
+                "Resume note: this older session may include previously compressed assistant text, so some Markdown structure may not fully recover.",
+              kind: "system_hint" as const,
+              tone: "neutral" as const,
+              color: "gray" as const,
+            },
+          ]
+        : []),
     ]);
     setResumePicker({
       active: false,
@@ -787,6 +936,7 @@ export const useChatApp = ({
         return;
       }
       const result = await transport.setModel(selected);
+      setCurrentModel(transport.getModel());
       if (result.ok) {
         pushSystemMessage(result.message, {
           kind: "system_hint",
@@ -1694,6 +1844,7 @@ export const useChatApp = ({
     if (query === "/model") {
       enqueueTask(async () => {
         const models = await transport.listModels();
+        setCurrentModel(transport.getModel());
       if (models.length === 0) {
           pushSystemMessage("No models available. Try /model refresh.");
           return;
@@ -1720,6 +1871,7 @@ export const useChatApp = ({
     if (query === "/model refresh") {
       enqueueTask(async () => {
         const result = await transport.refreshModels();
+        setCurrentModel(transport.getModel());
         if (result.ok) {
           pushSystemMessage(
             `${result.message}\nCurrent model: ${transport.getModel()}`
@@ -1740,6 +1892,7 @@ export const useChatApp = ({
           return;
         }
         const result = await transport.setModel(nextModel);
+        setCurrentModel(transport.getModel());
         if (result.ok) {
           pushSystemMessage(result.message);
         } else {
@@ -1754,6 +1907,7 @@ export const useChatApp = ({
       if (query === "/new") {
         const created = await sessionStore.createSession();
         setActiveSessionId(created.id);
+        clearLiveAssistantSegment();
         setItems([
           {
             role: "system",
@@ -2098,19 +2252,19 @@ export const useChatApp = ({
       setItems(previous => [
         ...previous,
         { role: "user", text: query, kind: "transcript", tone: "neutral" },
-        { role: "assistant", text: "", kind: "transcript", tone: "neutral" },
       ]);
+      clearLiveAssistantSegment();
       setInput("");
 
       const session = await ensureActiveSession(query);
+      await maybeRefreshSessionSummary(session);
+      const promptContext = await sessionStore.getPromptContext(session.id, query);
       const now = new Date().toISOString();
       await sessionStore.appendMessage(session.id, {
         role: "user",
         text: query,
         createdAt: now,
       });
-
-      const promptContext = await sessionStore.getPromptContext(session.id, query);
 
       const prompt = buildPromptWithContext(
         query,
@@ -2131,7 +2285,7 @@ export const useChatApp = ({
         },
         onTextDelta: text => {
           assistantBufferRef.current += text;
-          appendToLastAssistant(text);
+          appendToLiveAssistant(text);
         },
         onToolCall: async (toolName, toolInput) => {
           const result = await mcpService.handleToolCall(toolName, toolInput);
@@ -2218,15 +2372,17 @@ export const useChatApp = ({
     input,
     inputCommandState,
     items,
+    liveAssistantText,
     status,
     sessionState,
+    usage: sessionState?.usage ?? null,
     resumePicker,
     sessionsPanel,
     modelPicker,
     pendingReviews,
     approvalPanel,
     activeSessionId,
-    currentModel: transport.getModel(),
+    currentModel,
     closeApprovalPanel: () => closeApprovalPanel({ suppressCurrentQueue: true }),
     openApprovalPanel,
     approveCurrentPendingReview,

@@ -91,6 +91,19 @@ const summarizeListDirBody = (body: string, maxItems = 4) => {
   return `${visible} (${lines.length} items${more > 0 ? `, +${more} more` : ""})`;
 };
 
+const parseListDirBody = (body: string) => {
+  const lines = body
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean);
+  const confirmation = lines.find(line => line.startsWith("[confirmed directory state]"));
+  const entries = lines.filter(line => !line.startsWith("[confirmed directory state]"));
+  return {
+    confirmation,
+    entrySummary: summarizeListDirBody(entries.join("\n")),
+  };
+};
+
 export const summarizeToolMessage = (raw: string): {
   text: string;
   kind: ChatItem["kind"];
@@ -105,9 +118,18 @@ export const summarizeToolMessage = (raw: string): {
   if (firstLine.startsWith("Tool result:")) {
     const detail = firstLine.replace("Tool result:", "").trim();
     if (detail.startsWith("list_dir ")) {
+      const { confirmation, entrySummary } = parseListDirBody(body);
       return {
         ...normalized,
-        text: `Tool: ${detail} | ${summarizeListDirBody(body)}`,
+        text: `Tool: ${detail} | ${confirmation ? "confirmed directory state" : "directory state"} | ${entrySummary}`,
+      };
+    }
+    if (detail.startsWith("read_file ")) {
+      const bodyLine =
+        body.split("\n").find(line => line.trim().length > 0)?.trim() ?? "(empty file)";
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${bodyLine}`,
       };
     }
     let summary = `Tool: ${detail}`;

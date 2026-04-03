@@ -1,12 +1,14 @@
 import React from "react";
 import { Box, Text } from "ink";
 import TextInput from "ink-text-input";
+import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { SessionListItem } from "../../core/session/types";
 import type { PendingReviewItem } from "../../core/tools/mcp/types";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 
 type ChatScreenProps = {
   items: ChatItem[];
+  liveAssistantText: string;
   status: ChatStatus;
   input: string;
   inputCommandState: {
@@ -54,6 +56,7 @@ type ChatScreenProps = {
   };
   activeSessionId: string | null;
   currentModel: string;
+  usage: TokenUsage | null;
   onInputChange: (next: string) => void;
   onSubmit: () => void;
 };
@@ -69,6 +72,7 @@ type PagedResult<T> = {
 type CodeSegment = {
   text: string;
   color?: ChatItem["color"];
+  backgroundColor?: ChatItem["color"];
 };
 
 type ApprovalPreviewLine = {
@@ -81,9 +85,26 @@ type ApprovalPreviewLine = {
   content?: string;
 };
 
+type MarkdownInlineSegment = {
+  text: string;
+  kind: "text" | "code" | "strong";
+};
+
+type MarkdownBlock =
+  | { kind: "paragraph"; text: string }
+  | { kind: "heading"; level: number; text: string }
+  | { kind: "list"; ordered: boolean; items: string[] }
+  | { kind: "code"; language?: string; content: string }
+  | { kind: "diff"; lines: string[] }
+  | { kind: "rule" };
+
 const BRAND_NAME = "CYRENE";
 const SECTION_GAP = 1;
 const SPINNER_FRAMES = ["·", "•", "●", "•"];
+const STREAMING_IDLE_GLYPH = "●";
+const ENABLE_STREAMING_ANIMATION =
+  process.env.CYRENE_ANIMATE_STREAMING === "1" ||
+  (process.env.CYRENE_ANIMATE_STREAMING !== "0" && process.platform !== "win32");
 const CODE_KEYWORDS = new Set([
   "const",
   "let",
@@ -124,6 +145,30 @@ const resolveItemColor = (item: ChatItem) => {
   if (item.kind === "system_hint") return "gray";
   if (item.tone === "success") return "green";
   return item.color ?? "white";
+};
+
+const getMessageLabel = (
+  item: ChatItem
+): { label: string; color: ChatItem["color"] } => {
+  if (item.role === "user") {
+    return { label: "you", color: "green" };
+  }
+  if (item.kind === "tool_status") {
+    return { label: "tool", color: "cyan" };
+  }
+  if (item.kind === "review_status") {
+    return {
+      label: "review",
+      color: item.tone === "warning" ? "yellow" : "green",
+    };
+  }
+  if (item.kind === "error" || item.tone === "danger") {
+    return { label: "error", color: "red" };
+  }
+  if (item.role === "assistant") {
+    return { label: "cyrene", color: "cyan" };
+  }
+  return { label: "system", color: "gray" };
 };
 
 const shortenValue = (value: string, max = 20) =>
@@ -252,52 +297,320 @@ const tokenizeCodeLine = (line: string): CodeSegment[] => {
   });
 };
 
-const renderSegments = (segments: CodeSegment[], keyPrefix: string) => (
-  <Text>
+export const parseInlineMarkdownSegments = (line: string): MarkdownInlineSegment[] => {
+  const segments: MarkdownInlineSegment[] = [];
+  let cursor = 0;
+  let buffer = "";
+
+  const pushBuffer = () => {
+    if (!buffer) {
+      return;
+    }
+    segments.push({ text: buffer, kind: "text" });
+    buffer = "";
+  };
+
+  while (cursor < line.length) {
+    if (line.startsWith("`", cursor)) {
+      const end = line.indexOf("`", cursor + 1);
+      if (end !== -1) {
+        pushBuffer();
+        segments.push({
+          text: line.slice(cursor + 1, end),
+          kind: "code",
+        });
+        cursor = end + 1;
+        continue;
+      }
+    }
+
+    if (line.startsWith("**", cursor)) {
+      const end = line.indexOf("**", cursor + 2);
+      if (end !== -1) {
+        pushBuffer();
+        segments.push({
+          text: line.slice(cursor + 2, end),
+          kind: "strong",
+        });
+        cursor = end + 2;
+        continue;
+      }
+    }
+
+    buffer += line[cursor] ?? "";
+    cursor += 1;
+  }
+
+  pushBuffer();
+  return segments.filter(segment => segment.text.length > 0);
+};
+
+export const parseInlineCodeSegments = (line: string) =>
+  parseInlineMarkdownSegments(line).map(segment => ({
+    text: segment.text,
+    isCode: segment.kind === "code",
+  }));
+
+const renderSegments = (
+  segments: CodeSegment[],
+  keyPrefix: string,
+  options?: { backgroundColor?: ChatItem["color"] }
+) => (
+  <Text backgroundColor={options?.backgroundColor}>
     {segments.map((segment, index) => (
-      <Text key={`${keyPrefix}-${index}`} color={segment.color}>
+      <Text
+        key={`${keyPrefix}-${index}`}
+        color={segment.color}
+        backgroundColor={segment.backgroundColor ?? options?.backgroundColor}
+      >
         {segment.text}
       </Text>
     ))}
   </Text>
 );
 
-const renderPlainLine = (
+const renderInlineMarkdownLine = (
   line: string,
   key: string,
   color: ChatItem["color"],
   prefix?: string
-) => (
-  <Text key={key} color={color}>
-    {prefix ?? ""}
-    {line || " "}
-  </Text>
-);
+) => {
+  const segments = parseInlineMarkdownSegments(line);
+  if (segments.length === 0) {
+    return (
+      <Text key={key} color={color}>
+        {prefix ?? ""}
+        {line || " "}
+      </Text>
+    );
+  }
+
+  return (
+    <Text key={key} color={color}>
+      {prefix ?? ""}
+      {segments.map((segment, index) =>
+        segment.kind === "code" ? (
+          <Text
+            key={`${key}-code-${index}`}
+            color="white"
+            backgroundColor="gray"
+          >
+            {segment.text}
+          </Text>
+        ) : segment.kind === "strong" ? (
+          <Text key={`${key}-strong-${index}`} color={color} bold>
+            {segment.text}
+          </Text>
+        ) : (
+          <Text key={`${key}-text-${index}`} color={color}>
+            {segment.text}
+          </Text>
+        )
+      )}
+    </Text>
+  );
+};
 
 const renderCodeBlock = (code: string, itemIndex: number, langHint?: string) => {
   const language = langHint || inferCodeLanguage(code);
   const lines = code.split("\n");
   return (
-    <Box
-      key={`code-${itemIndex}-${language}`}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor="gray"
-      paddingX={1}
-      marginTop={1}
-      marginBottom={1}
-    >
-      <Text dimColor>{`code | ${language}`}</Text>
-      <Box marginTop={1} flexDirection="column">
-        {lines.map((line, lineIndex) => (
-          <Box key={`code-line-${itemIndex}-${lineIndex}`}>
-            <Text dimColor>{String(lineIndex + 1).padStart(3, " ")} </Text>
-            {renderSegments(tokenizeCodeLine(line), `code-token-${itemIndex}-${lineIndex}`)}
-          </Box>
-        ))}
-      </Box>
+    <Box key={`code-${itemIndex}-${language}`} flexDirection="column" marginTop={1}>
+      <Text dimColor>{`  code | ${language}`}</Text>
+      {lines.map((line, lineIndex) => (
+        <Box key={`code-line-${itemIndex}-${lineIndex}`}>
+          <Text dimColor>{`  ${String(lineIndex + 1).padStart(3, " ")} `}</Text>
+          {renderSegments(tokenizeCodeLine(line), `code-token-${itemIndex}-${lineIndex}`, {
+            backgroundColor: "gray",
+          })}
+        </Box>
+      ))}
     </Box>
   );
+};
+
+export const isTranscriptDiffLine = (line: string, neighbors?: { prev?: string; next?: string }) => {
+  if (line.startsWith("@@")) {
+    return true;
+  }
+
+  const diffWithLineNumber = /^([+-])\s*\d+\s*\|/.test(line);
+  if (diffWithLineNumber) {
+    return true;
+  }
+
+  const simpleDiff = /^([+-])\s+\S/.exec(line);
+  if (!simpleDiff) {
+    return false;
+  }
+
+  const prev = neighbors?.prev?.trimStart() ?? "";
+  const next = neighbors?.next?.trimStart() ?? "";
+  const currentSign = simpleDiff[1];
+  const oppositeSign = currentSign === "+" ? "-" : "+";
+
+  return (
+    prev.startsWith("@@") ||
+    next.startsWith("@@") ||
+    prev.startsWith(oppositeSign) ||
+    next.startsWith(oppositeSign)
+  );
+};
+
+export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
+  const lines = text.split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let paragraphLines: string[] = [];
+  let listState: { ordered: boolean; items: string[] } | null = null;
+  let diffLines: string[] = [];
+  let inCode = false;
+  let codeLanguage = "";
+  let codeLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraphLines.length === 0) {
+      return;
+    }
+    blocks.push({
+      kind: "paragraph",
+      text: paragraphLines.map(line => line.trim()).join(" "),
+    });
+    paragraphLines = [];
+  };
+
+  const flushList = () => {
+    if (!listState || listState.items.length === 0) {
+      listState = null;
+      return;
+    }
+    blocks.push({
+      kind: "list",
+      ordered: listState.ordered,
+      items: [...listState.items],
+    });
+    listState = null;
+  };
+
+  const flushDiff = () => {
+    if (diffLines.length === 0) {
+      return;
+    }
+    blocks.push({
+      kind: "diff",
+      lines: [...diffLines],
+    });
+    diffLines = [];
+  };
+
+  const flushCode = () => {
+    blocks.push({
+      kind: "code",
+      language: codeLanguage || undefined,
+      content: codeLines.join("\n"),
+    });
+    codeLines = [];
+    codeLanguage = "";
+  };
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    const prev = index > 0 ? lines[index - 1] : undefined;
+    const next = index < lines.length - 1 ? lines[index + 1] : undefined;
+
+    if (trimmed.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      flushDiff();
+      if (inCode) {
+        flushCode();
+        inCode = false;
+      } else {
+        inCode = true;
+        codeLanguage = trimmed.slice(3).trim();
+      }
+      return;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      return;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      flushDiff();
+      return;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      flushDiff();
+      blocks.push({ kind: "rule" });
+      return;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+    if (headingMatch) {
+      const headingLevel = headingMatch[1] ?? "";
+      const headingText = headingMatch[2] ?? "";
+      flushParagraph();
+      flushList();
+      flushDiff();
+      blocks.push({
+        kind: "heading",
+        level: headingLevel.length,
+        text: headingText,
+      });
+      return;
+    }
+
+    if (isTranscriptDiffLine(line, { prev, next })) {
+      flushParagraph();
+      flushList();
+      diffLines.push(line);
+      return;
+    }
+
+    const unorderedMatch = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (unorderedMatch) {
+      const itemText = unorderedMatch[1] ?? "";
+      flushParagraph();
+      flushDiff();
+      if (!listState || listState.ordered) {
+        flushList();
+        listState = { ordered: false, items: [] };
+      }
+      listState.items.push(itemText);
+      return;
+    }
+
+    const orderedMatch = /^\d+\.\s+(.+)$/.exec(trimmed);
+    if (orderedMatch) {
+      const itemText = orderedMatch[1] ?? "";
+      flushParagraph();
+      flushDiff();
+      if (!listState || !listState.ordered) {
+        flushList();
+        listState = { ordered: true, items: [] };
+      }
+      listState.items.push(itemText);
+      return;
+    }
+
+    flushList();
+    flushDiff();
+    paragraphLines.push(line);
+  });
+
+  if (inCode) {
+    flushCode();
+  }
+  flushParagraph();
+  flushList();
+  flushDiff();
+  return blocks;
 };
 
 const renderMessageItem = (item: ChatItem, itemIndex: number) => {
@@ -306,134 +619,140 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
   }
 
   const color = resolveItemColor(item);
-  const lines = item.text.split("\n");
+  const messageLabel = getMessageLabel(item);
+  const blocks = parseMarkdownBlocks(item.text);
   const nodes: React.ReactNode[] = [];
-  let inCode = false;
-  let codeLanguage = "";
-  let codeBuffer: string[] = [];
-
-  const flushCode = () => {
-    if (!codeBuffer.length) {
-      return;
-    }
-    nodes.push(renderCodeBlock(codeBuffer.join("\n"), itemIndex, codeLanguage));
-    codeBuffer = [];
-    codeLanguage = "";
-  };
-
-  lines.forEach((line, lineIndex) => {
-    if (line.trim().startsWith("```")) {
-      if (inCode) {
-        flushCode();
-        inCode = false;
-      } else {
-        inCode = true;
-        codeLanguage = line.trim().slice(3).trim();
-      }
-      return;
-    }
-
-    if (inCode) {
-      codeBuffer.push(line);
-      return;
-    }
-
-    const isDiff = line.startsWith("+") || line.startsWith("-") || line.startsWith("@@");
-    if (isDiff) {
+  blocks.forEach((block, blockIndex) => {
+    if (block.kind === "paragraph") {
       nodes.push(
-        <Box
-          key={`diff-${itemIndex}-${lineIndex}`}
-          borderStyle="single"
-          borderColor={line.startsWith("+") ? "green" : line.startsWith("-") ? "red" : "cyan"}
-          paddingX={1}
-          marginTop={1}
-        >
-          {renderSegments(tokenizeCodeLine(line), `diff-token-${itemIndex}-${lineIndex}`)}
-        </Box>
+        renderInlineMarkdownLine(
+          block.text,
+          `paragraph-${itemIndex}-${blockIndex}`,
+          color,
+          "  "
+        )
       );
       return;
     }
 
-    nodes.push(
-      renderPlainLine(
-        line,
-        `line-${itemIndex}-${lineIndex}`,
-        color,
-        item.role === "user" && lineIndex === 0 ? "> " : undefined
-      )
-    );
-  });
+    if (block.kind === "heading") {
+      nodes.push(
+        <Text
+          key={`heading-${itemIndex}-${blockIndex}`}
+          color="cyan"
+          bold
+        >
+          {`  ${block.text}`}
+        </Text>
+      );
+      return;
+    }
 
-  if (inCode) {
-    flushCode();
-  }
+    if (block.kind === "rule") {
+      nodes.push(
+        <Text key={`rule-${itemIndex}-${blockIndex}`} dimColor>
+          {"  ─────────────────────────"}
+        </Text>
+      );
+      return;
+    }
+
+    if (block.kind === "list") {
+      block.items.forEach((entry, entryIndex) => {
+        const marker = block.ordered ? `${entryIndex + 1}. ` : "• ";
+        nodes.push(
+          renderInlineMarkdownLine(
+            entry,
+            `list-${itemIndex}-${blockIndex}-${entryIndex}`,
+            color,
+            `  ${marker}`
+          )
+        );
+      });
+      return;
+    }
+
+    if (block.kind === "code") {
+      nodes.push(
+        renderCodeBlock(
+          block.content,
+          itemIndex * 1000 + blockIndex,
+          block.language
+        )
+      );
+      return;
+    }
+
+    if (block.kind === "diff") {
+      block.lines.forEach((line, lineIndex) => {
+        nodes.push(
+          <Box key={`diff-${itemIndex}-${blockIndex}-${lineIndex}`} marginTop={1}>
+            <Text dimColor>  </Text>
+            {renderSegments(
+              tokenizeCodeLine(line),
+              `diff-token-${itemIndex}-${blockIndex}-${lineIndex}`
+            )}
+          </Box>
+        );
+      });
+    }
+  });
 
   return (
     <Box key={`item-${itemIndex}`} flexDirection="column" marginBottom={1}>
+      <Text bold color={messageLabel.color}>
+        {messageLabel.label}
+      </Text>
       {nodes}
     </Box>
   );
 };
 
-const renderMetric = (label: string, value: string, accent?: "cyan" | "yellow" | "green") => (
-  <Box
-    flexDirection="column"
-    borderStyle="round"
-    borderColor={accent ?? "gray"}
-    paddingX={1}
-    marginRight={1}
-    marginBottom={1}
-    minWidth={18}
-  >
-    <Text dimColor>{label}</Text>
-    <Text bold color={accent ?? "white"}>
-      {value}
-    </Text>
-  </Box>
-);
-
 const renderShellHeader = (
   status: ChatStatus,
   activeSessionId: string | null,
   currentModel: string,
+  usage: TokenUsage | null,
   pendingCount: number,
   activePanel: string,
   spinner: string
 ) => {
   const statusBadge = getStatusBadge(status, spinner);
+  const queueColor = pendingCount > 0 ? "yellow" : "green";
+  const tokenSummary = [
+    `Prompt ${usage ? String(usage.promptTokens) : "-"}`,
+    `Completion ${usage ? String(usage.completionTokens) : "-"}`,
+    `Total ${usage ? String(usage.totalTokens) : "-"}`,
+  ].join("  |  ");
 
   return (
-    <Box
-      marginBottom={SECTION_GAP}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor="cyan"
-      paddingX={1}
-      paddingY={1}
-    >
-      <Box justifyContent="space-between" flexWrap="wrap">
-        <Box flexDirection="column">
-          <Text bold color="cyan">
-            {BRAND_NAME}
-          </Text>
-          <Text dimColor>coding console · review-aware shell</Text>
-        </Box>
-        <Box flexDirection="column" alignItems="flex-end">
-          <Text
-            color={statusBadge.textColor}
-            backgroundColor={statusBadge.backgroundColor}
-          >
-            {` ${statusBadge.headerLabel} `}
-          </Text>
-          <Text dimColor>{`panel ${activePanel} | approvals ${pendingCount}`}</Text>
-        </Box>
+    <Box marginBottom={SECTION_GAP} flexDirection="column">
+      <Box>
+        <Text bold color="cyan">
+          {BRAND_NAME}
+        </Text>
+        <Text> </Text>
+        <Text
+          color={statusBadge.textColor}
+          backgroundColor={statusBadge.backgroundColor}
+        >
+          {` ${statusBadge.headerLabel} `}
+        </Text>
+        <Text> </Text>
+        <Text dimColor>model </Text>
+        <Text>{shortenValue(currentModel || "none", 22)}</Text>
+        <Text dimColor>{`  |  queue `}</Text>
+        <Text color={queueColor}>{String(pendingCount)}</Text>
+        {activePanel !== "idle" ? (
+          <>
+            <Text dimColor>{`  |  panel `}</Text>
+            <Text dimColor>{activePanel}</Text>
+          </>
+        ) : null}
       </Box>
-      <Box marginTop={1} flexWrap="wrap">
-        {renderMetric("Session", shortenValue(activeSessionId ?? "none", 26), "cyan")}
-        {renderMetric("Model", shortenValue(currentModel || "none", 26))}
-        {renderMetric("Panel", activePanel, activePanel === "idle" ? "green" : "yellow")}
-        {renderMetric("Queue", String(pendingCount), pendingCount > 0 ? "yellow" : "green")}
-      </Box>
+      <Text dimColor>
+        {`session ${shortenValue(activeSessionId ?? "none", 26)}  |  ${tokenSummary}`}
+      </Text>
     </Box>
   );
 };
@@ -455,14 +774,9 @@ const renderPanelHeader = (
   currentLabel?: string
 ) => (
   <Box flexDirection="column" marginBottom={1}>
-    <Box justifyContent="space-between" flexWrap="wrap">
-      <Text bold color="cyan">
-        {title}
-      </Text>
-      <Text dimColor>
-        {`page ${page.currentPage}/${page.totalPages}  total ${page.total}`}
-      </Text>
-    </Box>
+    <Text bold color="cyan">
+      {`${title}  page ${page.currentPage}/${page.totalPages}  total ${page.total}`}
+    </Text>
     <Text dimColor>
       {`session ${shortenValue(activeSessionId ?? "none", 22)}  |  model ${shortenValue(
         currentModel || "none",
@@ -506,7 +820,7 @@ const renderPickerItem = (label: string, meta: string, selected: boolean, badge?
 );
 
 const getActionTone = (action: PendingReviewItem["request"]["action"]) => {
-  if (action === "run_command") {
+  if (action === "run_command" || action === "run_shell") {
     return { border: "red", badgeBg: "red", badgeFg: "black" } as const;
   }
   if (action === "delete_file") {
@@ -542,7 +856,9 @@ const getApprovalPreviewHeading = (action: PendingReviewItem["request"]["action"
     case "move_path":
       return "Path preview · move";
     case "run_command":
-      return "Command preview";
+      return "Process preview";
+    case "run_shell":
+      return "Shell preview";
     case "create_dir":
       return "Directory preview";
     default:
@@ -565,7 +881,9 @@ const describeApprovalAction = (action: PendingReviewItem["request"]["action"]) 
     case "move_path":
       return "move path";
     case "run_command":
-      return "command";
+      return "process";
+    case "run_shell":
+      return "shell command";
     case "create_dir":
       return "new directory";
     default:
@@ -635,16 +953,26 @@ const renderApprovalSummaryRow = (
   value: string,
   accent?: "cyan" | "yellow" | "red" | "green" | "magenta" | "white"
 ) => (
-  <Box marginTop={1}>
+  <Box>
+    <Text dimColor>· </Text>
     <Text dimColor>{`${label.padEnd(12, " ")} `}</Text>
     <Text color={accent ?? "white"}>{value}</Text>
   </Box>
 );
 
+const getApprovalDiffGutterWidth = (lines: string[]) => {
+  const widest = lines.reduce((max, line) => {
+    const match = /^[+-]\s*(\d+)\s*\|/.exec(line);
+    return Math.max(max, match?.[1]?.length ?? 0);
+  }, 0);
+  return Math.max(4, widest);
+};
+
 const renderApprovalLine = (
   line: string,
   index: number,
-  action: PendingReviewItem["request"]["action"]
+  action: PendingReviewItem["request"]["action"],
+  gutterWidth: number
 ) => {
   const parsed = classifyApprovalPreviewLine(line);
 
@@ -654,15 +982,11 @@ const renderApprovalLine = (
 
   if (parsed.kind === "section") {
     return (
-      <Box
-        key={`approval-section-${index}`}
-        borderStyle="round"
-        borderColor="cyan"
-        paddingX={1}
-        marginTop={1}
-      >
+      <Box key={`approval-section-${index}`}>
+        <Text dimColor>┌ </Text>
+        <Text dimColor>{`${" ".repeat(gutterWidth)}   `}</Text>
         <Text color="cyan" bold>
-          {` Section  ${parsed.label ?? "preview"} `}
+          {`Section  ${parsed.label ?? "preview"}`}
         </Text>
       </Box>
     );
@@ -670,15 +994,11 @@ const renderApprovalLine = (
 
   if (parsed.kind === "hunk") {
     return (
-      <Box
-        key={`approval-hunk-${index}`}
-        borderStyle="round"
-        borderColor="cyan"
-        paddingX={1}
-        marginTop={1}
-      >
+      <Box key={`approval-hunk-${index}`}>
+        <Text dimColor>│ </Text>
+        <Text dimColor>{`${" ".repeat(gutterWidth)} │ `}</Text>
         <Text color="cyan" bold>
-          {` Hunk  ${parsed.raw} `}
+          {`Hunk  ${parsed.raw}`}
         </Text>
       </Box>
     );
@@ -687,15 +1007,14 @@ const renderApprovalLine = (
   if (parsed.kind === "add" || parsed.kind === "remove") {
     const tone = parsed.kind === "add" ? "green" : "red";
     return (
-      <Box
-        key={`approval-diff-${index}`}
-        borderStyle="single"
-        borderColor={tone}
-        paddingX={1}
-        marginTop={1}
-      >
-        <Text color={tone}>{parsed.kind === "add" ? " + " : " - "}</Text>
-        <Text dimColor>{parsed.lineNumber ? `${parsed.lineNumber.padStart(4, " ")} │ ` : "   │ "}</Text>
+      <Box key={`approval-diff-${index}`}>
+        <Text color={tone}>{parsed.kind === "add" ? "+" : "-"}</Text>
+        <Text> </Text>
+        <Text dimColor>
+          {parsed.lineNumber
+            ? `${parsed.lineNumber.padStart(gutterWidth, " ")} │ `
+            : `${" ".repeat(gutterWidth)} · `}
+        </Text>
         {renderSegments(tokenizeCodeLine(parsed.content ?? ""), `approval-token-${index}`)}
       </Box>
     );
@@ -706,25 +1025,23 @@ const renderApprovalLine = (
     const keyTone =
       key === "command"
         ? "yellow"
+        : key === "shell" || key === "risk"
+          ? "red"
         : key === "source" || key === "destination"
           ? "cyan"
           : key === "cwd"
             ? "magenta"
             : "white";
     const borderColor =
-      action === "run_command"
+      action === "run_command" || action === "run_shell"
         ? "red"
         : key === "source" || key === "destination"
           ? "cyan"
           : "gray";
     return (
-      <Box
-        key={`approval-kv-${index}`}
-        borderStyle="round"
-        borderColor={borderColor}
-        paddingX={1}
-        marginTop={1}
-      >
+      <Box key={`approval-kv-${index}`}>
+        <Text color={borderColor}>› </Text>
+        <Text dimColor>{`${" ".repeat(gutterWidth)} · `}</Text>
         <Text dimColor>{`${formatApprovalLabel(key)} `}</Text>
         <Text color={keyTone}>{parsed.value || "(empty)"}</Text>
       </Box>
@@ -732,8 +1049,9 @@ const renderApprovalLine = (
   }
 
   return (
-    <Box key={`approval-context-${index}`} marginTop={1}>
-      <Text dimColor> │ </Text>
+    <Box key={`approval-context-${index}`}>
+      <Text dimColor>· </Text>
+      <Text dimColor>{`${" ".repeat(gutterWidth)} · `}</Text>
       <Text color="gray">{parsed.raw}</Text>
     </Box>
   );
@@ -764,6 +1082,7 @@ const renderApprovalPanel = (
       ? selectedPending.previewFull
       : selectedPending.previewSummary;
   const previewWindow = getPreviewWindow(previewSource, approvalPanel.previewOffset);
+  const diffGutterWidth = getApprovalDiffGutterWidth(previewWindow.pageLines);
   const queueStart = Math.max(0, approvalPanel.selectedIndex - 2);
   const queueItems = pendingReviews.slice(
     queueStart,
@@ -793,7 +1112,7 @@ const renderApprovalPanel = (
       </Text>
       <Text dimColor>{selectedPending.createdAt}</Text>
       {selectedInFlight ? (
-        <Box marginTop={1} flexDirection="column">
+        <Box flexDirection="column">
           <Text color="cyan">
             {`${approvalPanel.actionState === "reject" ? "Rejecting" : "Approving"} current item...`}
           </Text>
@@ -801,7 +1120,7 @@ const renderApprovalPanel = (
         </Box>
       ) : null}
       {selectedBlocked ? (
-        <Box marginTop={1} flexDirection="column">
+        <Box flexDirection="column">
           <Text color="red">
             {`Last error: ${shortenValue(blockedReason || "approval failed", 120)}`}
           </Text>
@@ -811,7 +1130,7 @@ const renderApprovalPanel = (
         </Box>
       ) : null}
 
-      <Box marginTop={1} marginBottom={1} flexDirection="column">
+      <Box flexDirection="column">
         {queueItems.map((item, localIndex) => {
           const index = queueStart + localIndex;
           const selected = index === approvalPanel.selectedIndex;
@@ -819,16 +1138,27 @@ const renderApprovalPanel = (
           const blocked = approvalPanel.blockedItemId === item.id;
           const inFlight = approvalPanel.inFlightId === item.id;
           return (
-            <Text key={`review-list-${item.id}`} color={selected ? "white" : "gray"}>
-              <Text color={selected ? "black" : tone.badgeBg} backgroundColor={selected ? "white" : undefined}>
-                {selected ? "▶" : " "}
+            <Box key={`review-list-${item.id}`}>
+              <Text
+                color={selected ? "black" : "gray"}
+                backgroundColor={selected ? "cyan" : undefined}
+              >
+                {selected ? " > " : "   "}
               </Text>
               <Text> </Text>
-              <Text color={tone.badgeFg} backgroundColor={tone.badgeBg}>
+              <Text
+                color={selected ? "black" : tone.badgeFg}
+                backgroundColor={selected ? "white" : tone.badgeBg}
+              >
                 {` ${item.request.action} `}
               </Text>
               <Text> </Text>
-              {shortenValue(item.request.path, 72)}
+              <Text
+                color={selected ? "black" : "gray"}
+                backgroundColor={selected ? "cyan" : undefined}
+              >
+                {shortenValue(item.request.path, 72)}
+              </Text>
               {blocked ? (
                 <>
                   <Text> </Text>
@@ -845,21 +1175,13 @@ const renderApprovalPanel = (
                   </Text>
                 </>
               ) : null}
-            </Text>
+            </Box>
           );
         })}
       </Box>
 
       <Text color="cyan">Action summary</Text>
-      <Box
-        marginTop={1}
-        marginBottom={1}
-        flexDirection="column"
-        borderStyle="round"
-        borderColor={tone.border}
-        paddingX={1}
-        paddingY={1}
-      >
+      <Box flexDirection="column">
         <Box justifyContent="space-between" flexWrap="wrap">
           <Text color={tone.badgeFg} backgroundColor={tone.badgeBg}>
             {` ${selectedPending.request.action} `}
@@ -872,8 +1194,11 @@ const renderApprovalPanel = (
         ) : null}
         {"command" in selectedPending.request ? (
           <>
+            {"action" in selectedPending.request && selectedPending.request.action === "run_shell"
+              ? renderApprovalSummaryRow("Shell", "platform default", "red")
+              : null}
             {renderApprovalSummaryRow("Command", selectedPending.request.command, "yellow")}
-            {selectedPending.request.args.length > 0
+            {"args" in selectedPending.request && selectedPending.request.args.length > 0
               ? renderApprovalSummaryRow("Args", selectedPending.request.args.join(" "), "white")
               : null}
             {renderApprovalSummaryRow("Cwd", selectedPending.request.cwd ?? ".", "magenta")}
@@ -893,16 +1218,9 @@ const renderApprovalPanel = (
           previewWindow.totalLines
         )}/${previewWindow.totalLines}`}
       </Text>
-      <Box
-        marginTop={1}
-        flexDirection="column"
-        borderStyle="round"
-        borderColor={tone.border}
-        paddingX={1}
-        paddingY={1}
-      >
+      <Box flexDirection="column">
         {previewWindow.pageLines.map((line, index) =>
-          renderApprovalLine(line, index, selectedPending.request.action)
+          renderApprovalLine(line, index, selectedPending.request.action, diffGutterWidth)
         )}
       </Box>
 
@@ -936,8 +1254,320 @@ const renderSimplePanel = (
   </Box>
 );
 
+const renderCompactPanelHeader = (
+  title: string,
+  page: PagedResult<unknown>,
+  activeSessionId: string | null,
+  currentModel: string,
+  currentLabel?: string
+) => (
+  <Box flexDirection="column" marginBottom={1}>
+    <Text bold color="cyan">
+      {`${title}  page ${page.currentPage}/${page.totalPages}  total ${page.total}`}
+    </Text>
+    <Text dimColor>
+      {`session ${shortenValue(activeSessionId ?? "none", 22)}  |  model ${shortenValue(
+        currentModel || "none",
+        22
+      )}${currentLabel ? `  |  current ${shortenValue(currentLabel, 24)}` : ""}`}
+    </Text>
+  </Box>
+);
+
+const renderCompactPickerItem = (
+  label: string,
+  meta: string,
+  selected: boolean,
+  badge?: string
+) => (
+  <Box flexDirection="column" marginTop={1}>
+    <Text
+      color={selected ? "black" : "white"}
+      backgroundColor={selected ? "cyan" : undefined}
+    >
+      {`${selected ? "> " : "  "}${label}${badge ? `  [${badge}]` : ""}`}
+    </Text>
+    {meta ? <Text dimColor>{`   ${meta}`}</Text> : null}
+  </Box>
+);
+
+const renderCompactSimplePanel = (
+  title: string,
+  page: PagedResult<any>,
+  activeSessionId: string | null,
+  currentModel: string,
+  currentLabel: string | undefined,
+  rows: React.ReactNode,
+  footer: string
+) => (
+  <Box marginBottom={SECTION_GAP} flexDirection="column">
+    {renderCompactPanelHeader(title, page, activeSessionId, currentModel, currentLabel)}
+    {rows}
+    <Text dimColor>{footer}</Text>
+  </Box>
+);
+
+const renderCompactApprovalSummaryRow = (
+  label: string,
+  value: string,
+  accent?: "cyan" | "yellow" | "red" | "green" | "magenta" | "white"
+) => (
+  <Box>
+    <Text dimColor>{`${label}: `}</Text>
+    <Text color={accent ?? "white"}>{value}</Text>
+  </Box>
+);
+
+const renderCompactApprovalLine = (
+  line: string,
+  index: number,
+  action: PendingReviewItem["request"]["action"],
+  gutterWidth: number
+) => {
+  const parsed = classifyApprovalPreviewLine(line);
+
+  if (parsed.kind === "blank") {
+    return <Text key={`approval-line-${index}`}> </Text>;
+  }
+
+  if (parsed.kind === "section") {
+    return (
+      <Text key={`approval-section-${index}`} dimColor>
+        {`[${parsed.label ?? "preview"}]`}
+      </Text>
+    );
+  }
+
+  if (parsed.kind === "hunk") {
+    return (
+      <Text
+        key={`approval-hunk-${index}`}
+        color="black"
+        backgroundColor="cyan"
+      >
+        {` ${parsed.raw} `}
+      </Text>
+    );
+  }
+
+  if (parsed.kind === "add" || parsed.kind === "remove") {
+    const backgroundColor = parsed.kind === "add" ? "green" : "red";
+    const marker = parsed.kind === "add" ? "+" : "-";
+    const lineNumber = parsed.lineNumber
+      ? parsed.lineNumber.padStart(gutterWidth, " ")
+      : " ".repeat(gutterWidth);
+    return (
+      <Text
+        key={`approval-diff-${index}`}
+        color="black"
+        backgroundColor={backgroundColor}
+      >
+        {` ${marker} ${lineNumber} | ${parsed.content ?? ""} `}
+      </Text>
+    );
+  }
+
+  if (parsed.kind === "kv") {
+    const key = parsed.key ?? "value";
+    const keyTone =
+      key === "command"
+        ? "yellow"
+        : key === "shell" || key === "risk"
+          ? "red"
+        : key === "source" || key === "destination"
+          ? "cyan"
+          : key === "cwd"
+            ? "magenta"
+            : "white";
+    return (
+      <Box key={`approval-kv-${index}`}>
+        <Text dimColor>{`${formatApprovalLabel(key)}: `}</Text>
+        <Text color={keyTone}>{parsed.value || "(empty)"}</Text>
+      </Box>
+    );
+  }
+
+  const tone = action === "run_command" || action === "run_shell" ? "white" : "gray";
+  return (
+    <Text key={`approval-context-${index}`} color={tone}>
+      {parsed.raw}
+    </Text>
+  );
+};
+
+const renderCompactApprovalPanel = (
+  pendingReviews: PendingReviewItem[],
+  approvalPanel: ChatScreenProps["approvalPanel"],
+  currentModel: string,
+  activeSessionId: string | null
+) => {
+  const selectedPending = pendingReviews[approvalPanel.selectedIndex];
+  if (!selectedPending) {
+    return null;
+  }
+
+  const selectedBlocked = approvalPanel.blockedItemId === selectedPending.id;
+  const selectedInFlight = approvalPanel.inFlightId === selectedPending.id;
+  const blockedReason = approvalPanel.blockedReason?.trim() ?? "";
+  const approvalState = selectedInFlight
+    ? `${approvalPanel.actionState ?? "approve"}...`
+    : selectedBlocked
+      ? "blocked"
+      : "ready";
+  const previewSource =
+    approvalPanel.previewMode === "full"
+      ? selectedPending.previewFull
+      : selectedPending.previewSummary;
+  const previewWindow = getPreviewWindow(previewSource, approvalPanel.previewOffset);
+  const diffGutterWidth = getApprovalDiffGutterWidth(previewWindow.pageLines);
+  const queueStart = Math.max(0, approvalPanel.selectedIndex - 2);
+  const queueItems = pendingReviews.slice(
+    queueStart,
+    Math.min(pendingReviews.length, approvalPanel.selectedIndex + 3)
+  );
+
+  return (
+    <Box marginBottom={SECTION_GAP} flexDirection="column">
+      <Text bold color="yellow">
+        {`Code Approval  ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${approvalState}`}
+      </Text>
+      <Text dimColor>
+        {`session ${shortenValue(activeSessionId ?? "none", 12)}  |  model ${shortenValue(currentModel, 12)}`}
+      </Text>
+      <Text dimColor>
+        {`current ${selectedPending.id}  |  ${selectedPending.request.action}  |  ${selectedPending.request.path}`}
+      </Text>
+      <Text dimColor>{selectedPending.createdAt}</Text>
+
+      {selectedInFlight ? (
+        <Box flexDirection="column">
+          <Text color="cyan">
+            {`${approvalPanel.actionState === "reject" ? "Rejecting" : "Approving"} current item...`}
+          </Text>
+          <Text dimColor>hotkeys locked until the current approval action finishes</Text>
+        </Box>
+      ) : null}
+
+      {selectedBlocked ? (
+        <Box flexDirection="column">
+          <Text color="red">
+            {`Last error: ${shortenValue(blockedReason || "approval failed", 120)}`}
+          </Text>
+          <Text dimColor>
+            approve blocked for current item  |  ↑/↓ switch  |  r/d reject  |  a retry after cooldown
+          </Text>
+        </Box>
+      ) : null}
+
+      <Box flexDirection="column" marginTop={1}>
+        {queueItems.map((item, localIndex) => {
+          const index = queueStart + localIndex;
+          const selected = index === approvalPanel.selectedIndex;
+          const blocked = approvalPanel.blockedItemId === item.id;
+          const inFlight = approvalPanel.inFlightId === item.id;
+          return (
+            <Box key={`compact-review-list-${item.id}`}>
+              <Text
+                color={selected ? "black" : "white"}
+                backgroundColor={selected ? "cyan" : undefined}
+              >
+                {`${selected ? "> " : "  "}${item.request.action}  ${shortenValue(item.request.path, 72)}`}
+              </Text>
+              {blocked ? (
+                <>
+                  <Text> </Text>
+                  <Text color={selected ? "black" : "red"}>blocked</Text>
+                </>
+              ) : null}
+              {inFlight ? (
+                <>
+                  <Text> </Text>
+                  <Text color={selected ? "black" : "cyan"}>
+                    {approvalPanel.actionState ?? "busy"}
+                  </Text>
+                </>
+              ) : null}
+            </Box>
+          );
+        })}
+      </Box>
+
+      <Text color="cyan">Action summary</Text>
+      <Text dimColor>{describeApprovalAction(selectedPending.request.action)}</Text>
+      <Box flexDirection="column">
+        {renderCompactApprovalSummaryRow("Path", selectedPending.request.path, "white")}
+        {"destination" in selectedPending.request ? (
+          renderCompactApprovalSummaryRow(
+            "Destination",
+            selectedPending.request.destination,
+            "cyan"
+          )
+        ) : null}
+        {"command" in selectedPending.request ? (
+          <>
+            {"action" in selectedPending.request &&
+            selectedPending.request.action === "run_shell"
+              ? renderCompactApprovalSummaryRow("Shell", "platform default", "red")
+              : null}
+            {renderCompactApprovalSummaryRow(
+              "Command",
+              selectedPending.request.command,
+              "yellow"
+            )}
+            {"args" in selectedPending.request &&
+            selectedPending.request.args.length > 0
+              ? renderCompactApprovalSummaryRow(
+                  "Args",
+                  selectedPending.request.args.join(" "),
+                  "white"
+                )
+              : null}
+            {renderCompactApprovalSummaryRow(
+              "Cwd",
+              selectedPending.request.cwd ?? ".",
+              "magenta"
+            )}
+          </>
+        ) : null}
+        {renderCompactApprovalSummaryRow(
+          "Preview mode",
+          approvalPanel.previewMode,
+          "cyan"
+        )}
+        {renderCompactApprovalSummaryRow(
+          "State",
+          approvalState,
+          selectedBlocked ? "red" : selectedInFlight ? "yellow" : "green"
+        )}
+      </Box>
+
+      <Text color="cyan">
+        {`${getApprovalPreviewHeading(selectedPending.request.action)}  ${previewWindow.safeOffset + 1}-${Math.min(
+          previewWindow.safeOffset + previewWindow.pageLines.length,
+          previewWindow.totalLines
+        )}/${previewWindow.totalLines}`}
+      </Text>
+      <Box flexDirection="column">
+        {previewWindow.pageLines.map((line, index) =>
+          renderCompactApprovalLine(
+            line,
+            index,
+            selectedPending.request.action,
+            diffGutterWidth
+          )
+        )}
+      </Box>
+
+      <Text dimColor>
+        Up/Down: select  Tab: summary/full  j/k or PgUp/PgDn: scroll  a: approve/retry  r/d: reject  Esc: close
+      </Text>
+    </Box>
+  );
+};
+
 export const ChatScreen = ({
   items,
+  liveAssistantText,
   status,
   input,
   inputCommandState,
@@ -948,22 +1578,24 @@ export const ChatScreen = ({
   approvalPanel,
   activeSessionId,
   currentModel,
+  usage,
   onInputChange,
   onSubmit,
 }: ChatScreenProps) => {
   const [spinnerIndex, setSpinnerIndex] = React.useState(0);
   const approvalModeActive = approvalPanel.active;
+  const shouldAnimateStreaming = ENABLE_STREAMING_ANIMATION && !approvalModeActive;
 
   React.useEffect(() => {
-    if (status !== "streaming" || approvalModeActive) {
+    if (status !== "streaming" || !shouldAnimateStreaming) {
       setSpinnerIndex(0);
       return;
     }
     const timer = setInterval(() => {
       setSpinnerIndex(previous => (previous + 1) % SPINNER_FRAMES.length);
-    }, 120);
+    }, 220);
     return () => clearInterval(timer);
-  }, [approvalModeActive, status]);
+  }, [shouldAnimateStreaming, status]);
 
   const resumePage = React.useMemo(
     () => formatPaged(resumePicker.sessions, resumePicker.selectedIndex, resumePicker.pageSize),
@@ -997,31 +1629,49 @@ export const ChatScreen = ({
     () => items.map((item, index) => renderMessageItem(item, index)),
     [items]
   );
+  const liveAssistantNode = React.useMemo(
+    () =>
+      liveAssistantText
+        ? renderMessageItem(
+            {
+              role: "assistant",
+              text: liveAssistantText,
+              kind: "transcript",
+              tone: "neutral",
+            },
+            items.length
+          )
+        : null,
+    [items.length, liveAssistantText]
+  );
 
-  const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length] || "·";
+  const spinner = shouldAnimateStreaming
+    ? SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length] || STREAMING_IDLE_GLYPH
+    : STREAMING_IDLE_GLYPH;
   const statusBadge = getStatusBadge(status, spinner);
+  const topSuggestions = inputCommandState.suggestions.slice(0, 3);
+  const suggestionSummary = topSuggestions
+    .map(suggestion => `${suggestion.command} ${suggestion.description}`)
+    .join("  ·  ");
+  const pendingSummary = pendingReviews[approvalPanel.selectedIndex]
+    ? `${pendingReviews[approvalPanel.selectedIndex]?.request.action}  |  ${pendingReviews[approvalPanel.selectedIndex]?.request.path}`
+    : "no active review";
 
   if (approvalModeActive) {
     return (
       <Box flexDirection="column">
-        {renderApprovalPanel(
+        {renderCompactApprovalPanel(
           pendingReviews,
           approvalPanel,
           currentModel,
           activeSessionId
         )}
 
-        <Box
-          flexShrink={0}
-          flexDirection="column"
-          borderStyle="round"
-          borderColor="gray"
-          paddingX={1}
-          paddingY={1}
-        >
-          {renderSubtleHeader("Input", "approval panel active")}
-          <Box marginTop={1}>
-            <Text color="yellow">Review mode         </Text>
+        <Box flexShrink={0} flexDirection="column">
+          <Text dimColor>approval panel active</Text>
+          <Box>
+            <Text color="yellow">Review mode</Text>
+            <Text> </Text>
             <TextInput
               value={input}
               focus={false}
@@ -1041,30 +1691,18 @@ export const ChatScreen = ({
         status,
         activeSessionId,
         currentModel,
+        usage,
         pendingReviews.length,
         activePanel,
         spinner
       )}
-
-      <Box
-        marginBottom={SECTION_GAP}
-        flexDirection="column"
-        borderStyle="round"
-        borderColor="gray"
-        paddingX={1}
-        paddingY={1}
-      >
-        {renderSubtleHeader(
-          "Conversation",
-          `${items.length} items  |  ${isPanelActive ? "panel focus" : "free input"}`
-        )}
-        <Box marginTop={1} flexDirection="column">
-          {transcriptNodes}
-        </Box>
+      <Box marginBottom={SECTION_GAP} flexDirection="column">
+        {transcriptNodes}
+        {liveAssistantNode}
       </Box>
 
       {sessionsPanel.active &&
-        renderSimplePanel(
+        renderCompactSimplePanel(
           "Sessions",
           sessionsPage,
           activeSessionId,
@@ -1075,13 +1713,22 @@ export const ChatScreen = ({
             const selected = index === sessionsPanel.selectedIndex;
             const isCurrent = session.id === activeSessionId;
             const meta = `${session.updatedAt}${session.title ? `  |  ${session.title}` : ""}`;
-            return renderPickerItem(session.id, meta, selected, isCurrent ? "current" : undefined);
+            return (
+              <React.Fragment key={`session-picker-${session.id}`}>
+                {renderCompactPickerItem(
+                  session.id,
+                  meta,
+                  selected,
+                  isCurrent ? "current" : undefined
+                )}
+              </React.Fragment>
+            );
           }),
           "Up/Down: select  Left/Right: page  Enter: resume  Esc: close"
         )}
 
       {resumePicker.active &&
-        renderSimplePanel(
+        renderCompactSimplePanel(
           "Resume",
           resumePage,
           activeSessionId,
@@ -1092,13 +1739,22 @@ export const ChatScreen = ({
             const selected = index === resumePicker.selectedIndex;
             const isCurrent = session.id === activeSessionId;
             const meta = `${session.updatedAt}${session.title ? `  |  ${session.title}` : ""}`;
-            return renderPickerItem(session.id, meta, selected, isCurrent ? "current" : undefined);
+            return (
+              <React.Fragment key={`resume-picker-${session.id}`}>
+                {renderCompactPickerItem(
+                  session.id,
+                  meta,
+                  selected,
+                  isCurrent ? "current" : undefined
+                )}
+              </React.Fragment>
+            );
           }),
           "Up/Down: select  Left/Right: page  Enter: resume  Esc: close"
         )}
 
       {modelPicker.active &&
-        renderSimplePanel(
+        renderCompactSimplePanel(
           "Models",
           modelPage,
           activeSessionId,
@@ -1107,37 +1763,28 @@ export const ChatScreen = ({
           modelPage.pageItems.map((model, localIndex) => {
             const index = modelPage.pageStart + localIndex;
             const selected = index === modelPicker.selectedIndex;
-            return renderPickerItem(model, model === currentModel ? "currently active" : "", selected, model === currentModel ? "current" : undefined);
+            return (
+              <React.Fragment key={`model-picker-${model}-${index}`}>
+                {renderCompactPickerItem(
+                  model,
+                  model === currentModel ? "currently active" : "",
+                  selected,
+                  model === currentModel ? "current" : undefined
+                )}
+              </React.Fragment>
+            );
           }),
           "Up/Down: select  Left/Right: page  Enter: switch  Esc: close"
         )}
 
       {pendingReviews.length > 0 && (
-        <Box
-          marginBottom={SECTION_GAP}
-          flexDirection="column"
-          borderStyle="round"
-          borderColor="gray"
-          paddingX={1}
-          paddingY={1}
-        >
-          {renderSubtleHeader(
-            "Approval Queue",
-            `${pendingReviews.length} pending  |  focus ${Math.min(
-              approvalPanel.selectedIndex + 1,
-              pendingReviews.length
-            )}/${pendingReviews.length}`
-          )}
-          <Text dimColor>
-            {pendingReviews[approvalPanel.selectedIndex]
-              ? `${pendingReviews[approvalPanel.selectedIndex]?.request.action}  |  ${pendingReviews[approvalPanel.selectedIndex]?.request.path}`
-              : "no active review"}
-          </Text>
-        </Box>
+        <Text color="yellow" dimColor>
+          {`review ${pendingReviews.length} pending  |  ${pendingSummary}`}
+        </Text>
       )}
 
       {approvalPanel.active
-        ? renderApprovalPanel(
+        ? renderCompactApprovalPanel(
             pendingReviews,
             approvalPanel,
             currentModel,
@@ -1145,22 +1792,12 @@ export const ChatScreen = ({
           )
         : null}
 
-      <Box
-        flexShrink={0}
-        flexDirection="column"
-        borderStyle="round"
-        borderColor="gray"
-        paddingX={1}
-        paddingY={1}
-      >
-        {renderSubtleHeader(
-          "Input",
-          isPanelActive ? "panel lock active" : "type and press Enter"
-        )}
-        <Box marginTop={1}>
+      <Box flexShrink={0} flexDirection="column">
+        <Box>
           <Text color={statusBadge.inputColor}>
-            {statusBadge.inputLabel.padEnd(18, " ")}
+            {statusBadge.inputLabel}
           </Text>
+          <Text> </Text>
           <TextInput
             value={input}
             focus={!isPanelActive}
@@ -1169,26 +1806,15 @@ export const ChatScreen = ({
             placeholder={isPanelActive ? "Panel active..." : "Ask something..."}
           />
         </Box>
-        {!isPanelActive && (inputCommandState.active || inputCommandState.historyPosition !== null) ? (
-          <Box marginTop={1} flexDirection="column">
-            {inputCommandState.active ? (
-              <>
-                <Text dimColor>
-                  {`Slash commands${inputCommandState.currentCommand ? `  |  current ${inputCommandState.currentCommand}` : ""}`}
-                </Text>
-                {inputCommandState.suggestions.map((suggestion, index) => (
-                  <Text key={`command-suggestion-${suggestion.command}-${index}`} color={index === 0 ? "cyan" : "gray"}>
-                    {`${suggestion.command}  |  ${suggestion.description}`}
-                  </Text>
-                ))}
-              </>
-            ) : null}
-            {inputCommandState.historyPosition !== null ? (
-              <Text dimColor>
-                {`History ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  Up/Down recall input`}
-              </Text>
-            ) : null}
-          </Box>
+        {!isPanelActive && inputCommandState.active ? (
+          <Text dimColor>
+            {`commands  ${suggestionSummary}`}
+          </Text>
+        ) : null}
+        {!isPanelActive && inputCommandState.historyPosition !== null ? (
+          <Text dimColor>
+            {`history ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  Up/Down recall input`}
+          </Text>
         ) : null}
       </Box>
     </Box>

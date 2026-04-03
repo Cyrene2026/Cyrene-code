@@ -12,7 +12,7 @@ export type FileAction =
   | "copy_path"
   | "move_path";
 
-export type CommandAction = "run_command";
+export type CommandAction = "run_command" | "run_shell";
 
 export type MpcAction = FileAction | CommandAction;
 
@@ -103,14 +103,21 @@ export type FileToolRequest =
   | MovePathToolRequest;
 
 export type CommandToolRequest = {
-  action: CommandAction;
+  action: "run_command";
   path: string;
   command: string;
   args: string[];
   cwd?: string;
 };
 
-export type ToolRequest = FileToolRequest | CommandToolRequest;
+export type ShellToolRequest = {
+  action: "run_shell";
+  path: string;
+  command: string;
+  cwd?: string;
+};
+
+export type ToolRequest = FileToolRequest | CommandToolRequest | ShellToolRequest;
 
 export type PendingReviewItem = {
   id: string;

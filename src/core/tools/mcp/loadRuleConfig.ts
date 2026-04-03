@@ -13,6 +13,7 @@ const DEFAULT_RULES: RuleConfig = {
     "copy_path",
     "move_path",
     "run_command",
+    "run_shell",
   ],
 };
 
@@ -34,6 +35,7 @@ const isMpcAction = (value: string): value is MpcAction =>
     "copy_path",
     "move_path",
     "run_command",
+    "run_shell",
   ].includes(value);
 
 const readConfigFile = async (path: string) => {

@@ -1,8 +1,10 @@
 import { z } from "zod";
+import type { TokenUsage } from "./tokenUsage";
 
 export type QueryStreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
+  | ({ type: "usage" } & TokenUsage)
   | { type: "done" };
 
 const textDeltaSchema = z.object({
@@ -16,11 +18,23 @@ const toolCallSchema = z.object({
   input: z.unknown().optional(),
 });
 
+const usageSchema = z.object({
+  type: z.literal("usage"),
+  promptTokens: z.number().int().nonnegative(),
+  completionTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+});
+
 const doneSchema = z.object({
   type: z.literal("done"),
 });
 
-const eventSchema = z.union([textDeltaSchema, toolCallSchema, doneSchema]);
+const eventSchema = z.union([
+  textDeltaSchema,
+  toolCallSchema,
+  usageSchema,
+  doneSchema,
+]);
 
 const legacyTextSchema = z.object({
   delta: z.string(),

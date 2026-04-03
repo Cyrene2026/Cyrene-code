@@ -2,7 +2,6 @@ import React from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { compressContext } from "../../src/core/session/contextCompression";
 import {
-  buildSummaryCacheFromMemoryIndex,
   createEmptyMemoryIndex,
   createMessageMemoryInputs,
   deriveFocusFromMemoryIndex,
@@ -112,10 +111,9 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
   });
 
   const syncRecordWithIndex = (record: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
-    const compressed = compressContext(record.messages);
     return {
       ...record,
-      summary: buildSummaryCacheFromMemoryIndex(index) || compressed.summary,
+      summary: record.summary.trim(),
       focus: deriveFocusFromMemoryIndex(index),
     };
   };
@@ -170,6 +168,7 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
         ...record,
         messages: [...record.messages, { ...message }],
         updatedAt: message.createdAt,
+        summary: message.role === "system" ? record.summary : "",
       };
       const inputs =
         message.role === "system"
@@ -281,7 +280,12 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       }
       const index = ensureIndex(record);
       const compressed = compressContext(record.messages);
-      return getPromptContextFromMemoryIndex(index, query, compressed.recent, record.summary);
+      return getPromptContextFromMemoryIndex(
+        index,
+        query,
+        compressed.recent,
+        record.summary.trim() || compressed.summary
+      );
     },
     __getRecord: (id: string) => {
       const record = records.get(id);
@@ -298,6 +302,16 @@ export const createTestTransport = (
     models?: string[];
     setModelImpl?: (model: string) => Promise<ModelSetResult>;
     refreshImpl?: () => Promise<ModelRefreshResult>;
+    summarizeImpl?: (prompt: string) => Promise<{
+      ok: boolean;
+      text?: string;
+      usage?: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+      };
+      message?: string;
+    }>;
   }
 ): QueryTransport => {
   let currentModel = options?.initialModel ?? "gpt-test";
@@ -321,6 +335,10 @@ export const createTestTransport = (
       options?.refreshImpl
         ? options.refreshImpl()
         : { ok: true, message: "Models refreshed", models: [...models] },
+    summarizeText: async prompt =>
+      options?.summarizeImpl
+        ? options.summarizeImpl(prompt)
+        : { ok: false, message: "summary unavailable" },
     requestStreamUrl: async query => `stream://${query}`,
     stream: async function* () {},
   };

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act } from "react-test-renderer";
 import type { FileAction, PendingReviewItem, ToolRequest } from "../src/core/tools/mcp/types";
+import type { QueryTransport } from "../src/core/query/transport";
 import {
   createSessionRecord,
   createTestSessionStore,
@@ -247,11 +248,69 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("startup sync prefers initialized transport model over initial placeholder", async () => {
+    let currentModel = "gpt-placeholder";
+    const transport: QueryTransport = {
+      getModel: () => currentModel,
+      setModel: async model => {
+        currentModel = model;
+        return { ok: true, message: `Model switched to ${model}` };
+      },
+      listModels: async () => {
+        currentModel = "gpt-from-yaml";
+        return ["gpt-from-yaml", "gpt-next"];
+      },
+      refreshModels: async () => ({
+        ok: true,
+        message: "Models refreshed",
+        models: ["gpt-from-yaml", "gpt-next"],
+      }),
+      summarizeText: async () => ({ ok: false, message: "summary unavailable" }),
+      requestStreamUrl: async query => `stream://${query}`,
+      stream: async function* () {},
+    };
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    expect(app.getLatest().currentModel).toBe("gpt-placeholder");
+    await flushMicrotasks();
+    expect(app.getLatest().currentModel).toBe("gpt-from-yaml");
+    app.cleanup();
+  });
+
   test("/sessions and /resume handle empty and populated session lists", async () => {
+    const markdownReply = [
+      "## Heading",
+      "",
+      "- item 1",
+      "- `Token` item",
+      "",
+      "```py",
+      "print('ok')",
+      "```",
+    ].join("\n");
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {
         title: "A",
-        messages: [{ role: "user", text: "hello", createdAt: "2026-01-01T00:00:00.000Z" }],
+        messages: [
+          { role: "user", text: "hello", createdAt: "2026-01-01T00:00:00.000Z" },
+          {
+            role: "assistant",
+            text: markdownReply,
+            createdAt: "2026-01-01T00:01:00.000Z",
+          },
+        ],
       }),
     ]);
 
@@ -281,9 +340,51 @@ describe("useChatApp", () => {
     await runCommand(app, "/resume session-a");
     expect(app.getLatest().activeSessionId).toBe("session-a");
     expect(getTexts(app.getLatest().items).some(text => text.includes("Resumed session: session-a"))).toBe(true);
+    expect(getTexts(app.getLatest().items)).toContain(markdownReply);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("some Markdown structure may not fully recover")
+      )
+    ).toBe(false);
 
     await runCommand(app, "/resume missing");
     expect(getTexts(app.getLatest().items).some(text => text.includes("Session not found: missing"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("/resume shows a light hint for likely legacy-compressed markdown", async () => {
+    const legacyCompressed = "## Heading - item 1 **bold** --- ```ts const value = 1 ```";
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("legacy-a", {
+        messages: [
+          {
+            role: "assistant",
+            text: legacyCompressed,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+      })
+    );
+
+    await runCommand(app, "/resume legacy-a");
+
+    expect(getTexts(app.getLatest().items)).toContain(legacyCompressed);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("some Markdown structure may not fully recover")
+      )
+    ).toBe(true);
     app.cleanup();
   });
 
@@ -529,6 +630,59 @@ describe("useChatApp", () => {
     const memoryIndex = sessionStore.__getMemoryIndex(activeSessionId);
     expect(memoryIndex?.entries.some(entry => entry.kind === "tool_result")).toBe(true);
     expect(memoryIndex?.entries.some(entry => entry.text.includes("test_files/u4.py"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("keeps streaming assistant text outside committed transcript until completion", async () => {
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("draft reply");
+      await streamGate;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("stream this");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("draft reply");
+    expect(getTexts(app.getLatest().items).includes("draft reply")).toBe(false);
+
+    await act(async () => {
+      releaseStream();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(getTexts(app.getLatest().items)).toContain("draft reply");
     app.cleanup();
   });
 
@@ -799,13 +953,22 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("long assistant output triggers compression warning and stores condensed assistant text", async () => {
+  test("assistant markdown output is stored verbatim instead of being condensed", async () => {
     const sessionStore = createTestSessionStore() as TestSessionStore;
-    const longOutput = Array.from({ length: 140 }, (_, index) => `token-${index}`).join(" ");
+    const markdownOutput = [
+      "## Build Plan",
+      "",
+      "- keep markdown",
+      "- keep `code`",
+      "",
+      "```ts",
+      "const value = 1;",
+      "```",
+    ].join("\n");
 
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
       onState({ status: "streaming" });
-      onTextDelta(longOutput);
+      onTextDelta(markdownOutput);
       onState({ status: "idle" });
       return { status: "completed" as const };
     });
@@ -825,19 +988,161 @@ describe("useChatApp", () => {
     await runCommand(app, "generate a lot");
     await flushMicrotasks();
 
-    expect(
-      getTexts(app.getLatest().items).some(text =>
-        text.includes("Long assistant output was compressed in session memory")
-      )
-    ).toBe(true);
-
     const activeSessionId = app.getLatest().activeSessionId;
     expect(activeSessionId).toBeTruthy();
     const stored = sessionStore.__getRecord(activeSessionId!);
     const assistantMessage = stored?.messages.findLast(message => message.role === "assistant");
     expect(assistantMessage).toBeDefined();
-    expect((assistantMessage?.text.length ?? 0) < longOutput.length).toBe(true);
+    expect(assistantMessage?.text).toBe(markdownOutput);
     app.cleanup();
+  });
+
+  test("refreshes AI summary lazily for long sessions, shows token hint, and invalidates stored summary after new turns", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        summary: "",
+        messages: Array.from({ length: 10 }, (_, index) => ({
+          role: index % 2 === 0 ? "user" : "assistant",
+          text: `message ${index + 1} about oauth and api behavior`,
+          createdAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+        })),
+      }),
+    ]) as TestSessionStore;
+    const summarizeImpl = mock(async () => ({
+      ok: true as const,
+      text: "- task: continue oauth work\n- fact: api behavior confirmed",
+      usage: {
+        promptTokens: 21,
+        completionTokens: 9,
+        totalTokens: 30,
+      },
+    }));
+    const baseUpdateSummary = sessionStore.updateSummary;
+    const updateSummary = mock((id: string, summary: string) =>
+      baseUpdateSummary(id, summary)
+    );
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("reply\n- keeps markdown");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport({ summarizeImpl }),
+        sessionStore: {
+          ...sessionStore,
+          updateSummary,
+        },
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "continue the oauth task");
+    await flushMicrotasks();
+
+    expect(summarizeImpl).toHaveBeenCalledTimes(1);
+    expect(updateSummary).toHaveBeenCalledTimes(1);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("summary updated | prompt 21 | completion 9 | total 30"))).toBe(true);
+
+    const stored = sessionStore.__getRecord("session-a");
+    expect(stored?.summary).toBe("");
+    expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
+      "reply\n- keeps markdown"
+    );
+    app.cleanup();
+  });
+
+  test("existing persisted summary skips AI refresh and summary failure does not block the turn", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        summary: "- existing summary",
+        messages: Array.from({ length: 10 }, (_, index) => ({
+          role: index % 2 === 0 ? "user" : "assistant",
+          text: `message ${index + 1}`,
+          createdAt: `2026-02-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+        })),
+      }),
+      createSessionRecord("session-b", {
+        summary: "",
+        messages: Array.from({ length: 10 }, (_, index) => ({
+          role: index % 2 === 0 ? "user" : "assistant",
+          text: `other message ${index + 1}`,
+          createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+        })),
+      }),
+    ]);
+    const summarizeExisting = mock(async () => ({
+      ok: true as const,
+      text: "- should not run",
+    }));
+    const runExisting = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("done existing");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const existingApp = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport({ summarizeImpl: summarizeExisting }),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl: runExisting,
+      })
+    );
+
+    await runCommand(existingApp, "/resume session-a");
+    await runCommand(existingApp, "continue");
+    await flushMicrotasks();
+
+    expect(summarizeExisting).toHaveBeenCalledTimes(0);
+    expect(getTexts(existingApp.getLatest().items)).toContain("done existing");
+    existingApp.cleanup();
+
+    const summarizeFailure = mock(async () => ({
+      ok: false as const,
+      message: "provider unavailable",
+    }));
+    const runFailure = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("done after summary failure");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const failureApp = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport({ summarizeImpl: summarizeFailure }),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl: runFailure,
+      })
+    );
+
+    await runCommand(failureApp, "/resume session-b");
+    await runCommand(failureApp, "continue despite failure");
+    await flushMicrotasks();
+
+    expect(summarizeFailure).toHaveBeenCalledTimes(1);
+    expect(runFailure).toHaveBeenCalledTimes(1);
+    expect(getTexts(failureApp.getLatest().items)).toContain("done after summary failure");
+    expect(
+      getTexts(failureApp.getLatest().items).some(text => text.includes("summary updated"))
+    ).toBe(false);
+    failureApp.cleanup();
   });
 
   test("approval input handler keeps enter disabled and a/r active", async () => {

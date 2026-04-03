@@ -28,5 +28,8 @@ render(
     pinMaxCount={cyreneConfig.pinMaxCount}
     queryMaxToolSteps={cyreneConfig.queryMaxToolSteps}
     mcpService={mcpService}
-  />
+  />,
+  {
+    exitOnCtrlC: false,
+  }
 );

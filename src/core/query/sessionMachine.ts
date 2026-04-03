@@ -1,3 +1,5 @@
+import type { TokenUsage } from "./tokenUsage";
+
 export type QuerySessionStatus = "idle" | "streaming" | "awaiting_review" | "error";
 
 export type ToolCallLog = {
@@ -10,12 +12,14 @@ export type QuerySessionState = {
   assistantText: string;
   toolCalls: ToolCallLog[];
   errorMessage: string | null;
+  usage: TokenUsage | null;
 };
 
 type QuerySessionEvent =
   | { type: "start" }
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
+  | ({ type: "usage" } & TokenUsage)
   | { type: "suspended" }
   | { type: "complete" }
   | { type: "fail"; message: string };
@@ -25,6 +29,7 @@ export const createQuerySessionState = (): QuerySessionState => ({
   assistantText: "",
   toolCalls: [],
   errorMessage: null,
+  usage: null,
 });
 
 export const querySessionReducer = (
@@ -38,6 +43,7 @@ export const querySessionReducer = (
         assistantText: "",
         toolCalls: [],
         errorMessage: null,
+        usage: null,
       };
     case "text_delta":
       return {
@@ -51,6 +57,15 @@ export const querySessionReducer = (
           ...state.toolCalls,
           { toolName: event.toolName, input: event.input },
         ],
+      };
+    case "usage":
+      return {
+        ...state,
+        usage: {
+          promptTokens: event.promptTokens,
+          completionTokens: event.completionTokens,
+          totalTokens: event.totalTokens,
+        },
       };
     case "suspended":
       return {

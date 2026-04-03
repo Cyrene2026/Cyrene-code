@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { FileMcpService } from "../src/core/tools/mcp/fileMcpService";
+import { join, posix } from "node:path";
+import {
+  FileMcpService,
+  isPathInsideWorkspaceRoot,
+} from "../src/core/tools/mcp/fileMcpService";
 
 const tempRoots: string[] = [];
 
@@ -46,6 +49,73 @@ describe("FileMcpService", () => {
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] read_file hello.txt");
     expect(result.message).toContain("hello world");
+  });
+
+  test("list_dir confirms directory state in result output", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "test_files"), { recursive: true });
+    await writeFile(join(root, "test_files", "u1.py"), "print('ok')\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[confirmed directory state] test_files");
+    expect(result.message).toContain("[F] u1.py");
+  });
+
+  test("list_dir short-circuits repeated immediate reads for same directory", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "test_files"), { recursive: true });
+    await writeFile(join(root, "test_files", "u1.py"), "print('ok')\n", "utf8");
+
+    const first = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(second.message).toContain("cached; no mutation since last check");
+
+    await writeFile(join(root, "test_files", "u2.py"), "print('new')\n", "utf8");
+    const writeResult = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "test_files/u3.py",
+      content: "print('fresh')\n",
+    });
+    expect(writeResult.ok).toBe(true);
+    if (!writeResult.pending) {
+      throw new Error("expected write_file to queue for approval");
+    }
+    const approved = await service.approve(writeResult.pending.id);
+    expect(approved.ok).toBe(true);
+
+    const third = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+    expect(third.ok).toBe(true);
+    expect(third.message).not.toContain("cached; no mutation since last check");
+  });
+
+  test("read_file returns explicit empty-file marker", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "empty.txt"), "", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "read_file",
+      path: "empty.txt",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("(empty file)");
   });
 
   test("create_file enters review queue and approve writes file", async () => {
@@ -165,6 +235,111 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("Invalid tool input");
   });
 
+  test("search_text accepts placeholder-heavy payloads by defaulting path and query", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "docs"), { recursive: true });
+    await writeFile(join(root, "docs", "oauth-notes.txt"), "oauth callback flow\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      args: ["oauth"],
+      caseSensitive: false,
+      command: "",
+      content: "",
+      cwd: ".",
+      destination: "",
+      find: "",
+      maxResults: 20,
+      path: "",
+      pattern: "",
+      query: "",
+      replace: "",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("docs/oauth-notes.txt:1");
+    expect(result.message).toContain("oauth callback flow");
+  });
+
+  test("find_files accepts placeholder-heavy payloads by defaulting path to workspace root", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "features"), { recursive: true });
+    await writeFile(join(root, "features", "oauth-client.ts"), "export {};\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "find_files",
+      args: [],
+      caseSensitive: true,
+      command: "",
+      content: "",
+      cwd: ".",
+      destination: "",
+      find: "",
+      maxResults: 200,
+      path: "",
+      pattern: "**/*oauth*",
+      query: "",
+      replace: "",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 file(s):");
+    expect(result.message).toContain("features/oauth-client.ts");
+  });
+
+  test("search_text returns targeted guidance when query is still missing", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      args: [],
+      caseSensitive: false,
+      command: "",
+      content: "",
+      cwd: ".",
+      destination: "",
+      find: "",
+      maxResults: 20,
+      path: "",
+      pattern: "",
+      query: "",
+      replace: "",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Invalid tool input for search_text");
+    expect(result.message).toContain("search_text requires `query`");
+    expect(result.message).toContain('Use `path: "."` when searching the whole workspace');
+  });
+
+  test("find_files returns targeted guidance when pattern is still missing", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "find_files",
+      args: [],
+      caseSensitive: true,
+      command: "",
+      content: "",
+      cwd: ".",
+      destination: "",
+      find: "",
+      maxResults: 200,
+      path: "",
+      pattern: "",
+      query: "",
+      replace: "",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Invalid tool input for find_files");
+    expect(result.message).toContain("find_files requires `pattern`");
+    expect(result.message).toContain('Use `path: "."` when searching the whole workspace');
+  });
+
   test("blocks paths that escape workspace root", async () => {
     const { service } = await createService();
 
@@ -175,6 +350,19 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Path escapes workspace root");
+  });
+
+  test("allows workspace root paths and subpaths under posix semantics", () => {
+    expect(isPathInsideWorkspaceRoot("/root/project", "/root/project", posix)).toBe(true);
+    expect(isPathInsideWorkspaceRoot("/root/project/src/file.ts", "/root/project", posix)).toBe(
+      true
+    );
+    expect(
+      isPathInsideWorkspaceRoot("/root/project-sibling/src/file.ts", "/root/project", posix)
+    ).toBe(false);
+    expect(isPathInsideWorkspaceRoot("/root/project/../outside.txt", "/root/project", posix)).toBe(
+      false
+    );
   });
 
   test("rejects duplicate pending create_file for same path", async () => {
@@ -468,7 +656,9 @@ describe("FileMcpService", () => {
       },
     });
 
-    const queued = await service.handleToolCall("shell", {
+    const queued = await service.handleToolCall("file", {
+      action: "run_command",
+      path: ".",
       command: "node",
       args: ["--version"],
     });
@@ -481,13 +671,20 @@ describe("FileMcpService", () => {
 
     expect(approved.ok).toBe(true);
     expect(approved.message).toContain("[approved]");
+    expect(approved.message).toContain("status: completed");
+    expect(approved.message).toContain("command: node");
+    expect(approved.message).toContain("args: --version");
+    expect(approved.message).toContain("cwd: .");
+    expect(approved.message).toContain("exit: 0");
     expect(approved.message).toContain("v24.14.0");
   });
 
   test("run_command allows arbitrary command names but still enters review queue", async () => {
     const { service } = await createService();
 
-    const result = await service.handleToolCall("shell", {
+    const result = await service.handleToolCall("file", {
+      action: "run_command",
+      path: ".",
       command: "curl",
       args: ["--version"],
     });
@@ -496,5 +693,136 @@ describe("FileMcpService", () => {
     expect(result.pending).toBeDefined();
     expect(result.pending?.request.action).toBe("run_command");
     expect((result.pending?.request as any).command).toBe("curl");
+  });
+
+  test("run_command returns stable failed result text when execution fails", async () => {
+    const { service } = await createService({
+      commandRunner: async () => {
+        throw new Error("command exploded");
+      },
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_command",
+      path: ".",
+      command: "node",
+      args: ["broken.js"],
+    });
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("status: failed");
+    expect(approved.message).toContain("exit: unknown");
+    expect(approved.message).toContain("command exploded");
+  });
+
+  test("run_command marks truncated bounded output explicitly", async () => {
+    const { service } = await createService({
+      commandRunner: async () => "x".repeat(25_000),
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_command",
+      path: ".",
+      command: "node",
+      args: ["--print", "hello"],
+    });
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("output_truncated: true");
+  });
+
+  test("run_command keeps stable timeout semantics", async () => {
+    const { service } = await createService({
+      commandRunner: async () =>
+        ({
+          status: "timed_out",
+          exitCode: null,
+          stderr: "Command timed out after 20000ms.",
+        }) as any,
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_command",
+      path: ".",
+      command: "node",
+      args: ["slow.js"],
+    });
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("status: timed_out");
+    expect(approved.message).toContain("exit: timeout");
+    expect(approved.message).toContain("Command timed out");
+  });
+
+  test("run_shell enters review queue and executes through platform shell on approve", async () => {
+    const { root, service } = await createService({
+      shellRunner: async (request, cwd, shell) => {
+        expect(request.command).toBe("Get-ChildItem test_files");
+        expect(cwd).toBe(root);
+        expect(shell).toBe(process.platform === "win32" ? "pwsh" : "sh");
+        return "ok";
+      },
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "Get-ChildItem test_files",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.request.action).toBe("run_shell");
+    expect(queued.pending?.previewSummary).toContain("[shell preview]");
+    expect(queued.pending?.previewSummary).toContain("risk: low");
+
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("shell:");
+    expect(approved.message).toContain("command: Get-ChildItem test_files");
+  });
+
+  test("run_shell blocks pipes and chaining before review", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "ls | cat",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("run_shell blocked");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("run_shell blocks dangerous root deletion before review", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "rm -rf /",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("dangerous root deletion");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("run_shell blocks workspace-escaping mutation targets before review", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "touch ../outside.txt",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("outside the workspace root");
+    expect(service.listPending()).toHaveLength(0);
   });
 });

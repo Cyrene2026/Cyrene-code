@@ -51,6 +51,7 @@ describe("toolMessageSummary", () => {
     const result = summarizeToolMessage(
       [
         "[tool result] list_dir .",
+        "[confirmed directory state] .",
         "[D] .cyrene",
         "[D] test_files",
         "[F] package.json",
@@ -60,9 +61,18 @@ describe("toolMessageSummary", () => {
     );
 
     expect(result.text).toContain("Tool: list_dir . |");
+    expect(result.text).toContain("confirmed directory state");
     expect(result.text).toContain("[D] .cyrene");
     expect(result.text).toContain("[D] test_files");
     expect(result.text).toContain("5 items");
     expect(result.text).toContain("+1 more");
+  });
+
+  test("summarizes empty read_file explicitly", () => {
+    const result = summarizeToolMessage(
+      ["[tool result] read_file test_files/u5.py", "(empty file)"].join("\n")
+    );
+
+    expect(result.text).toBe("Tool: read_file test_files/u5.py | (empty file)");
   });
 });

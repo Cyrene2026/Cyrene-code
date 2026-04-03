@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { z } from "zod";
 import { compressContext } from "../../core/session/contextCompression";
 import {
-  buildSummaryCacheFromMemoryIndex,
   createEmptyMemoryIndex,
   createMessageMemoryInputs,
   deriveFocusFromMemoryIndex,
@@ -142,11 +141,9 @@ export const createFileSessionStore = (
   };
 
   const syncSessionCaches = (session: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
-    const compressed = compressContext(session.messages);
-    const summaryCache = buildSummaryCacheFromMemoryIndex(index) || compressed.summary;
     return {
       ...session,
-      summary: summaryCache.trim(),
+      summary: session.summary.trim(),
       focus: deriveFocusFromMemoryIndex(index),
     };
   };
@@ -271,6 +268,10 @@ export const createFileSessionStore = (
         ...loaded.session,
         messages: nextMessages,
         updatedAt: new Date().toISOString(),
+        summary:
+          validated.role === "system"
+            ? loaded.session.summary
+            : "",
         title:
           loaded.session.messages.length === 0 && validated.role === "user"
             ? sanitizeTitle(validated.text)
@@ -379,7 +380,7 @@ export const createFileSessionStore = (
         loaded.index,
         query,
         compressed.recent,
-        loaded.session.summary || compressed.summary
+        loaded.session.summary.trim() || compressed.summary
       );
     },
   };

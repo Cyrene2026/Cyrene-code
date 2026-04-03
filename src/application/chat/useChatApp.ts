@@ -3,6 +3,7 @@ import {
   runQuerySession,
   type RunQuerySessionResult,
 } from "../../core/query/runQuerySession";
+import type { TokenUsage } from "../../core/query/tokenUsage";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
 import { compressContext } from "../../core/session/contextCompression";
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
@@ -94,6 +95,17 @@ type InputCommandState = {
   suggestions: CommandSpec[];
   historyPosition: number | null;
   historySize: number;
+};
+
+type RuntimeUsageSummary = {
+  startedAt: string;
+  activeSessionId: string | null;
+  currentModel: string;
+  requestCount: number;
+  summaryRequestCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
 };
 
 const defaultSystemText =
@@ -278,7 +290,12 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
   if (!action) {
     return undefined;
   }
-  if (action === "run_command" || action === "run_shell") {
+  if (
+    action === "run_command" ||
+    action === "run_shell" ||
+    action === "open_shell" ||
+    action === "write_shell"
+  ) {
     return "red";
   }
   if (action === "delete_file") {
@@ -289,6 +306,7 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
     action === "create_file" ||
     action === "write_file" ||
     action === "edit_file" ||
+    action === "apply_patch" ||
     action === "copy_path" ||
     action === "move_path"
   ) {
@@ -298,10 +316,13 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
 };
 
 const isHighRiskReviewAction = (action: MpcAction) =>
+  action === "apply_patch" ||
   action === "edit_file" ||
   action === "delete_file" ||
   action === "run_command" ||
-  action === "run_shell";
+  action === "run_shell" ||
+  action === "open_shell" ||
+  action === "write_shell";
 
 const extractMessageBody = (raw: string) => {
   const [, ...rest] = raw.split("\n");
@@ -363,6 +384,30 @@ const getPendingQueueSignature = (pending: PendingReviewItem[]) =>
 const HOTKEY_REPEAT_COOLDOWN_MS = 900;
 const APPROVAL_BLOCK_RETRY_MS = 1500;
 
+const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
+  startedAt: new Date().toISOString(),
+  activeSessionId: null,
+  currentModel: model,
+  requestCount: 0,
+  summaryRequestCount: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+});
+
+const addUsageToRuntimeSummary = (
+  summary: RuntimeUsageSummary,
+  usage: TokenUsage,
+  source: "query" | "summary"
+): RuntimeUsageSummary => ({
+  ...summary,
+  requestCount: summary.requestCount + (source === "query" ? 1 : 0),
+  summaryRequestCount: summary.summaryRequestCount + (source === "summary" ? 1 : 0),
+  promptTokens: summary.promptTokens + usage.promptTokens,
+  completionTokens: summary.completionTokens + usage.completionTokens,
+  totalTokens: summary.totalTokens + usage.totalTokens,
+});
+
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -389,6 +434,9 @@ export const useChatApp = ({
     null
   );
   const [currentModel, setCurrentModel] = useState(() => transport.getModel());
+  const [runtimeUsageSummary, setRuntimeUsageSummary] = useState<RuntimeUsageSummary>(
+    () => createRuntimeUsageSummary(transport.getModel())
+  );
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -456,7 +504,7 @@ export const useChatApp = ({
 
     const syncCurrentModel = () => {
       if (!cancelled) {
-        setCurrentModel(transport.getModel());
+        updateCurrentModelState(transport.getModel());
       }
     };
 
@@ -472,6 +520,36 @@ export const useChatApp = ({
       cancelled = true;
     };
   }, [transport]);
+
+  const updateCurrentModelState = (model: string) => {
+    setCurrentModel(model);
+    setRuntimeUsageSummary(previous =>
+      previous.currentModel === model
+        ? previous
+        : {
+            ...previous,
+            currentModel: model,
+          }
+    );
+  };
+
+  const updateActiveSessionIdState = (sessionId: string | null) => {
+    setActiveSessionId(sessionId);
+    setRuntimeUsageSummary(previous =>
+      previous.activeSessionId === sessionId
+        ? previous
+        : {
+            ...previous,
+            activeSessionId: sessionId,
+          }
+    );
+  };
+
+  const accumulateRuntimeUsage = (usage: TokenUsage, source: "query" | "summary") => {
+    setRuntimeUsageSummary(previous =>
+      addUsageToRuntimeSummary(previous, usage, source)
+    );
+  };
 
   const enqueueTask = (task: () => Promise<void> | void) => {
     queueRef.current = queueRef.current
@@ -764,7 +842,7 @@ export const useChatApp = ({
     }
 
     const created = await sessionStore.createSession(titleHint);
-    setActiveSessionId(created.id);
+    updateActiveSessionIdState(created.id);
     return created;
   };
 
@@ -774,6 +852,9 @@ export const useChatApp = ({
     }
 
     const summaryResult = await transport.summarizeText(buildSummaryPrompt(session));
+    if (summaryResult.usage) {
+      accumulateRuntimeUsage(summaryResult.usage, "summary");
+    }
     if (!summaryResult.ok || !summaryResult.text?.trim()) {
       return session;
     }
@@ -797,7 +878,7 @@ export const useChatApp = ({
   const applyLoadedSession = (loaded: SessionRecord) => {
     const shouldShowLegacyHint = hasLegacyCompressedMarkdown(loaded);
     clearLiveAssistantSegment();
-    setActiveSessionId(loaded.id);
+    updateActiveSessionIdState(loaded.id);
     setItems([
       {
         role: "system",
@@ -936,7 +1017,7 @@ export const useChatApp = ({
         return;
       }
       const result = await transport.setModel(selected);
-      setCurrentModel(transport.getModel());
+      updateCurrentModelState(transport.getModel());
       if (result.ok) {
         pushSystemMessage(result.message, {
           kind: "system_hint",
@@ -1844,7 +1925,7 @@ export const useChatApp = ({
     if (query === "/model") {
       enqueueTask(async () => {
         const models = await transport.listModels();
-        setCurrentModel(transport.getModel());
+        updateCurrentModelState(transport.getModel());
       if (models.length === 0) {
           pushSystemMessage("No models available. Try /model refresh.");
           return;
@@ -1871,7 +1952,7 @@ export const useChatApp = ({
     if (query === "/model refresh") {
       enqueueTask(async () => {
         const result = await transport.refreshModels();
-        setCurrentModel(transport.getModel());
+        updateCurrentModelState(transport.getModel());
         if (result.ok) {
           pushSystemMessage(
             `${result.message}\nCurrent model: ${transport.getModel()}`
@@ -1892,7 +1973,7 @@ export const useChatApp = ({
           return;
         }
         const result = await transport.setModel(nextModel);
-        setCurrentModel(transport.getModel());
+        updateCurrentModelState(transport.getModel());
         if (result.ok) {
           pushSystemMessage(result.message);
         } else {
@@ -1906,7 +1987,7 @@ export const useChatApp = ({
     enqueueTask(async () => {
       if (query === "/new") {
         const created = await sessionStore.createSession();
-        setActiveSessionId(created.id);
+        updateActiveSessionIdState(created.id);
         clearLiveAssistantSegment();
         setItems([
           {
@@ -2287,6 +2368,16 @@ export const useChatApp = ({
           assistantBufferRef.current += text;
           appendToLiveAssistant(text);
         },
+        onUsage: usage => {
+          accumulateRuntimeUsage(usage, "query");
+        },
+        onToolStatus: message => {
+          pushStreamingSystemMessage(message, {
+            kind: "tool_status",
+            tone: "info",
+            color: "cyan",
+          });
+        },
         onToolCall: async (toolName, toolInput) => {
           const result = await mcpService.handleToolCall(toolName, toolInput);
           if (result.pending) {
@@ -2383,6 +2474,7 @@ export const useChatApp = ({
     approvalPanel,
     activeSessionId,
     currentModel,
+    exitSummary: runtimeUsageSummary,
     closeApprovalPanel: () => closeApprovalPanel({ suppressCurrentQueue: true }),
     openApprovalPanel,
     approveCurrentPendingReview,

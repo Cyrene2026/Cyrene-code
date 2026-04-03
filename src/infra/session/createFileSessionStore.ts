@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { compressContext } from "../../core/session/contextCompression";
+import { getCyreneConfigDir } from "../config/appRoot";
 import {
   createEmptyMemoryIndex,
   createMessageMemoryInputs,
@@ -94,7 +95,7 @@ const isSessionDataFile = (fileName: string) =>
   fileName.endsWith(".json") && !fileName.endsWith(".index.json");
 
 export const createFileSessionStore = (
-  sessionDir = join(process.cwd(), ".cyrene", "session")
+  sessionDir = join(getCyreneConfigDir(), "session")
 ): SessionStore => {
   const ensureDir = async () => {
     await mkdir(sessionDir, { recursive: true });

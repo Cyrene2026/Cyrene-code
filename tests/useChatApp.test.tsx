@@ -36,18 +36,94 @@ const createPending = (
           find: "before",
           replace: "after",
         }
+      : action === "apply_patch"
+        ? {
+            action,
+            path,
+            find: "before",
+            replace: "after",
+          }
       : action === "find_files"
         ? {
             action,
             path,
             pattern: "*.py",
           }
-        : action === "search_text"
+      : action === "search_text"
           ? {
               action,
               path,
               query: "needle",
             }
+          : action === "find_symbol"
+            ? {
+                action,
+                path,
+                symbol: "Demo",
+              }
+          : action === "find_references"
+            ? {
+                action,
+                path,
+                symbol: "Demo",
+              }
+          : action === "search_text_context"
+            ? {
+                action,
+                path,
+                query: "needle",
+                before: 1,
+                after: 1,
+              }
+            : action === "read_files" || action === "stat_paths"
+              ? {
+                  action,
+                  path,
+                  paths: ["other.py"],
+                }
+              : action === "read_range"
+                ? {
+                    action,
+                    path,
+                    startLine: 1,
+                    endLine: 3,
+                  }
+                : action === "read_json"
+                  ? {
+                      action,
+                      path,
+                      jsonPath: "scripts.test",
+                    }
+                  : action === "read_yaml"
+                    ? {
+                        action,
+                        path,
+                        yamlPath: "services.api",
+                      }
+                  : action === "outline_file" || action === "stat_path" || action === "git_status" || action === "git_diff"
+                  ? {
+                      action,
+                      path,
+                    }
+                  : action === "git_log"
+                    ? {
+                        action,
+                        path,
+                        maxResults: 5,
+                      }
+                    : action === "git_show"
+                      ? {
+                          action,
+                          path,
+                          revision: "abc1234",
+                        }
+                      : action === "git_blame"
+                        ? {
+                            action,
+                            path,
+                            startLine: 1,
+                            endLine: 3,
+                          }
           : action === "copy_path" || action === "move_path"
             ? {
                 action,
@@ -245,6 +321,28 @@ describe("useChatApp", () => {
     await runCommand(app, "/model gpt-next");
 
     expect(app.getLatest().currentModel).toBe("gpt-next");
+    app.cleanup();
+  });
+
+  test("exitSummary tracks the current model after /model switch", async () => {
+    const transport = createTestTransport();
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/model gpt-next");
+
+    expect(app.getLatest().currentModel).toBe("gpt-next");
+    expect(app.getLatest().exitSummary.currentModel).toBe("gpt-next");
     app.cleanup();
   });
 
@@ -1143,6 +1241,103 @@ describe("useChatApp", () => {
       getTexts(failureApp.getLatest().items).some(text => text.includes("summary updated"))
     ).toBe(false);
     failureApp.cleanup();
+  });
+
+  test("exitSummary accumulates query and summary usage across resume and new session flows", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        summary: "",
+        messages: Array.from({ length: 10 }, (_, index) => ({
+          role: index % 2 === 0 ? "user" : "assistant",
+          text: `message ${index + 1} about oauth and review state`,
+          createdAt: `2026-04-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+        })),
+      }),
+    ]) as TestSessionStore;
+    const summarizeImpl = mock(async () => ({
+      ok: true as const,
+      text: "- task: continue oauth work\n- fact: previous steps confirmed",
+      usage: {
+        promptTokens: 21,
+        completionTokens: 9,
+        totalTokens: 30,
+      },
+    }));
+    let turn = 0;
+    const runQuerySessionImpl = mock(
+      async ({ onState, onTextDelta, onUsage }: any) => {
+        const usageByTurn = [
+          {
+            promptTokens: 10,
+            completionTokens: 4,
+            totalTokens: 14,
+            reply: "first reply",
+          },
+          {
+            promptTokens: 8,
+            completionTokens: 3,
+            totalTokens: 11,
+            reply: "second reply",
+          },
+        ];
+        const current = usageByTurn[turn] ?? usageByTurn[usageByTurn.length - 1]!;
+        turn += 1;
+        onState({ status: "streaming" });
+        onUsage?.({
+          promptTokens: current.promptTokens,
+          completionTokens: current.completionTokens,
+          totalTokens: current.totalTokens,
+        });
+        onTextDelta(current.reply);
+        onState({ status: "idle" });
+        return { status: "completed" as const };
+      }
+    );
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport({
+          initialModel: "gpt-test",
+          models: ["gpt-test", "gpt-next"],
+          summarizeImpl,
+        }),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "continue the oauth task");
+    await flushMicrotasks();
+
+    expect(app.getLatest().exitSummary).toMatchObject({
+      activeSessionId: "session-a",
+      currentModel: "gpt-test",
+      requestCount: 1,
+      summaryRequestCount: 1,
+      promptTokens: 31,
+      completionTokens: 13,
+      totalTokens: 44,
+    });
+
+    await runCommand(app, "/new");
+    await runCommand(app, "fresh turn");
+    await flushMicrotasks();
+
+    expect(app.getLatest().exitSummary).toMatchObject({
+      activeSessionId: "session-2",
+      currentModel: "gpt-test",
+      requestCount: 2,
+      summaryRequestCount: 1,
+      promptTokens: 39,
+      completionTokens: 16,
+      totalTokens: 55,
+    });
+    app.cleanup();
   });
 
   test("approval input handler keeps enter disabled and a/r active", async () => {

@@ -1,6 +1,10 @@
-# Bun Ink Query Loop
+<p align="center">
+  <img src="assets/brand/cyrene-logo.svg" alt="Cyrene" width="420" />
+</p>
 
-TypeScript + Bun + React Ink + Axios + Zod setup with an event-stream query loop.
+# Cyrene
+
+Terminal-first coding assistant built with Bun, React Ink, and a reviewable query loop.
 
 ## Install
 

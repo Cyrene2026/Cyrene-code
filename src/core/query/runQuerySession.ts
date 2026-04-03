@@ -6,6 +6,7 @@ import {
   type QuerySessionState,
 } from "./sessionMachine";
 import type { QueryTransport } from "./transport";
+import type { TokenUsage } from "./tokenUsage";
 
 type RunQuerySessionParams = {
   query: string;
@@ -14,6 +15,8 @@ type RunQuerySessionParams = {
   transport: QueryTransport;
   onState: (state: QuerySessionState) => void;
   onTextDelta: (text: string) => void;
+  onUsage?: (usage: TokenUsage) => void;
+  onToolStatus?: (message: string) => void;
   onToolCall: (
     toolName: string,
     input: unknown
@@ -84,6 +87,7 @@ const MUTATING_FILE_ACTIONS = new Set([
   "create_file",
   "write_file",
   "edit_file",
+  "apply_patch",
   "delete_file",
   "copy_path",
   "move_path",
@@ -94,6 +98,7 @@ const MUTATION_RESULT_MARKERS = [
   "Created directory:",
   "Wrote file:",
   "Edited file:",
+  "Patched file:",
   "Deleted file:",
   "Copied path:",
   "Moved path:",
@@ -107,7 +112,12 @@ const isReadFileAction = (toolName: string, input: unknown) =>
 
 const isCommandLikeAction = (toolName: string, input: unknown) => {
   const action = getToolAction(toolName, input);
-  return action === "run_command" || action === "run_shell";
+  return (
+    action === "run_command" ||
+    action === "run_shell" ||
+    action === "open_shell" ||
+    action === "write_shell"
+  );
 };
 
 const isFilesystemBoundFileAction = (toolName: string, input: unknown) =>
@@ -140,6 +150,95 @@ const stableSerialize = (value: unknown): string => {
   return JSON.stringify(value);
 };
 
+const truncatePreview = (value: string, maxLength = 88) =>
+  value.length <= maxLength
+    ? value
+    : `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+
+const formatQuotedPreview = (value: string, maxLength = 40) =>
+  JSON.stringify(truncatePreview(value, maxLength));
+
+const buildToolStatusMessage = (toolName: string, input: unknown) => {
+  const displayName = getLoopDisplayName(toolName, input);
+  const record = toRecord(input);
+  if (!record) {
+    return `Running ${displayName}...`;
+  }
+
+  if (toolName !== "file") {
+    return `Running ${truncatePreview(displayName)}...`;
+  }
+
+  const action = getToolAction(toolName, input);
+  const path = pickTrimmedString(record, "path");
+  let summary = displayName;
+
+  if (action === "run_command") {
+    const command = pickTrimmedString(record, "command");
+    const args = pickStringArray(record, "args") ?? [];
+    const commandPreview = [command, ...args].filter(Boolean).join(" ").trim();
+    const cwd = pickTrimmedString(record, "cwd");
+    summary = truncatePreview(
+      [displayName, commandPreview || path, cwd ? `cwd ${cwd}` : undefined]
+        .filter(Boolean)
+        .join(" | ")
+    );
+    return `Running ${summary}...`;
+  }
+
+  if (action === "run_shell") {
+    const command = pickTrimmedString(record, "command");
+    const cwd = pickTrimmedString(record, "cwd") ?? path;
+    summary = truncatePreview(
+      [displayName, command, cwd ? `cwd ${cwd}` : undefined]
+        .filter(Boolean)
+        .join(" | ")
+    );
+    return `Running ${summary}...`;
+  }
+
+  if (action === "open_shell") {
+    const cwd = pickTrimmedString(record, "cwd") ?? path;
+    summary = truncatePreview(
+      [displayName, cwd ? `cwd ${cwd}` : undefined].filter(Boolean).join(" | ")
+    );
+    return `Running ${summary}...`;
+  }
+
+  if (action === "write_shell") {
+    const inputPreview =
+      pickTrimmedString(record, "input") ?? pickTrimmedString(record, "text");
+    summary = truncatePreview([displayName, inputPreview].filter(Boolean).join(" | "));
+    return `Running ${summary}...`;
+  }
+
+  let detail: string | undefined;
+  if (action === "search_text" || action === "search_text_context") {
+    const query = pickTrimmedString(record, "query");
+    detail = query ? `query ${formatQuotedPreview(query)}` : undefined;
+  } else if (action === "find_files") {
+    const pattern = pickTrimmedString(record, "pattern");
+    detail = pattern ? `pattern ${formatQuotedPreview(pattern)}` : undefined;
+  } else if (action === "find_symbol" || action === "find_references") {
+    const symbol =
+      pickTrimmedString(record, "symbol") ?? pickTrimmedString(record, "query");
+    detail = symbol ? `symbol ${formatQuotedPreview(symbol)}` : undefined;
+  } else if (action === "git_show") {
+    const revision = pickTrimmedString(record, "revision");
+    detail = revision ? `revision ${revision}` : undefined;
+  } else if (action === "copy_path" || action === "move_path") {
+    const destination = pickTrimmedString(record, "destination");
+    detail = destination ? `to ${destination}` : undefined;
+  }
+
+  summary = truncatePreview(
+    [displayName, path && path !== "." ? path : path === "." ? "workspace" : undefined, detail]
+      .filter(Boolean)
+      .join(" | ")
+  );
+  return `Running ${summary || displayName}...`;
+};
+
 const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
   const record = toRecord(input);
   if (!record) {
@@ -161,8 +260,38 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
     case "write_file":
     case "delete_file":
     case "stat_path":
+    case "outline_file":
+    case "git_status":
+    case "git_diff":
       return { action, path };
+    case "read_files":
+    case "stat_paths":
+      return {
+        action,
+        path,
+        paths: pickStringArray(record, "paths") ?? [],
+      };
+    case "read_range":
+      return {
+        action,
+        path,
+        startLine: pickFiniteNumber(record, "startLine"),
+        endLine: pickFiniteNumber(record, "endLine"),
+      };
+    case "read_json":
+      return {
+        action,
+        path,
+        jsonPath: pickTrimmedString(record, "jsonPath"),
+      };
+    case "read_yaml":
+      return {
+        action,
+        path,
+        yamlPath: pickTrimmedString(record, "yamlPath"),
+      };
     case "edit_file":
+    case "apply_patch":
       return {
         action,
         path,
@@ -177,6 +306,15 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         maxResults: pickFiniteNumber(record, "maxResults"),
         caseSensitive: pickBoolean(record, "caseSensitive"),
       };
+    case "find_symbol":
+    case "find_references":
+      return {
+        action,
+        path: path ?? ".",
+        symbol: pickTrimmedString(record, "symbol") ?? pickTrimmedString(record, "query"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        caseSensitive: pickBoolean(record, "caseSensitive"),
+      };
     case "search_text":
       return {
         action,
@@ -184,6 +322,35 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         query: pickTrimmedString(record, "query"),
         maxResults: pickFiniteNumber(record, "maxResults"),
         caseSensitive: pickBoolean(record, "caseSensitive"),
+      };
+    case "search_text_context":
+      return {
+        action,
+        path: path ?? ".",
+        query: pickTrimmedString(record, "query"),
+        before: pickFiniteNumber(record, "before"),
+        after: pickFiniteNumber(record, "after"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        caseSensitive: pickBoolean(record, "caseSensitive"),
+      };
+    case "git_log":
+      return {
+        action,
+        path: path ?? ".",
+        maxResults: pickFiniteNumber(record, "maxResults"),
+      };
+    case "git_show":
+      return {
+        action,
+        path: path ?? ".",
+        revision: pickTrimmedString(record, "revision"),
+      };
+    case "git_blame":
+      return {
+        action,
+        path,
+        startLine: pickFiniteNumber(record, "startLine"),
+        endLine: pickFiniteNumber(record, "endLine"),
       };
     case "copy_path":
     case "move_path":
@@ -205,6 +372,27 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         path: path ?? ".",
         command: pickTrimmedString(record, "command"),
         cwd: pickTrimmedString(record, "cwd"),
+      };
+    case "open_shell":
+      return {
+        action,
+        path: path ?? ".",
+        cwd: pickTrimmedString(record, "cwd"),
+      };
+    case "write_shell":
+      return {
+        action,
+        path: path ?? ".",
+        input:
+          pickTrimmedString(record, "input") ?? pickTrimmedString(record, "text"),
+      };
+    case "read_shell":
+    case "shell_status":
+    case "interrupt_shell":
+    case "close_shell":
+      return {
+        action,
+        path: path ?? ".",
       };
     default:
       return {
@@ -269,7 +457,10 @@ const buildHeuristicNudges = (originalTask: string, toolResults: string[]) => {
 
   if (
     recentResults.includes("[tool result] find_files ") ||
+    recentResults.includes("[tool result] find_symbol ") ||
+    recentResults.includes("[tool result] find_references ") ||
     recentResults.includes("[tool result] search_text ") ||
+    recentResults.includes("[tool result] search_text_context ") ||
     recentResults.includes("[tool result] stat_path ")
   ) {
     nudges.push(
@@ -324,6 +515,8 @@ export const runQuerySession = async ({
   transport,
   onState,
   onTextDelta,
+  onUsage,
+  onToolStatus,
   onToolCall,
   onError,
 }: RunQuerySessionParams): Promise<RunQuerySessionResult> => {
@@ -437,6 +630,7 @@ export const runQuerySession = async ({
             toolName: event.toolName,
             input: event.input,
           });
+          onToolStatus?.(buildToolStatusMessage(event.toolName, event.input));
           const toolResult = await onToolCall(event.toolName, event.input);
           if (
             seen >= 2 &&
@@ -504,6 +698,11 @@ export const runQuerySession = async ({
         if (event.type === "usage") {
           dispatch({
             type: "usage",
+            promptTokens: event.promptTokens,
+            completionTokens: event.completionTokens,
+            totalTokens: event.totalTokens,
+          });
+          onUsage?.({
             promptTokens: event.promptTokens,
             completionTokens: event.completionTokens,
             totalTokens: event.totalTokens,

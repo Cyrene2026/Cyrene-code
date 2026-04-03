@@ -8,6 +8,7 @@ import {
 } from "../src/core/tools/mcp/fileMcpService";
 
 const tempRoots: string[] = [];
+const services: FileMcpService[] = [];
 
 const createService = async (options?: ConstructorParameters<typeof FileMcpService>[1]) => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
@@ -19,15 +20,173 @@ const createService = async (options?: ConstructorParameters<typeof FileMcpServi
       "create_file",
       "write_file",
       "edit_file",
+      "apply_patch",
       "delete_file",
       "copy_path",
       "move_path",
+      "open_shell",
+      "write_shell",
     ],
   }, options);
+  services.push(service);
   return { root, service };
 };
 
+const createFakePersistentShellFactory = () => {
+  const dataListeners: Array<(data: string) => void> = [];
+  const exitListeners: Array<(event: { exitCode: number; signal?: string | number }) => void> =
+    [];
+  const state = {
+    cwd: "",
+    env: {} as Record<string, string>,
+    writes: [] as string[],
+    killedSignals: [] as string[],
+    openFile: "",
+  };
+
+  const emit = (data: string) => {
+    for (const listener of dataListeners) {
+      listener(data);
+    }
+  };
+
+  const emitExit = (exitCode: number, signal?: string | number) => {
+    for (const listener of exitListeners) {
+      listener({ exitCode, signal });
+    }
+  };
+
+  const parseCommandId = (payload: string) =>
+    /__CYRENE_STATUS__([a-z0-9-]+)__/i.exec(payload)?.[1] ?? "unknown";
+
+  const parseWrappedInput = (payload: string) => {
+    const lines = payload
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    return (
+      lines.find(
+        line =>
+          line !== "& {" &&
+          line !== "{" &&
+          line !== "}" &&
+          !line.startsWith("$cyreneSuccess") &&
+          !line.startsWith("$cyreneExit") &&
+          !line.startsWith("$cyrenePwd") &&
+          !line.startsWith("__cyrene_exit=") &&
+          !line.startsWith("__cyrene_pwd=") &&
+          !line.includes("__CYRENE_STATUS__") &&
+          !line.includes("__CYRENE_CWD__") &&
+          !line.startsWith("Write-Output")
+      ) ?? ""
+    );
+  };
+
+  const emitMarkers = (commandId: string, exitCode: number) => {
+    emit(
+      `__CYRENE_STATUS__${commandId}__${exitCode}\n__CYRENE_CWD__${commandId}__${state.cwd}\n`
+    );
+  };
+
+  const factory = async (options: {
+    file: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string>;
+    name: string;
+    cols: number;
+    rows: number;
+  }) => {
+    state.cwd = options.cwd;
+    state.env = { ...options.env };
+    state.openFile = options.file;
+    emit("shell ready\n");
+
+    return {
+      write(data: string) {
+        state.writes.push(data);
+        if (data === "\u0003") {
+          emit("^C\n");
+          return;
+        }
+
+        const commandId = parseCommandId(data);
+        const input = parseWrappedInput(data);
+        if (!input) {
+          return;
+        }
+
+        if (input === "cd subdir") {
+          state.cwd = join(state.cwd, "subdir");
+          emit("changed directory\n");
+          emitMarkers(commandId, 0);
+          return;
+        }
+
+        if (input === ". .venv/bin/activate" || input === ".\\.venv\\Scripts\\Activate.ps1") {
+          state.env.VIRTUAL_ENV = join(state.cwd, ".venv");
+          emit("venv activated\n");
+          emitMarkers(commandId, 0);
+          return;
+        }
+
+        if (input === "python --version") {
+          emit(
+            `${state.env.VIRTUAL_ENV ? "Python 3.12.0 (venv)" : "Python 3.12.0 (system)"}\n`
+          );
+          emitMarkers(commandId, 0);
+          return;
+        }
+
+        if (input === "long_running") {
+          emit("still running\n");
+          return;
+        }
+
+        emit(`ran ${input}\n`);
+        emitMarkers(commandId, 0);
+      },
+      kill(signal?: string) {
+        state.killedSignals.push(signal ?? "");
+        emitExit(0, signal);
+      },
+      onData(listener: (data: string) => void) {
+        dataListeners.push(listener);
+        return {
+          dispose: () => {
+            const index = dataListeners.indexOf(listener);
+            if (index >= 0) {
+              dataListeners.splice(index, 1);
+            }
+          },
+        };
+      },
+      onExit(listener: (event: { exitCode: number; signal?: string | number }) => void) {
+        exitListeners.push(listener);
+        return {
+          dispose: () => {
+            const index = exitListeners.indexOf(listener);
+            if (index >= 0) {
+              exitListeners.splice(index, 1);
+            }
+          },
+        };
+      },
+    };
+  };
+
+  return {
+    state,
+    emit,
+    emitExit,
+    factory,
+  };
+};
+
 afterEach(async () => {
+  for (const service of services.splice(0)) {
+    service.dispose();
+  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -49,6 +208,26 @@ describe("FileMcpService", () => {
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] read_file hello.txt");
     expect(result.message).toContain("hello world");
+  });
+
+  test("read_files executes immediately and returns multiple file bodies", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "a.txt"), "alpha", "utf8");
+    await writeFile(join(root, "b.txt"), "", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "read_files",
+      path: "a.txt",
+      paths: ["b.txt"],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] read_files a.txt");
+    expect(result.message).toContain("[file] a.txt");
+    expect(result.message).toContain("alpha");
+    expect(result.message).toContain("[file] b.txt");
+    expect(result.message).toContain("(empty file)");
   });
 
   test("list_dir confirms directory state in result output", async () => {
@@ -521,6 +700,207 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("size: 5");
   });
 
+  test("stat_paths executes immediately and returns metadata for multiple exact paths", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "main.ts"), "export const ok = true;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "stat_paths",
+      path: ".",
+      paths: ["src/main.ts", "missing.ts"],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] stat_paths .");
+    expect(result.message).toContain("Stat 3 path(s):");
+    expect(result.message).toContain("[path] .");
+    expect(result.message).toContain("[path] src/main.ts");
+    expect(result.message).toContain("exists: true");
+    expect(result.message).toContain("[path] missing.ts");
+    expect(result.message).toContain("exists: false");
+  });
+
+  test("read_range executes immediately and returns numbered line slices", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "range.txt"), "alpha\nbeta\ngamma\ndelta\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "read_range",
+      path: "range.txt",
+      startLine: 2,
+      endLine: 3,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] read_range range.txt");
+    expect(result.message).toContain("lines: 2-3");
+    expect(result.message).toContain("2 | beta");
+    expect(result.message).toContain("3 | gamma");
+    expect(result.message).not.toContain("1 | alpha");
+  });
+
+  test("read_range rejects invalid ranges", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "read_range",
+      path: "range.txt",
+      startLine: 4,
+      endLine: 2,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("read_range requires `startLine` to be less than or equal to `endLine`");
+  });
+
+  test("read_json executes immediately and can return a nested jsonPath value", async () => {
+    const { root, service } = await createService();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "cyrene-demo",
+          scripts: {
+            test: "bun test",
+          },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "read_json",
+      path: "package.json",
+      jsonPath: "scripts.test",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] read_json package.json");
+    expect(result.message).toContain("jsonPath: scripts.test");
+    expect(result.message).toContain('"bun test"');
+  });
+
+  test("read_yaml executes immediately and can return a nested yamlPath value", async () => {
+    const { root, service } = await createService();
+    await writeFile(
+      join(root, "config.yaml"),
+      [
+        "app:",
+        "  name: cyrene",
+        "  enabled: true",
+        "  ports:",
+        "    - 3000",
+        "    - 3001",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "read_yaml",
+      path: "config.yaml",
+      yamlPath: "app.ports[1]",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] read_yaml config.yaml");
+    expect(result.message).toContain("yamlPath: app.ports[1]");
+    expect(result.message).toContain("3001");
+  });
+
+  test("outline_file executes immediately and returns lightweight symbol outline", async () => {
+    const { root, service } = await createService();
+    await writeFile(
+      join(root, "outline.py"),
+      [
+        "class Demo:",
+        "    pass",
+        "",
+        "def run_app():",
+        "    return True",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "outline_file",
+      path: "outline.py",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] outline_file outline.py");
+    expect(result.message).toContain("Outline for outline.py");
+    expect(result.message).toContain("1 | class Demo:");
+    expect(result.message).toContain("4 | def run_app():");
+  });
+
+  test("find_symbol executes immediately and returns matching definition lines", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "app.ts"),
+      [
+        "export class DemoService {}",
+        "export function runApp() {",
+        "  return true;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "find_symbol",
+      path: "src",
+      symbol: "runApp",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] find_symbol src");
+    expect(result.message).toContain("Found 1 symbol match(es):");
+    expect(result.message).toContain("src/app.ts:2 | export function runApp()");
+  });
+
+  test("find_references executes immediately and returns usage lines instead of symbol definitions", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.ts"), "export class DemoService {}\n", "utf8");
+    await writeFile(
+      join(root, "src", "app.ts"),
+      [
+        'import { DemoService } from "./demo";',
+        "const service = new DemoService();",
+        "console.log(DemoService);",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "find_references",
+      path: "src",
+      symbol: "DemoService",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] find_references src");
+    expect(result.message).toContain("Found 3 reference match(es):");
+    expect(result.message).toContain('src/app.ts:1 | import { DemoService } from "./demo";');
+    expect(result.message).toContain("src/app.ts:2 | const service = new DemoService();");
+    expect(result.message).not.toContain("src/demo.ts:1 | export class DemoService {}");
+  });
+
   test("find_files executes immediately and returns matching workspace-relative paths", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "test_files"), { recursive: true });
@@ -558,6 +938,30 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("Found 1 match(es):");
     expect(result.message).toContain("docs/");
     expect(result.message).toContain("needle");
+  });
+
+  test("search_text_context executes immediately and returns match windows with surrounding lines", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "docs"), { recursive: true });
+    await writeFile(join(root, "docs", "context.txt"), "alpha\nneedle here\nomega\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text_context",
+      path: "docs",
+      query: "needle",
+      before: 1,
+      after: 1,
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] search_text_context docs");
+    expect(result.message).toContain("Found 1 contextual match(es):");
+    expect(result.message).toContain("[match] docs/context.txt:2");
+    expect(result.message).toContain("1 | alpha");
+    expect(result.message).toContain(">    2 | needle here");
+    expect(result.message).toContain("3 | omega");
   });
 
   test("copy_path enters review queue and copies file on approve", async () => {
@@ -677,6 +1081,207 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("cwd: .");
     expect(approved.message).toContain("exit: 0");
     expect(approved.message).toContain("v24.14.0");
+  });
+
+  test("git_status executes immediately without review", async () => {
+    const { root, service } = await createService({
+      gitRunner: async (args, cwd) => {
+        expect(args).toEqual(["status", "--short", "--branch"]);
+        expect(cwd).toBe(root);
+        return "## main\n M src/app.ts";
+      },
+    });
+    await mkdir(join(root, ".git"), { recursive: true });
+
+    const result = await service.handleToolCall("file", {
+      action: "git_status",
+      path: ".",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] git_status .");
+    expect(result.message).toContain("repo: .");
+    expect(result.message).toContain("## main");
+  });
+
+  test("git_diff executes immediately for a scoped file path", async () => {
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const { root, service } = await createService({
+      gitRunner: async (args, cwd) => {
+        calls.push({ args, cwd });
+        if (args.includes("--cached")) {
+          return "";
+        }
+        return "diff --git a/src/app.ts b/src/app.ts\n+console.log('hi')";
+      },
+    });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "console.log('hi')\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "git_diff",
+      path: "src/app.ts",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        args: ["diff", "--no-ext-diff", "--minimal", "--", "src/app.ts"],
+        cwd: root,
+      },
+      {
+        args: ["diff", "--cached", "--no-ext-diff", "--minimal", "--", "src/app.ts"],
+        cwd: root,
+      },
+    ]);
+    expect(result.message).toContain("[tool result] git_diff src/app.ts");
+    expect(result.message).toContain("[unstaged]");
+    expect(result.message).toContain("[staged]");
+    expect(result.message).toContain("diff --git");
+    expect(result.message).toContain("(none)");
+  });
+
+  test("git_log executes immediately without review for a scoped path", async () => {
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const { root, service } = await createService({
+      gitRunner: async (args, cwd) => {
+        calls.push({ args, cwd });
+        return "abc1234 2026-04-03 add app\nbcd2345 2026-04-02 init";
+      },
+    });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "export const app = true;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "git_log",
+      path: "src/app.ts",
+      maxResults: 5,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        args: ["log", "-n5", "--date=short", "--pretty=format:%h %ad %s", "--", "src/app.ts"],
+        cwd: root,
+      },
+    ]);
+    expect(result.message).toContain("[tool result] git_log src/app.ts");
+    expect(result.message).toContain("scope: src/app.ts");
+    expect(result.message).toContain("abc1234 2026-04-03 add app");
+  });
+
+  test("git_show executes immediately for a revision and scoped path", async () => {
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const { root, service } = await createService({
+      gitRunner: async (args, cwd) => {
+        calls.push({ args, cwd });
+        return "commit abc1234\nAuthor: Test User\n\ndiff --git a/src/app.ts b/src/app.ts\n+console.log('hi')";
+      },
+    });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "console.log('hi')\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "git_show",
+      path: "src/app.ts",
+      revision: "abc1234",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        args: [
+          "show",
+          "--stat",
+          "--patch",
+          "--no-ext-diff",
+          "--minimal",
+          "abc1234",
+          "--",
+          "src/app.ts",
+        ],
+        cwd: root,
+      },
+    ]);
+    expect(result.message).toContain("[tool result] git_show src/app.ts");
+    expect(result.message).toContain("revision: abc1234");
+    expect(result.message).toContain("diff --git a/src/app.ts b/src/app.ts");
+  });
+
+  test("git_blame executes immediately for a scoped file range", async () => {
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const { root, service } = await createService({
+      gitRunner: async (args, cwd) => {
+        calls.push({ args, cwd });
+        return "abc1234 (Test User 2026-04-03 1) export const app = true;";
+      },
+    });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "export const app = true;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "git_blame",
+      path: "src/app.ts",
+      startLine: 1,
+      endLine: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        args: ["blame", "--date=short", "-L", "1,1", "--", "src/app.ts"],
+        cwd: root,
+      },
+    ]);
+    expect(result.message).toContain("[tool result] git_blame src/app.ts");
+    expect(result.message).toContain("lines: 1-1");
+    expect(result.message).toContain("abc1234 (Test User 2026-04-03 1)");
+  });
+
+  test("apply_patch enters review queue and patches file on approve", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "patch-me.ts"), "const label = 'before';\n", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "apply_patch",
+      path: "patch-me.ts",
+      find: "before",
+      replace: "after",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[patch preview]");
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("Patched file: patch-me.ts");
+    expect(await readFile(join(root, "patch-me.ts"), "utf8")).toBe("const label = 'after';\n");
+  });
+
+  test("apply_patch rejects before queue when find text does not exist", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "patch-missing.ts"), "const label = 'before';\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "apply_patch",
+      path: "patch-missing.ts",
+      find: "missing",
+      replace: "after",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("apply_patch find text not found");
+    expect(service.listPending()).toHaveLength(0);
   });
 
   test("run_command allows arbitrary command names but still enters review queue", async () => {
@@ -824,5 +1429,206 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toContain("outside the workspace root");
     expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("open_shell enters review queue and opens a single persistent shell on approve", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.request.action).toBe("open_shell");
+    expect(queued.pending?.previewSummary).toContain("[shell session preview]");
+
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("status: opened");
+    expect(approved.message).toContain("shell:");
+    expect(approved.message).toContain("cwd: .");
+
+    const secondOpen = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+    expect(secondOpen.ok).toBe(false);
+    expect(secondOpen.message).toContain("already exists");
+    expect(fakePty.state.openFile).toBe(process.platform === "win32" ? "pwsh" : "/bin/bash");
+  });
+
+  test("write_shell preserves cwd and environment across commands", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    await mkdir(join(root, "subdir"), { recursive: true });
+    await mkdir(join(root, ".venv"), { recursive: true });
+
+    const openQueued = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+    await service.approve(openQueued.pending!.id);
+
+    const activateQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input:
+        process.platform === "win32"
+          ? ".\\.venv\\Scripts\\Activate.ps1"
+          : ". .venv/bin/activate",
+    });
+    expect(activateQueued.ok).toBe(true);
+    expect(activateQueued.pending?.previewSummary).toContain("input:");
+    const activateApproved = await service.approve(activateQueued.pending!.id);
+    expect(activateApproved.ok).toBe(true);
+    expect(activateApproved.message).toContain("status: completed");
+    expect(activateApproved.message).toContain("venv activated");
+
+    const cdQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "cd subdir",
+    });
+    const cdApproved = await service.approve(cdQueued.pending!.id);
+    expect(cdApproved.ok).toBe(true);
+    expect(cdApproved.message).toContain("cwd: subdir");
+
+    const pythonQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "python --version",
+    });
+    const pythonApproved = await service.approve(pythonQueued.pending!.id);
+    expect(pythonApproved.ok).toBe(true);
+    expect(pythonApproved.message).toContain("Python 3.12.0 (venv)");
+
+    const status = await service.handleToolCall("file", {
+      action: "shell_status",
+      path: ".",
+    });
+    expect(status.ok).toBe(true);
+    expect(status.message).toContain("status: idle");
+    expect(status.message).toContain("cwd: subdir");
+  });
+
+  test("write_shell blocks workspace-escaping cd before review", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    const openQueued = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+    await service.approve(openQueued.pending!.id);
+
+    const result = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "cd ../outside",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("outside the workspace root");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("read_shell returns only unread output and shell_status reflects running state", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    const openQueued = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+    await service.approve(openQueued.pending!.id);
+
+    fakePty.emit("later line\n");
+    const firstRead = await service.handleToolCall("file", {
+      action: "read_shell",
+      path: ".",
+    });
+    expect(firstRead.ok).toBe(true);
+    expect(firstRead.message).toContain("later line");
+
+    const secondRead = await service.handleToolCall("file", {
+      action: "read_shell",
+      path: ".",
+    });
+    expect(secondRead.ok).toBe(true);
+    expect(secondRead.message).toContain("(no new output)");
+
+    const runningQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "long_running",
+    });
+    const runningApproved = await service.approve(runningQueued.pending!.id);
+    expect(runningApproved.ok).toBe(true);
+    expect(runningApproved.message).toContain("status: running");
+
+    const status = await service.handleToolCall("file", {
+      action: "shell_status",
+      path: ".",
+    });
+    expect(status.ok).toBe(true);
+    expect(status.message).toContain("status: running");
+  });
+
+  test("interrupt_shell and close_shell manage persistent shell lifecycle", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    const openQueued = await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+    await service.approve(openQueued.pending!.id);
+
+    const runningQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "long_running",
+    });
+    await service.approve(runningQueued.pending!.id);
+
+    const interrupted = await service.handleToolCall("file", {
+      action: "interrupt_shell",
+      path: ".",
+    });
+    expect(interrupted.ok).toBe(true);
+    expect(interrupted.message).toContain("status: interrupted");
+
+    const closed = await service.handleToolCall("file", {
+      action: "close_shell",
+      path: ".",
+    });
+    expect(closed.ok).toBe(true);
+    expect(closed.message).toContain("status: closed");
+    expect(fakePty.state.killedSignals).toContain("SIGTERM");
+
+    const writeAfterClose = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "python --version",
+    });
+    expect(writeAfterClose.ok).toBe(false);
+    expect(writeAfterClose.message).toContain("open_shell first");
   });
 });

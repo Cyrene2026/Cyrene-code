@@ -69,19 +69,40 @@ export const FILE_TOOL = {
           type: "string",
           enum: [
             "read_file",
+            "read_files",
+            "read_range",
+            "read_json",
+            "read_yaml",
             "list_dir",
             "create_dir",
             "create_file",
             "write_file",
             "edit_file",
+            "apply_patch",
             "delete_file",
             "stat_path",
+            "stat_paths",
+            "outline_file",
             "find_files",
+            "find_symbol",
+            "find_references",
             "search_text",
+            "search_text_context",
             "copy_path",
             "move_path",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_blame",
             "run_command",
             "run_shell",
+            "open_shell",
+            "write_shell",
+            "read_shell",
+            "shell_status",
+            "interrupt_shell",
+            "close_shell",
           ],
         },
         path: {
@@ -90,20 +111,66 @@ export const FILE_TOOL = {
             "Workspace-relative path. For find_files or search_text across the whole workspace, use '.'.",
         },
         content: { type: "string" },
+        paths: {
+          type: "array",
+          description:
+            "Additional workspace-relative paths for read_files or stat_paths. Put the first target in path and the rest in paths.",
+          items: { type: "string" },
+        },
+        startLine: {
+          type: "integer",
+          description: "1-based inclusive start line for read_range or git_blame.",
+          minimum: 1,
+        },
+        endLine: {
+          type: "integer",
+          description: "1-based inclusive end line for read_range or git_blame.",
+          minimum: 1,
+        },
+        jsonPath: {
+          type: "string",
+          description: "Optional dot path for read_json, such as scripts.test or compilerOptions.paths.",
+        },
+        yamlPath: {
+          type: "string",
+          description: "Optional dot path for read_yaml, such as services.api.image or deployments.0.name.",
+        },
         find: { type: "string" },
         replace: { type: "string" },
         pattern: {
           type: "string",
           description: "Glob pattern for find_files. Omit when unused.",
         },
+        symbol: {
+          type: "string",
+          description: "Symbol name for find_symbol or find_references, such as useChatApp or FileMcpService.",
+        },
         query: {
           type: "string",
-          description: "Search string for search_text. Omit when unused.",
+          description: "Search string for search_text or search_text_context. Omit when unused.",
+        },
+        before: {
+          type: "integer",
+          description: "Context lines before each hit for search_text_context.",
+          minimum: 0,
+        },
+        after: {
+          type: "integer",
+          description: "Context lines after each hit for search_text_context.",
+          minimum: 0,
         },
         maxResults: { type: "integer", minimum: 1, maximum: 200 },
         caseSensitive: { type: "boolean" },
         destination: { type: "string" },
+        revision: {
+          type: "string",
+          description: "Commit-ish for git_show, such as HEAD~1 or a commit hash.",
+        },
         command: { type: "string" },
+        input: {
+          type: "string",
+          description: "One line of shell input for write_shell. Omit when unused.",
+        },
         args: {
           type: "array",
           description:
@@ -120,28 +187,62 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "You are operating inside a workspace through exactly one function: `file`.",
   "Whenever you need filesystem or shell work, you MUST call `file` instead of describing the action abstractly.",
   "Function arguments must be valid JSON and include required fields:",
-  "{ action, path, content?, find?, replace?, pattern?, query?, maxResults?, caseSensitive?, destination?, command?, args?, cwd? }.",
+  "{ action, path, content?, paths?, startLine?, endLine?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, destination?, revision?, command?, input?, args?, cwd? }.",
   "Never call the file tool with empty arguments, placeholder values, or guessed fields you do not need.",
   "Available actions are:",
-  "read_file, list_dir, create_dir, create_file, write_file, edit_file, delete_file, stat_path, find_files, search_text, copy_path, move_path, run_command, run_shell.",
+  "read_file, read_files, read_range, read_json, read_yaml, list_dir, create_dir, create_file, write_file, edit_file, apply_patch, delete_file, stat_path, stat_paths, outline_file, find_files, find_symbol, find_references, search_text, search_text_context, copy_path, move_path, git_status, git_diff, git_log, git_show, git_blame, run_command, run_shell, open_shell, write_shell, read_shell, shell_status, interrupt_shell, close_shell.",
   "Choose the narrowest action that answers the question. Prefer precise search or metadata actions over broad exploratory reads.",
   "Tool selection rules:",
+  "- Use read_files when you already know multiple exact file paths and need to inspect them together.",
+  "- Use read_range when you need a specific line window from one file instead of reading the whole file.",
+  "- Use read_json for JSON configuration files when you want parsed structured output instead of raw text.",
+  "- Use read_yaml for YAML configuration files when you want parsed structured output instead of raw text.",
   "- Use stat_path to confirm whether a path exists and whether it is a file or directory.",
+  "- Use stat_paths when you need existence or metadata for several exact paths in one call.",
+  "- Use outline_file before full reads on large source files to find the important symbols first.",
   "- Use find_files for file discovery by name or glob pattern.",
+  "- Use find_symbol when you need to locate symbol definitions such as classes, functions, interfaces, types, or defs.",
+  "- Use find_references when you need cross-file symbol usages rather than definitions.",
   "- Use search_text for content discovery inside files.",
+  "- Use search_text_context when surrounding lines around each match matter.",
+  "- Use git_status to inspect the repository worktree without going through a reviewed shell command.",
+  "- Use git_diff to inspect unstaged and staged diff output for the repo or a path inside it.",
+  "- Use git_log to inspect recent commits for the repo or a scoped path.",
+  "- Use git_show to inspect one revision in detail. Provide `revision` explicitly.",
+  "- Use git_blame to inspect who last changed specific lines in a tracked file.",
   "- For find_files or search_text across the whole workspace, set `path` to `\".\"`.",
+  "- For search_text_context across the whole workspace, also set `path` to `\".\"`.",
   "- Omit every optional field you do not need. Do not send empty strings, empty arrays, or placeholder values.",
   "- Use read_file only when you actually need the file contents.",
+  "- For read_files, set `path` to the first file and `paths` to any additional files.",
+  "- For stat_paths, set `path` to the first target and `paths` to any additional targets.",
+  "- For read_range, provide 1-based inclusive `startLine` and `endLine`.",
+  "- For read_json, provide `jsonPath` only when you want one nested field instead of the whole document.",
+  "- For read_yaml, provide `yamlPath` only when you want one nested field instead of the whole document.",
+  "- For find_symbol, provide the exact symbol name in `symbol`.",
+  "- For find_references, provide the exact symbol name in `symbol`.",
+  "- For search_text_context, use `before` and `after` only when you need surrounding context lines.",
+  "- For git_log, use `maxResults` to limit how many commits you need.",
+  "- For git_show, use `revision` and an optional scoped `path`.",
+  "- For git_blame, provide a file path and optional `startLine` / `endLine` for a narrow range.",
   "- Use list_dir only when the directory listing itself is required.",
   "- Use create_file only for new-only file creation.",
   "- Use write_file for full overwrite writes.",
   "- Use edit_file for targeted replacement.",
+  "- Use apply_patch for reviewed targeted patches on one file using `find` and `replace`.",
   "- Use copy_path or move_path for path relocation instead of trying to emulate them with read/write/delete steps.",
   "- Use run_command only for direct program execution such as `node --version`.",
   "- `args` is only for run_command. Do not put search terms for find_files or search_text into args.",
   "- Use run_shell only when true shell semantics are required. For shell actions, set path to a relevant workspace path such as '.'.",
+  "- Use open_shell and write_shell when shell state must persist across steps, such as `source .venv/bin/activate`, `. .venv/bin/activate`, `.\\\\.venv\\\\Scripts\\\\Activate.ps1`, or `cd subdir`.",
+  "- When a persistent shell may already exist, call shell_status before opening another one.",
+  "- Use write_shell only after open_shell has created an active shell session.",
+  "- Use read_shell to fetch unread output from a running or recently completed persistent shell command.",
+  "- Use interrupt_shell to send Ctrl+C to the active persistent shell when a command is still running.",
+  "- Use close_shell to terminate the active persistent shell session when it is no longer needed.",
   "- Do not put shell syntax such as pipes, redirection, chaining, or subshells into run_command.",
   "- run_shell currently supports only a safe single-command subset. Do not use pipes, redirection, chaining, background execution, or subshell syntax.",
+  "- write_shell also supports only a reviewed safe single-line subset. Do not send multiline shell scripts or placeholder input.",
   "Avoid repetitive list_dir/read_file probing when search_text or find_files can answer directly.",
   "Directory-state rules:",
   "- If list_dir already returned a confirmed directory state for the same path, treat that result as authoritative until a mutation happens.",
@@ -185,16 +286,112 @@ const resolveModelsUrl = (baseUrl: string) => {
 const DONE_EVENT = JSON.stringify({ type: "done" });
 const resolveProviderBaseUrl = (baseUrl: string | undefined) =>
   baseUrl ? normalizeBaseUrl(baseUrl) : undefined;
+const joinVisibleParts = (parts: string[]) => parts.filter(Boolean).join("");
+
+const extractTextValue = (value: unknown): string => {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  const record = value as {
+    value?: unknown;
+    text?: unknown;
+  };
+  if (typeof record.value === "string") {
+    return record.value;
+  }
+  if (typeof record.text === "string") {
+    return record.text;
+  }
+
+  return "";
+};
+
+const extractReasoningText = (value: unknown, depth = 0): string => {
+  if (depth > 4) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return joinVisibleParts(
+      value.map(item => extractReasoningText(item, depth + 1))
+    );
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  const record = value as {
+    type?: unknown;
+    text?: unknown;
+    value?: unknown;
+    content?: unknown;
+    reasoning?: unknown;
+    reasoning_content?: unknown;
+    thinking?: unknown;
+    summary?: unknown;
+  };
+  const type = typeof record.type === "string" ? record.type : undefined;
+
+  if (
+    type === "text" ||
+    type === "output_text" ||
+    type === "input_text" ||
+    type === "reasoning" ||
+    type === "reasoning_text" ||
+    type === "thinking" ||
+    type === "summary_text"
+  ) {
+    return joinVisibleParts([
+      extractTextValue(record.text),
+      extractTextValue(record.value),
+      extractReasoningText(record.content, depth + 1),
+    ]);
+  }
+
+  return joinVisibleParts([
+    extractTextValue(record.text),
+    extractTextValue(record.value),
+    extractReasoningText(record.content, depth + 1),
+    extractReasoningText(record.reasoning, depth + 1),
+    extractReasoningText(record.reasoning_content, depth + 1),
+    extractReasoningText(record.thinking, depth + 1),
+    extractReasoningText(record.summary, depth + 1),
+  ]);
+};
+
 const extractTextContent = (content: unknown): string => {
   if (typeof content === "string") {
     return content;
+  }
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const typedContent = content as {
+      type?: unknown;
+      text?: unknown;
+    };
+    if (
+      typedContent.type === "text" ||
+      typedContent.type === "output_text" ||
+      typedContent.type === "input_text"
+    ) {
+      return extractTextValue(typedContent.text);
+    }
+    return "";
   }
   if (!Array.isArray(content)) {
     return "";
   }
 
-  return content
-    .map(item => {
+  return joinVisibleParts(
+    content.map(item => {
+      if (typeof item === "string") {
+        return item;
+      }
       if (!item || typeof item !== "object") {
         return "";
       }
@@ -202,12 +399,36 @@ const extractTextContent = (content: unknown): string => {
         type?: unknown;
         text?: unknown;
       };
-      if (typedItem.type === "text" && typeof typedItem.text === "string") {
-        return typedItem.text;
+      if (
+        typedItem.type === "text" ||
+        typedItem.type === "output_text" ||
+        typedItem.type === "input_text"
+      ) {
+        return extractTextValue(typedItem.text);
       }
       return "";
     })
-    .join("");
+  );
+};
+
+const extractVisibleDeltaText = (delta: unknown) => {
+  if (!delta || typeof delta !== "object") {
+    return "";
+  }
+
+  const typedDelta = delta as {
+    content?: unknown;
+    reasoning?: unknown;
+    reasoning_content?: unknown;
+    thinking?: unknown;
+  };
+
+  return joinVisibleParts([
+    extractTextContent(typedDelta.content),
+    extractReasoningText(typedDelta.reasoning_content),
+    extractReasoningText(typedDelta.reasoning),
+    extractReasoningText(typedDelta.thinking),
+  ]);
 };
 
 const parseCompletionTextPayload = (payload: unknown): string => {
@@ -294,7 +515,7 @@ async function* streamSseOpenAI(
             usage?: unknown;
             choices?: Array<{
               delta?: {
-                content?: string;
+                content?: unknown;
                 tool_calls?: Array<{
                   index?: number;
                   function?: { name?: string; arguments?: string };
@@ -309,9 +530,10 @@ async function* streamSseOpenAI(
           }
           const choice = parsed.choices?.[0];
           const delta = choice?.delta;
+          const deltaText = extractVisibleDeltaText(delta);
 
-          if (delta?.content) {
-            yield JSON.stringify({ type: "text_delta", text: delta.content });
+          if (deltaText) {
+            yield JSON.stringify({ type: "text_delta", text: deltaText });
           }
 
           if (delta?.tool_calls) {

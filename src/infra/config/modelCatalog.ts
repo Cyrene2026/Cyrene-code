@@ -1,18 +1,22 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { getCyreneConfigDir, resolveAppRoot } from "./appRoot";
 
-const getModelFile = () => join(process.cwd(), ".cyrene", "model.yaml");
+const getModelFile = (appRoot = resolveAppRoot()) =>
+  join(getCyreneConfigDir(appRoot), "model.yaml");
 
 const parseScalar = (value: string) =>
   value.replace(/^["']/, "").replace(/["']$/, "").trim();
 
-export const loadModelYaml = async (): Promise<{
+export const loadModelYaml = async (
+  appRoot = resolveAppRoot()
+): Promise<{
   models: string[];
   defaultModel?: string;
   lastUsedModel?: string;
   providerBaseUrl?: string;
 }> => {
-  const content = await readFile(getModelFile(), "utf8");
+  const content = await readFile(getModelFile(appRoot), "utf8");
   const models: string[] = [];
   let defaultModel: string | undefined;
   let lastUsedModel: string | undefined;
@@ -61,7 +65,8 @@ export const saveModelYaml = async (
   options?: {
     lastUsedModel?: string;
     providerBaseUrl?: string;
-  }
+  },
+  appRoot = resolveAppRoot()
 ): Promise<void> => {
   const unique = Array.from(new Set(models.map(model => model.trim()))).filter(
     Boolean
@@ -90,6 +95,6 @@ export const saveModelYaml = async (
     "",
   ];
 
-  await mkdir(join(process.cwd(), ".cyrene"), { recursive: true });
-  await writeFile(getModelFile(), lines.join("\n"), "utf8");
+  await mkdir(getCyreneConfigDir(appRoot), { recursive: true });
+  await writeFile(getModelFile(appRoot), lines.join("\n"), "utf8");
 };

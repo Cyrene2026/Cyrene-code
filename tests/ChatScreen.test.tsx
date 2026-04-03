@@ -57,6 +57,22 @@ const movePending: PendingReviewItem = {
   createdAt: "2026-01-01T00:01:00.000Z",
 };
 
+const patchPending: PendingReviewItem = {
+  id: "p2b",
+  request: {
+    action: "apply_patch",
+    path: "src/patch.ts",
+    find: "before",
+    replace: "after",
+  },
+  preview: "preview",
+  previewSummary:
+    "[patch preview]\n[old - to be removed]\n- 18 | const before = true;\n[new + to be written]\n+ 18 | const after = true;\n@@ patch",
+  previewFull:
+    "[patch preview]\n[old - to be removed]\n- 18 | const before = true;\n[new + to be written]\n+ 18 | const after = true;\n@@ patch",
+  createdAt: "2026-01-01T00:01:30.000Z",
+};
+
 const commandPending: PendingReviewItem = {
   id: "p3",
   request: {
@@ -90,6 +106,21 @@ const shellPending: PendingReviewItem = {
   createdAt: "2026-01-01T00:03:00.000Z",
 };
 
+const openShellPending: PendingReviewItem = {
+  id: "p5",
+  request: {
+    action: "open_shell",
+    path: ".",
+    cwd: "workspace/subdir",
+  },
+  preview: "preview",
+  previewSummary:
+    "[shell session preview]\nshell: pwsh\ncwd: workspace/subdir\nexisting_session: none\nrisk: medium\nnote: Persistent shell state is kept in memory for this CLI process only.\nmode: summary",
+  previewFull:
+    "[shell session preview]\nshell: pwsh\ncwd: workspace/subdir\nexisting_session: none\nrisk: medium\nnote: Persistent shell state is kept in memory for this CLI process only.\nmode: full",
+  createdAt: "2026-01-01T00:04:00.000Z",
+};
+
 const buildProps = (
   overrides: Partial<React.ComponentProps<typeof ChatScreen>> = {}
 ): React.ComponentProps<typeof ChatScreen> => ({
@@ -103,6 +134,7 @@ const buildProps = (
   ],
   liveAssistantText: "",
   status: "idle" as const,
+  appRoot: "D:/Projects/demo-root",
   input: "",
   inputCommandState: {
     active: false,
@@ -196,7 +228,7 @@ describe("ChatScreen", () => {
     ]);
   });
 
-  test("approval mode renders focused approval view with compact diff structure", () => {
+  test("approval mode renders bordered approval view with diff stats and hidden composer", () => {
     const tree = renderScreen({
       pendingReviews: [editPending],
       approvalPanel: {
@@ -208,12 +240,41 @@ describe("ChatScreen", () => {
 
     expect(output).toContain("Code Approval");
     expect(output).not.toContain("Conversation");
-    expect(output).toContain("approval panel active");
+    expect(output).toContain("Queue");
     expect(output).toContain("Action summary");
+    expect(output).toContain("Changes");
+    expect(output).toContain("+1 lines");
+    expect(output).toContain("-1 lines");
+    expect(output).toContain("root");
+    expect(output).toContain("D:/Projects/demo-root");
+    expect(output).toContain("added");
+    expect(output).toContain("deleted");
     expect(output).toContain("Diff preview");
     expect(output).toContain("[edit preview]");
     expect(output).toContain("@@ replacement");
     expect(output).toContain("newValue");
+    expect(output).not.toContain("Review mode");
+    expect(output).not.toContain("Approval panel active...");
+    expect(output).not.toContain("Message Cyrene...");
+  });
+
+  test("approval mode shows persistent shell session summary rows", () => {
+    const tree = renderScreen({
+      pendingReviews: [openShellPending],
+      approvalPanel: {
+        ...buildProps().approvalPanel,
+        active: true,
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("open_shell");
+    expect(output).toContain("open shell session");
+    expect(output).toContain("Shell");
+    expect(output).toContain("platform default");
+    expect(output).toContain("Cwd");
+    expect(output).toContain("workspace/subdir");
+    expect(output).toContain("Shell session preview");
   });
 
   test("normal mode renders minimalist transcript and input", () => {
@@ -221,10 +282,46 @@ describe("ChatScreen", () => {
     const output = JSON.stringify(tree);
 
     expect(output).toContain("CYRENE");
+    expect(output).toContain("[");
+    expect(output).toContain("]");
     expect(output).toContain("READY");
+    expect(output).toContain("model");
+    expect(output).toContain("queue");
+    expect(output).toContain("root");
+    expect(output).toContain("D:/Projects/demo-root");
     expect(output).toContain("Tool: write_file src/a.ts | ok");
-    expect(output).toContain("Ask something...");
+    expect(output).toContain("Message Cyrene...");
+    expect(output).toContain("interactive lane");
+    expect(output).toContain("guide");
+    expect(output).toContain("Enter send  |  / commands  |  Up/Down history");
     expect(output).not.toContain("Conversation");
+  });
+
+  test("empty startup mode renders gemini-style welcome prompt and lightweight suggestions", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          text: "Type /help to view commands. Use /resume to open session picker.",
+          kind: "system_hint",
+          tone: "neutral",
+          color: "gray",
+        },
+      ],
+      liveAssistantText: "",
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("█████");
+    expect(output).toContain("How can I help today?");
+    expect(output).toContain("Cyrene can inspect this workspace");
+    expect(output).toContain("Explain this repository");
+    expect(output).toContain("Fix something");
+    expect(output).toContain("Keep going");
+    expect(output).toContain("Type `/` for commands");
+    expect(output).toContain("Ask Cyrene...");
+    expect(output).toContain("Enter send  |  / commands  |  Up/Down history");
+    expect(output).not.toContain("Type /help to view commands. Use /resume to open session picker.");
   });
 
   test("renders token metrics when usage is available", () => {
@@ -266,7 +363,42 @@ describe("ChatScreen", () => {
     const output = JSON.stringify(tree);
 
     expect(output).toContain("WORKING");
-    expect(output).toContain("Thinking");
+    expect(output).toContain("model streaming");
+    expect(output).toContain("Message Cyrene...");
+  });
+
+  test("review and error states remain visible in the flagship composer", () => {
+    const reviewTree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: "pending review",
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+      status: "awaiting_review",
+    });
+    const reviewOutput = JSON.stringify(reviewTree);
+
+    expect(reviewOutput).toContain("REVIEW");
+    expect(reviewOutput).toContain("approval gate");
+
+    const errorTree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: "failed",
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+      status: "error",
+    });
+    const errorOutput = JSON.stringify(errorTree);
+
+    expect(errorOutput).toContain("ERROR");
+    expect(errorOutput).toContain("last step failed");
   });
 
   test("renders live assistant text separately from committed transcript", () => {
@@ -384,6 +516,23 @@ describe("ChatScreen", () => {
     expect(output).toContain("Source");
   });
 
+  test("renders apply_patch approval as patch diff preview", () => {
+    const tree = renderScreen({
+      items: [],
+      pendingReviews: [patchPending],
+      approvalPanel: {
+        ...buildProps().approvalPanel,
+        active: true,
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Diff preview · patch");
+    expect(output).toContain("scoped patch");
+    expect(output).toContain("[patch preview]");
+    expect(output).toContain("const after = true;");
+  });
+
   test("renders run_command approval as process preview card", () => {
     const tree = renderScreen({
       items: [],
@@ -437,9 +586,12 @@ describe("ChatScreen", () => {
     expect(output).toContain("Models  page 1/1  total 2");
     expect(output).toContain("> gpt-next");
     expect(output).toContain("[current]");
+    expect(output).toContain("interactive lane");
+    expect(output).toContain("Panel active...");
+    expect(output).toContain("panel active  |  close current panel to type");
   });
 
-  test("renders slash command hints and history indicator", () => {
+  test("renders slash command hints in the input card helper line", () => {
     const tree = renderScreen({
       items: [],
       input: "/mo",
@@ -450,8 +602,8 @@ describe("ChatScreen", () => {
           { command: "/model", description: "open model picker" },
           { command: "/model refresh", description: "refresh available models" },
         ],
-        historyPosition: 2,
-        historySize: 5,
+        historyPosition: null,
+        historySize: 0,
       },
     });
     const output = JSON.stringify(tree);
@@ -459,6 +611,22 @@ describe("ChatScreen", () => {
     expect(output).toContain("commands");
     expect(output).toContain("/model");
     expect(output).toContain("/model refresh");
+    expect(output).not.toContain("history 2/5");
+  });
+
+  test("renders history indicator in the input card helper line", () => {
+    const tree = renderScreen({
+      items: [],
+      inputCommandState: {
+        active: false,
+        currentCommand: null,
+        suggestions: [],
+        historyPosition: 2,
+        historySize: 5,
+      },
+    });
+    const output = JSON.stringify(tree);
+
     expect(output).toContain("history 2/5");
   });
 });

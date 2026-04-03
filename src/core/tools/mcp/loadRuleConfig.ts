@@ -1,21 +1,25 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { getCyreneConfigDir, resolveAppRoot } from "../../../infra/config/appRoot";
 import type { MpcAction, RuleConfig } from "./types";
 
-const DEFAULT_RULES: RuleConfig = {
-  workspaceRoot: process.cwd(),
+const createDefaultRules = (appRoot: string): RuleConfig => ({
+  workspaceRoot: appRoot,
   maxReadBytes: 120_000,
   requireReview: [
     "create_file",
     "write_file",
     "edit_file",
+    "apply_patch",
     "delete_file",
     "copy_path",
     "move_path",
     "run_command",
     "run_shell",
+    "open_shell",
+    "write_shell",
   ],
-};
+});
 
 const parseScalar = (value: string) =>
   value.replace(/^["']/, "").replace(/["']$/, "").trim();
@@ -23,19 +27,40 @@ const parseScalar = (value: string) =>
 const isMpcAction = (value: string): value is MpcAction =>
   [
     "read_file",
+    "read_files",
+    "read_range",
+    "read_json",
+    "read_yaml",
     "list_dir",
     "create_dir",
     "create_file",
     "write_file",
     "edit_file",
+    "apply_patch",
     "delete_file",
     "stat_path",
+    "stat_paths",
+    "outline_file",
     "find_files",
+    "find_symbol",
+    "find_references",
     "search_text",
+    "search_text_context",
     "copy_path",
     "move_path",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
     "run_command",
     "run_shell",
+    "open_shell",
+    "write_shell",
+    "read_shell",
+    "shell_status",
+    "interrupt_shell",
+    "close_shell",
   ].includes(value);
 
 const readConfigFile = async (path: string) => {
@@ -46,16 +71,20 @@ const readConfigFile = async (path: string) => {
   }
 };
 
-export const loadRuleConfig = async (): Promise<RuleConfig> => {
-  const configPath = join(process.cwd(), ".cyrene", "config.yaml");
-  const rulePath = join(process.cwd(), ".cyrene", "rule.yaml");
+export const loadRuleConfig = async (
+  appRoot = resolveAppRoot()
+): Promise<RuleConfig> => {
+  const defaultRules = createDefaultRules(appRoot);
+  const configDir = getCyreneConfigDir(appRoot);
+  const configPath = join(configDir, "config.yaml");
+  const rulePath = join(configDir, "rule.yaml");
   const content = (await readConfigFile(configPath)) || (await readConfigFile(rulePath));
   if (!content) {
-    return DEFAULT_RULES;
+    return defaultRules;
   }
 
-  let workspaceRoot = DEFAULT_RULES.workspaceRoot;
-  let maxReadBytes = DEFAULT_RULES.maxReadBytes;
+  let workspaceRoot = defaultRules.workspaceRoot;
+  let maxReadBytes = defaultRules.maxReadBytes;
   const requireReview: MpcAction[] = [];
   let inRequireReview = false;
 
@@ -67,7 +96,7 @@ export const loadRuleConfig = async (): Promise<RuleConfig> => {
 
     if (line.startsWith("workspace_root:")) {
       const rawPath = parseScalar(line.slice("workspace_root:".length));
-      workspaceRoot = resolve(process.cwd(), rawPath || ".");
+      workspaceRoot = resolve(appRoot, rawPath || ".");
       inRequireReview = false;
       continue;
     }
@@ -104,7 +133,7 @@ export const loadRuleConfig = async (): Promise<RuleConfig> => {
     requireReview:
       (requireReview.length > 0
         ? Array.from(new Set(requireReview))
-        : DEFAULT_RULES.requireReview
+        : defaultRules.requireReview
       ).filter(action => action !== "create_dir"),
   };
 };

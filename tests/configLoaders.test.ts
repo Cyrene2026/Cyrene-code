@@ -6,10 +6,16 @@ import { loadRuleConfig } from "../src/core/tools/mcp/loadRuleConfig";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
 
 const originalCwd = process.cwd();
+const originalRootEnv = process.env.CYRENE_ROOT;
 const tempRoots: string[] = [];
 
 afterEach(async () => {
   process.chdir(originalCwd);
+  if (originalRootEnv === undefined) {
+    delete process.env.CYRENE_ROOT;
+  } else {
+    process.env.CYRENE_ROOT = originalRootEnv;
+  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -22,6 +28,7 @@ const createWorkspace = async (configText: string) => {
   tempRoots.push(root);
   await mkdir(join(root, ".cyrene"), { recursive: true });
   await writeFile(join(root, ".cyrene", "config.yaml"), configText, "utf8");
+  delete process.env.CYRENE_ROOT;
   process.chdir(root);
   return root;
 };
@@ -60,5 +67,27 @@ describe("config loaders", () => {
       "move_path",
       "run_command",
     ]);
+  });
+
+  test("loaders honor CYRENE_ROOT for global project root override", async () => {
+    const root = await createWorkspace([
+      "workspace_root: ./workspace",
+      "pin_max_count: 11",
+      "query_max_tool_steps: 42",
+      "require_review:",
+      "  - run_shell",
+    ].join("\n"));
+
+    await mkdir(join(root, "workspace"), { recursive: true });
+    process.chdir(join(root, "workspace"));
+    process.env.CYRENE_ROOT = root;
+
+    const cyreneConfig = await loadCyreneConfig();
+    const ruleConfig = await loadRuleConfig();
+
+    expect(cyreneConfig.pinMaxCount).toBe(11);
+    expect(cyreneConfig.queryMaxToolSteps).toBe(42);
+    expect(ruleConfig.workspaceRoot).toBe(join(root, "workspace"));
+    expect(ruleConfig.requireReview).toEqual(["run_shell"]);
   });
 });

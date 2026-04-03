@@ -1,0 +1,11 @@
+<svg width="820" height="200" viewBox="0 0 820 200" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="cyreneLogoTitle cyreneLogoDesc">
+  <title id="cyreneLogoTitle">Cyrene Logo</title>
+  <desc id="cyreneLogoDesc">Cyrene wordmark paired with a geometric cyan C-shaped signal mark.</desc>
+  <g transform="translate(18 20)">
+    <path d="M108 44C95.8497 32.2032 77.5944 28.7658 61.9407 35.2795C46.287 41.7932 36 57.07 36 74.0252C36 90.9804 46.287 106.257 61.9407 112.771C77.5944 119.284 95.8497 115.847 108 104.05" stroke="#2FD7FF" stroke-width="18" stroke-linecap="round"/>
+    <path d="M77 63L98 80L77 97" stroke="#08131B" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M77 63L98 80L77 97" stroke="#F3FCFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="108" cy="80" r="8" fill="#2FD7FF" stroke="#08131B" stroke-width="4"/>
+  </g>
+  <text x="178" y="118" fill="#F4FCFF" stroke="#08131B" stroke-width="8" paint-order="stroke fill" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="88" font-weight="800" letter-spacing="11">CYRENE</text>
+</svg>

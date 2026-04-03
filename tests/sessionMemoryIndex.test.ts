@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFileSessionStore } from "../src/infra/session/createFileSessionStore";
 
 const tempRoots: string[] = [];
+const originalRootEnv = process.env.CYRENE_ROOT;
 
 const createStore = async () => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-session-memory-"));
@@ -16,6 +17,11 @@ const createStore = async () => {
 };
 
 afterEach(async () => {
+  if (originalRootEnv === undefined) {
+    delete process.env.CYRENE_ROOT;
+  } else {
+    process.env.CYRENE_ROOT = originalRootEnv;
+  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -183,5 +189,22 @@ describe("session memory index", () => {
 
     expect(after?.focus).toEqual(["first pin"]);
     expect(context.pins).toEqual(["first pin"]);
+  });
+
+  test("default session store path follows configured global root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
+    tempRoots.push(root);
+    process.env.CYRENE_ROOT = root;
+    await mkdir(join(root, ".cyrene"), { recursive: true });
+
+    const store = createFileSessionStore();
+    const session = await store.createSession("root aware");
+
+    const persisted = await readFile(
+      join(root, ".cyrene", "session", `${session.id}.json`),
+      "utf8"
+    );
+
+    expect(persisted).toContain("\"title\": \"root aware\"");
   });
 });

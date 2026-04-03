@@ -418,6 +418,42 @@ describe("runQuerySession", () => {
     expect(states.at(-1)).toEqual({ status: "idle", totalTokens: 19 });
   });
 
+  test("emits a visible tool status before awaiting tool execution", async () => {
+    const transport = createRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "search_text", path: "src", query: "needle" },
+      },
+      null,
+    ]);
+    const order: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "find the target text",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolStatus: message => {
+        order.push(`status:${message}`);
+      },
+      onToolCall: async () => {
+        order.push("tool:search_text");
+        return {
+          message:
+            "[tool result] search_text src\nFound 1 match(es):\nsrc/app.ts:12 | needle found here",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(order[0]).toContain("status:Running search_text");
+    expect(order[0]).toContain("src");
+    expect(order[0]).toContain('query "needle"');
+    expect(order[1]).toBe("tool:search_text");
+  });
+
   test("stops repeated same list_dir probe earlier than generic loop guard", async () => {
     const transport = createSameProbeTransport(3);
     const textDeltas: string[] = [];

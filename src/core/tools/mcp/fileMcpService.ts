@@ -1,6 +1,7 @@
 import {
   copyFile,
   cp,
+  access,
   mkdir,
   readdir,
   readFile,
@@ -12,15 +13,37 @@ import {
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import type {
+  ApplyPatchToolRequest,
   CommandToolRequest,
   FileAction,
   FindFilesToolRequest,
+  FindReferencesToolRequest,
+  FindSymbolToolRequest,
+  GitBlameToolRequest,
+  GitDiffToolRequest,
+  GitLogToolRequest,
+  GitShowToolRequest,
+  GitStatusToolRequest,
+  OutlineFileToolRequest,
   PendingReviewItem,
+  ReadJsonToolRequest,
+  ReadFilesToolRequest,
+  ReadRangeToolRequest,
+  ReadYamlToolRequest,
   RuleConfig,
+  SearchTextContextToolRequest,
   SearchTextToolRequest,
   ShellToolRequest,
+  OpenShellToolRequest,
+  WriteShellToolRequest,
+  ReadShellToolRequest,
+  ShellStatusToolRequest,
+  InterruptShellToolRequest,
+  CloseShellToolRequest,
+  StatPathsToolRequest,
   ToolRequest,
 } from "./types";
+import { parseYamlDocument } from "./simpleYaml";
 
 type HandleResult = {
   ok: boolean;
@@ -38,6 +61,12 @@ type FileMcpServiceOptions = {
     resolvedCwd: string,
     shell: ShellFlavor
   ) => Promise<string | CommandExecutionResult>;
+  gitRunner?: (
+    args: string[],
+    resolvedCwd: string
+  ) => Promise<string | CommandExecutionResult>;
+  ptyFactory?: PtyFactory;
+  shellSettleMs?: number;
 };
 
 type CommandExecutionResult = {
@@ -47,6 +76,68 @@ type CommandExecutionResult = {
   stderr?: string;
   output?: string;
   truncated?: boolean;
+};
+
+type ShellSessionStatus = "none" | "idle" | "running" | "exited";
+
+type PersistentShellFlavor = "pwsh" | "bash" | "sh";
+
+type PtyExitEvent = {
+  exitCode: number;
+  signal?: string | number;
+};
+
+type PtySubscription = {
+  dispose: () => void;
+};
+
+type PtyProcess = {
+  write: (data: string) => void;
+  kill: (signal?: string) => void;
+  onData: (listener: (data: string) => void) => PtySubscription | void;
+  onExit: (listener: (event: PtyExitEvent) => void) => PtySubscription | void;
+};
+
+type PtyFactoryOptions = {
+  file: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  name: string;
+  cols: number;
+  rows: number;
+};
+
+type PtyFactory = (options: PtyFactoryOptions) => Promise<PtyProcess> | PtyProcess;
+
+type ActiveShellSession = {
+  shell: PersistentShellFlavor;
+  program: string;
+  cwd: string;
+  busy: boolean;
+  alive: boolean;
+  exited: boolean;
+  createdAt: string;
+  lastActivityAt: string;
+  lastExitCode: number | null;
+  unreadOutputBuffer: string;
+  unreadOutputTruncated: boolean;
+  controlBuffer: string;
+  pendingCommandId: string | null;
+  pendingExitCode: number | null;
+  pendingCwd: string | null;
+  handle: PtyProcess;
+  dataSubscription?: PtySubscription;
+  exitSubscription?: PtySubscription;
+};
+
+type ShellSessionWriteAuditResult = {
+  ok: boolean;
+  shell: PersistentShellFlavor;
+  tokens: string[];
+  risk: "low" | "medium" | "high";
+  reason?: string;
+  notes: string[];
 };
 
 type SearchableFile = {
@@ -73,10 +164,24 @@ type ShellAuditResult = {
 
 const READ_ONLY_ACTIONS: FileAction[] = [
   "read_file",
+  "read_files",
+  "read_range",
+  "read_json",
+  "read_yaml",
   "list_dir",
   "stat_path",
+  "stat_paths",
+  "outline_file",
   "find_files",
+  "find_symbol",
+  "find_references",
   "search_text",
+  "search_text_context",
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_show",
+  "git_blame",
 ];
 const SHELL_MUTATING_COMMANDS = new Set([
   "rm",
@@ -113,11 +218,15 @@ const MAX_COMMAND_OUTPUT_CHARS = 24_000;
 const DEFAULT_SEARCH_RESULTS = 50;
 const MAX_SEARCH_RESULTS = 200;
 const MAX_SEARCH_SNIPPET_CHARS = 160;
+const DEFAULT_GIT_LOG_RESULTS = 12;
+const MAX_GIT_LOG_RESULTS = 50;
 const RECENT_LIST_DIR_WINDOW_MS = 5_000;
+const DEFAULT_SHELL_SETTLE_MS = 160;
 const PENDING_CONFLICT_ACTIONS: FileAction[] = [
   "create_file",
   "write_file",
   "edit_file",
+  "apply_patch",
   "delete_file",
   "copy_path",
   "move_path",
@@ -159,6 +268,22 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "read_file":
     case "cat":
       return "read_file";
+    case "read_files":
+    case "cat_files":
+    case "multi_read":
+      return "read_files";
+    case "read_range":
+    case "read_lines":
+    case "read_window":
+      return "read_range";
+    case "read_json":
+    case "json":
+    case "json_read":
+      return "read_json";
+    case "read_yaml":
+    case "yaml":
+    case "yaml_read":
+      return "read_yaml";
     case "list":
     case "list_dir":
     case "ls":
@@ -182,6 +307,9 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "edit_file":
     case "replace":
       return "edit_file";
+    case "apply_patch":
+    case "patch":
+      return "apply_patch";
     case "delete":
     case "delete_file":
     case "remove":
@@ -191,14 +319,33 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "stat_path":
     case "info":
       return "stat_path";
+    case "stat_paths":
+    case "multi_stat":
+      return "stat_paths";
+    case "outline":
+    case "outline_file":
+    case "symbols":
+      return "outline_file";
     case "find":
     case "find_files":
     case "glob":
       return "find_files";
+    case "find_symbol":
+    case "symbol":
+    case "symbols_find":
+      return "find_symbol";
+    case "find_references":
+    case "references":
+    case "refs":
+      return "find_references";
     case "search":
     case "search_text":
     case "grep":
       return "search_text";
+    case "search_text_context":
+    case "grep_context":
+    case "search_context":
+      return "search_text_context";
     case "copy":
     case "copy_path":
     case "cp":
@@ -213,11 +360,45 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "command":
     case "exec":
       return "run_command";
+    case "git_status":
+    case "status_git":
+      return "git_status";
+    case "git_diff":
+    case "diff_git":
+      return "git_diff";
+    case "git_log":
+    case "log_git":
+      return "git_log";
+    case "git_show":
+    case "show_git":
+      return "git_show";
+    case "git_blame":
+    case "blame_git":
+      return "git_blame";
     case "run_shell":
     case "shell_command":
     case "terminal":
     case "shell":
       return "run_shell";
+    case "open_shell":
+    case "shell_open":
+      return "open_shell";
+    case "write_shell":
+    case "shell_write":
+    case "shell_input":
+      return "write_shell";
+    case "read_shell":
+    case "shell_read":
+      return "read_shell";
+    case "shell_status":
+    case "status_shell":
+      return "shell_status";
+    case "interrupt_shell":
+    case "shell_interrupt":
+      return "interrupt_shell";
+    case "close_shell":
+    case "shell_close":
+      return "close_shell";
     default:
       return null;
   }
@@ -253,6 +434,36 @@ const pickFirstNonEmptyValue = (values: string[] | undefined) => {
   return undefined;
 };
 
+const buildPathTargets = (
+  path: string | undefined,
+  extraPaths: string[] | undefined,
+  options?: { allowCurrentDir?: boolean }
+) => {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  const allowCurrentDir = options?.allowCurrentDir ?? true;
+
+  for (const candidate of [path, ...(extraPaths ?? [])]) {
+    const trimmed = candidate?.trim();
+    if (!trimmed || (!allowCurrentDir && trimmed === ".")) {
+      continue;
+    }
+    if (seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    merged.push(trimmed);
+  }
+
+  return merged;
+};
+
+const buildReadFilesTargets = (path: string | undefined, extraPaths: string[] | undefined) =>
+  buildPathTargets(path, extraPaths, { allowCurrentDir: false });
+
+const buildStatPathsTargets = (path: string | undefined, extraPaths: string[] | undefined) =>
+  buildPathTargets(path, extraPaths, { allowCurrentDir: true });
+
 const pickNumber = (obj: Record<string, unknown>, keys: string[]) => {
   for (const key of keys) {
     const value = obj[key];
@@ -287,11 +498,44 @@ const pickBoolean = (obj: Record<string, unknown>, keys: string[]) => {
   return undefined;
 };
 
+const hasRecordValue = (obj: Record<string, unknown>, keys: string[]) =>
+  keys.some(key => {
+    const value = obj[key];
+    if (value === undefined || value === null) {
+      return false;
+    }
+    if (typeof value === "string") {
+      return value.trim().length > 0;
+    }
+    return true;
+  });
+
 const normalizeSearchLimit = (value: number | undefined) => {
   if (!Number.isFinite(value) || !value || value <= 0) {
     return DEFAULT_SEARCH_RESULTS;
   }
   return Math.min(MAX_SEARCH_RESULTS, Math.max(1, Math.floor(value)));
+};
+
+const normalizeGitLogLimit = (value: number | undefined) => {
+  if (!Number.isFinite(value) || !value || value <= 0) {
+    return DEFAULT_GIT_LOG_RESULTS;
+  }
+  return Math.min(MAX_GIT_LOG_RESULTS, Math.max(1, Math.floor(value)));
+};
+
+const normalizePositiveInteger = (value: number | undefined) => {
+  if (!Number.isFinite(value) || !value || value <= 0) {
+    return undefined;
+  }
+  return Math.floor(value);
+};
+
+const normalizeNonNegativeInteger = (value: number | undefined) => {
+  if (!Number.isFinite(value) || typeof value !== "number" || value < 0) {
+    return undefined;
+  }
+  return Math.floor(value);
 };
 
 const toRecord = (input: unknown): Record<string, unknown> | null => {
@@ -334,6 +578,48 @@ const tokenizeCommand = (raw: string) =>
 
 const getShellFlavor = (): ShellFlavor =>
   process.platform === "win32" ? "pwsh" : "sh";
+
+const getPersistentShellFlavor = async (): Promise<PersistentShellFlavor> => {
+  if (process.platform === "win32") {
+    return "pwsh";
+  }
+  try {
+    await access("/bin/bash");
+    return "bash";
+  } catch {
+    return "sh";
+  }
+};
+
+const getPersistentShellProgram = (shell: PersistentShellFlavor) =>
+  shell === "pwsh" ? "pwsh" : shell === "bash" ? "/bin/bash" : "/bin/sh";
+
+const isPersistentShellAction = (
+  action: ToolRequest["action"]
+): action is
+  | "open_shell"
+  | "write_shell"
+  | "read_shell"
+  | "shell_status"
+  | "interrupt_shell"
+  | "close_shell" =>
+  [
+    "open_shell",
+    "write_shell",
+    "read_shell",
+    "shell_status",
+    "interrupt_shell",
+    "close_shell",
+  ].includes(action);
+
+const SHELL_STATUS_MARKER_PREFIX = "__CYRENE_STATUS__";
+const SHELL_CWD_MARKER_PREFIX = "__CYRENE_CWD__";
+
+const buildShellStatusMarker = (commandId: string, exitCode: number | string) =>
+  `${SHELL_STATUS_MARKER_PREFIX}${commandId}__${exitCode}`;
+
+const buildShellCwdMarker = (commandId: string, cwd: string) =>
+  `${SHELL_CWD_MARKER_PREFIX}${commandId}__${cwd}`;
 
 const tokenizeSafeShellCommand = (
   raw: string
@@ -471,6 +757,50 @@ const getShellTargetOperands = (commandName: string, tokens: string[]) => {
   }
 };
 
+const getShellSessionStatus = (session: ActiveShellSession | null): ShellSessionStatus => {
+  if (!session) {
+    return "none";
+  }
+  if (session.exited || !session.alive) {
+    return "exited";
+  }
+  return session.busy ? "running" : "idle";
+};
+
+const formatShellExitCode = (exitCode: number | null) =>
+  exitCode === null ? "unknown" : String(exitCode);
+
+const buildShellCommandWrapper = (
+  shell: PersistentShellFlavor,
+  input: string,
+  commandId: string
+) => {
+  if (shell === "pwsh") {
+    return [
+      "& {",
+      input,
+      "$cyreneSuccess = $?",
+      "$cyreneExit = if ($LASTEXITCODE -is [int]) { $LASTEXITCODE } elseif ($cyreneSuccess) { 0 } else { 1 }",
+      "$cyrenePwd = (Get-Location).Path",
+      `Write-Output "${buildShellStatusMarker(commandId, "$cyreneExit")}"`,
+      `Write-Output "${buildShellCwdMarker(commandId, "$cyrenePwd")}"`,
+      "}",
+      "",
+    ].join("\n");
+  }
+
+  return [
+    "{",
+    input,
+    "__cyrene_exit=$?",
+    "__cyrene_pwd=$(pwd)",
+    `printf '%s\\n' "${buildShellStatusMarker(commandId, "$__cyrene_exit")}"`,
+    `printf '%s\\n' "${buildShellCwdMarker(commandId, "$__cyrene_pwd")}"`,
+    "}",
+    "",
+  ].join("\n");
+};
+
 const appendBoundedOutput = (
   current: string,
   incoming: string,
@@ -539,7 +869,7 @@ const resolveRecordAction = (
   normalizeAction(toolName);
 
 const buildSearchInputGuidance = (
-  action: "find_files" | "search_text",
+  action: "find_files" | "search_text" | "search_text_context",
   field: "pattern" | "query"
 ) =>
   `Invalid tool input for ${action}: ${action} requires \`${field}\`. Use \`path: "."\` when searching the whole workspace and omit unrelated empty fields.`;
@@ -551,16 +881,47 @@ const buildNormalizedFileRequest = (
   content: string | undefined,
   find: string | undefined,
   replace: string | undefined,
-  rawArgs: string[] | undefined
+  rawArgs: string[] | undefined,
+  explicitPaths: string[] | undefined
 ): ToolRequest | null => {
   const destination = pickString(record, ["destination", "dest", "to", "target_path"]);
   const pattern =
     pickString(record, ["pattern", "glob"]) ?? pickFirstNonEmptyValue(rawArgs);
+  const symbol =
+    pickString(record, ["symbol", "name", "identifier"]) ??
+    pickString(record, ["query", "needle"]);
   const query = pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
+  const revision = pickString(record, ["revision", "rev", "commit", "ref"]);
+  const jsonPath = pickString(record, ["jsonPath", "json_path", "pointer", "key"]);
+  const yamlPath = pickString(record, ["yamlPath", "yaml_path", "pointer", "key"]);
   const maxResults = normalizeSearchLimit(
     pickNumber(record, ["maxResults", "max_results", "limit"])
   );
   const caseSensitive = pickBoolean(record, ["caseSensitive", "case_sensitive"]);
+  const startLine = normalizePositiveInteger(
+    pickNumber(record, ["startLine", "start_line", "lineStart", "line_start"])
+  );
+  const endLine = normalizePositiveInteger(
+    pickNumber(record, ["endLine", "end_line", "lineEnd", "line_end"])
+  );
+  const before = normalizeNonNegativeInteger(
+    pickNumber(record, ["before", "contextBefore", "context_before"])
+  );
+  const after = normalizeNonNegativeInteger(
+    pickNumber(record, ["after", "contextAfter", "context_after"])
+  );
+  const hasStartLine = hasRecordValue(record, [
+    "startLine",
+    "start_line",
+    "lineStart",
+    "line_start",
+  ]);
+  const hasEndLine = hasRecordValue(record, [
+    "endLine",
+    "end_line",
+    "lineEnd",
+    "line_end",
+  ]);
 
   switch (action) {
     case "read_file":
@@ -568,10 +929,63 @@ const buildNormalizedFileRequest = (
     case "create_dir":
     case "delete_file":
     case "stat_path":
+    case "outline_file":
+    case "git_status":
+    case "git_diff":
       if (!path) {
         return null;
       }
       return { action, path };
+    case "read_json":
+      if (!path) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        jsonPath,
+      };
+    case "read_yaml":
+      if (!path) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        yamlPath,
+      };
+    case "read_files": {
+      const targets = buildReadFilesTargets(path, explicitPaths);
+      if (targets.length === 0) {
+        return null;
+      }
+      return {
+        action,
+        path: targets[0] ?? ".",
+        paths: targets.slice(1),
+      };
+    }
+    case "read_range":
+      if (!path || typeof startLine !== "number" || typeof endLine !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        startLine,
+        endLine,
+      };
+    case "stat_paths": {
+      const targets = buildStatPathsTargets(path, explicitPaths);
+      if (targets.length === 0) {
+        return null;
+      }
+      return {
+        action,
+        path: targets[0] ?? ".",
+        paths: targets.slice(1),
+      };
+    }
     case "create_file":
       if (!path) {
         return null;
@@ -583,6 +997,7 @@ const buildNormalizedFileRequest = (
       }
       return { action, path, content };
     case "edit_file":
+    case "apply_patch":
       if (!path) {
         return null;
       }
@@ -603,6 +1018,18 @@ const buildNormalizedFileRequest = (
         maxResults,
         caseSensitive,
       };
+    case "find_symbol":
+    case "find_references":
+      if (!symbol) {
+        return null;
+      }
+      return {
+        action,
+        path: path ?? ".",
+        symbol,
+        maxResults,
+        caseSensitive,
+      };
     case "search_text":
       if (!query) {
         return null;
@@ -614,6 +1041,52 @@ const buildNormalizedFileRequest = (
         maxResults,
         caseSensitive,
       };
+    case "search_text_context":
+      if (!query) {
+        return null;
+      }
+      return {
+        action,
+        path: path ?? ".",
+        query,
+        before,
+        after,
+        maxResults,
+        caseSensitive,
+      };
+    case "git_log":
+      return {
+        action,
+        path: path ?? ".",
+        maxResults: normalizeGitLogLimit(
+          pickNumber(record, ["maxResults", "max_results", "limit"])
+        ),
+      };
+    case "git_show":
+      if (!revision) {
+        return null;
+      }
+      return {
+        action,
+        path: path ?? ".",
+        revision,
+      };
+    case "git_blame": {
+      if (!path) {
+        return null;
+      }
+      if ((hasStartLine && typeof startLine !== "number") || (hasEndLine && typeof endLine !== "number")) {
+        return null;
+      }
+      const normalizedStart = startLine ?? endLine;
+      const normalizedEnd = endLine ?? startLine;
+      return {
+        action,
+        path,
+        startLine: normalizedStart,
+        endLine: normalizedEnd,
+      };
+    }
     case "copy_path":
     case "move_path":
       if (!path || !destination) {
@@ -647,7 +1120,14 @@ const normalizeFromRecord = (
   const replace = pickString(record, ["replace", "new", "after"]);
   const cwd = pickString(record, ["cwd", "working_directory", "workdir"]);
   const rawArgs = pickStringArray(record, ["args", "argv", "arguments"]);
+  const explicitPaths = pickStringArray(record, [
+    "paths",
+    "files",
+    "file_paths",
+    "filepaths",
+  ]);
   const rawCommand = pickString(record, ["command", "cmd", "program", "executable"]);
+  const shellInput = pickString(record, ["input", "text", "line"]);
 
   if (action === "run_command" || ["command", "exec"].includes(toolName)) {
     const tokens = rawCommand ? tokenizeCommand(rawCommand) : [];
@@ -678,11 +1158,85 @@ const normalizeFromRecord = (
     };
   }
 
+  if (action === "open_shell") {
+    return {
+      action: "open_shell",
+      cwd,
+      path: path ?? ".",
+    };
+  }
+
+  if (action === "write_shell") {
+    if (!shellInput) {
+      return null;
+    }
+    return {
+      action: "write_shell",
+      input: shellInput.trim(),
+      path: path ?? ".",
+    };
+  }
+
+  if (action === "read_shell") {
+    return {
+      action: "read_shell",
+      path: path ?? ".",
+    };
+  }
+
+  if (action === "shell_status") {
+    return {
+      action: "shell_status",
+      path: path ?? ".",
+    };
+  }
+
+  if (action === "interrupt_shell") {
+    return {
+      action: "interrupt_shell",
+      path: path ?? ".",
+    };
+  }
+
+  if (action === "close_shell") {
+    return {
+      action: "close_shell",
+      path: path ?? ".",
+    };
+  }
+
   if (!action) {
     if (path && pickString(record, ["destination", "dest", "to", "target_path"])) {
       action = "move_path";
+    } else if (path && pickString(record, ["revision", "rev", "commit", "ref"])) {
+      action = "git_show";
+    } else if (
+      path &&
+      typeof normalizePositiveInteger(
+        pickNumber(record, ["startLine", "start_line", "lineStart", "line_start"])
+      ) === "number" &&
+      typeof normalizePositiveInteger(
+        pickNumber(record, ["endLine", "end_line", "lineEnd", "line_end"])
+      ) === "number"
+    ) {
+      action = "read_range";
+    } else if (
+      path &&
+      pickString(record, ["symbol", "name", "identifier"])
+    ) {
+      action = "find_symbol";
     } else if (path && pickString(record, ["pattern", "glob"])) {
       action = "find_files";
+    } else if (
+      path &&
+      pickString(record, ["query", "needle"]) &&
+      (record.before !== undefined || record.after !== undefined)
+    ) {
+      action = "search_text_context";
+    } else if (path && pickString(record, ["yamlPath", "yaml_path"])) {
+      action = "read_yaml";
+    } else if (path && pickString(record, ["jsonPath", "json_path", "pointer", "key"])) {
+      action = "read_json";
     } else if (path && pickString(record, ["query", "needle"])) {
       action = "search_text";
     } else if (path && find && typeof replace === "string") {
@@ -705,7 +1259,8 @@ const normalizeFromRecord = (
     content,
     find,
     replace,
-    rawArgs
+    rawArgs,
+    explicitPaths
   );
 };
 
@@ -748,14 +1303,32 @@ const normalizeToolInput = (
         ? 4 + normalized.args.length + (normalized.cwd ? 1 : 0)
         : normalized.action === "run_shell"
           ? 4 + (normalized.cwd ? 1 : 0)
+        : normalized.action === "open_shell"
+          ? 4 + (normalized.cwd ? 1 : 0)
+        : normalized.action === "write_shell"
+          ? 4 + normalized.input.length
+        : normalized.action === "read_shell" ||
+            normalized.action === "shell_status" ||
+            normalized.action === "interrupt_shell" ||
+            normalized.action === "close_shell"
+          ? 3
         : 2 +
           (normalized.path ? 2 : 0) +
+          ("paths" in normalized ? (normalized.paths?.length ?? 0) : 0) +
           ("content" in normalized ? 1 : 0) +
           ("find" in normalized ? 1 : 0) +
           ("replace" in normalized ? 1 : 0) +
           ("destination" in normalized ? 2 : 0) +
+          ("startLine" in normalized ? 2 : 0) +
+          ("endLine" in normalized ? 2 : 0) +
+          ("jsonPath" in normalized && normalized.jsonPath ? 1 : 0) +
+          ("yamlPath" in normalized && normalized.yamlPath ? 1 : 0) +
           ("pattern" in normalized ? 2 : 0) +
-          ("query" in normalized ? 2 : 0);
+          ("symbol" in normalized ? 2 : 0) +
+          ("query" in normalized ? 2 : 0) +
+          ("before" in normalized ? 1 : 0) +
+          ("after" in normalized ? 1 : 0) +
+          ("revision" in normalized ? 2 : 0);
     if (score > bestScore) {
       bestScore = score;
       best = normalized;
@@ -787,6 +1360,110 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
         return buildSearchInputGuidance("search_text", "query");
       }
     }
+
+    if (action === "search_text_context") {
+      const query =
+        pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
+      if (!query) {
+        return buildSearchInputGuidance("search_text_context", "query");
+      }
+    }
+
+    if (action === "read_range") {
+      const startLine = normalizePositiveInteger(
+        pickNumber(record, ["startLine", "start_line", "lineStart", "line_start"])
+      );
+      const endLine = normalizePositiveInteger(
+        pickNumber(record, ["endLine", "end_line", "lineEnd", "line_end"])
+      );
+      if (typeof startLine !== "number" || typeof endLine !== "number") {
+        return "Invalid tool input for read_range: read_range requires `startLine` and `endLine` as 1-based inclusive integers.";
+      }
+    }
+
+    if (action === "stat_paths") {
+      const path = pickString(record, [
+        "path",
+        "file",
+        "file_path",
+        "filepath",
+        "target",
+        "dir",
+        "directory",
+      ]);
+      const paths = pickStringArray(record, ["paths", "files", "file_paths", "filepaths"]);
+      const targets = buildStatPathsTargets(path, paths);
+      if (targets.length === 0) {
+        return "Invalid tool input for stat_paths: provide at least one path via `path` or `paths`.";
+      }
+    }
+
+    if (action === "find_symbol") {
+      const symbol =
+        pickString(record, ["symbol", "name", "identifier"]) ??
+        pickString(record, ["query", "needle"]);
+      if (!symbol) {
+        return "Invalid tool input for find_symbol: find_symbol requires `symbol`.";
+      }
+    }
+
+    if (action === "find_references") {
+      const symbol =
+        pickString(record, ["symbol", "name", "identifier"]) ??
+        pickString(record, ["query", "needle"]);
+      if (!symbol) {
+        return "Invalid tool input for find_references: find_references requires `symbol`.";
+      }
+    }
+
+    if (action === "git_show") {
+      const revision = pickString(record, ["revision", "rev", "commit", "ref"]);
+      if (!revision) {
+        return "Invalid tool input for git_show: git_show requires `revision`.";
+      }
+    }
+
+    if (action === "git_blame") {
+      const hasStartLine = hasRecordValue(record, [
+        "startLine",
+        "start_line",
+        "lineStart",
+        "line_start",
+      ]);
+      const hasEndLine = hasRecordValue(record, [
+        "endLine",
+        "end_line",
+        "lineEnd",
+        "line_end",
+      ]);
+      const startLine = normalizePositiveInteger(
+        pickNumber(record, ["startLine", "start_line", "lineStart", "line_start"])
+      );
+      const endLine = normalizePositiveInteger(
+        pickNumber(record, ["endLine", "end_line", "lineEnd", "line_end"])
+      );
+
+      if ((hasStartLine && typeof startLine !== "number") || (hasEndLine && typeof endLine !== "number")) {
+        return "Invalid tool input for git_blame: git_blame requires positive integer `startLine` / `endLine` when provided.";
+      }
+
+      const normalizedStart = startLine ?? endLine;
+      const normalizedEnd = endLine ?? startLine;
+      if (
+        typeof normalizedStart === "number" &&
+        typeof normalizedEnd === "number" &&
+        normalizedStart > normalizedEnd
+      ) {
+        return "Invalid tool input for git_blame: git_blame requires `startLine` to be less than or equal to `endLine`.";
+      }
+    }
+
+    if (action === "write_shell") {
+      const shellInput = pickString(record, ["input", "text", "line"]);
+      if (!shellInput) {
+        return "Invalid tool input for write_shell: write_shell requires `input`.";
+      }
+    }
   }
 
   return null;
@@ -807,13 +1484,67 @@ const validateRequest = (request: ToolRequest): string | null => {
     return null;
   }
 
+  if (request.action === "open_shell") {
+    return null;
+  }
+
+  if (request.action === "write_shell") {
+    if (!request.input.trim()) {
+      return "write_shell requires `input`.";
+    }
+    if (/[\r\n]/.test(request.input)) {
+      return "write_shell requires a single-line `input`.";
+    }
+    return null;
+  }
+
+  if (
+    request.action === "read_shell" ||
+    request.action === "shell_status" ||
+    request.action === "interrupt_shell" ||
+    request.action === "close_shell"
+  ) {
+    return null;
+  }
+
   switch (request.action) {
+    case "read_files": {
+      const targets = buildReadFilesTargets(request.path, request.paths);
+      if (targets.length === 0) {
+        return "read_files requires at least one file path via `path` or `paths`.";
+      }
+      return null;
+    }
+    case "stat_paths": {
+      const targets = buildStatPathsTargets(request.path, request.paths);
+      if (targets.length === 0) {
+        return "stat_paths requires at least one path via `path` or `paths`.";
+      }
+      return null;
+    }
+    case "read_range":
+      if (!Number.isInteger(request.startLine) || request.startLine <= 0) {
+        return "read_range requires a positive integer `startLine`.";
+      }
+      if (!Number.isInteger(request.endLine) || request.endLine <= 0) {
+        return "read_range requires a positive integer `endLine`.";
+      }
+      if (request.startLine > request.endLine) {
+        return "read_range requires `startLine` to be less than or equal to `endLine`.";
+      }
+      return null;
+    case "read_json":
+    case "read_yaml":
     case "create_file":
     case "create_dir":
     case "read_file":
     case "list_dir":
     case "delete_file":
     case "stat_path":
+    case "outline_file":
+    case "git_status":
+    case "git_diff":
+    case "git_log":
       return null;
     case "write_file":
       if (typeof request.content !== "string") {
@@ -821,11 +1552,12 @@ const validateRequest = (request: ToolRequest): string | null => {
       }
       return null;
     case "edit_file":
+    case "apply_patch":
       if (!request.find) {
-        return "edit_file requires `find`.";
+        return `${request.action} requires \`find\`.`;
       }
       if (typeof request.replace !== "string") {
-        return "edit_file requires `replace`.";
+        return `${request.action} requires \`replace\`.`;
       }
       return null;
     case "find_files":
@@ -833,11 +1565,55 @@ const validateRequest = (request: ToolRequest): string | null => {
         return "find_files requires `pattern`.";
       }
       return null;
+    case "find_symbol":
+    case "find_references":
+      if (!request.symbol.trim()) {
+        return `${request.action} requires \`symbol\`.`;
+      }
+      return null;
     case "search_text":
       if (!request.query.trim()) {
         return "search_text requires `query`.";
       }
       return null;
+    case "search_text_context":
+      if (!request.query.trim()) {
+        return "search_text_context requires `query`.";
+      }
+      if (
+        typeof request.before === "number" &&
+        (!Number.isInteger(request.before) || request.before < 0)
+      ) {
+        return "search_text_context requires `before` to be a non-negative integer when provided.";
+      }
+      if (
+        typeof request.after === "number" &&
+        (!Number.isInteger(request.after) || request.after < 0)
+      ) {
+        return "search_text_context requires `after` to be a non-negative integer when provided.";
+      }
+      return null;
+    case "git_show":
+      if (!request.revision.trim()) {
+        return "git_show requires `revision`.";
+      }
+      return null;
+    case "git_blame": {
+      const startLine = request.startLine ?? request.endLine;
+      const endLine = request.endLine ?? request.startLine;
+      if (typeof startLine === "number" || typeof endLine === "number") {
+        if (!Number.isInteger(startLine) || !startLine || startLine <= 0) {
+          return "git_blame requires `startLine` to be a positive integer when provided.";
+        }
+        if (!Number.isInteger(endLine) || !endLine || endLine <= 0) {
+          return "git_blame requires `endLine` to be a positive integer when provided.";
+        }
+        if (startLine > endLine) {
+          return "git_blame requires `startLine` to be less than or equal to `endLine`.";
+        }
+      }
+      return null;
+    }
     case "copy_path":
     case "move_path":
       if (!request.destination.trim()) {
@@ -854,6 +1630,109 @@ const clipSnippet = (text: string) => {
   const normalized = text.replace(/\s+/g, " ").trim();
   return clip(normalized, MAX_SEARCH_SNIPPET_CHARS);
 };
+
+const clipContextLine = (text: string) =>
+  clip(text.replace(/\t/g, "  "), MAX_SEARCH_SNIPPET_CHARS);
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const splitFileLines = (content: string) => {
+  if (content.length === 0) {
+    return [] as string[];
+  }
+  const lines = content.split(/\r?\n/);
+  if (/\r?\n$/.test(content)) {
+    lines.pop();
+  }
+  return lines;
+};
+
+const formatNumberedLines = (lines: string[], startLine: number) =>
+  lines
+    .map((line, index) => {
+      const lineNo = String(startLine + index).padStart(lineNoWidth, " ");
+      return `  ${lineNo} | ${line}`;
+    })
+    .join("\n");
+
+const formatContextWindow = (
+  lines: string[],
+  hitIndex: number,
+  before: number,
+  after: number
+) => {
+  const start = Math.max(0, hitIndex - before);
+  const end = Math.min(lines.length - 1, hitIndex + after);
+  const window: string[] = [];
+
+  for (let index = start; index <= end; index += 1) {
+    const lineNo = String(index + 1).padStart(lineNoWidth, " ");
+    const marker = index === hitIndex ? ">" : " ";
+    window.push(`${marker} ${lineNo} | ${clipContextLine(lines[index] ?? "")}`);
+  }
+
+  return window.join("\n");
+};
+
+const parseStructuredPathSegments = (input: string) => {
+  const normalized = input.trim().replace(/^\$\./, "").replace(/^\$/, "");
+  if (!normalized) {
+    return [] as string[];
+  }
+
+  return normalized
+    .replace(/\[(\d+)\]/g, ".$1")
+    .split(".")
+    .map(segment => segment.trim())
+    .filter(Boolean);
+};
+
+const formatStructuredValue = (value: unknown) =>
+  typeof value === "string"
+    ? JSON.stringify(value)
+    : JSON.stringify(value, null, 2) ?? String(value);
+
+const OUTLINE_PATTERNS = [
+  /^(?:export\s+)?(?:default\s+)?class\s+[A-Za-z_$][\w$]*/,
+  /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*/,
+  /^(?:export\s+)?interface\s+[A-Za-z_$][\w$]*/,
+  /^(?:export\s+)?type\s+[A-Za-z_$][\w$]*/,
+  /^(?:export\s+)?enum\s+[A-Za-z_$][\w$]*/,
+  /^(?:export\s+)?const\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:\([^=]*\)|[A-Za-z_$][\w$]*)\s*=>/,
+  /^(?:async\s+)?def\s+[A-Za-z_][\w]*\s*\(/,
+  /^class\s+[A-Za-z_][\w]*(?:\([^)]*\))?:/,
+];
+
+const getOutlineEntry = (line: string) => {
+  const trimmed = line.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("*") ||
+    trimmed.startsWith("/*")
+  ) {
+    return null;
+  }
+  return OUTLINE_PATTERNS.some(pattern => pattern.test(trimmed)) ? trimmed : null;
+};
+
+const buildSymbolDefinitionPatterns = (symbol: string, flags: string) => [
+  new RegExp(`^(?:export\\s+)?(?:default\\s+)?class\\s+${symbol}\\b`, flags),
+  new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${symbol}\\b`, flags),
+  new RegExp(`^(?:export\\s+)?interface\\s+${symbol}\\b`, flags),
+  new RegExp(`^(?:export\\s+)?type\\s+${symbol}\\b`, flags),
+  new RegExp(`^(?:export\\s+)?enum\\s+${symbol}\\b`, flags),
+  new RegExp(
+    `^(?:export\\s+)?const\\s+${symbol}\\s*=\\s*(?:async\\s*)?(?:\\([^=]*\\)|[A-Za-z_$][\\w$]*)\\s*=>`,
+    flags
+  ),
+  new RegExp(`^(?:async\\s+)?def\\s+${symbol}\\b`, flags),
+  new RegExp(`^class\\s+${symbol}(?:\\(|:|\\s|$)`, flags),
+];
+
+const buildSymbolReferencePattern = (symbol: string, caseSensitive: boolean) =>
+  new RegExp(`(^|[^A-Za-z0-9_$])${symbol}([^A-Za-z0-9_$]|$)`, caseSensitive ? "" : "i");
 
 const globToRegExp = (pattern: string, caseSensitive: boolean) => {
   const normalized = pattern.replace(/\\/g, "/");
@@ -908,6 +1787,7 @@ export class FileMcpService {
     { output: string; listedAt: number; mutationVersion: number }
   >();
   private filesystemMutationVersion = 0;
+  private shellSession: ActiveShellSession | null = null;
 
   constructor(
     private readonly rules: RuleConfig,
@@ -963,6 +1843,7 @@ export class FileMcpService {
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
+      isPersistentShellAction(request.action) ||
       request.action === "create_dir" ||
       READ_ONLY_ACTIONS.includes(request.action)
     ) {
@@ -1007,6 +1888,7 @@ export class FileMcpService {
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
+      isPersistentShellAction(request.action) ||
       request.action === "create_dir"
     ) {
       return null;
@@ -1026,13 +1908,14 @@ export class FileMcpService {
         return null;
       case "write_file":
         return null;
-      case "edit_file": {
+      case "edit_file":
+      case "apply_patch": {
         if (!(await this.pathExists(request.path))) {
-          return `edit_file target does not exist: ${normalizedPath}`;
+          return `${request.action} target does not exist: ${normalizedPath}`;
         }
         const before = await readFile(this.resolvePath(request.path), "utf8");
         if (!request.find || !before.includes(request.find)) {
-          return `edit_file find text not found: ${normalizedPath}`;
+          return `${request.action} find text not found: ${normalizedPath}`;
         }
         return null;
       }
@@ -1166,6 +2049,573 @@ export class FileMcpService {
     };
   }
 
+  private auditShellSessionWrite(request: WriteShellToolRequest): ShellSessionWriteAuditResult {
+    const session = this.shellSession;
+    const shell = session?.shell ?? (process.platform === "win32" ? "pwsh" : "bash");
+    const tokenized = tokenizeSafeShellCommand(request.input);
+    if (!tokenized.ok) {
+      return {
+        ok: false,
+        shell,
+        tokens: [],
+        risk: "high",
+        reason: tokenized.reason.replace(/^run_shell\b/, "write_shell"),
+        notes: ["Only a safe reviewed single-line shell subset is allowed."],
+      };
+    }
+
+    const tokens = tokenized.tokens;
+    const commandName = (tokens[0] ?? "").toLowerCase();
+    const cwd = session?.cwd ?? resolve(this.rules.workspaceRoot);
+    const targetTokens = getShellTargetOperands(commandName, tokens);
+
+    if (["sudo", "su", "doas", "runas"].includes(commandName)) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "high",
+        reason: "write_shell blocks privilege-escalation commands.",
+        notes: ["Privilege escalation is not allowed."],
+      };
+    }
+
+    if (["curl", "wget", "invoke-webrequest", "invoke-restmethod", "iwr", "irm"].includes(commandName)) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "high",
+        reason: "write_shell blocks download-oriented commands in v1.",
+        notes: ["Network download commands are treated as high risk."],
+      };
+    }
+
+    if (["exit", "logout", "quit"].includes(commandName)) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "medium",
+        reason: "write_shell does not allow exit-style commands. Use close_shell instead.",
+        notes: ["Close the persistent shell through the dedicated action."],
+      };
+    }
+
+    if (
+      SHELL_DELETE_COMMANDS.has(commandName) &&
+      hasRecursiveForceFlags(commandName, tokens) &&
+      targetTokens.some(token => isRootLikeShellTarget(token))
+    ) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "high",
+        reason: "write_shell blocked a dangerous root deletion pattern.",
+        notes: ["High-risk recursive deletion was detected."],
+      };
+    }
+
+    if (targetTokens.some(token => looksLikeUrl(token))) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "high",
+        reason: "write_shell does not allow URL targets in workspace-mutating commands.",
+        notes: ["Workspace-targeted shell actions must stay local."],
+      };
+    }
+
+    if (commandName === "cd") {
+      const destination = targetTokens[0];
+      if (!destination) {
+        return {
+          ok: false,
+          shell,
+          tokens,
+          risk: "medium",
+          reason: "write_shell requires an explicit path for cd.",
+          notes: ["Use a workspace-relative directory path."],
+        };
+      }
+      const resolvedTarget = resolve(cwd, destination);
+      if (!isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot)) {
+        return {
+          ok: false,
+          shell,
+          tokens,
+          risk: "high",
+          reason: "write_shell blocked a cd target outside the workspace root.",
+          notes: ["Persistent shell navigation must stay inside the workspace root."],
+        };
+      }
+    }
+
+    if (commandName === "." || commandName === "source") {
+      const sourceTarget = targetTokens[0];
+      if (!sourceTarget) {
+        return {
+          ok: false,
+          shell,
+          tokens,
+          risk: "medium",
+          reason: "write_shell requires an explicit path for source commands.",
+          notes: ["Use a workspace-relative activation script path."],
+        };
+      }
+      const resolvedTarget = resolve(cwd, sourceTarget);
+      if (!isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot)) {
+        return {
+          ok: false,
+          shell,
+          tokens,
+          risk: "high",
+          reason: "write_shell blocked a source target outside the workspace root.",
+          notes: ["Sourced scripts must stay inside the workspace root."],
+        };
+      }
+    }
+
+    if (
+      SHELL_MUTATING_COMMANDS.has(commandName) &&
+      targetTokens.some(token => {
+        if (!looksLikePathToken(token)) {
+          return false;
+        }
+        const resolvedTarget = resolve(cwd, token);
+        return !isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot);
+      })
+    ) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        risk: "high",
+        reason: "write_shell blocked a write or delete target outside the workspace root.",
+        notes: ["Shell mutations must stay inside the workspace root."],
+      };
+    }
+
+    const risk =
+      commandName === "cd" || commandName === "." || commandName === "source"
+        ? "low"
+        : SHELL_MUTATING_COMMANDS.has(commandName)
+          ? "medium"
+          : "low";
+
+    return {
+      ok: true,
+      shell,
+      tokens,
+      risk,
+      notes: [
+        "Only a safe reviewed single-line shell subset is allowed.",
+        risk === "medium"
+          ? "This shell input may mutate workspace files and still requires review."
+          : "This shell input is stateful or low-impact, but still requires review.",
+      ],
+    };
+  }
+
+  private getShellSettleMs() {
+    const value = this.options.shellSettleMs;
+    if (!Number.isFinite(value) || typeof value !== "number" || value < 0) {
+      return DEFAULT_SHELL_SETTLE_MS;
+    }
+    return Math.floor(value);
+  }
+
+  private toWorkspaceDisplayPath(inputPath: string) {
+    try {
+      return this.normalizeWorkspacePath(inputPath);
+    } catch {
+      return inputPath;
+    }
+  }
+
+  private getShellSessionCwdDisplay(session: ActiveShellSession | null) {
+    if (!session) {
+      return ".";
+    }
+    return this.toWorkspaceDisplayPath(session.cwd);
+  }
+
+  private formatShellSessionState(
+    session: ActiveShellSession | null,
+    output?: string,
+    outputTruncated = false
+  ) {
+    const status = getShellSessionStatus(session);
+    const outputText = output?.trim() ? output : "(no new output)";
+    return [
+      `status: ${status}`,
+      `shell: ${session?.shell ?? "none"}`,
+      `cwd: ${this.getShellSessionCwdDisplay(session)}`,
+      `busy: ${session?.busy ? "true" : "false"}`,
+      `alive: ${session?.alive ? "true" : "false"}`,
+      `pending_output: ${session?.unreadOutputBuffer.trim() ? "true" : "false"}`,
+      `last_exit: ${formatShellExitCode(session?.lastExitCode ?? null)}`,
+      output !== undefined
+        ? `output_truncated: ${outputTruncated ? `true (bounded to ${MAX_COMMAND_OUTPUT_CHARS} chars)` : "false"}`
+        : "",
+      output !== undefined ? "output:" : "",
+      output !== undefined ? outputText : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private consumeShellControlBuffer(session: ActiveShellSession) {
+    const normalized = session.controlBuffer.replace(/\r\n/g, "\n");
+    const lines = normalized.split("\n");
+    session.controlBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (
+        session.pendingCommandId &&
+        line.startsWith(`${SHELL_STATUS_MARKER_PREFIX}${session.pendingCommandId}__`)
+      ) {
+        const rawExit = line.slice(
+          `${SHELL_STATUS_MARKER_PREFIX}${session.pendingCommandId}__`.length
+        );
+        const parsedExit = Number(rawExit);
+        session.pendingExitCode = Number.isFinite(parsedExit) ? parsedExit : null;
+        continue;
+      }
+
+      if (
+        session.pendingCommandId &&
+        line.startsWith(`${SHELL_CWD_MARKER_PREFIX}${session.pendingCommandId}__`)
+      ) {
+        session.pendingCwd = line.slice(
+          `${SHELL_CWD_MARKER_PREFIX}${session.pendingCommandId}__`.length
+        );
+        session.cwd = session.pendingCwd || session.cwd;
+        session.lastExitCode = session.pendingExitCode;
+        session.busy = false;
+        session.pendingCommandId = null;
+        session.pendingCwd = null;
+        session.pendingExitCode = null;
+        continue;
+      }
+
+      const next = appendBoundedOutput(
+        session.unreadOutputBuffer,
+        `${line}\n`,
+        MAX_COMMAND_OUTPUT_CHARS
+      );
+      session.unreadOutputBuffer = next.text;
+      session.unreadOutputTruncated =
+        session.unreadOutputTruncated || next.truncated;
+    }
+  }
+
+  private flushUnreadShellOutput(session: ActiveShellSession) {
+    this.consumeShellControlBuffer(session);
+    let output = session.unreadOutputBuffer;
+    let truncated = session.unreadOutputTruncated;
+    if (
+      session.controlBuffer &&
+      !session.controlBuffer.startsWith(SHELL_STATUS_MARKER_PREFIX) &&
+      !session.controlBuffer.startsWith(SHELL_CWD_MARKER_PREFIX)
+    ) {
+      const next = appendBoundedOutput(output, session.controlBuffer, MAX_COMMAND_OUTPUT_CHARS);
+      output = next.text;
+      truncated = truncated || next.truncated;
+      session.controlBuffer = "";
+    }
+    session.unreadOutputBuffer = "";
+    session.unreadOutputTruncated = false;
+    return {
+      output: output.trimEnd(),
+      truncated,
+    };
+  }
+
+  private async waitForShellSettle() {
+    await new Promise(resolvePromise => {
+      setTimeout(resolvePromise, this.getShellSettleMs());
+    });
+  }
+
+  private async loadPtyFactory(): Promise<PtyFactory> {
+    if (this.options.ptyFactory) {
+      return this.options.ptyFactory;
+    }
+
+    try {
+      const module = await import("node-pty");
+      return options => {
+        const handle = module.spawn(options.file, options.args, {
+          cwd: options.cwd,
+          env: options.env,
+          name: options.name,
+          cols: options.cols,
+          rows: options.rows,
+        });
+        return {
+          write: data => handle.write(data),
+          kill: signal => handle.kill(signal),
+          onData: listener => {
+            const disposable = handle.onData(listener);
+            return { dispose: () => disposable.dispose() };
+          },
+          onExit: listener => {
+            const disposable = handle.onExit(event =>
+              listener({
+                exitCode: event.exitCode,
+                signal: event.signal,
+              })
+            );
+            return { dispose: () => disposable.dispose() };
+          },
+        } satisfies PtyProcess;
+      };
+    } catch (error) {
+      throw new Error(
+        `Persistent shell support requires node-pty. ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  dispose() {
+    const session = this.shellSession;
+    if (!session) {
+      return;
+    }
+    session.dataSubscription?.dispose();
+    session.exitSubscription?.dispose();
+    try {
+      session.handle.kill("SIGTERM");
+    } catch {
+      // Best effort cleanup on exit.
+    }
+    this.shellSession = null;
+  }
+
+  private buildShellSpawnArgs(shell: PersistentShellFlavor) {
+    if (shell === "pwsh") {
+      return ["-NoLogo", "-NoProfile"];
+    }
+    if (shell === "bash") {
+      return ["--noprofile", "--norc"];
+    }
+    return [];
+  }
+
+  private buildPtyEnvironment() {
+    return Object.fromEntries(
+      Object.entries(process.env).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string"
+      )
+    );
+  }
+
+  private async openPersistentShell(request: OpenShellToolRequest) {
+    const existingSession = this.shellSession;
+    if (existingSession) {
+      throw new Error(
+        `Persistent shell session already exists (${getShellSessionStatus(existingSession)}). Use close_shell before opening another session.`
+      );
+    }
+
+    const shell = await getPersistentShellFlavor();
+    const program = getPersistentShellProgram(shell);
+    const cwd = request.cwd
+      ? this.resolvePath(request.cwd)
+      : resolve(this.rules.workspaceRoot);
+    const ptyFactory = await this.loadPtyFactory();
+    const handle = await ptyFactory({
+      file: program,
+      args: this.buildShellSpawnArgs(shell),
+      cwd,
+      env: this.buildPtyEnvironment(),
+      name: "xterm-256color",
+      cols: 120,
+      rows: 32,
+    });
+
+    const session: ActiveShellSession = {
+      shell,
+      program,
+      cwd,
+      busy: false,
+      alive: true,
+      exited: false,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      lastExitCode: null,
+      unreadOutputBuffer: "",
+      unreadOutputTruncated: false,
+      controlBuffer: "",
+      pendingCommandId: null,
+      pendingExitCode: null,
+      pendingCwd: null,
+      handle,
+    };
+
+    session.dataSubscription = handle.onData(data => {
+      const next = appendBoundedOutput(session.controlBuffer, data, MAX_COMMAND_OUTPUT_CHARS * 2);
+      session.controlBuffer = next.text;
+      session.lastActivityAt = new Date().toISOString();
+      this.consumeShellControlBuffer(session);
+    }) ?? undefined;
+
+    session.exitSubscription = handle.onExit(event => {
+      session.alive = false;
+      session.exited = true;
+      session.busy = false;
+      session.pendingCommandId = null;
+      session.pendingCwd = null;
+      session.pendingExitCode = null;
+      session.lastExitCode = Number.isFinite(event.exitCode)
+        ? event.exitCode
+        : session.lastExitCode;
+      session.lastActivityAt = new Date().toISOString();
+      this.consumeShellControlBuffer(session);
+    }) ?? undefined;
+
+    this.shellSession = session;
+    await this.waitForShellSettle();
+    return session;
+  }
+
+  private async executeOpenShell(request: OpenShellToolRequest): Promise<string> {
+    const session = await this.openPersistentShell(request);
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    return [
+      "status: opened",
+      `program: ${session.program}`,
+      this.formatShellSessionState(session, output, truncated),
+    ].join("\n");
+  }
+
+  private getActiveShellSession() {
+    const session = this.shellSession;
+    if (!session) {
+      throw new Error("No active persistent shell session. Use open_shell first.");
+    }
+    if (!session.alive || session.exited) {
+      throw new Error(
+        "Persistent shell session has already exited. Use close_shell, then open_shell again."
+      );
+    }
+    return session;
+  }
+
+  private async executeWriteShell(request: WriteShellToolRequest): Promise<string> {
+    const session = this.getActiveShellSession();
+    if (session.busy) {
+      throw new Error(
+        "Persistent shell session is busy. Use read_shell, shell_status, or interrupt_shell before sending more input."
+      );
+    }
+
+    const audit = this.auditShellSessionWrite(request);
+    if (!audit.ok) {
+      throw new Error(audit.reason ?? "write_shell blocked by shell auditor.");
+    }
+
+    const commandId = crypto.randomUUID().slice(0, 8);
+    session.busy = true;
+    session.pendingCommandId = commandId;
+    session.pendingExitCode = null;
+    session.pendingCwd = null;
+    session.lastActivityAt = new Date().toISOString();
+    session.handle.write(buildShellCommandWrapper(session.shell, request.input, commandId));
+    await this.waitForShellSettle();
+    this.consumeShellControlBuffer(session);
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    return [
+      `status: ${session.busy ? "running" : "completed"}`,
+      `input: ${request.input}`,
+      this.formatShellSessionState(session, output, truncated),
+    ].join("\n");
+  }
+
+  private async executeReadShell(): Promise<string> {
+    const session = this.shellSession;
+    if (!session) {
+      return this.formatShellSessionState(null, "", false);
+    }
+    this.consumeShellControlBuffer(session);
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    return this.formatShellSessionState(session, output, truncated);
+  }
+
+  private async executeShellStatus(): Promise<string> {
+    const session = this.shellSession;
+    if (!session) {
+      return this.formatShellSessionState(null);
+    }
+    this.consumeShellControlBuffer(session);
+    return this.formatShellSessionState(session);
+  }
+
+  private async executeInterruptShell(): Promise<string> {
+    const session = this.shellSession;
+    if (!session) {
+      return [
+        "status: no_session",
+        this.formatShellSessionState(null, "", false),
+      ].join("\n");
+    }
+
+    try {
+      session.handle.write("\u0003");
+    } catch {
+      try {
+        session.handle.kill("SIGINT");
+      } catch {
+        // Best effort interrupt only.
+      }
+    }
+
+    session.busy = false;
+    session.pendingCommandId = null;
+    session.pendingCwd = null;
+    session.pendingExitCode = null;
+    session.lastExitCode = 130;
+    session.lastActivityAt = new Date().toISOString();
+    await this.waitForShellSettle();
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    return [
+      "status: interrupted",
+      this.formatShellSessionState(session, output, truncated),
+    ].join("\n");
+  }
+
+  private async executeCloseShell(): Promise<string> {
+    const session = this.shellSession;
+    if (!session) {
+      return [
+        "status: closed",
+        this.formatShellSessionState(null),
+      ].join("\n");
+    }
+
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    const summary = [
+      "status: closed",
+      `shell: ${session.shell}`,
+      `cwd: ${this.getShellSessionCwdDisplay(session)}`,
+      `alive: false`,
+      `busy: false`,
+      `pending_output: false`,
+      `last_exit: ${formatShellExitCode(session.lastExitCode)}`,
+      "output_truncated: " +
+        (truncated ? `true (bounded to ${MAX_COMMAND_OUTPUT_CHARS} chars)` : "false"),
+      "output:",
+      output.trim() ? output : "(no new output)",
+    ].join("\n");
+    this.dispose();
+    return summary;
+  }
+
   private noteFilesystemMutation() {
     this.filesystemMutationVersion += 1;
     this.recentListDir.clear();
@@ -1208,6 +2658,37 @@ export class FileMcpService {
     request: ToolRequest,
     mode: "summary" | "full"
   ): Promise<string> {
+    if (request.action === "open_shell") {
+      const shell = await getPersistentShellFlavor();
+      return [
+        "[shell session preview]",
+        `shell: ${shell}`,
+        `cwd: ${request.cwd ?? "."}`,
+        `existing_session: ${getShellSessionStatus(this.shellSession)}`,
+        "risk: medium",
+        "note: Persistent shell state is kept in memory for this CLI process only.",
+        "note: Use write_shell after approval when environment or cwd must persist.",
+        `mode: ${mode}`,
+      ].join("\n");
+    }
+
+    if (request.action === "write_shell") {
+      const audit = this.auditShellSessionWrite(request);
+      return [
+        "[shell session preview]",
+        `shell: ${audit.shell}`,
+        `cwd: ${this.getShellSessionCwdDisplay(this.shellSession)}`,
+        `input: ${request.input}`,
+        `risk: ${audit.risk}`,
+        `tokens: ${audit.tokens.length > 0 ? audit.tokens.join(" ") : "(none)"}`,
+        ...audit.notes.map(note => `note: ${note}`),
+        audit.reason ? `reason: ${audit.reason}` : "",
+        `mode: ${mode}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     if (request.action === "run_command") {
       return [
         "[process preview]",
@@ -1266,7 +2747,8 @@ export class FileMcpService {
     if (
       request.action !== "create_file" &&
       request.action !== "write_file" &&
-      request.action !== "edit_file"
+      request.action !== "edit_file" &&
+      request.action !== "apply_patch"
     ) {
       return "";
     }
@@ -1308,12 +2790,13 @@ export class FileMcpService {
 
     const find = request.find ?? "";
     const replace = request.replace ?? "";
+    const previewLabel = request.action === "apply_patch" ? "[patch preview]" : "[edit preview]";
     try {
       const before = await readFile(abs, "utf8");
       const hit = before.indexOf(find);
       const startLine = hit >= 0 ? lineNumberAtIndex(before, hit) : 1;
       return [
-        "[edit preview]",
+        previewLabel,
         "[old - to be removed]",
         formatDiffLines(
           "-",
@@ -1331,7 +2814,7 @@ export class FileMcpService {
       ].join("\n");
     } catch {
       return [
-        "[edit preview]",
+        previewLabel,
         "[old - to be removed]",
         formatDiffLines(
           "-",
@@ -1370,11 +2853,39 @@ export class FileMcpService {
       }
       return chunks.join(" | ");
     }
+    if (request.action === "open_shell") {
+      chunks.push(`shell=${process.platform === "win32" ? "pwsh" : "bash/sh"}`);
+      if (request.cwd) {
+        chunks.push(`cwd=${request.cwd}`);
+      }
+      return chunks.join(" | ");
+    }
+    if (request.action === "write_shell") {
+      chunks.push(`input=${clip(request.input, 120)}`);
+      chunks.push(`cwd=${this.getShellSessionCwdDisplay(this.shellSession)}`);
+      return chunks.join(" | ");
+    }
+    if (
+      request.action === "read_shell" ||
+      request.action === "shell_status" ||
+      request.action === "interrupt_shell" ||
+      request.action === "close_shell"
+    ) {
+      chunks.push(`cwd=${this.getShellSessionCwdDisplay(this.shellSession)}`);
+      return chunks.join(" | ");
+    }
     if ("destination" in request) {
       chunks.push(`destination=${request.destination}`);
     }
     if ("pattern" in request) {
       chunks.push(`pattern=${request.pattern}`);
+      chunks.push(`maxResults=${request.maxResults ?? DEFAULT_SEARCH_RESULTS}`);
+      if (typeof request.caseSensitive === "boolean") {
+        chunks.push(`caseSensitive=${request.caseSensitive}`);
+      }
+    }
+    if ("symbol" in request) {
+      chunks.push(`symbol=${request.symbol}`);
       chunks.push(`maxResults=${request.maxResults ?? DEFAULT_SEARCH_RESULTS}`);
       if (typeof request.caseSensitive === "boolean") {
         chunks.push(`caseSensitive=${request.caseSensitive}`);
@@ -1386,6 +2897,18 @@ export class FileMcpService {
       if (typeof request.caseSensitive === "boolean") {
         chunks.push(`caseSensitive=${request.caseSensitive}`);
       }
+    }
+    if ("jsonPath" in request && request.jsonPath) {
+      chunks.push(`jsonPath=${request.jsonPath}`);
+    }
+    if ("yamlPath" in request && request.yamlPath) {
+      chunks.push(`yamlPath=${request.yamlPath}`);
+    }
+    if ("startLine" in request && typeof request.startLine === "number") {
+      chunks.push(`startLine=${request.startLine}`);
+    }
+    if ("endLine" in request && typeof request.endLine === "number") {
+      chunks.push(`endLine=${request.endLine}`);
     }
     if ("find" in request && request.find) {
       chunks.push(`find=${request.find}`);
@@ -1815,6 +3338,50 @@ export class FileMcpService {
     return [`Found ${matches.length} match(es):`, ...matches].join("\n");
   }
 
+  private async executeSearchTextContext(
+    request: SearchTextContextToolRequest
+  ): Promise<string> {
+    const files = await this.walkFiles(request.path);
+    const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
+    const caseSensitive = request.caseSensitive ?? false;
+    const query = caseSensitive ? request.query : request.query.toLowerCase();
+    const before = request.before ?? 2;
+    const after = request.after ?? 2;
+    const matches: string[] = [];
+
+    for (const file of files) {
+      const info = await stat(file.absolutePath);
+      if (info.size > this.rules.maxReadBytes) {
+        continue;
+      }
+
+      const content = await readFile(file.absolutePath, "utf8");
+      const lines = splitFileLines(content);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? "";
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        if (!haystack.includes(query)) {
+          continue;
+        }
+
+        matches.push(
+          [`[match] ${file.workspacePath}:${index + 1}`, formatContextWindow(lines, index, before, after)].join(
+            "\n"
+          )
+        );
+        if (matches.length >= limit) {
+          return [`Found ${matches.length} contextual match(es):`, ...matches].join("\n\n");
+        }
+      }
+    }
+
+    if (matches.length === 0) {
+      return `(no text matches for query: ${request.query})`;
+    }
+
+    return [`Found ${matches.length} contextual match(es):`, ...matches].join("\n\n");
+  }
+
   private async executeMovePath(request: Extract<ToolRequest, { action: "move_path" }>) {
     const source = this.resolvePath(request.path);
     const destination = this.resolvePath(request.destination);
@@ -1855,12 +3422,648 @@ export class FileMcpService {
     return `Copied path: ${request.path} -> ${request.destination}`;
   }
 
+  private getReadFilesTargets(request: ReadFilesToolRequest) {
+    return buildReadFilesTargets(request.path, request.paths);
+  }
+
+  private getStatPathsTargets(request: StatPathsToolRequest) {
+    return buildStatPathsTargets(request.path, request.paths);
+  }
+
+  private async executeReadFiles(request: ReadFilesToolRequest) {
+    const outputs: string[] = [];
+
+    for (const target of this.getReadFilesTargets(request)) {
+      const abs = this.resolvePath(target);
+      const info = await stat(abs);
+      if (!info.isFile()) {
+        throw new Error(`read_files only supports files: ${target}`);
+      }
+      if (info.size > this.rules.maxReadBytes) {
+        throw new Error(
+          `read_files target too large: ${target} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
+        );
+      }
+      const content = await readFile(abs, "utf8");
+      outputs.push(`[file] ${target}`);
+      outputs.push(content.length > 0 ? content : "(empty file)");
+    }
+
+    return outputs.join("\n\n");
+  }
+
+  private async executeReadRange(request: ReadRangeToolRequest) {
+    const abs = this.resolvePath(request.path);
+    const info = await stat(abs);
+    if (!info.isFile()) {
+      throw new Error(`read_range only supports files: ${request.path}`);
+    }
+    if (info.size > this.rules.maxReadBytes) {
+      throw new Error(
+        `read_range target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
+      );
+    }
+
+    const content = await readFile(abs, "utf8");
+    const allLines = splitFileLines(content);
+    const selectedLines = allLines.slice(request.startLine - 1, request.endLine);
+
+    return [
+      `path: ${request.path}`,
+      `lines: ${request.startLine}-${request.endLine}`,
+      selectedLines.length > 0
+        ? formatNumberedLines(selectedLines.map(line => clipContextLine(line)), request.startLine)
+        : "(no lines in requested range)",
+    ].join("\n");
+  }
+
+  private async executeReadJson(request: ReadJsonToolRequest) {
+    const abs = this.resolvePath(request.path);
+    const info = await stat(abs);
+    if (!info.isFile()) {
+      throw new Error(`read_json only supports files: ${request.path}`);
+    }
+    if (info.size > this.rules.maxReadBytes) {
+      throw new Error(
+        `read_json target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
+      );
+    }
+
+    const content = await readFile(abs, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch (error) {
+      throw new Error(
+        `read_json requires valid JSON in ${request.path}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    let value = parsed;
+    if (request.jsonPath) {
+      for (const segment of parseStructuredPathSegments(request.jsonPath)) {
+        if (Array.isArray(value)) {
+          const index = Number(segment);
+          if (!Number.isInteger(index) || index < 0 || index >= value.length) {
+            throw new Error(`read_json jsonPath not found: ${request.jsonPath}`);
+          }
+          value = value[index];
+          continue;
+        }
+        if (!value || typeof value !== "object" || !(segment in (value as Record<string, unknown>))) {
+          throw new Error(`read_json jsonPath not found: ${request.jsonPath}`);
+        }
+        value = (value as Record<string, unknown>)[segment];
+      }
+    }
+
+    return [
+      `path: ${request.path}`,
+      request.jsonPath ? `jsonPath: ${request.jsonPath}` : "",
+      "value:",
+      formatStructuredValue(value),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async executeReadYaml(request: ReadYamlToolRequest) {
+    const abs = this.resolvePath(request.path);
+    const info = await stat(abs);
+    if (!info.isFile()) {
+      throw new Error(`read_yaml only supports files: ${request.path}`);
+    }
+    if (info.size > this.rules.maxReadBytes) {
+      throw new Error(
+        `read_yaml target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
+      );
+    }
+
+    const content = await readFile(abs, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = parseYamlDocument(content);
+    } catch (error) {
+      throw new Error(
+        `read_yaml requires supported YAML in ${request.path}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    let value = parsed;
+    if (request.yamlPath) {
+      for (const segment of parseStructuredPathSegments(request.yamlPath)) {
+        if (Array.isArray(value)) {
+          const index = Number(segment);
+          if (!Number.isInteger(index) || index < 0 || index >= value.length) {
+            throw new Error(`read_yaml yamlPath not found: ${request.yamlPath}`);
+          }
+          value = value[index];
+          continue;
+        }
+        if (!value || typeof value !== "object" || !(segment in (value as Record<string, unknown>))) {
+          throw new Error(`read_yaml yamlPath not found: ${request.yamlPath}`);
+        }
+        value = (value as Record<string, unknown>)[segment];
+      }
+    }
+
+    return [
+      `path: ${request.path}`,
+      request.yamlPath ? `yamlPath: ${request.yamlPath}` : "",
+      "value:",
+      formatStructuredValue(value),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async executeStatPaths(request: StatPathsToolRequest) {
+    const targets = this.getStatPathsTargets(request);
+    const outputs: string[] = [`Stat ${targets.length} path(s):`];
+
+    for (const target of targets) {
+      const normalizedTarget = this.normalizeWorkspacePath(target);
+      try {
+        const info = await stat(this.resolvePath(target));
+        const kind = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
+        outputs.push(
+          [
+            `[path] ${normalizedTarget}`,
+            "exists: true",
+            `kind: ${kind}`,
+            `size: ${info.size}`,
+            `mtime: ${info.mtime.toISOString()}`,
+          ].join("\n")
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+        outputs.push(
+          [`[path] ${normalizedTarget}`, "exists: false", "kind: missing", "size: -", "mtime: -"].join(
+            "\n"
+          )
+        );
+      }
+    }
+
+    return outputs.join("\n\n");
+  }
+
+  private async executeOutlineFile(request: OutlineFileToolRequest) {
+    const abs = this.resolvePath(request.path);
+    const info = await stat(abs);
+    if (!info.isFile()) {
+      throw new Error(`outline_file only supports files: ${request.path}`);
+    }
+    if (info.size > this.rules.maxReadBytes) {
+      throw new Error(
+        `outline_file target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
+      );
+    }
+
+    const content = await readFile(abs, "utf8");
+    const entries = splitFileLines(content)
+      .map((line, index) => {
+        const entry = getOutlineEntry(line);
+        if (!entry) {
+          return null;
+        }
+        const lineNo = String(index + 1).padStart(lineNoWidth, " ");
+        return `${lineNo} | ${clip(entry, 160)}`;
+      })
+      .filter((entry): entry is string => Boolean(entry));
+
+    if (entries.length === 0) {
+      return `Outline for ${request.path}\n(no outline symbols found)`;
+    }
+
+    return [`Outline for ${request.path}`, ...entries].join("\n");
+  }
+
+  private async executeFindSymbol(request: FindSymbolToolRequest) {
+    const files = await this.walkFiles(request.path);
+    const caseSensitive = request.caseSensitive ?? false;
+    const flags = caseSensitive ? "" : "i";
+    const symbol = escapeRegExp(request.symbol);
+    const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
+    const patterns = buildSymbolDefinitionPatterns(symbol, flags);
+    const matches: string[] = [];
+
+    for (const file of files) {
+      const info = await stat(file.absolutePath);
+      if (info.size > this.rules.maxReadBytes) {
+        continue;
+      }
+      const content = await readFile(file.absolutePath, "utf8");
+      const lines = splitFileLines(content);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? "";
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        if (!patterns.some(pattern => pattern.test(trimmed))) {
+          continue;
+        }
+        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
+        if (matches.length >= limit) {
+          return [`Found ${matches.length} symbol match(es):`, ...matches].join("\n");
+        }
+      }
+    }
+
+    if (matches.length === 0) {
+      return `(no symbol matches for: ${request.symbol})`;
+    }
+
+    return [`Found ${matches.length} symbol match(es):`, ...matches].join("\n");
+  }
+
+  private async executeFindReferences(request: FindReferencesToolRequest) {
+    const files = await this.walkFiles(request.path);
+    const caseSensitive = request.caseSensitive ?? false;
+    const flags = caseSensitive ? "" : "i";
+    const escapedSymbol = escapeRegExp(request.symbol);
+    const definitionPatterns = buildSymbolDefinitionPatterns(escapedSymbol, flags);
+    const referencePattern = buildSymbolReferencePattern(escapedSymbol, caseSensitive);
+    const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
+    const matches: string[] = [];
+
+    for (const file of files) {
+      const info = await stat(file.absolutePath);
+      if (info.size > this.rules.maxReadBytes) {
+        continue;
+      }
+      const content = await readFile(file.absolutePath, "utf8");
+      const lines = splitFileLines(content);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? "";
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        if (definitionPatterns.some(pattern => pattern.test(trimmed))) {
+          continue;
+        }
+        if (!referencePattern.test(line)) {
+          continue;
+        }
+        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
+        if (matches.length >= limit) {
+          return [`Found ${matches.length} reference match(es):`, ...matches].join("\n");
+        }
+      }
+    }
+
+    if (matches.length === 0) {
+      return `(no reference matches for symbol: ${request.symbol})`;
+    }
+
+    return [`Found ${matches.length} reference match(es):`, ...matches].join("\n");
+  }
+
+  private async findGitRepoRoot(inputPath: string) {
+    const workspaceRoot = resolve(this.rules.workspaceRoot);
+    let current = this.resolvePath(inputPath);
+
+    try {
+      const info = await stat(current);
+      if (info.isFile()) {
+        current = dirname(current);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        current = dirname(current);
+      } else {
+        throw error;
+      }
+    }
+
+    while (true) {
+      try {
+        await stat(resolve(current, ".git"));
+        return current;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+
+      if (current === workspaceRoot) {
+        break;
+      }
+
+      const parent = dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+
+    throw new Error(`git repository not found for path: ${inputPath}`);
+  }
+
+  private getGitScopePath(repoRoot: string, inputPath: string) {
+    const absolute = this.resolvePath(inputPath);
+    const relativePath = relative(repoRoot, absolute).replace(/\\/g, "/");
+    return relativePath && relativePath !== "." ? relativePath : null;
+  }
+
+  private formatGitOutput(label: string, result: CommandExecutionResult) {
+    const sections: string[] = [];
+    if (typeof result.output === "string" && result.output.trim()) {
+      sections.push(result.output.trim());
+    } else {
+      if (result.stdout?.trim()) {
+        sections.push(result.stdout.trim());
+      }
+      if (result.stderr?.trim()) {
+        sections.push(result.stderr.trim());
+      }
+    }
+
+    const body = sections.join("\n").trim();
+    const bounded = appendBoundedOutput("", body, MAX_COMMAND_OUTPUT_CHARS);
+    if (result.status !== "completed" || result.exitCode !== 0) {
+      const exitDisplay =
+        result.status === "timed_out"
+          ? "timeout"
+          : result.exitCode === null
+            ? "unknown"
+            : String(result.exitCode);
+      throw new Error(body || `${label} failed with exit ${exitDisplay}`);
+    }
+
+    if (!bounded.text.trim()) {
+      return "";
+    }
+
+    return bounded.truncated
+      ? `${bounded.text}\n... output truncated at ${MAX_COMMAND_OUTPUT_CHARS} chars`
+      : bounded.text;
+  }
+
+  private async runGit(
+    args: string[],
+    cwd: string
+  ): Promise<CommandExecutionResult> {
+    if (this.options.gitRunner) {
+      try {
+        const result = await this.options.gitRunner(args, cwd);
+        if (typeof result === "string") {
+          const bounded = appendBoundedOutput("", result, MAX_COMMAND_OUTPUT_CHARS);
+          return {
+            status: "completed",
+            exitCode: 0,
+            output: bounded.text,
+            truncated: bounded.truncated,
+          };
+        }
+        return result;
+      } catch (error) {
+        return {
+          status: "failed",
+          exitCode: null,
+          stderr: error instanceof Error ? error.message : String(error),
+          truncated: false,
+        };
+      }
+    }
+
+    return await new Promise<CommandExecutionResult>(resolvePromise => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("git", args, {
+          cwd,
+          shell: false,
+        });
+      } catch (error) {
+        resolvePromise({
+          status: "failed",
+          exitCode: null,
+          stderr: error instanceof Error ? error.message : String(error),
+          truncated: false,
+        });
+        return;
+      }
+
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      let outputTruncated = false;
+
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        child.kill("SIGTERM");
+        resolvePromise({
+          status: "timed_out",
+          exitCode: null,
+          stderr: `Command timed out after ${COMMAND_TIMEOUT_MS}ms.`,
+          stdout,
+          truncated: outputTruncated,
+        });
+      }, COMMAND_TIMEOUT_MS);
+
+      const appendChunk = (target: "stdout" | "stderr", chunk: Buffer | string) => {
+        const text = chunk.toString();
+        if (target === "stdout") {
+          const next = appendBoundedOutput(stdout, text, MAX_COMMAND_OUTPUT_CHARS);
+          stdout = next.text;
+          outputTruncated = outputTruncated || next.truncated;
+        } else {
+          const next = appendBoundedOutput(stderr, text, MAX_COMMAND_OUTPUT_CHARS);
+          stderr = next.text;
+          outputTruncated = outputTruncated || next.truncated;
+        }
+      };
+
+      child.stdout?.on("data", chunk => appendChunk("stdout", chunk));
+      child.stderr?.on("data", chunk => appendChunk("stderr", chunk));
+      child.on("error", error => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise({
+          status: "failed",
+          exitCode: null,
+          stderr: error.message,
+          stdout,
+          truncated: outputTruncated,
+        });
+      });
+      child.on("close", code => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise({
+          status: code === 0 ? "completed" : "failed",
+          exitCode: code ?? null,
+          stdout,
+          stderr,
+          truncated: outputTruncated,
+        });
+      });
+    });
+  }
+
+  private async executeGitStatus(request: GitStatusToolRequest) {
+    const repoRoot = await this.findGitRepoRoot(request.path);
+    const scopePath = this.getGitScopePath(repoRoot, request.path);
+    const args = ["status", "--short", "--branch"];
+    if (scopePath) {
+      args.push("--", scopePath);
+    }
+    const statusOutput = this.formatGitOutput(
+      "git status",
+      await this.runGit(args, repoRoot)
+    );
+    return [
+      `repo: ${this.normalizeWorkspacePath(relative(this.rules.workspaceRoot, repoRoot) || ".")}`,
+      `scope: ${scopePath ?? "."}`,
+      statusOutput || "(clean working tree)",
+    ].join("\n");
+  }
+
+  private async executeGitDiff(request: GitDiffToolRequest) {
+    const repoRoot = await this.findGitRepoRoot(request.path);
+    const scopePath = this.getGitScopePath(repoRoot, request.path);
+    const repoLabel = this.normalizeWorkspacePath(relative(this.rules.workspaceRoot, repoRoot) || ".");
+    const scopeArgs = scopePath ? ["--", scopePath] : [];
+    const unstaged = this.formatGitOutput(
+      "git diff",
+      await this.runGit(["diff", "--no-ext-diff", "--minimal", ...scopeArgs], repoRoot)
+    );
+    const staged = this.formatGitOutput(
+      "git diff --cached",
+      await this.runGit(["diff", "--cached", "--no-ext-diff", "--minimal", ...scopeArgs], repoRoot)
+    );
+
+    return [
+      `repo: ${repoLabel}`,
+      `scope: ${scopePath ?? "."}`,
+      "[unstaged]",
+      unstaged || "(none)",
+      "",
+      "[staged]",
+      staged || "(none)",
+    ].join("\n");
+  }
+
+  private async executeGitLog(request: GitLogToolRequest) {
+    const repoRoot = await this.findGitRepoRoot(request.path);
+    const scopePath = this.getGitScopePath(repoRoot, request.path);
+    const repoLabel = this.normalizeWorkspacePath(relative(this.rules.workspaceRoot, repoRoot) || ".");
+    const args = [
+      "log",
+      `-n${normalizeGitLogLimit(request.maxResults)}`,
+      "--date=short",
+      "--pretty=format:%h %ad %s",
+    ];
+    if (scopePath) {
+      args.push("--", scopePath);
+    }
+    const output = this.formatGitOutput("git log", await this.runGit(args, repoRoot));
+
+    return [
+      `repo: ${repoLabel}`,
+      `scope: ${scopePath ?? "."}`,
+      output || "(no commits found)",
+    ].join("\n");
+  }
+
+  private async executeGitShow(request: GitShowToolRequest) {
+    const repoRoot = await this.findGitRepoRoot(request.path);
+    const scopePath = this.getGitScopePath(repoRoot, request.path);
+    const repoLabel = this.normalizeWorkspacePath(relative(this.rules.workspaceRoot, repoRoot) || ".");
+    const args = [
+      "show",
+      "--stat",
+      "--patch",
+      "--no-ext-diff",
+      "--minimal",
+      request.revision,
+    ];
+    if (scopePath) {
+      args.push("--", scopePath);
+    }
+    const output = this.formatGitOutput("git show", await this.runGit(args, repoRoot));
+
+    return [
+      `repo: ${repoLabel}`,
+      `scope: ${scopePath ?? "."}`,
+      `revision: ${request.revision}`,
+      output || "(no output for revision in scope)",
+    ].join("\n");
+  }
+
+  private async executeGitBlame(request: GitBlameToolRequest) {
+    const absolute = this.resolvePath(request.path);
+    const info = await stat(absolute);
+    if (!info.isFile()) {
+      throw new Error(`git_blame only supports files: ${request.path}`);
+    }
+
+    const repoRoot = await this.findGitRepoRoot(request.path);
+    const scopePath = this.getGitScopePath(repoRoot, request.path);
+    if (!scopePath) {
+      throw new Error(`git_blame requires a file path inside the repository: ${request.path}`);
+    }
+
+    const repoLabel = this.normalizeWorkspacePath(relative(this.rules.workspaceRoot, repoRoot) || ".");
+    const startLine = request.startLine ?? request.endLine;
+    const endLine = request.endLine ?? request.startLine;
+    const args = ["blame", "--date=short"];
+    if (typeof startLine === "number" && typeof endLine === "number") {
+      args.push("-L", `${startLine},${endLine}`);
+    }
+    args.push("--", scopePath);
+
+    const output = this.formatGitOutput("git blame", await this.runGit(args, repoRoot));
+
+    return [
+      `repo: ${repoLabel}`,
+      `scope: ${scopePath}`,
+      typeof startLine === "number" && typeof endLine === "number"
+        ? `lines: ${startLine}-${endLine}`
+        : "",
+      output || "(no blame output)",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   private async execute(request: ToolRequest): Promise<string> {
     if (request.action === "run_command") {
       return this.executeCommand(request);
     }
     if (request.action === "run_shell") {
       return this.executeShell(request);
+    }
+    if (request.action === "open_shell") {
+      return this.executeOpenShell(request);
+    }
+    if (request.action === "write_shell") {
+      return this.executeWriteShell(request);
+    }
+    if (request.action === "read_shell") {
+      return this.executeReadShell();
+    }
+    if (request.action === "shell_status") {
+      return this.executeShellStatus();
+    }
+    if (request.action === "interrupt_shell") {
+      return this.executeInterruptShell();
+    }
+    if (request.action === "close_shell") {
+      return this.executeCloseShell();
     }
 
     const abs = this.resolvePath(request.path);
@@ -1876,6 +4079,14 @@ export class FileMcpService {
         const content = await readFile(abs, "utf8");
         return content.length > 0 ? content : "(empty file)";
       }
+      case "read_files":
+        return this.executeReadFiles(request);
+      case "read_range":
+        return this.executeReadRange(request);
+      case "read_json":
+        return this.executeReadJson(request);
+      case "read_yaml":
+        return this.executeReadYaml(request);
       case "list_dir": {
         const entries = await readdir(abs, { withFileTypes: true });
         if (entries.length === 0) {
@@ -1895,10 +4106,30 @@ export class FileMcpService {
           `mtime: ${info.mtime.toISOString()}`,
         ].join("\n");
       }
+      case "stat_paths":
+        return this.executeStatPaths(request);
+      case "outline_file":
+        return this.executeOutlineFile(request);
       case "find_files":
         return this.executeFindFiles(request);
+      case "find_symbol":
+        return this.executeFindSymbol(request);
+      case "find_references":
+        return this.executeFindReferences(request);
       case "search_text":
         return this.executeSearchText(request);
+      case "search_text_context":
+        return this.executeSearchTextContext(request);
+      case "git_status":
+        return this.executeGitStatus(request);
+      case "git_diff":
+        return this.executeGitDiff(request);
+      case "git_log":
+        return this.executeGitLog(request);
+      case "git_show":
+        return this.executeGitShow(request);
+      case "git_blame":
+        return this.executeGitBlame(request);
       case "create_file": {
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, request.content ?? "", { flag: "wx" });
@@ -1931,6 +4162,22 @@ export class FileMcpService {
         await writeFile(abs, after, "utf8");
         this.noteFilesystemMutation();
         return `Edited file: ${request.path}`;
+      }
+      case "apply_patch": {
+        const before = await readFile(abs, "utf8");
+        if (!request.find) {
+          throw new Error("apply_patch requires `find`.");
+        }
+        if (typeof request.replace !== "string") {
+          throw new Error("apply_patch requires `replace`.");
+        }
+        if (!before.includes(request.find)) {
+          throw new Error("apply_patch find text not found.");
+        }
+        const after = before.replace(request.find, request.replace);
+        await writeFile(abs, after, "utf8");
+        this.noteFilesystemMutation();
+        return `Patched file: ${request.path}`;
       }
       case "delete_file": {
         await rm(abs, { force: false, recursive: false });
@@ -1965,7 +4212,7 @@ export class FileMcpService {
         ok: false,
         message:
           describeInvalidToolInput(normalizedName, input) ??
-          `Invalid tool input. Expected { action, path, content?, find?, replace?, pattern?, query?, maxResults?, caseSensitive?, destination?, command?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
+          `Invalid tool input. Expected { action, path, content?, paths?, startLine?, endLine?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, destination?, revision?, command?, input?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
       };
     }
     const validationError = validateRequest(request);
@@ -1995,7 +4242,61 @@ export class FileMcpService {
       }
     }
 
-    if (request.action !== "run_command" && request.action !== "run_shell") {
+    if (request.action === "open_shell") {
+      if (this.shellSession) {
+        return {
+          ok: false,
+          message: `open_shell blocked: persistent shell session already exists (${getShellSessionStatus(this.shellSession)}). Use close_shell first.`,
+        };
+      }
+      if (request.cwd) {
+        try {
+          this.resolvePath(request.cwd);
+        } catch (error) {
+          return {
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+    }
+
+    if (request.action === "write_shell") {
+      const session = this.shellSession;
+      if (!session) {
+        return {
+          ok: false,
+          message: "write_shell blocked: no active persistent shell session. Use open_shell first.",
+        };
+      }
+      if (!session.alive || session.exited) {
+        return {
+          ok: false,
+          message:
+            "write_shell blocked: the persistent shell session has exited. Use close_shell, then open_shell again.",
+        };
+      }
+      if (session.busy) {
+        return {
+          ok: false,
+          message:
+            "write_shell blocked: the persistent shell session is busy. Use read_shell, shell_status, or interrupt_shell first.",
+        };
+      }
+      const audit = this.auditShellSessionWrite(request);
+      if (!audit.ok) {
+        return {
+          ok: false,
+          message: `write_shell blocked: ${audit.reason ?? "Shell input rejected by shell auditor."}`,
+        };
+      }
+    }
+
+    if (
+      request.action !== "run_command" &&
+      request.action !== "run_shell" &&
+      !isPersistentShellAction(request.action)
+    ) {
       try {
         const conflict = this.getPendingConflict(request);
         if (conflict) {
@@ -2024,7 +4325,10 @@ export class FileMcpService {
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
+      request.action === "open_shell" ||
+      request.action === "write_shell" ||
       (request.action !== "create_dir" &&
+        !isPersistentShellAction(request.action) &&
         !READ_ONLY_ACTIONS.includes(request.action) &&
         this.rules.requireReview.includes(request.action))
     ) {
@@ -2051,6 +4355,23 @@ export class FileMcpService {
         message: `[review required] ${id}\n${pending.previewSummary}`,
         pending,
       };
+    }
+
+    if (request.action === "read_shell" || request.action === "shell_status") {
+      try {
+        const output = await this.execute(request);
+        return {
+          ok: true,
+          message: `[tool result] ${request.action} ${request.path}\n${output}`,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          message: `[tool error] ${request.action} ${request.path}\n${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
     }
 
     if (request.action === "list_dir") {

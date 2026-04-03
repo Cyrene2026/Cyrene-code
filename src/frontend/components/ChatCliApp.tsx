@@ -5,7 +5,7 @@ import type { SessionStore } from "../../core/session/store";
 import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
 import { useChatApp } from "../../application/chat/useChatApp";
 import { ChatScreen } from "./ChatScreen";
-import { createExitHandler } from "./exitSummary";
+import { createExitHandler, type ExitSummarySnapshot } from "./exitSummary";
 
 type ChatCliAppProps = {
   transport: QueryTransport;
@@ -15,6 +15,7 @@ type ChatCliAppProps = {
   pinMaxCount: number;
   queryMaxToolSteps?: number;
   mcpService: FileMcpService;
+  appRoot: string;
 };
 
 export const ChatCliApp = ({
@@ -25,14 +26,18 @@ export const ChatCliApp = ({
   pinMaxCount,
   queryMaxToolSteps,
   mcpService,
+  appRoot,
 }: ChatCliAppProps) => {
   const { exit } = useApp();
-  const exitSnapshotRef = useRef<{
-    sessionId: string | null;
-    usage: ReturnType<typeof useChatApp>["usage"];
-  }>({
-    sessionId: null,
-    usage: null,
+  const exitSnapshotRef = useRef<ExitSummarySnapshot>({
+    startedAt: new Date().toISOString(),
+    activeSessionId: null,
+    currentModel: transport.getModel(),
+    requestCount: 0,
+    summaryRequestCount: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
   });
   const {
     items,
@@ -47,6 +52,7 @@ export const ChatCliApp = ({
     approvalPanel,
     activeSessionId,
     currentModel,
+    exitSummary,
     usage,
     setInput,
     submit,
@@ -61,8 +67,7 @@ export const ChatCliApp = ({
   });
 
   exitSnapshotRef.current = {
-    sessionId: activeSessionId,
-    usage,
+    ...exitSummary,
   };
 
   const handleExit = useMemo(
@@ -72,9 +77,15 @@ export const ChatCliApp = ({
         text => {
           process.stdout.write(text);
         },
-        exit
+        () => {
+          mcpService.dispose();
+          exit();
+        },
+        {
+          ansi: process.stdout.isTTY !== false,
+        }
       ),
-    [exit]
+    [exit, mcpService]
   );
 
   useInput((inputValue, key) => {
@@ -89,13 +100,15 @@ export const ChatCliApp = ({
 
     return () => {
       process.off("SIGINT", handleExit);
+      mcpService.dispose();
     };
-  }, [handleExit]);
+  }, [handleExit, mcpService]);
 
   return (
     <ChatScreen
       items={items}
       liveAssistantText={liveAssistantText}
+      appRoot={appRoot}
       input={input}
       inputCommandState={inputCommandState}
       status={status}

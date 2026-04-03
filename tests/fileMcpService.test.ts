@@ -1431,27 +1431,24 @@ describe("FileMcpService", () => {
     expect(service.listPending()).toHaveLength(0);
   });
 
-  test("open_shell enters review queue and opens a single persistent shell on approve", async () => {
+  test("open_shell executes directly and opens a single persistent shell", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { service } = await createService({
       ptyFactory: fakePty.factory,
       shellSettleMs: 0,
     });
 
-    const queued = await service.handleToolCall("file", {
+    const opened = await service.handleToolCall("file", {
       action: "open_shell",
       path: ".",
     });
 
-    expect(queued.ok).toBe(true);
-    expect(queued.pending?.request.action).toBe("open_shell");
-    expect(queued.pending?.previewSummary).toContain("[shell session preview]");
-
-    const approved = await service.approve(queued.pending!.id);
-    expect(approved.ok).toBe(true);
-    expect(approved.message).toContain("status: opened");
-    expect(approved.message).toContain("shell:");
-    expect(approved.message).toContain("cwd: .");
+    expect(opened.ok).toBe(true);
+    expect(opened.pending).toBeUndefined();
+    expect(opened.message).toContain("status: opened");
+    expect(opened.message).toContain("shell:");
+    expect(opened.message).toContain("cwd: .");
+    expect(service.listPending()).toHaveLength(0);
 
     const secondOpen = await service.handleToolCall("file", {
       action: "open_shell",
@@ -1462,7 +1459,7 @@ describe("FileMcpService", () => {
     expect(fakePty.state.openFile).toBe(process.platform === "win32" ? "pwsh" : "/bin/bash");
   });
 
-  test("write_shell preserves cwd and environment across commands", async () => {
+  test("low-risk write_shell inputs execute directly and preserve cwd and environment", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { root, service } = await createService({
       ptyFactory: fakePty.factory,
@@ -1471,13 +1468,14 @@ describe("FileMcpService", () => {
     await mkdir(join(root, "subdir"), { recursive: true });
     await mkdir(join(root, ".venv"), { recursive: true });
 
-    const openQueued = await service.handleToolCall("file", {
+    const opened = await service.handleToolCall("file", {
       action: "open_shell",
       path: ".",
     });
-    await service.approve(openQueued.pending!.id);
+    expect(opened.ok).toBe(true);
+    expect(opened.pending).toBeUndefined();
 
-    const activateQueued = await service.handleToolCall("file", {
+    const activateResult = await service.handleToolCall("file", {
       action: "write_shell",
       path: ".",
       input:
@@ -1485,30 +1483,46 @@ describe("FileMcpService", () => {
           ? ".\\.venv\\Scripts\\Activate.ps1"
           : ". .venv/bin/activate",
     });
-    expect(activateQueued.ok).toBe(true);
-    expect(activateQueued.pending?.previewSummary).toContain("input:");
-    const activateApproved = await service.approve(activateQueued.pending!.id);
-    expect(activateApproved.ok).toBe(true);
-    expect(activateApproved.message).toContain("status: completed");
-    expect(activateApproved.message).toContain("venv activated");
+    expect(activateResult.ok).toBe(true);
+    expect(activateResult.pending).toBeUndefined();
+    expect(activateResult.message).toContain("status: completed");
+    expect(activateResult.message).toContain("venv activated");
 
-    const cdQueued = await service.handleToolCall("file", {
+    const cdResult = await service.handleToolCall("file", {
       action: "write_shell",
       path: ".",
       input: "cd subdir",
     });
-    const cdApproved = await service.approve(cdQueued.pending!.id);
-    expect(cdApproved.ok).toBe(true);
-    expect(cdApproved.message).toContain("cwd: subdir");
+    expect(cdResult.ok).toBe(true);
+    expect(cdResult.pending).toBeUndefined();
+    expect(cdResult.message).toContain("cwd: subdir");
 
-    const pythonQueued = await service.handleToolCall("file", {
+    const pythonResult = await service.handleToolCall("file", {
       action: "write_shell",
       path: ".",
       input: "python --version",
     });
-    const pythonApproved = await service.approve(pythonQueued.pending!.id);
-    expect(pythonApproved.ok).toBe(true);
-    expect(pythonApproved.message).toContain("Python 3.12.0 (venv)");
+    expect(pythonResult.ok).toBe(true);
+    expect(pythonResult.pending).toBeUndefined();
+    expect(pythonResult.message).toContain("Python 3.12.0 (venv)");
+
+    const pipListResult = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "pip list",
+    });
+    expect(pipListResult.ok).toBe(true);
+    expect(pipListResult.pending).toBeUndefined();
+    expect(pipListResult.message).toContain("ran pip list");
+
+    const gitStatusResult = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "git status",
+    });
+    expect(gitStatusResult.ok).toBe(true);
+    expect(gitStatusResult.pending).toBeUndefined();
+    expect(gitStatusResult.message).toContain("ran git status");
 
     const status = await service.handleToolCall("file", {
       action: "shell_status",
@@ -1526,11 +1540,10 @@ describe("FileMcpService", () => {
       shellSettleMs: 0,
     });
 
-    const openQueued = await service.handleToolCall("file", {
+    await service.handleToolCall("file", {
       action: "open_shell",
       path: ".",
     });
-    await service.approve(openQueued.pending!.id);
 
     const result = await service.handleToolCall("file", {
       action: "write_shell",
@@ -1543,6 +1556,62 @@ describe("FileMcpService", () => {
     expect(service.listPending()).toHaveLength(0);
   });
 
+  test("medium-risk and unknown write_shell inputs still enter review", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    const mkdirQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "mkdir foo",
+    });
+    expect(mkdirQueued.ok).toBe(true);
+    expect(mkdirQueued.pending?.request.action).toBe("write_shell");
+    expect(mkdirQueued.pending?.previewSummary).toContain("policy: review");
+    expect(mkdirQueued.pending?.previewSummary).toContain("risk: medium");
+
+    const unknownQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "pytest",
+    });
+    expect(unknownQueued.ok).toBe(true);
+    expect(unknownQueued.pending?.request.action).toBe("write_shell");
+    expect(unknownQueued.pending?.previewSummary).toContain("policy: review");
+    expect(unknownQueued.pending?.previewSummary).toContain("risk: low");
+  });
+
+  test("high-risk write_shell inputs are blocked before review", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    const result = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "rm -rf /",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("dangerous root deletion pattern");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
   test("read_shell returns only unread output and shell_status reflects running state", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { service } = await createService({
@@ -1550,11 +1619,10 @@ describe("FileMcpService", () => {
       shellSettleMs: 0,
     });
 
-    const openQueued = await service.handleToolCall("file", {
+    await service.handleToolCall("file", {
       action: "open_shell",
       path: ".",
     });
-    await service.approve(openQueued.pending!.id);
 
     fakePty.emit("later line\n");
     const firstRead = await service.handleToolCall("file", {
@@ -1576,6 +1644,8 @@ describe("FileMcpService", () => {
       path: ".",
       input: "long_running",
     });
+    expect(runningQueued.ok).toBe(true);
+    expect(runningQueued.pending?.request.action).toBe("write_shell");
     const runningApproved = await service.approve(runningQueued.pending!.id);
     expect(runningApproved.ok).toBe(true);
     expect(runningApproved.message).toContain("status: running");
@@ -1595,11 +1665,10 @@ describe("FileMcpService", () => {
       shellSettleMs: 0,
     });
 
-    const openQueued = await service.handleToolCall("file", {
+    await service.handleToolCall("file", {
       action: "open_shell",
       path: ".",
     });
-    await service.approve(openQueued.pending!.id);
 
     const runningQueued = await service.handleToolCall("file", {
       action: "write_shell",

@@ -69,6 +69,16 @@ describe("config loaders", () => {
     ]);
   });
 
+  test("loadRuleConfig default review list keeps write_shell but not open_shell", async () => {
+    const root = await createWorkspace("");
+
+    const config = await loadRuleConfig();
+
+    expect(config.workspaceRoot).toBe(root);
+    expect(config.requireReview).toContain("write_shell");
+    expect(config.requireReview).not.toContain("open_shell");
+  });
+
   test("loaders honor CYRENE_ROOT for global project root override", async () => {
     const root = await createWorkspace([
       "workspace_root: ./workspace",

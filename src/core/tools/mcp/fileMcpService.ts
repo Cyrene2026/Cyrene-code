@@ -135,6 +135,7 @@ type ShellSessionWriteAuditResult = {
   ok: boolean;
   shell: PersistentShellFlavor;
   tokens: string[];
+  policy: "blocked" | "direct" | "review";
   risk: "low" | "medium" | "high";
   reason?: string;
   notes: string[];
@@ -212,6 +213,24 @@ const SHELL_DELETE_COMMANDS = new Set([
   "erase",
   "rd",
   "rmdir",
+]);
+const SHELL_SESSION_DIRECT_PATH_COMMANDS = new Set([
+  "ls",
+  "dir",
+  "get-childitem",
+]);
+const SHELL_SESSION_DIRECT_READ_COMMANDS = new Set([
+  "cat",
+  "type",
+  "get-content",
+]);
+const SHELL_SESSION_DIRECT_LITERAL_COMMANDS = new Set([
+  "pwd",
+  "get-location",
+  "echo",
+  "write-output",
+  "which",
+  "where",
 ]);
 const COMMAND_TIMEOUT_MS = 20_000;
 const MAX_COMMAND_OUTPUT_CHARS = 24_000;
@@ -709,6 +728,10 @@ const tokenizeSafeShellCommand = (
 
 const looksLikeUrl = (value: string) => /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
 
+const isShellNonFileSystemTarget = (value: string) =>
+  /^~(?:[\\/]|$)/.test(value) ||
+  (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-zA-Z]:([\\/]|$)/.test(value));
+
 const looksLikePathToken = (value: string) =>
   value.startsWith(".") ||
   value.startsWith("/") ||
@@ -756,6 +779,9 @@ const getShellTargetOperands = (commandName: string, tokens: string[]) => {
       return operands;
   }
 };
+
+const looksLikeVenvActivationTarget = (value: string) =>
+  /(^|\/)\.venv\/.*\/activate(\.ps1)?$/i.test(value.replace(/\\/g, "/"));
 
 const getShellSessionStatus = (session: ActiveShellSession | null): ShellSessionStatus => {
   if (!session) {
@@ -2058,6 +2084,7 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens: [],
+        policy: "blocked",
         risk: "high",
         reason: tokenized.reason.replace(/^run_shell\b/, "write_shell"),
         notes: ["Only a safe reviewed single-line shell subset is allowed."],
@@ -2065,6 +2092,7 @@ export class FileMcpService {
     }
 
     const tokens = tokenized.tokens;
+    const rawInput = request.input.trim();
     const commandName = (tokens[0] ?? "").toLowerCase();
     const cwd = session?.cwd ?? resolve(this.rules.workspaceRoot);
     const targetTokens = getShellTargetOperands(commandName, tokens);
@@ -2074,6 +2102,7 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "high",
         reason: "write_shell blocks privilege-escalation commands.",
         notes: ["Privilege escalation is not allowed."],
@@ -2085,6 +2114,7 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "high",
         reason: "write_shell blocks download-oriented commands in v1.",
         notes: ["Network download commands are treated as high risk."],
@@ -2096,6 +2126,7 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "medium",
         reason: "write_shell does not allow exit-style commands. Use close_shell instead.",
         notes: ["Close the persistent shell through the dedicated action."],
@@ -2111,6 +2142,7 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "high",
         reason: "write_shell blocked a dangerous root deletion pattern.",
         notes: ["High-risk recursive deletion was detected."],
@@ -2122,60 +2154,206 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "high",
         reason: "write_shell does not allow URL targets in workspace-mutating commands.",
         notes: ["Workspace-targeted shell actions must stay local."],
       };
     }
 
+    const targetsStayInWorkspace = (targets: string[]) =>
+      targets.every(token => {
+        if (!token || token === "-") {
+          return false;
+        }
+        if (isShellNonFileSystemTarget(token)) {
+          return false;
+        }
+        const resolvedTarget = resolve(cwd, token);
+        return isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot);
+      });
+
     if (commandName === "cd") {
-      const destination = targetTokens[0];
-      if (!destination) {
+      if (targetTokens.length !== 1) {
         return {
           ok: false,
           shell,
           tokens,
+          policy: "blocked",
           risk: "medium",
           reason: "write_shell requires an explicit path for cd.",
           notes: ["Use a workspace-relative directory path."],
         };
       }
-      const resolvedTarget = resolve(cwd, destination);
-      if (!isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot)) {
+      if (!targetsStayInWorkspace(targetTokens)) {
         return {
           ok: false,
           shell,
           tokens,
+          policy: "blocked",
           risk: "high",
           reason: "write_shell blocked a cd target outside the workspace root.",
           notes: ["Persistent shell navigation must stay inside the workspace root."],
         };
       }
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "Persistent shell navigation is allowlisted for direct execution inside the workspace root.",
+        ],
+      };
     }
 
     if (commandName === "." || commandName === "source") {
-      const sourceTarget = targetTokens[0];
-      if (!sourceTarget) {
+      if (targetTokens.length !== 1) {
         return {
           ok: false,
           shell,
           tokens,
+          policy: "blocked",
           risk: "medium",
           reason: "write_shell requires an explicit path for source commands.",
           notes: ["Use a workspace-relative activation script path."],
         };
       }
-      const resolvedTarget = resolve(cwd, sourceTarget);
-      if (!isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot)) {
+      if (!targetsStayInWorkspace(targetTokens)) {
         return {
           ok: false,
           shell,
           tokens,
+          policy: "blocked",
           risk: "high",
           reason: "write_shell blocked a source target outside the workspace root.",
           notes: ["Sourced scripts must stay inside the workspace root."],
         };
       }
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "Workspace-local source commands are allowlisted for direct execution.",
+        ],
+      };
+    }
+
+    if (tokens.length === 1 && looksLikeVenvActivationTarget(rawInput)) {
+      if (!targetsStayInWorkspace([rawInput])) {
+        return {
+          ok: false,
+          shell,
+          tokens,
+          policy: "blocked",
+          risk: "high",
+          reason: "write_shell blocked a venv activation target outside the workspace root.",
+          notes: ["Activation scripts must stay inside the workspace root."],
+        };
+      }
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "Workspace-local virtual-environment activation is allowlisted for direct execution.",
+        ],
+      };
+    }
+
+    if (
+      SHELL_SESSION_DIRECT_PATH_COMMANDS.has(commandName) &&
+      (!targetTokens.length || targetsStayInWorkspace(targetTokens))
+    ) {
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "This read-only shell command is on the persistent-shell direct allowlist.",
+        ],
+      };
+    }
+
+    if (
+      SHELL_SESSION_DIRECT_READ_COMMANDS.has(commandName) &&
+      targetTokens.length > 0 &&
+      targetsStayInWorkspace(targetTokens)
+    ) {
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "This read-only shell command is on the persistent-shell direct allowlist.",
+        ],
+      };
+    }
+
+    if (
+      (SHELL_SESSION_DIRECT_PATH_COMMANDS.has(commandName) ||
+        SHELL_SESSION_DIRECT_READ_COMMANDS.has(commandName)) &&
+      targetTokens.length > 0
+    ) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        policy: "blocked",
+        risk: "high",
+        reason: "write_shell blocked a read target outside the workspace root.",
+        notes: ["Direct persistent-shell read commands must stay inside the workspace root."],
+      };
+    }
+
+    if (
+      SHELL_SESSION_DIRECT_LITERAL_COMMANDS.has(commandName) &&
+      ((commandName === "pwd" || commandName === "get-location")
+        ? targetTokens.length === 0
+        : true)
+    ) {
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "This low-risk environment or discovery command is allowlisted for direct execution.",
+        ],
+      };
+    }
+
+    if (
+      (commandName === "python" && (tokens[1] === "--version" || tokens[1] === "-V") && tokens.length === 2) ||
+      ((commandName === "node" || commandName === "bun" || commandName === "npm") &&
+        tokens[1] === "--version" &&
+        tokens.length === 2) ||
+      (commandName === "pip" &&
+        ((tokens[1] === "--version" && tokens.length === 2) ||
+          (tokens[1] === "list" && tokens.length === 2))) ||
+      (commandName === "git" && tokens[1] === "status" && tokens.length === 2)
+    ) {
+      return {
+        ok: true,
+        shell,
+        tokens,
+        policy: "direct",
+        risk: "low",
+        notes: [
+          "This allowlisted version or status command can execute directly in the persistent shell.",
+        ],
+      };
     }
 
     if (
@@ -2192,29 +2370,24 @@ export class FileMcpService {
         ok: false,
         shell,
         tokens,
+        policy: "blocked",
         risk: "high",
         reason: "write_shell blocked a write or delete target outside the workspace root.",
         notes: ["Shell mutations must stay inside the workspace root."],
       };
     }
 
-    const risk =
-      commandName === "cd" || commandName === "." || commandName === "source"
-        ? "low"
-        : SHELL_MUTATING_COMMANDS.has(commandName)
-          ? "medium"
-          : "low";
-
     return {
       ok: true,
       shell,
       tokens,
-      risk,
+      policy: "review",
+      risk: SHELL_MUTATING_COMMANDS.has(commandName) ? "medium" : "low",
       notes: [
         "Only a safe reviewed single-line shell subset is allowed.",
-        risk === "medium"
+        SHELL_MUTATING_COMMANDS.has(commandName)
           ? "This shell input may mutate workspace files and still requires review."
-          : "This shell input is stateful or low-impact, but still requires review.",
+          : "This shell input is not in the low-risk direct allowlist, so it requires review.",
       ],
     };
   }
@@ -2665,9 +2838,11 @@ export class FileMcpService {
         `shell: ${shell}`,
         `cwd: ${request.cwd ?? "."}`,
         `existing_session: ${getShellSessionStatus(this.shellSession)}`,
-        "risk: medium",
+        "policy: direct",
+        "risk: low",
         "note: Persistent shell state is kept in memory for this CLI process only.",
-        "note: Use write_shell after approval when environment or cwd must persist.",
+        "note: open_shell now opens directly after local validation succeeds.",
+        "note: Use write_shell when environment or cwd must persist.",
         `mode: ${mode}`,
       ].join("\n");
     }
@@ -2679,6 +2854,7 @@ export class FileMcpService {
         `shell: ${audit.shell}`,
         `cwd: ${this.getShellSessionCwdDisplay(this.shellSession)}`,
         `input: ${request.input}`,
+        `policy: ${audit.policy}`,
         `risk: ${audit.risk}`,
         `tokens: ${audit.tokens.length > 0 ? audit.tokens.join(" ") : "(none)"}`,
         ...audit.notes.map(note => `note: ${note}`),
@@ -4223,6 +4399,8 @@ export class FileMcpService {
       };
     }
 
+    let shellWriteAudit: ShellSessionWriteAuditResult | null = null;
+
     if (request.action === "run_shell") {
       try {
         const audit = this.auditShellRequest(request);
@@ -4283,11 +4461,11 @@ export class FileMcpService {
             "write_shell blocked: the persistent shell session is busy. Use read_shell, shell_status, or interrupt_shell first.",
         };
       }
-      const audit = this.auditShellSessionWrite(request);
-      if (!audit.ok) {
+      shellWriteAudit = this.auditShellSessionWrite(request);
+      if (!shellWriteAudit.ok) {
         return {
           ok: false,
-          message: `write_shell blocked: ${audit.reason ?? "Shell input rejected by shell auditor."}`,
+          message: `write_shell blocked: ${shellWriteAudit.reason ?? "Shell input rejected by shell auditor."}`,
         };
       }
     }
@@ -4325,8 +4503,7 @@ export class FileMcpService {
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
-      request.action === "open_shell" ||
-      request.action === "write_shell" ||
+      (request.action === "write_shell" && shellWriteAudit?.policy === "review") ||
       (request.action !== "create_dir" &&
         !isPersistentShellAction(request.action) &&
         !READ_ONLY_ACTIONS.includes(request.action) &&

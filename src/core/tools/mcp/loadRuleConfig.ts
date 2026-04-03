@@ -16,7 +16,6 @@ const createDefaultRules = (appRoot: string): RuleConfig => ({
     "move_path",
     "run_command",
     "run_shell",
-    "open_shell",
     "write_shell",
   ],
 });

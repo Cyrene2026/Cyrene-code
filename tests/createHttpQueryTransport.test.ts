@@ -152,7 +152,10 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not put shell syntax");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("When a persistent shell may already exist, call shell_status before opening another one");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use open_shell and write_shell when shell state must persist across steps");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("open_shell opens a persistent shell directly after local validation succeeds");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use write_shell only after open_shell has created an active shell session");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Low-risk write_shell inputs");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Medium-risk write_shell inputs still require review");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use close_shell to terminate the active persistent shell session");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive list_dir/read_file probing");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("confirmed directory state");

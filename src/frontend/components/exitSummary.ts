@@ -19,11 +19,24 @@ export type ExitSummarySnapshot = {
 type BuildExitScreenOptions = {
   ansi?: boolean;
   now?: Date | string | number;
+  confirmHint?: string;
 };
 
 type CreateExitHandlerOptions = {
   ansi?: boolean;
   now?: () => Date | string | number;
+  confirmBeforeExit?: boolean;
+  confirmTimeoutMs?: number;
+  forceExit?: () => void;
+  stdin?: {
+    on: (event: "data", listener: (chunk: Buffer | string) => void) => void;
+    off: (event: "data", listener: (chunk: Buffer | string) => void) => void;
+    isTTY?: boolean;
+  };
+  signalTarget?: {
+    on: (event: "SIGINT", listener: () => void) => void;
+    off: (event: "SIGINT", listener: () => void) => void;
+  };
 };
 
 const stripAnsi = (value: string) =>
@@ -82,6 +95,7 @@ export const buildExitScreen = (
   options: BuildExitScreenOptions = {}
 ) => {
   const ansi = options.ansi ?? true;
+  const confirmHint = options.confirmHint?.trim() || "";
   const sessionLabel = summary.activeSessionId ?? "-";
   const modelLabel = summary.currentModel.trim() || "-";
   const runtimeLabel = formatDuration(summary.startedAt, options.now);
@@ -109,6 +123,7 @@ export const buildExitScreen = (
   });
 
   const bye = colorize("bye!", ANSI_CYAN, ansi);
+  const hintLine = confirmHint ? colorize(confirmHint, ANSI_DIM, ansi) : "";
   const plainTitle = "CYRENE | Session Summary";
   const title = ansi
     ? `${ANSI_CYAN}${ANSI_BOLD}CYRENE${ANSI_RESET}${ANSI_CYAN} | Session Summary${ANSI_RESET}`
@@ -116,6 +131,7 @@ export const buildExitScreen = (
   const contentWidth = Math.max(
     plainTitle.length,
     stripAnsi(bye).length,
+    stripAnsi(hintLine).length,
     ...bodyLines.map(line => stripAnsi(line).length)
   );
 
@@ -128,6 +144,8 @@ export const buildExitScreen = (
     divider,
     ...bodyLines.map(line => padCardLine(line, contentWidth)),
     divider,
+    ...(hintLine ? [padCardLine(hintLine, contentWidth)] : []),
+    ...(hintLine ? [divider] : []),
     padCardLine(bye, contentWidth),
     bottom,
   ];
@@ -141,21 +159,100 @@ export const createExitHandler = (
   exit: () => void,
   options: CreateExitHandlerOptions = {}
 ) => {
-  let exiting = false;
+  type ExitState = "idle" | "awaiting_confirm" | "finalized";
+  let state: ExitState = "idle";
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  let stdinListener: ((chunk: Buffer | string) => void) | null = null;
+  let sigintListener: (() => void) | null = null;
+  const stdin = options.stdin ?? process.stdin;
+  const signalTarget = options.signalTarget ?? process;
 
-  return () => {
-    if (exiting) {
+  const cleanupConfirmGuards = () => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+    if (stdinListener) {
+      stdin.off("data", stdinListener);
+      stdinListener = null;
+    }
+    if (sigintListener) {
+      signalTarget.off("SIGINT", sigintListener);
+      sigintListener = null;
+    }
+  };
+
+  const finalize = () => {
+    if (state === "finalized") {
       return false;
     }
-    exiting = true;
+    state = "finalized";
+    cleanupConfirmGuards();
+    options.forceExit?.();
+    return true;
+  };
+
+  const armConfirmGuards = () => {
+    if (!options.forceExit) {
+      return;
+    }
+
+    stdinListener = chunk => {
+      const raw = chunk.toString();
+      if (raw.includes("\r") || raw.includes("\n")) {
+        finalize();
+      }
+    };
+
+    sigintListener = () => {
+      finalize();
+    };
+
+    const canReadConfirmInput = stdin?.isTTY !== false;
+    if (canReadConfirmInput && stdin?.on) {
+      stdin.on("data", stdinListener);
+    }
+    signalTarget.on("SIGINT", sigintListener);
+
+    const confirmTimeoutMs = options.confirmTimeoutMs ?? 10_000;
+    if (confirmTimeoutMs > 0) {
+      timeoutHandle = setTimeout(() => {
+        finalize();
+      }, confirmTimeoutMs);
+    }
+  };
+
+  return () => {
+    if (state === "finalized") {
+      return false;
+    }
+    if (state === "awaiting_confirm") {
+      return finalize();
+    }
+
+    const confirmBeforeExit = options.confirmBeforeExit ?? true;
     const snapshot = getSnapshot();
-    write(
-      buildExitScreen(snapshot, {
-        ansi: options.ansi,
-        now: options.now?.(),
-      })
-    );
-    exit();
+    const screen = buildExitScreen(snapshot, {
+      ansi: options.ansi,
+      now: options.now?.(),
+      confirmHint: confirmBeforeExit
+        ? "Press Enter or Ctrl+C to exit"
+        : undefined,
+    });
+
+    try {
+      exit();
+    } finally {
+      write(screen);
+    }
+
+    if (confirmBeforeExit) {
+      state = "awaiting_confirm";
+      armConfirmGuards();
+      return true;
+    }
+
+    state = "finalized";
     return true;
   };
 };

@@ -123,6 +123,12 @@ type RenderClipResult = {
   hiddenChars: number;
 };
 
+type RenderClipOptions = {
+  maxLines?: number;
+  maxChars?: number;
+  preferTail?: boolean;
+};
+
 type ComposerTone = {
   borderColor: "gray" | "yellow" | "magenta" | "red";
   panelBorderColor: "cyan" | "yellow" | "magenta" | "red";
@@ -160,6 +166,8 @@ const APPROVAL_DIFF_REMOVE_ACCENT = "#991b1b";
 const MAX_RENDERED_TRANSCRIPT_ITEMS = 80;
 const MAX_RENDER_TEXT_LINES = 420;
 const MAX_RENDER_TEXT_CHARS = 24000;
+const MAX_STREAMING_RENDER_TEXT_LINES = 160;
+const MAX_STREAMING_RENDER_TEXT_CHARS = 12000;
 const MAX_RENDERED_TERMINAL_OUTPUT_LINES = 220;
 const CODE_KEYWORDS = new Set([
   "const",
@@ -230,13 +238,23 @@ const getMessageLabel = (
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
 
-const clipTextForRender = (text: string): RenderClipResult => {
+const clipTextForRender = (
+  text: string,
+  options: RenderClipOptions = {}
+): RenderClipResult => {
+  const maxLines = Math.max(1, options.maxLines ?? MAX_RENDER_TEXT_LINES);
+  const maxChars = Math.max(1, options.maxChars ?? MAX_RENDER_TEXT_CHARS);
+  const preferTail = options.preferTail ?? false;
   const allLines = text.split("\n");
-  const visibleLines = allLines.slice(0, MAX_RENDER_TEXT_LINES);
+  const visibleLines = preferTail
+    ? allLines.slice(-maxLines)
+    : allLines.slice(0, maxLines);
   let clippedText = visibleLines.join("\n");
 
-  if (clippedText.length > MAX_RENDER_TEXT_CHARS) {
-    clippedText = clippedText.slice(0, MAX_RENDER_TEXT_CHARS);
+  if (clippedText.length > maxChars) {
+    clippedText = preferTail
+      ? clippedText.slice(-maxChars)
+      : clippedText.slice(0, maxChars);
   }
 
   const hiddenLines = Math.max(0, allLines.length - visibleLines.length);
@@ -249,7 +267,10 @@ const clipTextForRender = (text: string): RenderClipResult => {
   };
 };
 
-const formatRenderClipNotice = (clip: RenderClipResult) => {
+const formatRenderClipNotice = (
+  clip: RenderClipResult,
+  options: RenderClipOptions = {}
+) => {
   if (!clip.clipped) {
     return "";
   }
@@ -257,7 +278,8 @@ const formatRenderClipNotice = (clip: RenderClipResult) => {
     clip.hiddenLines > 0 ? `${clip.hiddenLines} lines` : "",
     clip.hiddenChars > 0 ? `${clip.hiddenChars} chars` : "",
   ].filter(Boolean);
-  return `[render clipped] omitted ${parts.join(" / ")} to keep terminal stable`;
+  const prefix = options.preferTail ? "showing latest slice, " : "";
+  return `[render clipped] ${prefix}omitted ${parts.join(" / ")} to keep terminal stable`;
 };
 
 const getTranscriptWindow = (items: ChatItem[]) => {
@@ -1017,13 +1039,17 @@ const renderTerminalTranscript = (
   );
 };
 
-const renderMessageItem = (item: ChatItem, itemIndex: number) => {
+const renderMessageItem = (
+  item: ChatItem,
+  itemIndex: number,
+  clipOptions: RenderClipOptions = {}
+) => {
   if (!item.text) {
     return null;
   }
 
-  const clip = clipTextForRender(item.text);
-  const clipNotice = formatRenderClipNotice(clip);
+  const clip = clipTextForRender(item.text, clipOptions);
+  const clipNotice = formatRenderClipNotice(clip, clipOptions);
   const color = resolveItemColor(item);
   const terminalTranscript = parseTerminalTranscript({
     ...item,
@@ -2555,7 +2581,12 @@ export const ChatScreen = ({
               kind: "transcript",
               tone: "neutral",
             },
-            items.length
+            items.length,
+            {
+              preferTail: true,
+              maxLines: MAX_STREAMING_RENDER_TEXT_LINES,
+              maxChars: MAX_STREAMING_RENDER_TEXT_CHARS,
+            }
           )
         : null,
     [items.length, liveAssistantText]

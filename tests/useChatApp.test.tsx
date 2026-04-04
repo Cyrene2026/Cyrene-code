@@ -986,6 +986,66 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("batches rapid streaming deltas before repainting the live assistant text", async () => {
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("draft ");
+      onTextDelta("reply");
+      await streamGate;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("stream this");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("draft ");
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 70));
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("draft reply");
+
+    await act(async () => {
+      releaseStream();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(getTexts(app.getLatest().items)).toContain("draft reply");
+    app.cleanup();
+  });
+
   test("pins enforce upper limit and unpin validates index", async () => {
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {

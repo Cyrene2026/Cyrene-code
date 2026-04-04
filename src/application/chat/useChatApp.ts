@@ -124,6 +124,7 @@ const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
 const MULTILINE_DISPLAY_TOKEN = " ↩ ";
 const SUMMARY_RECENT_KEEP = 8;
+const STREAMING_RENDER_BATCH_MS = 40;
 const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
 const SUMMARY_TRIGGER_CHAR_THRESHOLD = 1200;
 const SUMMARY_RECENT_MESSAGE_LIMIT = 16;
@@ -559,6 +560,9 @@ export const useChatApp = ({
   const historyCursorRef = useRef(-1);
   const inputDraftRef = useRef("");
   const liveAssistantTextRef = useRef("");
+  const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveAssistantRenderedTextRef = useRef("");
+  const liveAssistantLastFlushAtRef = useRef(0);
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
@@ -568,6 +572,16 @@ export const useChatApp = ({
   pendingReviewsRef.current = pendingReviews;
   inputHistoryRef.current = inputHistory;
   historyCursorRef.current = historyCursor;
+
+  useEffect(
+    () => () => {
+      if (liveAssistantRenderTimerRef.current) {
+        clearTimeout(liveAssistantRenderTimerRef.current);
+        liveAssistantRenderTimerRef.current = null;
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -734,16 +748,45 @@ export const useChatApp = ({
     ]);
   };
 
-  const setLiveAssistantSegment = (next: string) => {
-    liveAssistantTextRef.current = next;
+  const cancelLiveAssistantRender = () => {
+    if (!liveAssistantRenderTimerRef.current) {
+      return;
+    }
+    clearTimeout(liveAssistantRenderTimerRef.current);
+    liveAssistantRenderTimerRef.current = null;
+  };
+
+  const flushLiveAssistantSegment = (next = liveAssistantTextRef.current) => {
+    cancelLiveAssistantRender();
+    liveAssistantRenderedTextRef.current = next;
+    liveAssistantLastFlushAtRef.current = Date.now();
     startTransition(() => {
-      setLiveAssistantText(next);
+      setLiveAssistantText(previous => (previous === next ? previous : next));
     });
   };
 
+  const scheduleLiveAssistantRender = () => {
+    if (liveAssistantRenderTimerRef.current) {
+      return;
+    }
+    const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
+    const waitMs = Math.max(0, STREAMING_RENDER_BATCH_MS - elapsed);
+    if (waitMs === 0) {
+      flushLiveAssistantSegment();
+      return;
+    }
+    liveAssistantRenderTimerRef.current = setTimeout(() => {
+      liveAssistantRenderTimerRef.current = null;
+      flushLiveAssistantSegment();
+    }, waitMs);
+  };
+
   const clearLiveAssistantSegment = () => {
+    cancelLiveAssistantRender();
     liveAssistantTextRef.current = "";
-    setLiveAssistantText("");
+    liveAssistantRenderedTextRef.current = "";
+    liveAssistantLastFlushAtRef.current = 0;
+    setLiveAssistantText(previous => (previous ? "" : previous));
   };
 
   const pushStreamingSystemMessage = (
@@ -946,7 +989,23 @@ export const useChatApp = ({
   };
 
   const appendToLiveAssistant = (text: string) => {
-    setLiveAssistantSegment(liveAssistantTextRef.current + text);
+    if (!text) {
+      return;
+    }
+    liveAssistantTextRef.current += text;
+
+    if (!liveAssistantRenderedTextRef.current) {
+      flushLiveAssistantSegment();
+      return;
+    }
+
+    const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
+    if (elapsed >= STREAMING_RENDER_BATCH_MS) {
+      flushLiveAssistantSegment();
+      return;
+    }
+
+    scheduleLiveAssistantRender();
   };
 
   const applyLoadedSession = (loaded: SessionRecord) => {

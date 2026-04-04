@@ -85,6 +85,11 @@ export const ChatCliApp = ({
         },
         {
           ansi: process.stdout.isTTY !== false,
+          confirmBeforeExit: true,
+          confirmTimeoutMs: 10_000,
+          forceExit: () => {
+            process.exit(0);
+          },
         }
       ),
     [exit, mcpService]

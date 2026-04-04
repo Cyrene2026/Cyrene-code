@@ -822,4 +822,26 @@ describe("ChatScreen", () => {
     expect(output).toContain("session-msg-099");
     expect(output).not.toContain("session-msg-000");
   });
+
+  test("shows only the latest slice of oversized live streaming output", () => {
+    const hugeStreamingBlock = [
+      "```txt",
+      ...Array.from(
+        { length: 220 },
+        (_, index) => `stream-${String(index + 1).padStart(3, "0")}`
+      ),
+      "```",
+    ].join("\n");
+
+    const tree = renderScreen({
+      items: [],
+      liveAssistantText: hugeStreamingBlock,
+      status: "streaming",
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("[render clipped] showing latest slice");
+    expect(output).toContain("stream-220");
+    expect(output).not.toContain("stream-001");
+  });
 });

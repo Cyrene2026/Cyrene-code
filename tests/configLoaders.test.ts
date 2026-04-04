@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadRuleConfig } from "../src/core/tools/mcp/loadRuleConfig";
-import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
+import {
+  configureAppRootFromArgs,
+  resetConfiguredAppRoot,
+} from "../src/infra/config/appRoot";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
 
 const originalCwd = process.cwd();
@@ -79,6 +82,30 @@ describe("config loaders", () => {
     expect(config.workspaceRoot).toBe(root);
     expect(config.requireReview).toContain("write_shell");
     expect(config.requireReview).not.toContain("open_shell");
+  });
+
+  test("config loaders prefer the ambient workspace over an unrelated configured app root", async () => {
+    const root = await createWorkspace([
+      "pin_max_count: 9",
+      "workspace_root: .",
+      "require_review:",
+      "  - run_command",
+    ].join("\n"));
+    const unrelatedRoot = await mkdtemp(join(tmpdir(), "cyrene-config-other-"));
+    tempRoots.push(unrelatedRoot);
+
+    configureAppRootFromArgs({
+      cwd: unrelatedRoot,
+      argv: ["--root", "."],
+      env: {},
+    });
+
+    const cyreneConfig = await loadCyreneConfig();
+    const ruleConfig = await loadRuleConfig();
+
+    expect(cyreneConfig.pinMaxCount).toBe(9);
+    expect(ruleConfig.workspaceRoot).toBe(root);
+    expect(ruleConfig.requireReview).toEqual(["run_command"]);
   });
 
   test("loaders honor CYRENE_ROOT for global project root override", async () => {

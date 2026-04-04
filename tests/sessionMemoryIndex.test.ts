@@ -193,6 +193,34 @@ describe("session memory index", () => {
     expect(context.pins).toEqual(["first pin"]);
   });
 
+  test("removeFocus keeps newest pin ordering stable when timestamps tie", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("pins");
+    const originalToISOString = Date.prototype.toISOString;
+
+    Date.prototype.toISOString = function () {
+      return "2026-01-01T00:00:00.000Z";
+    };
+
+    try {
+      await store.addFocus(session.id, "first pin");
+      await store.addFocus(session.id, "second pin");
+    } finally {
+      Date.prototype.toISOString = originalToISOString;
+    }
+
+    const before = await store.loadSession(session.id);
+    expect(before?.focus).toEqual(["second pin", "first pin"]);
+
+    await store.removeFocus(session.id, 0);
+
+    const after = await store.loadSession(session.id);
+    const context = await store.getPromptContext(session.id, "pin");
+
+    expect(after?.focus).toEqual(["first pin"]);
+    expect(context.pins).toEqual(["first pin"]);
+  });
+
   test("default session store path follows configured global root", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
     tempRoots.push(root);

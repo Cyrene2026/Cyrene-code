@@ -216,7 +216,48 @@ const createDedupeKey = (
 };
 
 const sortEntriesByTime = (entries: SessionMemoryEntry[]) =>
-  [...entries].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((left, right) => {
+      const createdAtOrder = right.entry.createdAt.localeCompare(left.entry.createdAt);
+      if (createdAtOrder !== 0) {
+        return createdAtOrder;
+      }
+
+      const leftUpdatedAt = left.entry.updatedAt ?? left.entry.createdAt;
+      const rightUpdatedAt = right.entry.updatedAt ?? right.entry.createdAt;
+      const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
+      if (updatedAtOrder !== 0) {
+        return updatedAtOrder;
+      }
+
+      return left.index - right.index;
+    })
+    .map(item => item.entry);
+
+const sortEntriesByPriorityAndTime = (entries: SessionMemoryEntry[]) =>
+  entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((left, right) => {
+      if (right.entry.priority !== left.entry.priority) {
+        return right.entry.priority - left.entry.priority;
+      }
+
+      const createdAtOrder = right.entry.createdAt.localeCompare(left.entry.createdAt);
+      if (createdAtOrder !== 0) {
+        return createdAtOrder;
+      }
+
+      const leftUpdatedAt = left.entry.updatedAt ?? left.entry.createdAt;
+      const rightUpdatedAt = right.entry.updatedAt ?? right.entry.createdAt;
+      const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
+      if (updatedAtOrder !== 0) {
+        return updatedAtOrder;
+      }
+
+      return right.index - left.index;
+    })
+    .map(item => item.entry);
 
 export const createEmptyMemoryIndex = (
   sessionId: string,
@@ -289,14 +330,7 @@ export const rebuildMemoryLookup = (
     byPath,
     byTool,
     byAction,
-    byPriority: [...sortedEntries]
-      .sort((left, right) => {
-        if (right.priority !== left.priority) {
-          return right.priority - left.priority;
-        }
-        return right.createdAt.localeCompare(left.createdAt);
-      })
-      .map(entry => entry.id),
+    byPriority: sortEntriesByPriorityAndTime(sortedEntries).map(entry => entry.id),
   };
 };
 
@@ -362,14 +396,8 @@ export const upsertMemoryEntries = (
 };
 
 export const deriveFocusFromMemoryIndex = (index: SessionMemoryIndex, limit = 6) =>
-  sortEntriesByTime(index.entries)
+  sortEntriesByPriorityAndTime(index.entries)
     .filter(entry => entry.kind === "pin")
-    .sort((left, right) => {
-      if (right.priority !== left.priority) {
-        return right.priority - left.priority;
-      }
-      return right.createdAt.localeCompare(left.createdAt);
-    })
     .slice(0, limit)
     .map(entry => entry.text);
 
@@ -450,14 +478,8 @@ export const getPromptContextFromMemoryIndex = (
   relevantLimit = 6
 ): SessionPromptContext => {
   const queryTokens = tokenizeText(query);
-  const pins = sortEntriesByTime(index.entries)
+  const pins = sortEntriesByPriorityAndTime(index.entries)
     .filter(entry => entry.kind === "pin")
-    .sort((left, right) => {
-      if (right.priority !== left.priority) {
-        return right.priority - left.priority;
-      }
-      return right.createdAt.localeCompare(left.createdAt);
-    })
     .slice(0, 6)
     .map(entry => entry.text);
 

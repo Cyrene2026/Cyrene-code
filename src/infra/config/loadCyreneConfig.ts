@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { resolveAppRoot } from "./appRoot";
+import { resolveAmbientAppRoot } from "./appRoot";
 
 export type CyreneConfig = {
   pinMaxCount: number;
@@ -26,7 +26,7 @@ const parseValue = (raw: string): string | number => {
 };
 
 export const loadCyreneConfig = async (
-  appRoot = resolveAppRoot()
+  appRoot = resolveAmbientAppRoot()
 ): Promise<CyreneConfig> => {
   const path = join(appRoot, ".cyrene", "config.yaml");
   let content = "";

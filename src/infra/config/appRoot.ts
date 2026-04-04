@@ -41,6 +41,14 @@ export const resolveAppRoot = (options?: AppRootResolveOptions) => {
   return configuredAppRoot ?? resolve(cwd, envRoot ?? ".");
 };
 
+export const resolveAmbientAppRoot = (
+  options?: Pick<AppRootResolveOptions, "cwd" | "env">
+) => {
+  const cwd = options?.cwd ?? process.cwd();
+  const envRoot = trimNonEmpty((options?.env ?? process.env).CYRENE_ROOT);
+  return resolve(cwd, envRoot ?? ".");
+};
+
 export const configureAppRootFromArgs = (options?: AppRootResolveOptions) => {
   const cwd = options?.cwd ?? process.cwd();
   const cliRoot = parseRootArg(options?.argv ?? process.argv.slice(2));

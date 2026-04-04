@@ -6,7 +6,6 @@ import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
 import { createFileSessionStore } from "../src/infra/session/createFileSessionStore";
 
 const tempRoots: string[] = [];
-const originalRootEnv = process.env.CYRENE_ROOT;
 
 const createStore = async () => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-session-memory-"));
@@ -19,11 +18,6 @@ const createStore = async () => {
 
 afterEach(async () => {
   resetConfiguredAppRoot();
-  if (originalRootEnv === undefined) {
-    delete process.env.CYRENE_ROOT;
-  } else {
-    process.env.CYRENE_ROOT = originalRootEnv;
-  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -224,10 +218,14 @@ describe("session memory index", () => {
   test("default session store path follows configured global root", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
     tempRoots.push(root);
-    process.env.CYRENE_ROOT = root;
     await mkdir(join(root, ".cyrene"), { recursive: true });
+    const cwdElsewhere = await mkdtemp(join(tmpdir(), "cyrene-session-cwd-"));
+    tempRoots.push(cwdElsewhere);
 
-    const store = createFileSessionStore();
+    const store = createFileSessionStore(undefined, {
+      cwd: cwdElsewhere,
+      env: { CYRENE_ROOT: root },
+    });
     const session = await store.createSession("root aware");
 
     const persisted = await readFile(

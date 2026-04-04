@@ -22,6 +22,11 @@ import type {
   SessionRecord,
 } from "../../core/session/types";
 
+type SessionStoreContext = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
 const messageSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
   text: z.string(),
@@ -95,14 +100,19 @@ const isSessionDataFile = (fileName: string) =>
   fileName.endsWith(".json") && !fileName.endsWith(".index.json");
 
 export const createFileSessionStore = (
-  sessionDir = join(getCyreneConfigDir(resolveAmbientAppRoot()), "session")
+  sessionDir?: string,
+  context?: SessionStoreContext
 ): SessionStore => {
+  const resolvedSessionDir =
+    sessionDir ??
+    join(getCyreneConfigDir(resolveAmbientAppRoot(context)), "session");
+
   const ensureDir = async () => {
-    await mkdir(sessionDir, { recursive: true });
+    await mkdir(resolvedSessionDir, { recursive: true });
   };
 
-  const getSessionPath = (id: string) => join(sessionDir, fileNameFor(id));
-  const getIndexPath = (id: string) => join(sessionDir, indexFileNameFor(id));
+  const getSessionPath = (id: string) => join(resolvedSessionDir, fileNameFor(id));
+  const getIndexPath = (id: string) => join(resolvedSessionDir, indexFileNameFor(id));
 
   const readSession = async (id: string): Promise<SessionRecord | null> => {
     await ensureDir();
@@ -232,7 +242,7 @@ export const createFileSessionStore = (
     },
     listSessions: async () => {
       await ensureDir();
-      const files = await readdir(sessionDir, { withFileTypes: true });
+      const files = await readdir(resolvedSessionDir, { withFileTypes: true });
       const items: SessionListItem[] = [];
 
       for (const file of files) {

@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { QueryTransport } from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
+import { resolveAmbientAppRoot } from "../config/appRoot";
 
 const envSchema = z.object({
   CYRENE_BASE_URL: z.string().url().optional(),
@@ -700,11 +701,26 @@ const parseModelsPayload = (payload: unknown): string[] => {
   return Array.from(new Set(models));
 };
 
-export const createHttpQueryTransport = (): QueryTransport => {
+type HttpQueryTransportOptions = {
+  appRoot?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+export const createHttpQueryTransport = (
+  options?: HttpQueryTransportOptions
+): QueryTransport => {
+  const effectiveEnv = options?.env ?? process.env;
+  const appRoot =
+    options?.appRoot ??
+    resolveAmbientAppRoot({
+      cwd: options?.cwd,
+      env: effectiveEnv,
+    });
   const env = envSchema.safeParse({
-    CYRENE_BASE_URL: process.env.CYRENE_BASE_URL,
-    CYRENE_API_KEY: process.env.CYRENE_API_KEY,
-    CYRENE_MODEL: process.env.CYRENE_MODEL,
+    CYRENE_BASE_URL: effectiveEnv.CYRENE_BASE_URL,
+    CYRENE_API_KEY: effectiveEnv.CYRENE_API_KEY,
+    CYRENE_MODEL: effectiveEnv.CYRENE_MODEL,
   });
 
   const baseUrl = env.success ? env.data.CYRENE_BASE_URL : undefined;
@@ -735,7 +751,7 @@ export const createHttpQueryTransport = (): QueryTransport => {
       lastUsedModel: selectedModel,
       providerBaseUrl: provider,
       providers: providerCatalog,
-    });
+    }, appRoot);
   };
 
   const refreshFromApi = async (
@@ -780,7 +796,7 @@ export const createHttpQueryTransport = (): QueryTransport => {
 
   const initializeModels = async () => {
     try {
-      const local = await loadModelYaml();
+      const local = await loadModelYaml(appRoot);
       providerCatalog = dedupeProviders([
         ...local.providers,
         local.providerBaseUrl,

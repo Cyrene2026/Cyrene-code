@@ -170,6 +170,10 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain('set `path` to `"."`');
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Omit every optional field you do not need");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("`args` is only for run_command");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Match the user's language for all progress and final responses");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not mix languages in the same response");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Keep pre-tool narration concise");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive phrases that restate the same plan");
   });
 });
 

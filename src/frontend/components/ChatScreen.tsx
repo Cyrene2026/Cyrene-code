@@ -315,8 +315,7 @@ const formatPaged = <T,>(items: T[], selectedIndex: number, pageSize: number): P
   };
 };
 
-const getPreviewWindow = (text: string, offset: number, pageSize = 20) => {
-  const lines = text.split("\n");
+const getPreviewWindow = <T,>(lines: T[], offset: number, pageSize = 20) => {
   const maxOffset = Math.max(0, lines.length - pageSize);
   const safeOffset = Math.max(0, Math.min(offset, maxOffset));
   return {
@@ -1530,6 +1529,48 @@ const classifyApprovalPreviewLine = (line: string): ApprovalPreviewLine => {
   return { kind: "context", raw: line };
 };
 
+const inferSectionDiffMode = (label?: string): "add" | "remove" | null => {
+  const normalized = (label ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    normalized.includes("old -") ||
+    normalized.includes("to be removed") ||
+    normalized.includes("to be overwritten")
+  ) {
+    return "remove";
+  }
+  if (normalized.includes("new +") || normalized.includes("to be written")) {
+    return "add";
+  }
+  return null;
+};
+
+const parseApprovalPreviewLines = (previewText: string): ApprovalPreviewLine[] => {
+  let sectionMode: "add" | "remove" | null = null;
+  return previewText.split("\n").map(rawLine => {
+    const parsed = classifyApprovalPreviewLine(rawLine);
+    if (parsed.kind === "section") {
+      sectionMode = inferSectionDiffMode(parsed.label);
+      return parsed;
+    }
+    if (parsed.kind === "context" && sectionMode) {
+      const numbered = /^\s*(\d+)\s*\|\s?(.*)$/.exec(rawLine);
+      if (numbered) {
+        const [, lineNumber = "", content = ""] = numbered;
+        return {
+          kind: sectionMode,
+          raw: rawLine,
+          lineNumber,
+          content,
+        };
+      }
+    }
+    return parsed;
+  });
+};
+
 const getApprovalDiffPalette = (kind: "add" | "remove") =>
   kind === "add"
     ? {
@@ -1546,12 +1587,11 @@ const getApprovalDiffPalette = (kind: "add" | "remove") =>
       };
 
 const getApprovalDiffStats = (previewText: string) =>
-  previewText.split("\n").reduce(
+  parseApprovalPreviewLines(previewText).reduce(
     (stats, line) => {
-      const parsed = classifyApprovalPreviewLine(line);
-      if (parsed.kind === "add") {
+      if (line.kind === "add") {
         stats.additions += 1;
-      } else if (parsed.kind === "remove") {
+      } else if (line.kind === "remove") {
         stats.deletions += 1;
       }
       return stats;
@@ -1610,22 +1650,22 @@ const renderCompactApprovalSection = (
   </Box>
 );
 
-const getApprovalDiffGutterWidth = (lines: string[]) => {
+const getApprovalDiffGutterWidth = (lines: ApprovalPreviewLine[]) => {
   const widest = lines.reduce((max, line) => {
-    const match = /^[+-]\s*(\d+)\s*\|/.exec(line);
-    return Math.max(max, match?.[1]?.length ?? 0);
+    if (line.kind !== "add" && line.kind !== "remove") {
+      return max;
+    }
+    return Math.max(max, line.lineNumber?.length ?? 0);
   }, 0);
   return Math.max(4, widest);
 };
 
 const renderApprovalLine = (
-  line: string,
+  parsed: ApprovalPreviewLine,
   index: number,
   action: PendingReviewItem["request"]["action"],
   gutterWidth: number
 ) => {
-  const parsed = classifyApprovalPreviewLine(line);
-
   if (parsed.kind === "blank") {
     return <Text key={`approval-line-${index}`}> </Text>;
   }
@@ -1743,7 +1783,8 @@ const renderApprovalPanel = (
     approvalPanel.previewMode === "full"
       ? selectedPending.previewFull
       : selectedPending.previewSummary;
-  const previewWindow = getPreviewWindow(previewSource, approvalPanel.previewOffset);
+  const parsedPreviewLines = parseApprovalPreviewLines(previewSource);
+  const previewWindow = getPreviewWindow(parsedPreviewLines, approvalPanel.previewOffset);
   const diffGutterWidth = getApprovalDiffGutterWidth(previewWindow.pageLines);
   const queueStart = Math.max(0, approvalPanel.selectedIndex - 2);
   const queueItems = pendingReviews.slice(
@@ -1990,13 +2031,11 @@ const renderCompactApprovalSummaryRow = (
 );
 
 const renderCompactApprovalLine = (
-  line: string,
+  parsed: ApprovalPreviewLine,
   index: number,
   action: PendingReviewItem["request"]["action"],
   gutterWidth: number
 ) => {
-  const parsed = classifyApprovalPreviewLine(line);
-
   if (parsed.kind === "blank") {
     return <Text key={`approval-line-${index}`}> </Text>;
   }
@@ -2097,8 +2136,9 @@ const renderCompactApprovalPanel = (
     approvalPanel.previewMode === "full"
       ? selectedPending.previewFull
       : selectedPending.previewSummary;
+  const parsedPreviewLines = parseApprovalPreviewLines(previewSource);
   const diffStats = getApprovalDiffStats(previewSource);
-  const previewWindow = getPreviewWindow(previewSource, approvalPanel.previewOffset);
+  const previewWindow = getPreviewWindow(parsedPreviewLines, approvalPanel.previewOffset);
   const diffGutterWidth = getApprovalDiffGutterWidth(previewWindow.pageLines);
   const queueStart = Math.max(0, approvalPanel.selectedIndex - 2);
   const queueItems = pendingReviews.slice(
@@ -2292,9 +2332,9 @@ const renderCompactApprovalPanel = (
           previewWindow.totalLines
         )}/${previewWindow.totalLines}`,
         <Box flexDirection="column">
-          {previewWindow.pageLines.map((line, index) =>
-            renderCompactApprovalLine(
-              line,
+        {previewWindow.pageLines.map((line, index) =>
+          renderCompactApprovalLine(
+            line,
               index,
               selectedPending.request.action,
               diffGutterWidth

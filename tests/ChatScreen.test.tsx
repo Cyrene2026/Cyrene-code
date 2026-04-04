@@ -73,6 +73,22 @@ const patchPending: PendingReviewItem = {
   createdAt: "2026-01-01T00:01:30.000Z",
 };
 
+const legacyNoSignDiffPending: PendingReviewItem = {
+  id: "p2c",
+  request: {
+    action: "edit_file",
+    path: "src/legacy.ts",
+    find: "before",
+    replace: "after",
+  },
+  preview: "preview",
+  previewSummary:
+    "[edit preview]\n[old - to be removed]\n18 | const before = true;\n[new + to be written]\n18 | const after = true;",
+  previewFull:
+    "[edit preview]\n[old - to be removed]\n18 | const before = true;\n[new + to be written]\n18 | const after = true;",
+  createdAt: "2026-01-01T00:01:45.000Z",
+};
+
 const commandPending: PendingReviewItem = {
   id: "p3",
   request: {
@@ -539,6 +555,24 @@ describe("ChatScreen", () => {
     expect(output).toContain("Diff preview · patch");
     expect(output).toContain("scoped patch");
     expect(output).toContain("[patch preview]");
+    expect(output).toContain("const after = true;");
+  });
+
+  test("infers add/remove rows from legacy numbered preview lines without +/- markers", () => {
+    const tree = renderScreen({
+      items: [],
+      pendingReviews: [legacyNoSignDiffPending],
+      approvalPanel: {
+        ...buildProps().approvalPanel,
+        active: true,
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Diff preview · edit");
+    expect(output).toContain("+1 lines");
+    expect(output).toContain("-1 lines");
+    expect(output).toContain("const before = true;");
     expect(output).toContain("const after = true;");
   });
 

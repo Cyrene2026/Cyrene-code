@@ -558,6 +558,8 @@ describe("runQuerySession", () => {
     expect(result.status).toBe("completed");
     expect(prompts[1]).toContain("Heuristic nudges:");
     expect(prompts[1]).toContain("Stop exploring and start writing");
+    expect(prompts[1]).toContain("Execution style rules:");
+    expect(prompts[1]).toContain("Keep assistant wording in the same language as the user request");
   });
 
   test("injects write-not-read nudge after empty file is confirmed", async () => {

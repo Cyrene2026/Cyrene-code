@@ -116,6 +116,13 @@ type TerminalTranscript = {
   outputLines: string[];
 };
 
+type RenderClipResult = {
+  text: string;
+  clipped: boolean;
+  hiddenLines: number;
+  hiddenChars: number;
+};
+
 type ComposerTone = {
   borderColor: "gray" | "yellow" | "magenta" | "red";
   panelBorderColor: "cyan" | "yellow" | "magenta" | "red";
@@ -150,6 +157,10 @@ const APPROVAL_DIFF_REMOVE_FOREGROUND = "#fee2e2";
 const APPROVAL_DIFF_REMOVE_BACKGROUND = "#7f1d1d";
 const APPROVAL_DIFF_ADD_ACCENT = "#166534";
 const APPROVAL_DIFF_REMOVE_ACCENT = "#991b1b";
+const MAX_RENDERED_TRANSCRIPT_ITEMS = 80;
+const MAX_RENDER_TEXT_LINES = 420;
+const MAX_RENDER_TEXT_CHARS = 24000;
+const MAX_RENDERED_TERMINAL_OUTPUT_LINES = 220;
 const CODE_KEYWORDS = new Set([
   "const",
   "let",
@@ -218,6 +229,49 @@ const getMessageLabel = (
 
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
+
+const clipTextForRender = (text: string): RenderClipResult => {
+  const allLines = text.split("\n");
+  const visibleLines = allLines.slice(0, MAX_RENDER_TEXT_LINES);
+  let clippedText = visibleLines.join("\n");
+
+  if (clippedText.length > MAX_RENDER_TEXT_CHARS) {
+    clippedText = clippedText.slice(0, MAX_RENDER_TEXT_CHARS);
+  }
+
+  const hiddenLines = Math.max(0, allLines.length - visibleLines.length);
+  const hiddenChars = Math.max(0, text.length - clippedText.length);
+  return {
+    text: clippedText,
+    clipped: hiddenLines > 0 || hiddenChars > 0,
+    hiddenLines,
+    hiddenChars,
+  };
+};
+
+const formatRenderClipNotice = (clip: RenderClipResult) => {
+  if (!clip.clipped) {
+    return "";
+  }
+  const parts = [
+    clip.hiddenLines > 0 ? `${clip.hiddenLines} lines` : "",
+    clip.hiddenChars > 0 ? `${clip.hiddenChars} chars` : "",
+  ].filter(Boolean);
+  return `[render clipped] omitted ${parts.join(" / ")} to keep terminal stable`;
+};
+
+const getTranscriptWindow = (items: ChatItem[]) => {
+  if (items.length <= MAX_RENDERED_TRANSCRIPT_ITEMS) {
+    return {
+      items,
+      hiddenCount: 0,
+    };
+  }
+  return {
+    items: items.slice(-MAX_RENDERED_TRANSCRIPT_ITEMS),
+    hiddenCount: items.length - MAX_RENDERED_TRANSCRIPT_ITEMS,
+  };
+};
 
 const formatProviderLabel = (provider: string, max = 22) => {
   if (!provider || provider === "none") {
@@ -894,10 +948,19 @@ const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
 
 const renderTerminalTranscript = (
   transcript: TerminalTranscript,
-  itemIndex: number
+  itemIndex: number,
+  clipNotice?: string
 ) => {
   const shellPrompt = getTerminalPrompt(transcript.action, transcript.shell);
   const meta = transcript.metaParts.join("  |  ");
+  const visibleOutputLines = transcript.outputLines.slice(
+    0,
+    MAX_RENDERED_TERMINAL_OUTPUT_LINES
+  );
+  const hiddenOutputLines = Math.max(
+    0,
+    transcript.outputLines.length - visibleOutputLines.length
+  );
 
   return (
     <Box key={`terminal-${itemIndex}`} flexDirection="column" marginBottom={1}>
@@ -910,7 +973,7 @@ const renderTerminalTranscript = (
         </Box>
       ) : null}
       <Box flexDirection="column">
-        {transcript.outputLines.map((line, lineIndex) => (
+        {visibleOutputLines.map((line, lineIndex) => (
           (() => {
             const promptLine = normalizeTranscriptPromptLine(
               line,
@@ -945,6 +1008,10 @@ const renderTerminalTranscript = (
             );
           })()
         ))}
+        {hiddenOutputLines > 0 ? (
+          <Text dimColor>{`[render clipped] omitted ${hiddenOutputLines} output lines`}</Text>
+        ) : null}
+        {clipNotice ? <Text dimColor>{clipNotice}</Text> : null}
       </Box>
     </Box>
   );
@@ -955,12 +1022,17 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
     return null;
   }
 
+  const clip = clipTextForRender(item.text);
+  const clipNotice = formatRenderClipNotice(clip);
   const color = resolveItemColor(item);
-  const terminalTranscript = parseTerminalTranscript(item);
-  const blocks = parseMarkdownBlocks(item.text);
+  const terminalTranscript = parseTerminalTranscript({
+    ...item,
+    text: clip.text,
+  });
+  const blocks = parseMarkdownBlocks(clip.text);
   const nodes: React.ReactNode[] = [];
   if (terminalTranscript) {
-    nodes.push(renderTerminalTranscript(terminalTranscript, itemIndex));
+    nodes.push(renderTerminalTranscript(terminalTranscript, itemIndex, clipNotice));
   } else {
   blocks.forEach((block, blockIndex) => {
     if (block.kind === "paragraph") {
@@ -1037,6 +1109,13 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
       });
     }
   });
+  if (clipNotice) {
+    nodes.push(
+      <Text key={`clip-${itemIndex}`} dimColor>
+        {`  ${clipNotice}`}
+      </Text>
+    );
+  }
   }
 
   if (terminalTranscript) {
@@ -1547,28 +1626,55 @@ const inferSectionDiffMode = (label?: string): "add" | "remove" | null => {
   return null;
 };
 
+const isApprovalPreviewHeaderLine = (line: string) => {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("action=")) {
+    return false;
+  }
+  return trimmed
+    .split("|")
+    .map(part => part.trim())
+    .every(part => /^[a-z_]+=.*/i.test(part));
+};
+
 const parseApprovalPreviewLines = (previewText: string): ApprovalPreviewLine[] => {
   let sectionMode: "add" | "remove" | null = null;
-  return previewText.split("\n").map(rawLine => {
+  const parsedLines: ApprovalPreviewLine[] = [];
+  const rawLines = previewText.split("\n");
+
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const rawLine = rawLines[index] ?? "";
+    if (isApprovalPreviewHeaderLine(rawLine)) {
+      const nextLine = rawLines[index + 1] ?? "";
+      if (!nextLine.trim()) {
+        index += 1;
+      }
+      continue;
+    }
+
     const parsed = classifyApprovalPreviewLine(rawLine);
     if (parsed.kind === "section") {
       sectionMode = inferSectionDiffMode(parsed.label);
-      return parsed;
+      parsedLines.push(parsed);
+      continue;
     }
     if (parsed.kind === "context" && sectionMode) {
       const numbered = /^\s*(\d+)\s*\|\s?(.*)$/.exec(rawLine);
       if (numbered) {
         const [, lineNumber = "", content = ""] = numbered;
-        return {
+        parsedLines.push({
           kind: sectionMode,
           raw: rawLine,
           lineNumber,
           content,
-        };
+        });
+        continue;
       }
     }
-    return parsed;
-  });
+    parsedLines.push(parsed);
+  }
+
+  return parsedLines;
 };
 
 const getApprovalDiffPalette = (kind: "add" | "remove") =>
@@ -2428,13 +2534,16 @@ export const ChatScreen = ({
 
   const showStartupView =
     !liveAssistantText && items.every(item => item.role === "system" && item.kind === "system_hint");
-  const visibleTranscriptItems = React.useMemo(
-    () => (showStartupView ? [] : items),
+  const transcriptWindow = React.useMemo(
+    () => (showStartupView ? getTranscriptWindow([]) : getTranscriptWindow(items)),
     [items, showStartupView]
   );
   const transcriptNodes = React.useMemo(
-    () => visibleTranscriptItems.map((item, index) => renderMessageItem(item, index)),
-    [visibleTranscriptItems]
+    () =>
+      transcriptWindow.items.map((item, index) =>
+        renderMessageItem(item, index + transcriptWindow.hiddenCount)
+      ),
+    [transcriptWindow.hiddenCount, transcriptWindow.items]
   );
   const liveAssistantNode = React.useMemo(
     () =>
@@ -2494,6 +2603,11 @@ export const ChatScreen = ({
         {showStartupView
           ? renderStartupView(currentModel, currentProvider, activeSessionId)
           : null}
+        {transcriptWindow.hiddenCount > 0 ? (
+          <Text dimColor>
+            {`[render window] showing latest ${transcriptWindow.items.length} of ${items.length} messages`}
+          </Text>
+        ) : null}
         {transcriptNodes}
         {liveAssistantNode}
       </Box>

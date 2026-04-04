@@ -44,6 +44,15 @@ const editPending: PendingReviewItem = {
   createdAt: "2026-01-01T00:00:00.000Z",
 };
 
+const editPendingWithPreviewHeader: PendingReviewItem = {
+  ...editPending,
+  id: "p1-header",
+  previewSummary:
+    "action=edit_file | path=src/example.ts\n\n[edit preview]\n[old - to be removed]\n- 12 | oldValue\n[new + to be written]\n+ 12 | newValue\n@@ replacement",
+  previewFull:
+    "action=edit_file | path=src/example.ts\n\n[edit preview]\n[old - to be removed]\n- 12 | const oldValue = 1;\n[new + to be written]\n+ 12 | const newValue = 2;\n@@ replacement",
+};
+
 const movePending: PendingReviewItem = {
   id: "p2",
   request: {
@@ -279,6 +288,22 @@ describe("ChatScreen", () => {
     expect(output).not.toContain("Review mode");
     expect(output).not.toContain("Approval panel active...");
     expect(output).not.toContain("Message Cyrene...");
+  });
+
+  test("approval mode hides raw preview header metadata lines", () => {
+    const tree = renderScreen({
+      pendingReviews: [editPendingWithPreviewHeader],
+      approvalPanel: {
+        ...buildProps().approvalPanel,
+        active: true,
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).not.toContain("action=edit_file");
+    expect(output).not.toContain("path=src/example.ts");
+    expect(output).toContain("[edit preview]");
+    expect(output).toContain("newValue");
   });
 
   test("approval mode shows persistent shell session summary rows", () => {
@@ -754,5 +779,47 @@ describe("ChatScreen", () => {
     const output = JSON.stringify(tree);
 
     expect(output).toContain("history 2/5");
+  });
+
+  test("clips oversized transcript blocks and shows render clip notice", () => {
+    const hugeCodeBlock = [
+      "```txt",
+      ...Array.from({ length: 460 }, (_, index) => `line-${String(index + 1).padStart(3, "0")}`),
+      "```",
+    ].join("\n");
+
+    const tree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: hugeCodeBlock,
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("[render clipped]");
+    expect(output).toContain("\"001\"");
+    expect(output).not.toContain("\"460\"");
+  });
+
+  test("shows only a recent transcript window for very long sessions", () => {
+    const manyItems = Array.from({ length: 100 }, (_, index) => ({
+      role: "assistant" as const,
+      text: `session-msg-${String(index).padStart(3, "0")}`,
+      kind: "transcript" as const,
+      tone: "neutral" as const,
+    }));
+
+    const tree = renderScreen({
+      items: manyItems,
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("[render window] showing latest 80 of 100 messages");
+    expect(output).toContain("session-msg-099");
+    expect(output).not.toContain("session-msg-000");
   });
 });

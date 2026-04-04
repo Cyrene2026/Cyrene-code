@@ -211,6 +211,112 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("/undo calls mcp undo and appends returned message", async () => {
+    const undoLastMutation = mock(async () => ({
+      ok: true,
+      message: "[undo] reverted write_file: restored notes.txt",
+    }));
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          undoLastMutation,
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/undo");
+
+    expect(undoLastMutation).toHaveBeenCalledTimes(1);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("[undo] reverted write_file: restored notes.txt")
+      )
+    ).toBe(true);
+    app.cleanup();
+  });
+
+  test("/tag add|list|remove manages current session tags", async () => {
+    const sessionStore = createTestSessionStore();
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          undoLastMutation: async () => ({ ok: false, message: "Nothing to undo." }),
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/tag add urgent");
+    await runCommand(app, "/tag list");
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("#urgent"))
+    ).toBe(true);
+
+    await runCommand(app, "/tag remove urgent");
+    await runCommand(app, "/tag list");
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("No tags yet. Use /tag add <tag>."))
+    ).toBe(true);
+
+    app.cleanup();
+  });
+
+  test("/search-session finds sessions by query and tag", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-1", {
+        title: "alpha feature rollout",
+        tags: ["feature"],
+        messages: [
+          {
+            role: "user",
+            text: "investigate flaky feature tests",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+      createSessionRecord("session-2", {
+        title: "ops cleanup",
+        tags: ["maintenance"],
+      }),
+    ]);
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          undoLastMutation: async () => ({ ok: false, message: "Nothing to undo." }),
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/search-session feature");
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("session-1 | alpha feature rollout"))
+    ).toBe(true);
+
+    await runCommand(app, "/search-session #maintenance");
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("session-2 | ops cleanup"))
+    ).toBe(true);
+
+    app.cleanup();
+  });
+
   test("free input supports terminal-style history with up/down arrows", async () => {
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
@@ -608,6 +714,12 @@ describe("useChatApp", () => {
     expect(app.getLatest().approvalPanel.active).toBe(true);
     expect(app.getLatest().approvalPanel.selectedIndex).toBeGreaterThanOrEqual(0);
     expect(app.getLatest().approvalPanel.selectedIndex).toBeLessThan(2);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("risk: high"))
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("batch: /approve low | /approve all | /reject all"))
+    ).toBe(true);
 
     await act(async () => {
       app.getLatest().closeApprovalPanel();
@@ -967,11 +1079,117 @@ describe("useChatApp", () => {
 
     pending = [createPending("r1"), createPending("r2")];
     await runCommand(app, "/reject");
-    expect(getTexts(app.getLatest().items).some(text => text.includes("use: /reject <id> or the approval panel"))).toBe(true);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("use: /reject <id>"))).toBe(true);
 
     await runCommand(app, "/reject r1");
     expect(pending.map(item => item.id)).toEqual(["r2"]);
     expect(getTexts(app.getLatest().items).some(text => text.includes("Rejected"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("/approve low bulk-approves non-high-risk operations only", async () => {
+    let pending = [
+      createPending("b1", "create_file", "safe.txt"),
+      createPending("b2", "edit_file", "risky.ts"),
+    ];
+    const approvedIds: string[] = [];
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => {
+        approvedIds.push(id);
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[approved] ${id}\nok` };
+      }),
+      reject: mock((id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await runCommand(app, "/approve low");
+    await flushMicrotasks();
+    expect(approvedIds).toEqual(["b1"]);
+    expect(pending.map(item => item.id)).toEqual(["b2"]);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("Batch approved"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("/approve all bulk-approves every pending operation", async () => {
+    let pending = [createPending("a1"), createPending("a2", "edit_file", "x.ts")];
+    const approvedIds: string[] = [];
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => {
+        approvedIds.push(id);
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[approved] ${id}\nok` };
+      }),
+      reject: mock((id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await runCommand(app, "/approve all");
+    await flushMicrotasks();
+    expect(approvedIds).toEqual(["a1", "a2"]);
+    expect(pending).toHaveLength(0);
+    app.cleanup();
+  });
+
+  test("/reject all rejects all pending operations in one batch", async () => {
+    let pending = [createPending("ra"), createPending("rb")];
+    const rejectedIds: string[] = [];
+    const mcpService = {
+      listPending: () => [...pending],
+      approve: mock(async (id: string) => {
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[approved] ${id}\nok` };
+      }),
+      reject: mock((id: string) => {
+        rejectedIds.push(id);
+        pending = pending.filter(item => item.id !== id);
+        return { ok: true, message: `[rejected] ${id}` };
+      }),
+    };
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await runCommand(app, "/reject all");
+    expect(rejectedIds).toEqual(["ra", "rb"]);
+    expect(pending).toHaveLength(0);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("Batch rejected"))).toBe(true);
     app.cleanup();
   });
 

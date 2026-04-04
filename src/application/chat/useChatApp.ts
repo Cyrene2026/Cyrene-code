@@ -143,13 +143,22 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/resume", description: "open session resume picker" },
   { command: "/resume <id>", description: "resume a session by id" },
   { command: "/new", description: "start a fresh session" },
+  { command: "/undo", description: "undo last approved filesystem mutation" },
+  { command: "/search-session <query>", description: "search sessions by id/title/content" },
+  { command: "/search-session #<tag> [query]", description: "search sessions by tag + query" },
+  { command: "/tag list", description: "list tags of current session" },
+  { command: "/tag add <tag>", description: "add tag to current session" },
+  { command: "/tag remove <tag>", description: "remove tag from current session" },
   { command: "/pin <note>", description: "pin important context" },
   { command: "/pins", description: "list pinned context" },
   { command: "/unpin <index>", description: "remove a pin" },
   { command: "/review", description: "open approval queue" },
   { command: "/review <id>", description: "inspect one pending operation" },
   { command: "/approve [id]", description: "approve pending operation(s)" },
+  { command: "/approve low", description: "approve all non-high-risk operations" },
+  { command: "/approve all", description: "approve all pending operations" },
   { command: "/reject [id]", description: "reject pending operation(s)" },
+  { command: "/reject all", description: "reject all pending operations" },
 ];
 const HELP_TEXT = [
   "Commands:",
@@ -336,6 +345,34 @@ const isHighRiskReviewAction = (action: MpcAction) =>
   action === "run_shell" ||
   action === "open_shell" ||
   action === "write_shell";
+
+type ApprovalRisk = "high" | "medium" | "low";
+
+const getApprovalRisk = (action: MpcAction): ApprovalRisk => {
+  if (isHighRiskReviewAction(action)) {
+    return "high";
+  }
+  if (
+    action === "create_file" ||
+    action === "create_dir" ||
+    action === "write_file" ||
+    action === "move_path" ||
+    action === "copy_path"
+  ) {
+    return "medium";
+  }
+  return "low";
+};
+
+const summarizePendingRisk = (pending: PendingReviewItem[]) =>
+  pending.reduce(
+    (acc, item) => {
+      const risk = getApprovalRisk(item.request.action);
+      acc[risk] += 1;
+      return acc;
+    },
+    { high: 0, medium: 0, low: 0 } as Record<ApprovalRisk, number>
+  );
 
 const extractMessageBody = (raw: string) => {
   const [, ...rest] = raw.split("\n");
@@ -1597,6 +1634,114 @@ export const useChatApp = ({
     });
   };
 
+  const processPendingBatch = (
+    action: ApprovalActionKind,
+    selector: (item: PendingReviewItem) => boolean,
+    scopeLabel: string
+  ) => {
+    enqueueTask(async () => {
+      try {
+        const before = mcpService.listPending();
+        const targets = before.filter(selector);
+        const wasOpen = approvalPanelRef.current.active;
+        const currentIndex = approvalPanelRef.current.selectedIndex;
+
+        if (targets.length === 0) {
+          pushSystemMessage(
+            `No pending operations matched batch scope: ${scopeLabel}.`,
+            { kind: "system_hint", tone: "neutral", color: "white" }
+          );
+          return;
+        }
+
+        syncApprovalPanelState(previous => ({
+          ...previous,
+          inFlightId: `batch:${action}`,
+          actionState: action,
+          resumePending: Boolean(suspendedTaskRef.current),
+        }));
+
+        let success = 0;
+        let failed = 0;
+        let resumeMessage: string | null = null;
+        const failureDetails: string[] = [];
+
+        for (const target of targets) {
+          const result =
+            action === "approve"
+              ? await mcpService.approve(target.id)
+              : mcpService.reject(target.id);
+          if (result.ok) {
+            success += 1;
+            if (!resumeMessage) {
+              resumeMessage = result.message;
+            }
+            continue;
+          }
+
+          failed += 1;
+          failureDetails.push(
+            `${target.id}: ${extractMessageBody(result.message) || result.message}`
+          );
+        }
+
+        const nextPending = mcpService.listPending();
+        updatePendingState(nextPending, {
+          open: shouldKeepApprovalPanelOpen(nextPending.length, wasOpen),
+          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
+          clearBlocked: true,
+        });
+
+        const processedRisk = summarizePendingRisk(targets);
+        const remainingRisk = summarizePendingRisk(nextPending);
+        const title =
+          action === "approve" ? "Batch approved" : "Batch rejected";
+        const tone =
+          failed > 0
+            ? "warning"
+            : action === "approve"
+              ? "success"
+              : "warning";
+        const color = failed > 0 ? "yellow" : action === "approve" ? "green" : "yellow";
+        const lines = [
+          `scope: ${scopeLabel}`,
+          `processed: ${targets.length}`,
+          `success: ${success}`,
+          `failed: ${failed}`,
+          `remaining: ${nextPending.length}`,
+          `processed_risk: high ${processedRisk.high} | medium ${processedRisk.medium} | low ${processedRisk.low}`,
+          `remaining_risk: high ${remainingRisk.high} | medium ${remainingRisk.medium} | low ${remainingRisk.low}`,
+          ...failureDetails.slice(0, 3).map(detail => `failure: ${detail}`),
+          failureDetails.length > 3
+            ? `failure: ... ${failureDetails.length - 3} more`
+            : "",
+        ].filter(Boolean);
+
+        const summaryMessage = buildApprovalMessage(title, undefined, lines);
+        pushSystemMessage(summaryMessage, {
+          kind: "review_status",
+          tone,
+          color,
+        });
+        await recordSessionMemory(getMemorySessionId(), {
+          kind: failed > 0 ? "error" : "approval",
+          text: summaryMessage,
+          priority: failed > 0 ? 86 : 79,
+          entities: {
+            action: [action],
+            status: [failed > 0 ? "partial" : "ok"],
+          },
+        });
+
+        if (resumeMessage) {
+          resumeSuspendedTask(resumeMessage);
+        }
+      } finally {
+        syncApprovalPanelState(previous => clearApprovalInFlight(previous));
+      }
+    });
+  };
+
   const approveCurrentPendingReview = () => {
     const target =
       pendingReviewsRef.current[approvalPanelRef.current.selectedIndex];
@@ -2264,6 +2409,118 @@ export const useChatApp = ({
         return;
       }
 
+      if (query === "/undo") {
+        const result = await mcpService.undoLastMutation();
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        setInput("");
+        return;
+      }
+
+      if (query === "/search-session") {
+        pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
+        setInput("");
+        return;
+      }
+
+      if (query.startsWith("/search-session ")) {
+        const raw = query.slice("/search-session ".length).trim();
+        if (!raw) {
+          pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
+          setInput("");
+          return;
+        }
+
+        const parts = raw.split(/\s+/).filter(Boolean);
+        const tagToken = parts.find(part => part.startsWith("#"));
+        const tag = tagToken ? tagToken.replace(/^#+/, "").trim() : "";
+        const textQuery = parts
+          .filter(part => !part.startsWith("#"))
+          .join(" ")
+          .trim();
+        const searchQuery = textQuery || (tag ? "" : raw);
+
+        const results = await sessionStore.searchSessions(searchQuery, {
+          tag: tag || undefined,
+          limit: 12,
+        });
+        if (results.length === 0) {
+          pushSystemMessage(
+            `No sessions matched.${tag ? ` (tag: ${tag})` : ""}`
+          );
+          setInput("");
+          return;
+        }
+        pushSystemMessage(
+          [
+            `Found ${results.length} session(s):`,
+            ...results.map((item, index) => {
+              const tagSuffix =
+                item.tags.length > 0 ? ` #${item.tags.join(" #")}` : "";
+              return `${index + 1}. ${item.id} | ${item.title}${tagSuffix}`;
+            }),
+          ].join("\n")
+        );
+        setInput("");
+        return;
+      }
+
+      if (query === "/tag") {
+        pushSystemMessage("Usage: /tag list | /tag add <tag> | /tag remove <tag>");
+        setInput("");
+        return;
+      }
+
+      if (query === "/tag list") {
+        const session = await ensureActiveSession();
+        if (session.tags.length === 0) {
+          pushSystemMessage("No tags yet. Use /tag add <tag>.");
+        } else {
+          pushSystemMessage(`Session tags:\n${session.tags.map(tag => `#${tag}`).join("\n")}`);
+        }
+        setInput("");
+        return;
+      }
+
+      if (query.startsWith("/tag add ")) {
+        const tag = query.slice("/tag add ".length).trim();
+        if (!tag) {
+          pushSystemMessage("Usage: /tag add <tag>");
+          setInput("");
+          return;
+        }
+        const session = await ensureActiveSession();
+        const next = await sessionStore.addTag(session.id, tag);
+        pushSystemMessage(
+          next.tags.length > 0
+            ? `Tag added. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`
+            : "Tag was not added."
+        );
+        setInput("");
+        return;
+      }
+
+      if (query.startsWith("/tag remove ")) {
+        const tag = query.slice("/tag remove ".length).trim();
+        if (!tag) {
+          pushSystemMessage("Usage: /tag remove <tag>");
+          setInput("");
+          return;
+        }
+        const session = await ensureActiveSession();
+        const next = await sessionStore.removeTag(session.id, tag);
+        if (next.tags.length === 0) {
+          pushSystemMessage("Tag removed. No tags remain.");
+        } else {
+          pushSystemMessage(`Tag removed. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`);
+        }
+        setInput("");
+        return;
+      }
+
       if (query === "/system") {
         pushSystemMessage(`Current system prompt:\n${systemPrompt}`);
         setInput("");
@@ -2321,11 +2578,14 @@ export const useChatApp = ({
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
           } else {
+            const risk = summarizePendingRisk(pending);
             pushSystemMessage(
               buildApprovalMessage("Approval required", undefined, [
                 `pending: ${pending.length}`,
+                `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
                 "panel: opened",
                 "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
+                "batch: /approve low | /approve all | /reject all",
               ]),
               { kind: "review_status", tone: "warning", color: "yellow" }
             );
@@ -2386,10 +2646,12 @@ export const useChatApp = ({
           return;
         }
         if (pending.length > 1) {
+          const risk = summarizePendingRisk(pending);
           pushSystemMessage(
             buildApprovalMessage("Approval required", undefined, [
               `pending: ${pending.length}`,
-              "use: /approve <id> or the approval panel",
+              `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
+              "use: /approve <id>, /approve low, /approve all, or the approval panel",
             ]),
             { kind: "review_status", tone: "warning", color: "yellow" }
           );
@@ -2410,10 +2672,26 @@ export const useChatApp = ({
         return;
       }
 
+      if (query === "/approve low") {
+        processPendingBatch(
+          "approve",
+          item => getApprovalRisk(item.request.action) !== "high",
+          "low-and-medium"
+        );
+        setInput("");
+        return;
+      }
+
+      if (query === "/approve all") {
+        processPendingBatch("approve", () => true, "all");
+        setInput("");
+        return;
+      }
+
       if (query.startsWith("/approve ")) {
         const id = query.slice("/approve ".length).trim();
         if (!id) {
-          pushSystemMessage("Usage: /approve <id>");
+          pushSystemMessage("Usage: /approve <id> | /approve low | /approve all");
           setInput("");
           return;
         }
@@ -2433,10 +2711,12 @@ export const useChatApp = ({
           return;
         }
         if (pending.length > 1) {
+          const risk = summarizePendingRisk(pending);
           pushSystemMessage(
             buildApprovalMessage("Approval required", undefined, [
               `pending: ${pending.length}`,
-              "use: /reject <id> or the approval panel",
+              `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
+              "use: /reject <id>, /reject all, or the approval panel",
             ]),
             { kind: "review_status", tone: "warning", color: "yellow" }
           );
@@ -2457,10 +2737,16 @@ export const useChatApp = ({
         return;
       }
 
+      if (query === "/reject all") {
+        processPendingBatch("reject", () => true, "all");
+        setInput("");
+        return;
+      }
+
       if (query.startsWith("/reject ")) {
         const id = query.slice("/reject ".length).trim();
         if (!id) {
-          pushSystemMessage("Usage: /reject <id>");
+          pushSystemMessage("Usage: /reject <id> | /reject all");
           setInput("");
           return;
         }

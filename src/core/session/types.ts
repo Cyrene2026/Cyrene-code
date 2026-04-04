@@ -13,6 +13,7 @@ export type SessionRecord = {
   updatedAt: string;
   summary: string;
   focus: string[];
+  tags: string[];
   messages: SessionMessage[];
 };
 
@@ -20,4 +21,5 @@ export type SessionListItem = {
   id: string;
   title: string;
   updatedAt: string;
+  tags: string[];
 };

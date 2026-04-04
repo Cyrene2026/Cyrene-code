@@ -40,6 +40,7 @@ const sessionSchema = z.object({
   updatedAt: z.string(),
   summary: z.string().optional(),
   focus: z.array(z.string()).optional(),
+  tags: z.array(z.string()).optional(),
   messages: z.array(messageSchema),
 });
 
@@ -93,6 +94,23 @@ const sanitizeTitle = (title: string) => {
   return `${normalized.slice(0, 60)}...`;
 };
 
+const normalizeTag = (tag: string) =>
+  tag
+    .trim()
+    .replace(/^#+/, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+
+const normalizeTagSet = (tags: string[]) =>
+  Array.from(
+    new Set(
+      tags
+        .map(normalizeTag)
+        .filter(Boolean)
+    )
+  );
+
 const fileNameFor = (id: string) => `${id}.json`;
 const indexFileNameFor = (id: string) => `${id}.index.json`;
 
@@ -124,6 +142,7 @@ export const createFileSessionStore = (
         ...normalized,
         summary: normalized.summary ?? "",
         focus: normalized.focus ?? [],
+        tags: normalizeTagSet(normalized.tags ?? []),
       };
     } catch {
       return null;
@@ -204,6 +223,33 @@ export const createFileSessionStore = (
     return nextSession;
   };
 
+  const scoreSessionQuery = (session: SessionRecord, normalizedQuery: string) => {
+    if (!normalizedQuery) {
+      return 1;
+    }
+    const query = normalizedQuery.toLowerCase();
+    let score = 0;
+    if (session.id.toLowerCase().includes(query)) {
+      score += 6;
+    }
+    if (session.title.toLowerCase().includes(query)) {
+      score += 10;
+    }
+    if (session.summary.toLowerCase().includes(query)) {
+      score += 5;
+    }
+    if (session.tags.some(tag => tag.toLowerCase().includes(query))) {
+      score += 8;
+    }
+    if (session.focus.some(note => note.toLowerCase().includes(query))) {
+      score += 4;
+    }
+    if (session.messages.some(message => message.text.toLowerCase().includes(query))) {
+      score += 2;
+    }
+    return score;
+  };
+
   const recordMemoriesInternal = async (id: string, entries: SessionMemoryInput[]) => {
     const loaded = await ensureSessionWithIndex(id);
     if (!loaded) {
@@ -233,6 +279,7 @@ export const createFileSessionStore = (
         updatedAt: now,
         summary: "",
         focus: [],
+        tags: [],
         messages: [],
       };
       const index = createEmptyMemoryIndex(id, now);
@@ -258,10 +305,58 @@ export const createFileSessionStore = (
           id: loaded.session.id,
           title: loaded.session.title,
           updatedAt: loaded.session.updatedAt,
+          tags: [...loaded.session.tags],
         });
       }
 
       return items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    },
+    searchSessions: async (query, options) => {
+      await ensureDir();
+      const files = await readdir(resolvedSessionDir, { withFileTypes: true });
+      const normalizedQuery = query.trim().toLowerCase();
+      const normalizedTag = options?.tag ? normalizeTag(options.tag) : "";
+      const scored: Array<{ item: SessionListItem; score: number }> = [];
+
+      for (const file of files) {
+        if (!file.isFile() || !isSessionDataFile(file.name)) {
+          continue;
+        }
+        const id = file.name.replace(/\.json$/, "");
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded) {
+          continue;
+        }
+        const session = loaded.session;
+        if (normalizedTag && !session.tags.includes(normalizedTag)) {
+          continue;
+        }
+        const score = scoreSessionQuery(session, normalizedQuery);
+        if (score <= 0) {
+          continue;
+        }
+        scored.push({
+          item: {
+            id: session.id,
+            title: session.title,
+            updatedAt: session.updatedAt,
+            tags: [...session.tags],
+          },
+          score,
+        });
+      }
+
+      const sorted = scored
+        .sort((left, right) => {
+          if (left.score !== right.score) {
+            return right.score - left.score;
+          }
+          return right.item.updatedAt.localeCompare(left.item.updatedAt);
+        })
+        .map(entry => entry.item);
+
+      const limit = options?.limit && options.limit > 0 ? Math.floor(options.limit) : undefined;
+      return typeof limit === "number" ? sorted.slice(0, limit) : sorted;
     },
     loadSession: async id => {
       const loaded = await ensureSessionWithIndex(id);
@@ -364,6 +459,43 @@ export const createFileSessionStore = (
         },
         nextIndex
       );
+    },
+    addTag: async (id, tag) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const normalized = normalizeTag(tag);
+      if (!normalized) {
+        return loaded.session;
+      }
+      if (loaded.session.tags.includes(normalized)) {
+        return loaded.session;
+      }
+      const next: SessionRecord = {
+        ...loaded.session,
+        tags: [...loaded.session.tags, normalized],
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
+    },
+    removeTag: async (id, tag) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const normalized = normalizeTag(tag);
+      if (!normalized || !loaded.session.tags.includes(normalized)) {
+        return loaded.session;
+      }
+      const next: SessionRecord = {
+        ...loaded.session,
+        tags: loaded.session.tags.filter(item => item !== normalized),
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
     },
     getMemoryIndex: async id => {
       const loaded = await ensureSessionWithIndex(id);

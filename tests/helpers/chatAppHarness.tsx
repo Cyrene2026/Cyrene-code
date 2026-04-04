@@ -80,10 +80,18 @@ export const renderHookHarness = <T,>(useHook: () => T): ChatAppHarnessResult<T>
 };
 
 const now = () => new Date("2026-01-01T00:00:00.000Z").toISOString();
+const normalizeTag = (tag: string) =>
+  tag
+    .trim()
+    .replace(/^#+/, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
 
 const cloneRecord = (record: SessionRecord): SessionRecord => ({
   ...record,
   focus: [...record.focus],
+  tags: [...record.tags],
   messages: record.messages.map(message => ({ ...message })),
 });
 
@@ -97,6 +105,7 @@ export const createSessionRecord = (
   updatedAt: overrides?.updatedAt ?? now(),
   summary: overrides?.summary ?? "",
   focus: overrides?.focus ? [...overrides.focus] : [],
+  tags: overrides?.tags ? [...overrides.tags] : [],
   messages: overrides?.messages ? overrides.messages.map(message => ({ ...message })) : [],
 });
 
@@ -109,6 +118,7 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
     id: record.id,
     title: record.title,
     updatedAt: record.updatedAt,
+    tags: [...record.tags],
   });
 
   const syncRecordWithIndex = (record: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
@@ -150,6 +160,56 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
         })
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
         .map(toListItem),
+    searchSessions: async (query, options) => {
+      const normalizedQuery = query.trim().toLowerCase();
+      const normalizedTag = options?.tag ? normalizeTag(options.tag) : "";
+      const results = [...records.values()]
+        .map(record => {
+          const index = ensureIndex(record);
+          const synced = syncRecordWithIndex(record, index);
+          records.set(record.id, synced);
+          if (normalizedTag && !synced.tags.includes(normalizedTag)) {
+            return null;
+          }
+          let score = 1;
+          if (normalizedQuery) {
+            score = 0;
+            if (synced.id.toLowerCase().includes(normalizedQuery)) {
+              score += 6;
+            }
+            if (synced.title.toLowerCase().includes(normalizedQuery)) {
+              score += 10;
+            }
+            if (synced.summary.toLowerCase().includes(normalizedQuery)) {
+              score += 5;
+            }
+            if (synced.tags.some(tag => tag.includes(normalizedQuery))) {
+              score += 8;
+            }
+            if (synced.focus.some(note => note.toLowerCase().includes(normalizedQuery))) {
+              score += 4;
+            }
+            if (synced.messages.some(message => message.text.toLowerCase().includes(normalizedQuery))) {
+              score += 2;
+            }
+          }
+          if (score <= 0) {
+            return null;
+          }
+          return { item: toListItem(synced), score };
+        })
+        .filter((entry): entry is { item: SessionListItem; score: number } => Boolean(entry))
+        .sort((left, right) => {
+          if (left.score !== right.score) {
+            return right.score - left.score;
+          }
+          return right.item.updatedAt.localeCompare(left.item.updatedAt);
+        })
+        .map(entry => entry.item);
+
+      const limit = options?.limit && options.limit > 0 ? Math.floor(options.limit) : undefined;
+      return typeof limit === "number" ? results.slice(0, limit) : results;
+    },
     loadSession: async id => {
       const record = records.get(id);
       if (!record) {
@@ -228,6 +288,40 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       const nextIndex = target ? removePinMemoryEntry(currentIndex, target) : currentIndex;
       memory.set(id, nextIndex);
       const next = syncRecordWithIndex({ ...record, updatedAt: now() }, nextIndex);
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    addTag: async (id, tag) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const normalized = normalizeTag(tag);
+      if (!normalized || record.tags.includes(normalized)) {
+        return cloneRecord(record);
+      }
+      const next: SessionRecord = {
+        ...record,
+        tags: [...record.tags, normalized],
+        updatedAt: now(),
+      };
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    removeTag: async (id, tag) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const normalized = normalizeTag(tag);
+      if (!normalized || !record.tags.includes(normalized)) {
+        return cloneRecord(record);
+      }
+      const next: SessionRecord = {
+        ...record,
+        tags: record.tags.filter(item => item !== normalized),
+        updatedAt: now(),
+      };
       records.set(id, next);
       return cloneRecord(next);
     },

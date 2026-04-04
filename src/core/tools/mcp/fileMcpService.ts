@@ -51,6 +51,26 @@ type HandleResult = {
   pending?: PendingReviewItem;
 };
 
+type UndoEntry =
+  | {
+      kind: "restore_file";
+      path: string;
+      existedBefore: boolean;
+      content: Uint8Array;
+      sourceAction: ToolRequest["action"];
+    }
+  | {
+      kind: "delete_path";
+      path: string;
+      sourceAction: ToolRequest["action"];
+    }
+  | {
+      kind: "move_path";
+      from: string;
+      to: string;
+      sourceAction: ToolRequest["action"];
+    };
+
 type FileMcpServiceOptions = {
   commandRunner?: (
     request: CommandToolRequest,
@@ -241,6 +261,7 @@ const DEFAULT_GIT_LOG_RESULTS = 12;
 const MAX_GIT_LOG_RESULTS = 50;
 const RECENT_LIST_DIR_WINDOW_MS = 5_000;
 const DEFAULT_SHELL_SETTLE_MS = 160;
+const MAX_UNDO_HISTORY = 50;
 const PENDING_CONFLICT_ACTIONS: FileAction[] = [
   "create_file",
   "write_file",
@@ -1820,6 +1841,8 @@ export class FileMcpService {
     { output: string; listedAt: number; mutationVersion: number }
   >();
   private filesystemMutationVersion = 0;
+  private undoHistory: UndoEntry[] = [];
+  private suppressUndoRecording = false;
   private shellSession: ActiveShellSession | null = null;
 
   constructor(
@@ -2902,6 +2925,79 @@ export class FileMcpService {
     this.recentListDir.clear();
   }
 
+  private pushUndoEntry(entry: UndoEntry) {
+    if (this.suppressUndoRecording) {
+      return;
+    }
+    this.undoHistory.push(entry);
+    if (this.undoHistory.length > MAX_UNDO_HISTORY) {
+      this.undoHistory.splice(0, this.undoHistory.length - MAX_UNDO_HISTORY);
+    }
+  }
+
+  private async moveAbsolutePath(source: string, destination: string) {
+    await mkdir(dirname(destination), { recursive: true });
+    try {
+      await rename(source, destination);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "EXDEV") {
+        throw error;
+      }
+      const info = await stat(source);
+      if (info.isDirectory()) {
+        await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
+        await rm(source, { recursive: true, force: false });
+      } else {
+        await copyFile(source, destination);
+        await rm(source, { recursive: false, force: false });
+      }
+    }
+  }
+
+  private async applyUndoEntry(entry: UndoEntry) {
+    if (entry.kind === "restore_file") {
+      const absolute = this.resolvePath(entry.path);
+      if (!entry.existedBefore) {
+        try {
+          await rm(absolute, { recursive: false, force: false });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw error;
+          }
+        }
+        return `reverted ${entry.sourceAction}: removed ${entry.path}`;
+      }
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, entry.content);
+      return `reverted ${entry.sourceAction}: restored ${entry.path}`;
+    }
+
+    if (entry.kind === "delete_path") {
+      const absolute = this.resolvePath(entry.path);
+      try {
+        const info = await stat(absolute);
+        await rm(absolute, {
+          recursive: info.isDirectory(),
+          force: false,
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+      return `reverted ${entry.sourceAction}: removed ${entry.path}`;
+    }
+
+    if (await this.pathExists(entry.to)) {
+      throw new Error(`undo target already exists: ${entry.to}`);
+    }
+    const from = this.resolvePath(entry.from);
+    const to = this.resolvePath(entry.to);
+    await this.moveAbsolutePath(from, to);
+    return `reverted ${entry.sourceAction}: moved ${entry.from} -> ${entry.to}`;
+  }
+
   private getRecentListDirSnapshot(inputPath: string) {
     const normalizedPath = this.normalizeWorkspacePath(inputPath);
     const snapshot = this.recentListDir.get(normalizedPath);
@@ -3669,25 +3765,13 @@ export class FileMcpService {
   private async executeMovePath(request: Extract<ToolRequest, { action: "move_path" }>) {
     const source = this.resolvePath(request.path);
     const destination = this.resolvePath(request.destination);
-    await mkdir(dirname(destination), { recursive: true });
-
-    try {
-      await rename(source, destination);
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code !== "EXDEV") {
-        throw error;
-      }
-      const info = await stat(source);
-      if (info.isDirectory()) {
-        await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
-        await rm(source, { recursive: true, force: false });
-      } else {
-        await copyFile(source, destination);
-        await rm(source, { recursive: false, force: false });
-      }
-    }
-
+    await this.moveAbsolutePath(source, destination);
+    this.pushUndoEntry({
+      kind: "move_path",
+      from: this.normalizeWorkspacePath(request.destination),
+      to: this.normalizeWorkspacePath(request.path),
+      sourceAction: request.action,
+    });
     this.noteFilesystemMutation();
     return `Moved path: ${request.path} -> ${request.destination}`;
   }
@@ -3702,6 +3786,11 @@ export class FileMcpService {
     } else {
       await copyFile(source, destination);
     }
+    this.pushUndoEntry({
+      kind: "delete_path",
+      path: this.normalizeWorkspacePath(request.destination),
+      sourceAction: request.action,
+    });
     this.noteFilesystemMutation();
     return `Copied path: ${request.path} -> ${request.destination}`;
   }
@@ -4417,17 +4506,39 @@ export class FileMcpService {
       case "create_file": {
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, request.content ?? "", { flag: "wx" });
+        this.pushUndoEntry({
+          kind: "delete_path",
+          path: this.normalizeWorkspacePath(request.path),
+          sourceAction: request.action,
+        });
         this.noteFilesystemMutation();
         return `Created file: ${request.path}`;
       }
       case "create_dir": {
+        const existedBefore = await this.pathExists(request.path);
         await mkdir(abs, { recursive: true });
+        if (!existedBefore) {
+          this.pushUndoEntry({
+            kind: "delete_path",
+            path: this.normalizeWorkspacePath(request.path),
+            sourceAction: request.action,
+          });
+        }
         this.noteFilesystemMutation();
         return `Created directory: ${request.path}`;
       }
       case "write_file": {
+        const existedBefore = await this.pathExists(request.path);
+        const before = existedBefore ? await readFile(abs) : new Uint8Array();
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, request.content ?? "", "utf8");
+        this.pushUndoEntry({
+          kind: "restore_file",
+          path: this.normalizeWorkspacePath(request.path),
+          existedBefore,
+          content: before,
+          sourceAction: request.action,
+        });
         this.noteFilesystemMutation();
         return `Wrote file: ${request.path}`;
       }
@@ -4444,6 +4555,13 @@ export class FileMcpService {
         }
         const after = before.replace(request.find, request.replace);
         await writeFile(abs, after, "utf8");
+        this.pushUndoEntry({
+          kind: "restore_file",
+          path: this.normalizeWorkspacePath(request.path),
+          existedBefore: true,
+          content: Buffer.from(before, "utf8"),
+          sourceAction: request.action,
+        });
         this.noteFilesystemMutation();
         return `Edited file: ${request.path}`;
       }
@@ -4460,11 +4578,26 @@ export class FileMcpService {
         }
         const after = before.replace(request.find, request.replace);
         await writeFile(abs, after, "utf8");
+        this.pushUndoEntry({
+          kind: "restore_file",
+          path: this.normalizeWorkspacePath(request.path),
+          existedBefore: true,
+          content: Buffer.from(before, "utf8"),
+          sourceAction: request.action,
+        });
         this.noteFilesystemMutation();
         return `Patched file: ${request.path}`;
       }
       case "delete_file": {
+        const before = await readFile(abs);
         await rm(abs, { force: false, recursive: false });
+        this.pushUndoEntry({
+          kind: "restore_file",
+          path: this.normalizeWorkspacePath(request.path),
+          existedBefore: true,
+          content: before,
+          sourceAction: request.action,
+        });
         this.noteFilesystemMutation();
         return `Deleted file: ${request.path}`;
       }
@@ -4700,6 +4833,34 @@ export class FileMcpService {
     return [...this.pending.values()].sort((a, b) =>
       a.createdAt.localeCompare(b.createdAt)
     );
+  }
+
+  async undoLastMutation(): Promise<HandleResult> {
+    const entry = this.undoHistory.pop();
+    if (!entry) {
+      return {
+        ok: false,
+        message: "Nothing to undo.",
+      };
+    }
+
+    this.suppressUndoRecording = true;
+    try {
+      const summary = await this.applyUndoEntry(entry);
+      this.noteFilesystemMutation();
+      return {
+        ok: true,
+        message: `[undo] ${summary}`,
+      };
+    } catch (error) {
+      this.undoHistory.push(entry);
+      return {
+        ok: false,
+        message: `[undo failed] ${error instanceof Error ? error.message : String(error)}`,
+      };
+    } finally {
+      this.suppressUndoRecording = false;
+    }
   }
 
   async approve(id: string): Promise<HandleResult> {

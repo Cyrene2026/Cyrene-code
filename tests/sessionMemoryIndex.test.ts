@@ -215,6 +215,30 @@ describe("session memory index", () => {
     expect(context.pins).toEqual(["first pin"]);
   });
 
+  test("tag operations persist on session and searchSessions can filter by tag", async () => {
+    const { store } = await createStore();
+    const alpha = await store.createSession("alpha feature rollout");
+    const beta = await store.createSession("beta cleanup");
+
+    await store.addTag(alpha.id, "feature");
+    await store.addTag(alpha.id, "#urgent");
+    await store.addTag(beta.id, "maintenance");
+
+    const loaded = await store.loadSession(alpha.id);
+    expect(loaded?.tags).toEqual(["feature", "urgent"]);
+
+    const tagMatches = await store.searchSessions("", { tag: "feature" });
+    expect(tagMatches.map(item => item.id)).toContain(alpha.id);
+    expect(tagMatches.map(item => item.id)).not.toContain(beta.id);
+
+    const queryMatches = await store.searchSessions("cleanup");
+    expect(queryMatches.map(item => item.id)).toContain(beta.id);
+
+    await store.removeTag(alpha.id, "urgent");
+    const afterRemove = await store.loadSession(alpha.id);
+    expect(afterRemove?.tags).toEqual(["feature"]);
+  });
+
   test("default session store path follows configured global root", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
     tempRoots.push(root);

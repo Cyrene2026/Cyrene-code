@@ -405,6 +405,53 @@ describe("FileMcpService", () => {
     await expect(readFile(join(root, "remove-me.txt"), "utf8")).rejects.toThrow();
   });
 
+  test("undoLastMutation returns explicit error when no reversible history exists", async () => {
+    const { service } = await createService();
+
+    const result = await service.undoLastMutation();
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Nothing to undo");
+  });
+
+  test("undoLastMutation restores previous content after approved write_file", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "notes.txt"), "before", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "notes.txt",
+      content: "after",
+    });
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(await readFile(join(root, "notes.txt"), "utf8")).toBe("after");
+
+    const undone = await service.undoLastMutation();
+
+    expect(undone.ok).toBe(true);
+    expect(undone.message).toContain("[undo]");
+    expect(await readFile(join(root, "notes.txt"), "utf8")).toBe("before");
+  });
+
+  test("undoLastMutation restores deleted file after approved delete_file", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "remove-me.txt"), "bye", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "delete_file",
+      path: "remove-me.txt",
+    });
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    await expect(readFile(join(root, "remove-me.txt"), "utf8")).rejects.toThrow();
+
+    const undone = await service.undoLastMutation();
+
+    expect(undone.ok).toBe(true);
+    expect(await readFile(join(root, "remove-me.txt"), "utf8")).toBe("bye");
+  });
+
   test("edit_file rejects before queue when find text does not exist", async () => {
     const { root, service } = await createService();
     await writeFile(join(root, "edit.txt"), "hello world", "utf8");
@@ -1035,6 +1082,26 @@ describe("FileMcpService", () => {
     expect(approved.ok).toBe(true);
     expect(await readFile(join(root, "dest", "moved.txt"), "utf8")).toBe("move me");
     await expect(readFile(join(root, "src", "move-me.txt"), "utf8")).rejects.toThrow();
+  });
+
+  test("undoLastMutation reverts approved move_path", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "move-me.txt"), "move me", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "move_path",
+      path: "src/move-me.txt",
+      destination: "dest/moved.txt",
+    });
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+
+    const undone = await service.undoLastMutation();
+
+    expect(undone.ok).toBe(true);
+    expect(await readFile(join(root, "src", "move-me.txt"), "utf8")).toBe("move me");
+    await expect(readFile(join(root, "dest", "moved.txt"), "utf8")).rejects.toThrow();
   });
 
   test("copy_path rejects before queue when destination already exists", async () => {

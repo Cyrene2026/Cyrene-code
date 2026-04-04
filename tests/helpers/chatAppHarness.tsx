@@ -229,7 +229,7 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
         ...record,
         messages: [...record.messages, { ...message }],
         updatedAt: message.createdAt,
-        summary: message.role === "system" ? record.summary : "",
+        summary: record.summary,
       };
       const inputs =
         message.role === "system"

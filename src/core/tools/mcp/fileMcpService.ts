@@ -10,8 +10,10 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import type {
   ApplyPatchToolRequest,
   CommandToolRequest,
@@ -167,6 +169,12 @@ type SearchableFile = {
   relativeToStart: string;
 };
 
+type WalkFilesResult = {
+  files: SearchableFile[];
+  skippedDirectoryNames: string[];
+  fileLimitHit: boolean;
+};
+
 type PathConflict = {
   action: ToolRequest["action"];
   path: string;
@@ -259,6 +267,25 @@ const MAX_SEARCH_RESULTS = 200;
 const MAX_SEARCH_SNIPPET_CHARS = 160;
 const DEFAULT_GIT_LOG_RESULTS = 12;
 const MAX_GIT_LOG_RESULTS = 50;
+const MIN_STREAM_SCAN_BYTES = 1024 * 1024;
+const MAX_STREAM_SCAN_BYTES = 4 * 1024 * 1024;
+const MAX_OUTLINE_ENTRIES = 200;
+const MAX_SEARCHABLE_FILES = 8_000;
+const DEFAULT_IGNORED_SEARCH_DIRECTORY_NAMES = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".turbo",
+  ".cache",
+  "out",
+  "target",
+  "vendor",
+]);
 const RECENT_LIST_DIR_WINDOW_MS = 5_000;
 const DEFAULT_SHELL_SETTLE_MS = 160;
 const MAX_UNDO_HISTORY = 50;
@@ -1761,6 +1788,12 @@ const formatContextWindow = (
   return window.join("\n");
 };
 
+const formatContextLineAtNumber = (
+  lineNumber: number,
+  line: string,
+  marker: ">" | " "
+) => `${marker} ${String(lineNumber).padStart(lineNoWidth, " ")} | ${clipContextLine(line)}`;
+
 const parseStructuredPathSegments = (input: string) => {
   const normalized = input.trim().replace(/^\$\./, "").replace(/^\$/, "");
   if (!normalized) {
@@ -1803,6 +1836,16 @@ const getOutlineEntry = (line: string) => {
   }
   return OUTLINE_PATTERNS.some(pattern => pattern.test(trimmed)) ? trimmed : null;
 };
+
+const formatOutlineEntry = (line: string, index: number) => {
+  const lineNo = String(index).padStart(lineNoWidth, " ");
+  return `${lineNo} | ${clip(line, 160)}`;
+};
+
+const uniqueSorted = (values: string[]) =>
+  Array.from(new Set(values.filter(Boolean))).sort((left, right) =>
+    left.localeCompare(right)
+  );
 
 const buildSymbolDefinitionPatterns = (symbol: string, flags: string) => [
   new RegExp(`^(?:export\\s+)?(?:default\\s+)?class\\s+${symbol}\\b`, flags),
@@ -3659,23 +3702,56 @@ export class FileMcpService {
     });
   }
 
-  private async walkFiles(startPath: string): Promise<SearchableFile[]> {
+  private shouldSkipSearchDirectory(
+    directoryName: string,
+    absolutePath: string,
+    startAbsolute: string
+  ) {
+    return (
+      absolutePath !== startAbsolute &&
+      DEFAULT_IGNORED_SEARCH_DIRECTORY_NAMES.has(directoryName)
+    );
+  }
+
+  private formatWalkFilesNotes(result: WalkFilesResult) {
+    const notes: string[] = [];
+    const skippedDirectoryNames = uniqueSorted(result.skippedDirectoryNames);
+    if (skippedDirectoryNames.length > 0) {
+      notes.push(
+        `note: skipped common large directories: ${skippedDirectoryNames.join(", ")}`
+      );
+    }
+    if (result.fileLimitHit) {
+      notes.push(
+        `note: file scan capped at ${MAX_SEARCHABLE_FILES} files; narrow \`path\` for a deeper search`
+      );
+    }
+    return notes;
+  }
+
+  private async walkFiles(startPath: string): Promise<WalkFilesResult> {
     const startAbsolute = this.resolvePath(startPath);
     const startWorkspace = this.normalizeWorkspacePath(startPath);
     const info = await stat(startAbsolute);
 
     if (!info.isDirectory()) {
-      return [{
-        absolutePath: startAbsolute,
-        workspacePath: startWorkspace,
-        relativeToStart: basename(startAbsolute).replace(/\\/g, "/"),
-      }];
+      return {
+        files: [{
+          absolutePath: startAbsolute,
+          workspacePath: startWorkspace,
+          relativeToStart: basename(startAbsolute).replace(/\\/g, "/"),
+        }],
+        skippedDirectoryNames: [],
+        fileLimitHit: false,
+      };
     }
 
     const files: SearchableFile[] = [];
+    const skippedDirectoryNames: string[] = [];
     const queue: Array<{ absolutePath: string }> = [{ absolutePath: startAbsolute }];
+    let fileLimitHit = false;
 
-    while (queue.length > 0) {
+    while (queue.length > 0 && !fileLimitHit) {
       const current = queue.shift();
       if (!current) {
         continue;
@@ -3687,6 +3763,10 @@ export class FileMcpService {
           .replace(/\\/g, "/")
           .replace(/^\.\/+/, "") || ".";
         if (entry.isDirectory()) {
+          if (this.shouldSkipSearchDirectory(entry.name, absolutePath, startAbsolute)) {
+            skippedDirectoryNames.push(entry.name);
+            continue;
+          }
           queue.push({ absolutePath });
           continue;
         }
@@ -3696,41 +3776,85 @@ export class FileMcpService {
           relativeToStart:
             relative(startAbsolute, absolutePath).replace(/\\/g, "/") || entry.name,
         });
+        if (files.length >= MAX_SEARCHABLE_FILES) {
+          fileLimitHit = true;
+          break;
+        }
       }
     }
 
-    return files;
+    return {
+      files,
+      skippedDirectoryNames,
+      fileLimitHit,
+    };
   }
 
   private async executeFindFiles(request: FindFilesToolRequest): Promise<string> {
-    const files = await this.walkFiles(request.path);
+    const walkResult = await this.walkFiles(request.path);
     const matcher = globToRegExp(request.pattern, request.caseSensitive ?? false);
-    const matches = files
+    const matches = walkResult.files
       .filter(file => matcher.test(file.relativeToStart) || matcher.test(file.workspacePath))
       .slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS)
       .map(file => file.workspacePath);
+    const notes = this.formatWalkFilesNotes(walkResult);
 
     if (matches.length === 0) {
-      return `(no matches for pattern: ${request.pattern})`;
+      return [`(no matches for pattern: ${request.pattern})`, ...notes]
+        .filter(Boolean)
+        .join("\n");
     }
 
-    return [`Found ${matches.length} file(s):`, ...matches].join("\n");
+    return [`Found ${matches.length} file(s):`, ...notes, ...matches].join("\n");
   }
 
   private async executeSearchText(request: SearchTextToolRequest): Promise<string> {
-    const files = await this.walkFiles(request.path);
+    const walkResult = await this.walkFiles(request.path);
+    const files = walkResult.files;
     const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
     const caseSensitive = request.caseSensitive ?? false;
     const query = caseSensitive ? request.query : request.query.toLowerCase();
     const matches: string[] = [];
+    let scannedOversizedFiles = 0;
+    let partialScanCount = 0;
+    const walkNotes = this.formatWalkFilesNotes(walkResult);
 
     for (const file of files) {
       const info = await stat(file.absolutePath);
       if (info.size > this.rules.maxReadBytes) {
+        scannedOversizedFiles += 1;
+        const scanBytes = this.getLargeFileScanByteLimit(info.size);
+        if (scanBytes < info.size) {
+          partialScanCount += 1;
+        }
+        await this.scanTextFileLines(
+          file.absolutePath,
+          scanBytes,
+          (line, lineNumber) => {
+            const haystack = caseSensitive ? line : line.toLowerCase();
+            if (!haystack.includes(query)) {
+              return false;
+            }
+            matches.push(`${file.workspacePath}:${lineNumber} | ${clipSnippet(line)}`);
+            return matches.length >= limit;
+          }
+        );
+        if (matches.length >= limit) {
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
+        }
         continue;
       }
       const content = await readFile(file.absolutePath, "utf8");
-      const lines = content.split(/\r?\n/);
+      const lines = splitFileLines(content);
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index] ?? "";
         const haystack = caseSensitive ? line : line.toLowerCase();
@@ -3739,32 +3863,136 @@ export class FileMcpService {
         }
         matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(line)}`);
         if (matches.length >= limit) {
-          return [`Found ${matches.length} match(es):`, ...matches].join("\n");
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
         }
       }
     }
 
+    const note = this.formatLargeFileSearchNote(
+      scannedOversizedFiles,
+      partialScanCount
+    );
     if (matches.length === 0) {
-      return `(no text matches for query: ${request.query})`;
+      return [`(no text matches for query: ${request.query})`, ...walkNotes, note]
+        .filter(Boolean)
+        .join("\n");
     }
 
-    return [`Found ${matches.length} match(es):`, ...matches].join("\n");
+    return [
+      `Found ${matches.length} match(es):`,
+      ...walkNotes,
+      ...(note ? [note] : []),
+      ...matches,
+    ].join("\n");
   }
 
   private async executeSearchTextContext(
     request: SearchTextContextToolRequest
   ): Promise<string> {
-    const files = await this.walkFiles(request.path);
+    const walkResult = await this.walkFiles(request.path);
+    const files = walkResult.files;
     const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
     const caseSensitive = request.caseSensitive ?? false;
     const query = caseSensitive ? request.query : request.query.toLowerCase();
     const before = request.before ?? 2;
     const after = request.after ?? 2;
     const matches: string[] = [];
+    let scannedOversizedFiles = 0;
+    let partialScanCount = 0;
+    const walkNotes = this.formatWalkFilesNotes(walkResult);
 
     for (const file of files) {
       const info = await stat(file.absolutePath);
       if (info.size > this.rules.maxReadBytes) {
+        scannedOversizedFiles += 1;
+        const scanBytes = this.getLargeFileScanByteLimit(info.size);
+        if (scanBytes < info.size) {
+          partialScanCount += 1;
+        }
+
+        const recentLines: Array<{ lineNumber: number; text: string }> = [];
+        const pendingWindows: Array<{
+          header: string;
+          body: string[];
+          remainingAfter: number;
+        }> = [];
+        let createdMatchCount = matches.length;
+        let stopCreatingNewMatches = false;
+
+        await this.scanTextFileLines(
+          file.absolutePath,
+          scanBytes,
+          (line, lineNumber) => {
+            for (let index = pendingWindows.length - 1; index >= 0; index -= 1) {
+              const pending = pendingWindows[index];
+              if (!pending) {
+                continue;
+              }
+              pending.body.push(formatContextLineAtNumber(lineNumber, line, " "));
+              pending.remainingAfter -= 1;
+              if (pending.remainingAfter <= 0) {
+                matches.push([pending.header, ...pending.body].join("\n"));
+                pendingWindows.splice(index, 1);
+              }
+            }
+
+            const haystack = caseSensitive ? line : line.toLowerCase();
+            if (!stopCreatingNewMatches && haystack.includes(query)) {
+              const body = [
+                ...recentLines.map(item =>
+                  formatContextLineAtNumber(item.lineNumber, item.text, " ")
+                ),
+                formatContextLineAtNumber(lineNumber, line, ">"),
+              ];
+              createdMatchCount += 1;
+              if (after <= 0) {
+                matches.push([`[match] ${file.workspacePath}:${lineNumber}`, ...body].join("\n"));
+              } else {
+                pendingWindows.push({
+                  header: `[match] ${file.workspacePath}:${lineNumber}`,
+                  body,
+                  remainingAfter: after,
+                });
+              }
+              if (createdMatchCount >= limit) {
+                stopCreatingNewMatches = true;
+              }
+            }
+
+            recentLines.push({ lineNumber, text: line });
+            if (recentLines.length > before) {
+              recentLines.shift();
+            }
+
+            return stopCreatingNewMatches && pendingWindows.length === 0;
+          }
+        );
+
+        for (const pending of pendingWindows) {
+          matches.push([pending.header, ...pending.body].join("\n"));
+        }
+
+        if (matches.length >= limit) {
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} contextual match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n\n");
+        }
         continue;
       }
 
@@ -3783,16 +4011,36 @@ export class FileMcpService {
           )
         );
         if (matches.length >= limit) {
-          return [`Found ${matches.length} contextual match(es):`, ...matches].join("\n\n");
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} contextual match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n\n");
         }
       }
     }
 
+    const note = this.formatLargeFileSearchNote(
+      scannedOversizedFiles,
+      partialScanCount
+    );
     if (matches.length === 0) {
-      return `(no text matches for query: ${request.query})`;
+      return [`(no text matches for query: ${request.query})`, ...walkNotes, note]
+        .filter(Boolean)
+        .join("\n");
     }
 
-    return [`Found ${matches.length} contextual match(es):`, ...matches].join("\n\n");
+    return [
+      `Found ${matches.length} contextual match(es):`,
+      ...walkNotes,
+      ...(note ? [note] : []),
+      ...matches,
+    ].join("\n\n");
   }
 
   private async executeMovePath(request: Extract<ToolRequest, { action: "move_path" }>) {
@@ -4022,43 +4270,183 @@ export class FileMcpService {
     if (!info.isFile()) {
       throw new Error(`outline_file only supports files: ${request.path}`);
     }
-    if (info.size > this.rules.maxReadBytes) {
-      throw new Error(
-        `outline_file target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
-      );
+
+    let entries: string[] = [];
+    let partialScan = false;
+    let entryLimitHit = false;
+    let scanBytes = info.size;
+
+    if (info.size <= this.rules.maxReadBytes) {
+      const content = await readFile(abs, "utf8");
+      entries = splitFileLines(content)
+        .map((line, index) => {
+          const entry = getOutlineEntry(line);
+          if (!entry) {
+            return null;
+          }
+          return formatOutlineEntry(entry, index + 1);
+        })
+        .filter((entry): entry is string => Boolean(entry));
+      if (entries.length > MAX_OUTLINE_ENTRIES) {
+        entries = entries.slice(0, MAX_OUTLINE_ENTRIES);
+        entryLimitHit = true;
+      }
+    } else {
+      scanBytes = this.getLargeFileScanByteLimit(info.size);
+      partialScan = scanBytes < info.size;
+      const scanned = await this.scanOutlineEntries(abs, scanBytes);
+      entries = scanned.entries;
+      entryLimitHit = scanned.entryLimitHit;
     }
 
-    const content = await readFile(abs, "utf8");
-    const entries = splitFileLines(content)
-      .map((line, index) => {
-        const entry = getOutlineEntry(line);
-        if (!entry) {
-          return null;
-        }
-        const lineNo = String(index + 1).padStart(lineNoWidth, " ");
-        return `${lineNo} | ${clip(entry, 160)}`;
-      })
-      .filter((entry): entry is string => Boolean(entry));
+    const header = [`Outline for ${request.path}`];
+    if (info.size > this.rules.maxReadBytes) {
+      header.push(
+        `large-file mode: scanned ${scanBytes} of ${info.size} bytes (max_read_bytes=${this.rules.maxReadBytes})`
+      );
+      if (partialScan) {
+        header.push("note: partial scan; use find_symbol/search_text_context for deeper targeting");
+      }
+    }
+    if (entryLimitHit) {
+      header.push(`note: showing first ${entries.length} outline entries`);
+    }
 
     if (entries.length === 0) {
-      return `Outline for ${request.path}\n(no outline symbols found)`;
+      return [...header, "(no outline symbols found)"].join("\n");
     }
 
-    return [`Outline for ${request.path}`, ...entries].join("\n");
+    return [...header, ...entries].join("\n");
+  }
+
+  private getLargeFileScanByteLimit(fileSize: number) {
+    return Math.min(
+      fileSize,
+      Math.max(this.rules.maxReadBytes, MIN_STREAM_SCAN_BYTES),
+      MAX_STREAM_SCAN_BYTES
+    );
+  }
+
+  private async scanTextFileLines(
+    absolutePath: string,
+    byteLimit: number,
+    onLine: (line: string, lineNumber: number) => boolean | void | Promise<boolean | void>
+  ) {
+    const stream = createReadStream(absolutePath, {
+      encoding: "utf8",
+      start: 0,
+      end: Math.max(0, byteLimit - 1),
+    });
+    const lines = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+
+    let lineNumber = 0;
+
+    try {
+      for await (const line of lines) {
+        lineNumber += 1;
+        const shouldStop = await onLine(line, lineNumber);
+        if (shouldStop) {
+          break;
+        }
+      }
+    } finally {
+      lines.close();
+      stream.destroy();
+    }
+  }
+
+  private async scanOutlineEntries(
+    absolutePath: string,
+    byteLimit: number
+  ): Promise<{ entries: string[]; entryLimitHit: boolean }> {
+    const entries: string[] = [];
+    let entryLimitHit = false;
+
+    await this.scanTextFileLines(absolutePath, byteLimit, (line, lineNumber) => {
+      const entry = getOutlineEntry(line);
+      if (!entry) {
+        return false;
+      }
+      entries.push(formatOutlineEntry(entry, lineNumber));
+      if (entries.length >= MAX_OUTLINE_ENTRIES) {
+        entryLimitHit = true;
+        return true;
+      }
+      return false;
+    });
+
+    return {
+      entries,
+      entryLimitHit,
+    };
+  }
+
+  private formatLargeFileSearchNote(
+    scannedOversizedFiles: number,
+    partialScanCount: number
+  ) {
+    if (scannedOversizedFiles <= 0) {
+      return "";
+    }
+    if (partialScanCount > 0) {
+      return `note: large-file mode scanned ${scannedOversizedFiles} oversized file(s); ${partialScanCount} partial scan(s) may omit deeper matches`;
+    }
+    return `note: large-file mode scanned ${scannedOversizedFiles} oversized file(s)`;
   }
 
   private async executeFindSymbol(request: FindSymbolToolRequest) {
-    const files = await this.walkFiles(request.path);
+    const walkResult = await this.walkFiles(request.path);
+    const files = walkResult.files;
     const caseSensitive = request.caseSensitive ?? false;
     const flags = caseSensitive ? "" : "i";
     const symbol = escapeRegExp(request.symbol);
     const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
     const patterns = buildSymbolDefinitionPatterns(symbol, flags);
     const matches: string[] = [];
+    let scannedOversizedFiles = 0;
+    let partialScanCount = 0;
+    const walkNotes = this.formatWalkFilesNotes(walkResult);
 
     for (const file of files) {
       const info = await stat(file.absolutePath);
       if (info.size > this.rules.maxReadBytes) {
+        scannedOversizedFiles += 1;
+        const scanBytes = this.getLargeFileScanByteLimit(info.size);
+        if (scanBytes < info.size) {
+          partialScanCount += 1;
+        }
+        await this.scanTextFileLines(
+          file.absolutePath,
+          scanBytes,
+          (line, lineNumber) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              return false;
+            }
+            if (!patterns.some(pattern => pattern.test(trimmed))) {
+              return false;
+            }
+            matches.push(
+              `${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
+            );
+            return matches.length >= limit;
+          }
+        );
+        if (matches.length >= limit) {
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} symbol match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
+        }
         continue;
       }
       const content = await readFile(file.absolutePath, "utf8");
@@ -4074,20 +4462,41 @@ export class FileMcpService {
         }
         matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
         if (matches.length >= limit) {
-          return [`Found ${matches.length} symbol match(es):`, ...matches].join("\n");
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} symbol match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
         }
       }
     }
 
+    const note = this.formatLargeFileSearchNote(
+      scannedOversizedFiles,
+      partialScanCount
+    );
     if (matches.length === 0) {
-      return `(no symbol matches for: ${request.symbol})`;
+      return [`(no symbol matches for: ${request.symbol})`, ...walkNotes, note]
+        .filter(Boolean)
+        .join("\n");
     }
 
-    return [`Found ${matches.length} symbol match(es):`, ...matches].join("\n");
+    return [
+      `Found ${matches.length} symbol match(es):`,
+      ...walkNotes,
+      ...(note ? [note] : []),
+      ...matches,
+    ].join("\n");
   }
 
   private async executeFindReferences(request: FindReferencesToolRequest) {
-    const files = await this.walkFiles(request.path);
+    const walkResult = await this.walkFiles(request.path);
+    const files = walkResult.files;
     const caseSensitive = request.caseSensitive ?? false;
     const flags = caseSensitive ? "" : "i";
     const escapedSymbol = escapeRegExp(request.symbol);
@@ -4095,10 +4504,50 @@ export class FileMcpService {
     const referencePattern = buildSymbolReferencePattern(escapedSymbol, caseSensitive);
     const limit = request.maxResults ?? DEFAULT_SEARCH_RESULTS;
     const matches: string[] = [];
+    let scannedOversizedFiles = 0;
+    let partialScanCount = 0;
+    const walkNotes = this.formatWalkFilesNotes(walkResult);
 
     for (const file of files) {
       const info = await stat(file.absolutePath);
       if (info.size > this.rules.maxReadBytes) {
+        scannedOversizedFiles += 1;
+        const scanBytes = this.getLargeFileScanByteLimit(info.size);
+        if (scanBytes < info.size) {
+          partialScanCount += 1;
+        }
+        await this.scanTextFileLines(
+          file.absolutePath,
+          scanBytes,
+          (line, lineNumber) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              return false;
+            }
+            if (definitionPatterns.some(pattern => pattern.test(trimmed))) {
+              return false;
+            }
+            if (!referencePattern.test(line)) {
+              return false;
+            }
+            matches.push(
+              `${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
+            );
+            return matches.length >= limit;
+          }
+        );
+        if (matches.length >= limit) {
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} reference match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
+        }
         continue;
       }
       const content = await readFile(file.absolutePath, "utf8");
@@ -4117,16 +4566,36 @@ export class FileMcpService {
         }
         matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
         if (matches.length >= limit) {
-          return [`Found ${matches.length} reference match(es):`, ...matches].join("\n");
+          const note = this.formatLargeFileSearchNote(
+            scannedOversizedFiles,
+            partialScanCount
+          );
+          return [
+            `Found ${matches.length} reference match(es):`,
+            ...walkNotes,
+            ...(note ? [note] : []),
+            ...matches,
+          ].join("\n");
         }
       }
     }
 
+    const note = this.formatLargeFileSearchNote(
+      scannedOversizedFiles,
+      partialScanCount
+    );
     if (matches.length === 0) {
-      return `(no reference matches for symbol: ${request.symbol})`;
+      return [`(no reference matches for symbol: ${request.symbol})`, ...walkNotes, note]
+        .filter(Boolean)
+        .join("\n");
     }
 
-    return [`Found ${matches.length} reference match(es):`, ...matches].join("\n");
+    return [
+      `Found ${matches.length} reference match(es):`,
+      ...walkNotes,
+      ...(note ? [note] : []),
+      ...matches,
+    ].join("\n");
   }
 
   private async findGitRepoRoot(inputPath: string) {

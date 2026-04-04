@@ -200,16 +200,27 @@ export const createFileSessionStore = (
 
     const index = await readMemoryIndex(id);
     if (index) {
-      const nextSession = syncSessionCaches(session, index);
+      const sanitizedIndex = rebuildMemoryLookup(
+        index.sessionId,
+        index.entries,
+        index.updatedAt
+      );
+      const indexChanged =
+        JSON.stringify(sanitizedIndex) !== JSON.stringify(index);
+      const nextSession = syncSessionCaches(session, sanitizedIndex);
       if (
+        indexChanged ||
         nextSession.summary !== session.summary ||
         JSON.stringify(nextSession.focus) !== JSON.stringify(session.focus)
       ) {
+        if (indexChanged) {
+          await writeMemoryIndex(sanitizedIndex);
+        }
         await writeSession(nextSession);
       }
       return {
         session: nextSession,
-        index,
+        index: sanitizedIndex,
       };
     }
 
@@ -374,10 +385,7 @@ export const createFileSessionStore = (
         ...loaded.session,
         messages: nextMessages,
         updatedAt: new Date().toISOString(),
-        summary:
-          validated.role === "system"
-            ? loaded.session.summary
-            : "",
+        summary: loaded.session.summary,
         title:
           loaded.session.messages.length === 0 && validated.role === "user"
             ? sanitizeTitle(validated.text)

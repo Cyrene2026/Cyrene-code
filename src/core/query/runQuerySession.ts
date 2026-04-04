@@ -5,6 +5,7 @@ import {
   type QuerySessionDispatch,
   type QuerySessionState,
 } from "./sessionMachine";
+import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
 import type { QueryTransport } from "./transport";
 import type { TokenUsage } from "./tokenUsage";
 
@@ -903,7 +904,7 @@ const isFailedCommandResult = (message: string) =>
 export const runQuerySession = async ({
   query,
   originalTask,
-  queryMaxToolSteps = 24,
+  queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   transport,
   onState,
   onTextDelta,
@@ -922,7 +923,7 @@ export const runQuerySession = async ({
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
       ? Math.floor(queryMaxToolSteps)
-      : 24;
+      : DEFAULT_QUERY_MAX_TOOL_STEPS;
   const dispatch: QuerySessionDispatch = event => {
     state = querySessionReducer(state, event);
     onState(state);

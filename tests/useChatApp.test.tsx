@@ -429,6 +429,47 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("/model <name> ignores duplicate immediate submit", async () => {
+    const setModelImpl = mock(async (model: string) => ({
+      ok: true,
+      message: `Model switched to: ${model}`,
+    }));
+    const transport = createTestTransport({ setModelImpl });
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("/model gpt-next");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      app.getLatest().submit();
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(setModelImpl).toHaveBeenCalledTimes(1);
+    expect(
+      getTexts(app.getLatest().items).filter(
+        text => text === "Model switched to: gpt-next"
+      )
+    ).toHaveLength(1);
+    app.cleanup();
+  });
+
   test("/provider opens picker and /provider <url> switches provider", async () => {
     const transport = createTestTransport({
       initialProvider: "https://provider-a.test/v1",
@@ -1463,7 +1504,7 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("refreshes AI summary lazily for long sessions, shows token hint, and invalidates stored summary after new turns", async () => {
+  test("refreshes AI summary lazily after the turn completes, shows token hint, and preserves stored summary for reuse", async () => {
     const capturedSummaryPrompts: string[] = [];
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {
@@ -1514,7 +1555,9 @@ describe("useChatApp", () => {
     const updateSummary = mock((id: string, summary: string) =>
       baseUpdateSummary(id, summary)
     );
+    const runStartedBeforeSummary = { current: false };
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      runStartedBeforeSummary.current = capturedSummaryPrompts.length === 0;
       onState({ status: "streaming" });
       onTextDelta("reply\n- keeps markdown");
       onState({ status: "idle" });
@@ -1539,8 +1582,10 @@ describe("useChatApp", () => {
     await runCommand(app, "/resume session-a");
     await runCommand(app, "continue the oauth task");
     await flushMicrotasks();
+    await flushMicrotasks();
 
     expect(summarizeImpl).toHaveBeenCalledTimes(1);
+    expect(runStartedBeforeSummary.current).toBe(true);
     expect(capturedSummaryPrompts[0]).toContain(
       "Reduce the prior conversation into a durable working-state record."
     );
@@ -1553,7 +1598,8 @@ describe("useChatApp", () => {
     expect(getTexts(app.getLatest().items).some(text => text.includes("summary updated | prompt 21 | completion 9 | total 30"))).toBe(true);
 
     const stored = sessionStore.__getRecord("session-a");
-    expect(stored?.summary).toBe("");
+    expect(stored?.summary).toContain("OBJECTIVE:");
+    expect(stored?.summary).toContain("NEXT BEST ACTIONS:");
     expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
       "reply\n- keeps markdown"
     );
@@ -2348,10 +2394,15 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("model picker keyboard wraps, pages, confirms and closes", async () => {
+  test("model picker keyboard wraps, pages, confirms once, and closes", async () => {
+    const setModelImpl = mock(async (model: string) => ({
+      ok: true,
+      message: `Model switched to: ${model}`,
+    }));
     const transport = createTestTransport({
       initialModel: "m1",
       models: ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"],
+      setModelImpl,
     });
 
     const app = renderHookHarness(() =>
@@ -2385,11 +2436,16 @@ describe("useChatApp", () => {
 
     await act(async () => {
       inputHandler?.("", { return: true });
+      inputHandler?.("", { return: true });
       await Promise.resolve();
     });
     await flushMicrotasks();
+    expect(setModelImpl).toHaveBeenCalledTimes(1);
     expect(app.getLatest().currentModel).toBe("m2");
     expect(app.getLatest().modelPicker.active).toBe(false);
+    expect(
+      getTexts(app.getLatest().items).filter(text => text === "Model switched to: m2")
+    ).toHaveLength(1);
     app.cleanup();
   });
 

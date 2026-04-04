@@ -1,5 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  DEFAULT_PIN_MAX_COUNT,
+  DEFAULT_QUERY_MAX_TOOL_STEPS,
+} from "../../shared/runtimeDefaults";
 import { resolveAmbientAppRoot } from "./appRoot";
 
 export type CyreneConfig = {
@@ -14,8 +18,8 @@ type CyreneConfigLoadContext = {
 };
 
 const DEFAULT_CONFIG: CyreneConfig = {
-  pinMaxCount: 6,
-  queryMaxToolSteps: 24,
+  pinMaxCount: DEFAULT_PIN_MAX_COUNT,
+  queryMaxToolSteps: DEFAULT_QUERY_MAX_TOOL_STEPS,
 };
 
 const parseValue = (raw: string): string | number => {
@@ -60,7 +64,9 @@ export const loadCyreneConfig = async (
 
   const pinRaw = map.get("pin_max_count");
   const pinMaxCount =
-    typeof pinRaw === "number" && pinRaw > 0 ? Math.floor(pinRaw) : 6;
+    typeof pinRaw === "number" && pinRaw > 0
+      ? Math.floor(pinRaw)
+      : DEFAULT_PIN_MAX_COUNT;
 
   const queryMaxToolStepsRaw = map.get("query_max_tool_steps");
   const queryMaxToolSteps =

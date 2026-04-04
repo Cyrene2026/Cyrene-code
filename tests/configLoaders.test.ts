@@ -8,6 +8,7 @@ import {
   resetConfiguredAppRoot,
 } from "../src/infra/config/appRoot";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
+import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../src/shared/runtimeDefaults";
 
 const tempRoots: string[] = [];
 
@@ -41,6 +42,15 @@ describe("config loaders", () => {
     expect(config.pinMaxCount).toBe(9);
     expect(config.queryMaxToolSteps).toBe(31);
     expect(config.systemPrompt).toBe("focus on tests");
+  });
+
+  test("loadCyreneConfig falls back to raised default tool budget when config is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-config-default-"));
+    tempRoots.push(root);
+
+    const config = await loadCyreneConfig(root);
+
+    expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
   });
 
   test("loadRuleConfig falls back to config.yaml for MCP review settings", async () => {

@@ -74,6 +74,61 @@ describe("session memory index", () => {
     ).toBe(true);
   });
 
+  test("legacy rebuild filters low-signal chatter and keeps only durable memories", async () => {
+    const { root, store } = await createStore();
+    const legacyId = "legacy-chatter-session";
+
+    await writeFile(
+      join(root, `${legacyId}.json`),
+      JSON.stringify(
+        {
+          id: legacyId,
+          title: "legacy chatter",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          summary: "",
+          focus: [],
+          tags: [],
+          messages: [
+            {
+              role: "user",
+              text: "好",
+              createdAt: "2026-01-01T00:00:01.000Z",
+            },
+            {
+              role: "user",
+              text: "inspect src/query.ts",
+              createdAt: "2026-01-01T00:00:02.000Z",
+            },
+            {
+              role: "assistant",
+              text: "让我继续查看 src/query.ts 文件的更多内容。让我读取接下来的部分。",
+              createdAt: "2026-01-01T00:00:03.000Z",
+            },
+            {
+              role: "assistant",
+              text: "Created file test_files/u4.py",
+              createdAt: "2026-01-01T00:00:04.000Z",
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const index = await store.getMemoryIndex(legacyId);
+
+    expect(index.entries.some(entry => entry.kind === "task" && entry.text === "好")).toBe(false);
+    expect(index.entries.some(entry => entry.text.includes("让我继续查看"))).toBe(false);
+    expect(
+      index.entries.some(
+        entry => entry.kind === "fact" && entry.text.includes("test_files/u4.py")
+      )
+    ).toBe(true);
+  });
+
   test("dedupes repeated tool and error memories instead of appending duplicates", async () => {
     const { store } = await createStore();
     const session = await store.createSession("memory dedupe");
@@ -170,6 +225,140 @@ describe("session memory index", () => {
       true
     );
     expect(context.archiveSections?.["KNOWN PATHS"]).toContain("test_files/u4.py");
+  });
+
+  test("prompt context prefers tool results over assistant facts for the same path", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("tool preference");
+
+    await store.recordMemory(session.id, {
+      kind: "fact",
+      text: "src/query.ts is a complex query loop module",
+      priority: 60,
+      entities: {
+        path: ["src/query.ts"],
+        queryTerms: ["query", "module"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "tool_result",
+      text: "Tool: read_file src/query.ts | // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered",
+      priority: 72,
+      entities: {
+        path: ["src/query.ts"],
+        action: ["read_file"],
+        toolName: ["read_file"],
+        status: ["ok"],
+      },
+    });
+
+    const context = await store.getPromptContext(session.id, "src/query.ts");
+
+    expect(context.archiveSections?.["CONFIRMED FACTS"]?.[0]?.includes("[tool_result]")).toBe(
+      true
+    );
+    expect(
+      context.archiveSections?.["CONFIRMED FACTS"]?.some(item =>
+        item.includes("src/query.ts")
+      )
+    ).toBe(true);
+  });
+
+  test("loading an existing sidecar index self-repairs polluted chatter entries", async () => {
+    const { root, store } = await createStore();
+    const sessionId = "polluted-index-session";
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await writeFile(
+      join(root, `${sessionId}.json`),
+      JSON.stringify(
+        {
+          id: sessionId,
+          title: "polluted index",
+          createdAt: now,
+          updatedAt: now,
+          summary: "",
+          focus: [],
+          tags: [],
+          messages: [],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    await writeFile(
+      join(root, `${sessionId}.index.json`),
+      JSON.stringify(
+        {
+          version: 1,
+          sessionId,
+          updatedAt: now,
+          entries: [
+            {
+              id: "fact-1",
+              sessionId,
+              kind: "fact",
+              text: "让我继续查看 src/query.ts 文件的更多内容。让我读取接下来的部分。",
+              priority: 40,
+              createdAt: now,
+              tags: ["让我继续查看", "src/query.ts"],
+              entities: {
+                path: ["src/query.ts"],
+                queryTerms: ["让我继续查看", "src/query.ts"],
+              },
+              dedupeKey: "fact:raw-chatter",
+              hitCount: 1,
+            },
+            {
+              id: "tool-1",
+              sessionId,
+              kind: "tool_result",
+              text: "Tool: read_file src/query.ts | // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered",
+              priority: 72,
+              createdAt: now,
+              tags: ["src/query.ts", "read_file", "ok"],
+              entities: {
+                path: ["src/query.ts"],
+                toolName: ["read_file"],
+                action: ["read_file"],
+                status: ["ok"],
+                queryTerms: ["src/query.ts", "read_file"],
+              },
+              dedupeKey: "tool_result:read_file:src/query.ts:ok",
+              hitCount: 1,
+            },
+          ],
+          byKind: {
+            fact: ["fact-1"],
+            tool_result: ["tool-1"],
+          },
+          byPath: {
+            "src/query.ts": ["fact-1", "tool-1"],
+          },
+          byTool: {
+            read_file: ["tool-1"],
+          },
+          byAction: {
+            read_file: ["tool-1"],
+          },
+          byPriority: ["tool-1", "fact-1"],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const index = await store.getMemoryIndex(sessionId);
+    const persisted = JSON.parse(
+      await readFile(join(root, `${sessionId}.index.json`), "utf8")
+    ) as { entries: Array<{ text: string }> };
+
+    expect(index.entries.some(entry => entry.text.includes("让我继续查看"))).toBe(false);
+    expect(index.entries.some(entry => entry.kind === "tool_result")).toBe(true);
+    expect(persisted.entries.some(entry => entry.text.includes("让我继续查看"))).toBe(false);
   });
 
   test("working-state remaining/known-path signals help archive retrieval even for generic follow-up queries", async () => {

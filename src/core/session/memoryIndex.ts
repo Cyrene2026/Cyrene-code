@@ -83,6 +83,56 @@ const MEMORY_COMPACTION_TARGET_SIZE = 140;
 const MEMORY_COMPACTION_RECENT_KEEP = 36;
 const DEFAULT_ARCHIVE_SECTION_LIMIT = 2;
 const KNOWN_PATH_ARCHIVE_LIMIT = 4;
+const LOW_SIGNAL_TASK_PATTERN =
+  /^(?:ok(?:ay)?|sure|yes|yep|go|thanks?|thank you|cool|nice|good|done|来吧?|好(?:的)?|行|可以|收到|嗯|开始吧?|继续)$/iu;
+const PROCESS_NARRATION_PATTERN =
+  /^(?:let me|i(?:'ll| will| need to| want to| should)|first let me|now let me|we need to|我来|让我|我需要|我先|我会|我继续|接下来|继续查看|继续读取|让我继续|让我读取|我需要继续|我已经查看了|我来帮您|我先查看|我先读取)/iu;
+const LOW_SIGNAL_ENGLISH_TOKENS = new Set([
+  "let",
+  "lets",
+  "me",
+  "my",
+  "we",
+  "our",
+  "need",
+  "needs",
+  "continue",
+  "check",
+  "look",
+  "view",
+  "read",
+  "reading",
+  "more",
+  "next",
+  "file",
+  "files",
+  "project",
+  "code",
+  "task",
+  "quickly",
+  "please",
+  "help",
+  "understand",
+  "analysis",
+]);
+const LOW_SIGNAL_CHINESE_TOKEN_PATTERNS = [
+  /我来/u,
+  /让我/u,
+  /我需要/u,
+  /我先/u,
+  /我会/u,
+  /继续查看/u,
+  /继续读取/u,
+  /接下来/u,
+  /帮您/u,
+  /了解/u,
+  /基本情况/u,
+  /更多内容/u,
+  /剩余部分/u,
+  /其余部分/u,
+  /完整结构/u,
+  /完整上下文/u,
+];
 const CONSTRAINT_SIGNAL =
   /\b(must|should|cannot|can't|do not|don't|avoid|blocked|pending|requires|limit|constraint)\b|必须|不能|不要|避免|受限|限制|阻塞|待审批|需要/iu;
 const COMPLETED_SIGNAL =
@@ -98,13 +148,42 @@ const clipText = (text: string, max = MEMORY_TEXT_LIMIT) => {
   return `${normalized.slice(0, max)}...`;
 };
 
+const normalizeMemoryWhitespace = (text: string) =>
+  text
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+const stripMemorySegmentPrefix = (text: string) =>
+  text
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^>\s+/, "")
+    .trim();
+
+const isMeaningfulToken = (token: string) => {
+  if (!token) {
+    return false;
+  }
+  const lowered = token.toLowerCase();
+  if (LOW_SIGNAL_ENGLISH_TOKENS.has(lowered)) {
+    return false;
+  }
+  if (LOW_SIGNAL_CHINESE_TOKEN_PATTERNS.some(pattern => pattern.test(token))) {
+    return false;
+  }
+  return true;
+};
+
 const tokenizeText = (text: string, max = QUERY_TOKEN_LIMIT) => {
   const tokens =
     text
       .toLowerCase()
       .match(/[a-z0-9_./-]+|[\u4e00-\u9fff]{2,}/g)
       ?.map(token => token.trim())
-      .filter(Boolean) ?? [];
+      .filter(token => Boolean(token) && isMeaningfulToken(token)) ?? [];
 
   return Array.from(new Set(tokens)).slice(0, max);
 };
@@ -162,6 +241,81 @@ const collectToolNames = (text: string) =>
     )
   ).slice(0, 6);
 
+const splitMemorySegments = (text: string) =>
+  normalizeMemoryWhitespace(text)
+    .replace(/```[\s\S]*?```/g, " ")
+    .split(/\n+/)
+    .flatMap(line => line.split(/(?<=[。！？!?])\s+/u))
+    .map(stripMemorySegmentPrefix)
+    .map(segment => segment.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+const hasStructuredMemorySignal = (text: string) =>
+  collectPathCandidates(text).length > 0 ||
+  collectToolNames(text).length > 0 ||
+  /`[^`]+`/.test(text) ||
+  CONSTRAINT_SIGNAL.test(text) ||
+  COMPLETED_SIGNAL.test(text) ||
+  FAILURE_SIGNAL.test(text);
+
+const extractDurableFactSegments = (text: string) =>
+  Array.from(
+    new Set(
+      splitMemorySegments(text).filter(
+        segment =>
+          !PROCESS_NARRATION_PATTERN.test(segment) && hasStructuredMemorySignal(segment)
+      )
+    )
+  ).slice(0, 4);
+
+const normalizeTaskMemoryText = (text: string) => {
+  const normalized = normalizeMemoryWhitespace(text);
+  if (!normalized) {
+    return null;
+  }
+  if (
+    LOW_SIGNAL_TASK_PATTERN.test(normalized) &&
+    !hasStructuredMemorySignal(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+};
+
+const normalizeFactMemoryText = (text: string) => {
+  const normalized = normalizeMemoryWhitespace(text);
+  if (!normalized) {
+    return null;
+  }
+
+  const durableSegments = extractDurableFactSegments(normalized);
+  if (durableSegments.length > 0) {
+    return durableSegments.join(" | ");
+  }
+
+  const segments = splitMemorySegments(normalized);
+  if (segments.length > 0 && segments.every(segment => PROCESS_NARRATION_PATTERN.test(segment))) {
+    return null;
+  }
+
+  if (PROCESS_NARRATION_PATTERN.test(normalized) && !hasStructuredMemorySignal(normalized)) {
+    return null;
+  }
+
+  return normalized;
+};
+
+const normalizeMemoryTextForKind = (kind: MemoryKind, text: string) => {
+  switch (kind) {
+    case "task":
+      return normalizeTaskMemoryText(text);
+    case "fact":
+      return normalizeFactMemoryText(text);
+    default:
+      return normalizeMemoryWhitespace(text);
+  }
+};
+
 const inferStatuses = (kind: MemoryKind, text: string) => {
   const lowered = text.toLowerCase();
   if (kind === "approval") {
@@ -177,6 +331,15 @@ const inferStatuses = (kind: MemoryKind, text: string) => {
   }
   if (kind === "tool_result") {
     return ["ok"];
+  }
+  if (FAILURE_SIGNAL.test(text)) {
+    return ["error"];
+  }
+  if (COMPLETED_SIGNAL.test(text)) {
+    return ["ok"];
+  }
+  if (CONSTRAINT_SIGNAL.test(text)) {
+    return ["blocked"];
   }
   return [];
 };
@@ -200,7 +363,7 @@ const buildEntities = (
     new Set([...(entities?.action ?? []), ...(entities?.toolName ?? []), ...toolNames])
   ).slice(0, 6);
   const topics = Array.from(
-    new Set([...(entities?.topic ?? []), ...queryTerms.slice(0, 4)])
+    new Set((entities?.topic ?? []).filter(isMeaningfulToken))
   ).slice(0, 6);
   const statuses = Array.from(
     new Set([...(entities?.status ?? []), ...inferStatuses(kind, text)])
@@ -217,7 +380,7 @@ const buildEntities = (
 };
 
 const buildTags = (
-  text: string,
+  _text: string,
   entities: SessionMemoryEntities,
   tags?: string[]
 ) =>
@@ -228,7 +391,7 @@ const buildTags = (
       ...(entities.toolName ?? []),
       ...(entities.action ?? []),
       ...(entities.status ?? []),
-      ...tokenizeText(text, 8),
+      ...(entities.queryTerms ?? []).slice(0, 4),
     ])
   ).slice(0, 12);
 
@@ -260,6 +423,15 @@ const createDedupeKey = (
       action ?? "none",
       path ?? "none",
       clipText(text, 160).toLowerCase(),
+    ].join(":");
+  }
+
+  if ((kind === "fact" || kind === "task") && (path || action || status)) {
+    return [
+      kind,
+      action ?? status ?? "none",
+      path ?? "none",
+      clipText(text, 96).toLowerCase(),
     ].join(":");
   }
 
@@ -310,6 +482,11 @@ const sortEntriesByPriorityAndTime = (entries: SessionMemoryEntry[]) =>
     })
     .map(item => item.entry);
 
+const isLowSignalNarrationEntry = (entry: SessionMemoryEntry) =>
+  (entry.kind === "fact" || entry.kind === "task") &&
+  PROCESS_NARRATION_PATTERN.test(entry.text) &&
+  !hasStructuredMemorySignal(entry.text);
+
 const compactMemoryEntries = (entries: SessionMemoryEntry[]) => {
   if (entries.length <= MEMORY_COMPACTION_HARD_LIMIT) {
     return entries;
@@ -353,6 +530,10 @@ const compactMemoryEntries = (entries: SessionMemoryEntry[]) => {
         case "fact":
           score += 15;
           break;
+      }
+
+      if (isLowSignalNarrationEntry(entry)) {
+        score -= 120;
       }
 
       score += (entry.entities.path?.length ?? 0) * 18;
@@ -401,9 +582,13 @@ export const createEmptyMemoryIndex = (
 export const materializeMemoryInput = (
   sessionId: string,
   input: SessionMemoryInput
-): SessionMemoryEntry => {
+): SessionMemoryEntry | null => {
   const createdAt = input.createdAt ?? new Date().toISOString();
-  const text = clipText(input.text);
+  const normalizedText = normalizeMemoryTextForKind(input.kind, input.text);
+  if (!normalizedText) {
+    return null;
+  }
+  const text = clipText(normalizedText);
   const entities = buildEntities(input.kind, text, input.entities);
   return {
     id: crypto.randomUUID(),
@@ -420,12 +605,93 @@ export const materializeMemoryInput = (
   };
 };
 
+const mergeMemoryEntry = (
+  existing: SessionMemoryEntry,
+  nextEntry: SessionMemoryEntry
+): SessionMemoryEntry => ({
+  ...existing,
+  text: nextEntry.text,
+  priority: Math.max(existing.priority, nextEntry.priority),
+  createdAt: nextEntry.createdAt,
+  updatedAt: nextEntry.createdAt,
+  tags: Array.from(new Set([...existing.tags, ...nextEntry.tags])).slice(0, 12),
+  entities: {
+    path: Array.from(
+      new Set([...(existing.entities.path ?? []), ...(nextEntry.entities.path ?? [])])
+    ).slice(0, 6),
+    toolName: Array.from(
+      new Set([...(existing.entities.toolName ?? []), ...(nextEntry.entities.toolName ?? [])])
+    ).slice(0, 6),
+    action: Array.from(
+      new Set([...(existing.entities.action ?? []), ...(nextEntry.entities.action ?? [])])
+    ).slice(0, 6),
+    topic: Array.from(
+      new Set([...(existing.entities.topic ?? []), ...(nextEntry.entities.topic ?? [])])
+    ).slice(0, 6),
+    status: Array.from(
+      new Set([...(existing.entities.status ?? []), ...(nextEntry.entities.status ?? [])])
+    ).slice(0, 6),
+    queryTerms: Array.from(
+      new Set([...(existing.entities.queryTerms ?? []), ...(nextEntry.entities.queryTerms ?? [])])
+    ).slice(0, QUERY_TOKEN_LIMIT),
+  },
+  dedupeKey: nextEntry.dedupeKey ?? existing.dedupeKey,
+  hitCount: (existing.hitCount ?? 1) + (nextEntry.hitCount ?? 1),
+});
+
+const sanitizeExistingEntry = (
+  entry: SessionMemoryEntry
+): SessionMemoryEntry | null => {
+  const normalizedText = normalizeMemoryTextForKind(entry.kind, entry.text);
+  if (!normalizedText) {
+    return null;
+  }
+  const text = clipText(normalizedText);
+  const entities = buildEntities(entry.kind, text, entry.entities);
+  return {
+    ...entry,
+    text,
+    entities,
+    tags: buildTags(text, entities, entry.tags),
+    dedupeKey: createDedupeKey(entry.kind, text, entities),
+  };
+};
+
+const dedupeMemoryEntries = (entries: SessionMemoryEntry[]) => {
+  const deduped: SessionMemoryEntry[] = [];
+
+  for (const entry of entries) {
+    const existingIndex = deduped.findIndex(
+      candidate => candidate.dedupeKey && candidate.dedupeKey === entry.dedupeKey
+    );
+    if (existingIndex < 0) {
+      deduped.push(entry);
+      continue;
+    }
+    const existing = deduped[existingIndex];
+    if (!existing) {
+      continue;
+    }
+    deduped[existingIndex] = mergeMemoryEntry(existing, entry);
+  }
+
+  return deduped;
+};
+
 export const rebuildMemoryLookup = (
   sessionId: string,
   entries: SessionMemoryEntry[],
   updatedAt = new Date().toISOString()
 ): SessionMemoryIndex => {
-  const sortedEntries = sortEntriesByTime(compactMemoryEntries(entries));
+  const sortedEntries = sortEntriesByTime(
+    compactMemoryEntries(
+      dedupeMemoryEntries(
+        entries
+          .map(entry => sanitizeExistingEntry(entry))
+          .filter((entry): entry is SessionMemoryEntry => Boolean(entry))
+      )
+    )
+  );
   const byKind: SessionMemoryIndex["byKind"] = {};
   const byPath: Record<string, string[]> = {};
   const byTool: Record<string, string[]> = {};
@@ -466,6 +732,9 @@ export const upsertMemoryEntries = (
 
   for (const input of inputs) {
     const nextEntry = materializeMemoryInput(index.sessionId, input);
+    if (!nextEntry) {
+      continue;
+    }
     const existingIndex = entries.findIndex(
       entry => entry.dedupeKey && entry.dedupeKey === nextEntry.dedupeKey
     );
@@ -475,41 +744,7 @@ export const upsertMemoryEntries = (
       if (!existing) {
         continue;
       }
-      entries[existingIndex] = {
-        ...existing,
-        text: nextEntry.text,
-        priority: Math.max(existing.priority, nextEntry.priority),
-        createdAt: nextEntry.createdAt,
-        updatedAt: nextEntry.createdAt,
-        tags: Array.from(new Set([...existing.tags, ...nextEntry.tags])).slice(0, 12),
-        entities: {
-          path: Array.from(
-            new Set([...(existing.entities.path ?? []), ...(nextEntry.entities.path ?? [])])
-          ).slice(0, 6),
-          toolName: Array.from(
-            new Set([
-              ...(existing.entities.toolName ?? []),
-              ...(nextEntry.entities.toolName ?? []),
-            ])
-          ).slice(0, 6),
-          action: Array.from(
-            new Set([...(existing.entities.action ?? []), ...(nextEntry.entities.action ?? [])])
-          ).slice(0, 6),
-          topic: Array.from(
-            new Set([...(existing.entities.topic ?? []), ...(nextEntry.entities.topic ?? [])])
-          ).slice(0, 6),
-          status: Array.from(
-            new Set([...(existing.entities.status ?? []), ...(nextEntry.entities.status ?? [])])
-          ).slice(0, 6),
-          queryTerms: Array.from(
-            new Set([
-              ...(existing.entities.queryTerms ?? []),
-              ...(nextEntry.entities.queryTerms ?? []),
-            ])
-          ).slice(0, QUERY_TOKEN_LIMIT),
-        },
-        hitCount: (existing.hitCount ?? 1) + 1,
-      };
+      entries[existingIndex] = mergeMemoryEntry(existing, nextEntry);
       continue;
     }
 
@@ -722,6 +957,9 @@ const scoreEntryForArchiveSection = (
   if ((entry.entities.path?.length ?? 0) > 0 || (entry.hitCount ?? 1) >= 3) {
     score += 8;
   }
+  if (isLowSignalNarrationEntry(entry)) {
+    score -= 140;
+  }
 
   switch (section) {
     case "OBJECTIVE":
@@ -733,11 +971,11 @@ const scoreEntryForArchiveSection = (
       }
       break;
     case "CONFIRMED FACTS":
-      if (entry.kind === "fact") {
-        score += 80;
-      }
       if (entry.kind === "tool_result" || entry.kind === "approval") {
-        score += 70;
+        score += 110;
+      }
+      if (entry.kind === "fact") {
+        score += 50;
       }
       if (isFailureLikeEntry(entry)) {
         score -= 25;

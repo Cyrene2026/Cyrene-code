@@ -924,6 +924,49 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("4 | def run_app():");
   });
 
+  test("outline_file falls back to large-file scan instead of failing on oversized source files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    const content = [
+      "export class HugeDemo {}",
+      ...Array.from({ length: 2500 }, () => filler),
+      "export function runHugeDemo() {",
+      "  return true;",
+      "}",
+    ].join("\n");
+    await writeFile(join(root, "huge.ts"), content, "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "outline_file",
+      path: "huge.ts",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] outline_file huge.ts");
+    expect(result.message).toContain("large-file mode: scanned");
+    expect(result.message).toContain("1 | export class HugeDemo {}");
+    expect(result.message).toContain("2502 | export function runHugeDemo() {");
+  });
+
   test("find_symbol executes immediately and returns matching definition lines", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "src"), { recursive: true });
@@ -950,6 +993,53 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("[tool result] find_symbol src");
     expect(result.message).toContain("Found 1 symbol match(es):");
     expect(result.message).toContain("src/app.ts:2 | export function runApp()");
+  });
+
+  test("find_symbol falls back to large-file scan for oversized source files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    await mkdir(join(root, "src"), { recursive: true });
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    await writeFile(
+      join(root, "src", "huge.ts"),
+      [
+        "export class HugeDemoService {}",
+        ...Array.from({ length: 2500 }, () => filler),
+        "export function runHugeDemo() {",
+        "  return true;",
+        "}",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "find_symbol",
+      path: "src",
+      symbol: "runHugeDemo",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 symbol match(es):");
+    expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
+    expect(result.message).toContain("src/huge.ts:2502 | export function runHugeDemo()");
   });
 
   test("find_references executes immediately and returns usage lines instead of symbol definitions", async () => {
@@ -980,6 +1070,52 @@ describe("FileMcpService", () => {
     expect(result.message).toContain('src/app.ts:1 | import { DemoService } from "./demo";');
     expect(result.message).toContain("src/app.ts:2 | const service = new DemoService();");
     expect(result.message).not.toContain("src/demo.ts:1 | export class DemoService {}");
+  });
+
+  test("find_references falls back to large-file scan for oversized source files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    await mkdir(join(root, "src"), { recursive: true });
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    await writeFile(
+      join(root, "src", "huge-ref.ts"),
+      [
+        "export class HugeDemoService {}",
+        ...Array.from({ length: 2500 }, () => filler),
+        "console.log(HugeDemoService);",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "find_references",
+      path: "src",
+      symbol: "HugeDemoService",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 reference match(es):");
+    expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
+    expect(result.message).toContain("src/huge-ref.ts:2502 | console.log(HugeDemoService);");
+    expect(result.message).not.toContain("src/huge-ref.ts:1 | export class HugeDemoService {}");
   });
 
   test("find_files executes immediately and returns matching workspace-relative paths", async () => {
@@ -1021,6 +1157,104 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("needle");
   });
 
+  test("search_text skips common large directories during workspace-wide search", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "node_modules", "demo-pkg"), { recursive: true });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "import queryRunner from './query';\n", "utf8");
+    await writeFile(
+      join(root, "node_modules", "demo-pkg", "index.ts"),
+      "import queryRunner from 'ignored-package';\n",
+      "utf8"
+    );
+    await writeFile(join(root, ".git", "HEAD"), "import queryRunner from 'git';\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: ".",
+      query: "import query",
+      maxResults: 10,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("note: skipped common large directories:");
+    expect(result.message).toContain(".git");
+    expect(result.message).toContain("node_modules");
+    expect(result.message).toContain("src/app.ts:1 | import queryRunner from './query';");
+    expect(result.message).not.toContain("node_modules/demo-pkg/index.ts");
+  });
+
+  test("search_text still searches inside node_modules when path explicitly targets it", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "node_modules", "demo-pkg"), { recursive: true });
+    await writeFile(
+      join(root, "node_modules", "demo-pkg", "index.ts"),
+      "import queryRunner from 'pkg';\n",
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: "node_modules",
+      query: "import query",
+      maxResults: 10,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("node_modules/demo-pkg/index.ts:1 | import queryRunner from 'pkg';");
+    expect(result.message).not.toContain("note: skipped common large directories:");
+  });
+
+  test("search_text falls back to large-file scan for oversized files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    await mkdir(join(root, "docs"), { recursive: true });
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    await writeFile(
+      join(root, "docs", "huge.txt"),
+      [
+        ...Array.from({ length: 2500 }, () => filler),
+        "needle is here",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: "docs",
+      query: "needle",
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
+    expect(result.message).toContain("docs/huge.txt:2501 | needle is here");
+  });
+
   test("search_text_context executes immediately and returns match windows with surrounding lines", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "docs"), { recursive: true });
@@ -1043,6 +1277,58 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("1 | alpha");
     expect(result.message).toContain(">    2 | needle here");
     expect(result.message).toContain("3 | omega");
+  });
+
+  test("search_text_context falls back to large-file scan for oversized files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    await mkdir(join(root, "docs"), { recursive: true });
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    await writeFile(
+      join(root, "docs", "huge-context.txt"),
+      [
+        ...Array.from({ length: 2499 }, () => filler),
+        "before line",
+        "needle is here",
+        "after line",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text_context",
+      path: "docs",
+      query: "needle",
+      before: 1,
+      after: 1,
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 contextual match(es):");
+    expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
+    expect(result.message).toContain("[match] docs/huge-context.txt:2501");
+    expect(result.message).toContain("2500 | before line");
+    expect(result.message).toContain("> 2501 | needle is here");
+    expect(result.message).toContain("2502 | after line");
   });
 
   test("copy_path enters review queue and copies file on approve", async () => {

@@ -15,6 +15,7 @@ import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type { QueryTransport } from "../../core/query/transport";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
+import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
 import type { SessionListItem, SessionRecord } from "../../core/session/types";
 import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
 import type { MpcAction, PendingReviewItem } from "../../core/tools/mcp/types";
@@ -452,6 +453,7 @@ const getPendingQueueSignature = (pending: PendingReviewItem[]) =>
   pending.map(item => item.id).join("|");
 
 const HOTKEY_REPEAT_COOLDOWN_MS = 900;
+const ACTION_REPEAT_COOLDOWN_MS = 400;
 const APPROVAL_BLOCK_RETRY_MS = 1500;
 
 const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
@@ -494,7 +496,7 @@ export const useChatApp = ({
   defaultSystemPrompt,
   projectPrompt,
   pinMaxCount,
-  queryMaxToolSteps = 24,
+  queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   mcpService,
   runQuerySessionImpl = runQuerySession,
   inputAdapterHook = useInputAdapter,
@@ -574,6 +576,8 @@ export const useChatApp = ({
   const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
+  const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
+  const summaryRefreshInFlightRef = useRef(new Set<string>());
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
@@ -834,7 +838,7 @@ export const useChatApp = ({
     clearLiveAssistantSegment();
   };
 
-  const isRepeatedApprovalInteraction = (
+  const isRepeatedInteraction = (
     ref: { current: { token: string; at: number } | null },
     token: string,
     cooldownMs = HOTKEY_REPEAT_COOLDOWN_MS
@@ -847,6 +851,11 @@ export const useChatApp = ({
     ref.current = { token, at: now };
     return false;
   };
+
+  const isRepeatedActionInteraction = (
+    token: string,
+    cooldownMs = ACTION_REPEAT_COOLDOWN_MS
+  ) => isRepeatedInteraction(lastActionIntentRef, token, cooldownMs);
 
   const clearApprovalBlock = (
     state: ApprovalPanelState
@@ -903,6 +912,29 @@ export const useChatApp = ({
   const getMemorySessionId = () =>
     suspendedTaskRef.current?.sessionId ?? activeSessionId;
 
+  const scheduleSessionSummaryRefresh = (sessionId: string) => {
+    if (!transport.summarizeText) {
+      return;
+    }
+    if (summaryRefreshInFlightRef.current.has(sessionId)) {
+      return;
+    }
+    summaryRefreshInFlightRef.current.add(sessionId);
+    void (async () => {
+      try {
+        const latest = await sessionStore.loadSession(sessionId);
+        if (!latest) {
+          return;
+        }
+        await maybeRefreshSessionSummary(latest);
+      } catch {
+        // Summary refresh is best-effort and must never block the main chat flow.
+      } finally {
+        summaryRefreshInFlightRef.current.delete(sessionId);
+      }
+    })();
+  };
+
   const finalizeAssistantBuffer = async (
     sessionId: string,
     assistantBuffer: string
@@ -938,6 +970,7 @@ export const useChatApp = ({
         clearLiveAssistantSegment();
       }
       await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
+      scheduleSessionSummaryRefresh(sessionId);
       return;
     }
 
@@ -1191,8 +1224,16 @@ export const useChatApp = ({
   };
 
   const confirmModelPickerSelection = () => {
+    const selected =
+      modelPickerRef.current.models[modelPickerRef.current.selectedIndex];
+    if (
+      isRepeatedActionInteraction(
+        `model-picker:${selected ?? "none"}:${modelPickerRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     enqueueTask(async () => {
-      const selected = modelPicker.models[modelPicker.selectedIndex];
       if (!selected) {
         pushSystemMessage("No model selected.", {
           kind: "error",
@@ -1221,8 +1262,16 @@ export const useChatApp = ({
   };
 
   const confirmProviderPickerSelection = () => {
+    const selected =
+      providerPickerRef.current.providers[providerPickerRef.current.selectedIndex];
+    if (
+      isRepeatedActionInteraction(
+        `provider-picker:${selected ?? "none"}:${providerPickerRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     enqueueTask(async () => {
-      const selected = providerPicker.providers[providerPicker.selectedIndex];
       if (!selected) {
         pushSystemMessage("No provider selected.", {
           kind: "error",
@@ -1252,8 +1301,16 @@ export const useChatApp = ({
   };
 
   const confirmResumePickerSelection = () => {
+    const selected =
+      resumePickerRef.current.sessions[resumePickerRef.current.selectedIndex];
+    if (
+      isRepeatedActionInteraction(
+        `resume-picker:${selected?.id ?? "none"}:${resumePickerRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     enqueueTask(async () => {
-      const selected = resumePicker.sessions[resumePicker.selectedIndex];
       if (!selected) {
         pushSystemMessage("No session selected.", {
           kind: "error",
@@ -1267,8 +1324,16 @@ export const useChatApp = ({
   };
 
   const confirmSessionsPanelSelection = () => {
+    const selected =
+      sessionsPanelRef.current.sessions[sessionsPanelRef.current.selectedIndex];
+    if (
+      isRepeatedActionInteraction(
+        `sessions-panel:${selected?.id ?? "none"}:${sessionsPanelRef.current.selectedIndex}`
+      )
+    ) {
+      return;
+    }
     enqueueTask(async () => {
-      const selected = sessionsPanel.sessions[sessionsPanel.selectedIndex];
       if (!selected) {
         pushSystemMessage("No session selected.", {
           kind: "error",
@@ -1865,7 +1930,7 @@ export const useChatApp = ({
       return;
     }
     if (
-      isRepeatedApprovalInteraction(
+      isRepeatedInteraction(
         lastApprovalIntentRef,
         `approve:${target.id}:${approvalPanelRef.current.selectedIndex}`
       )
@@ -1900,7 +1965,7 @@ export const useChatApp = ({
       return;
     }
     if (
-      isRepeatedApprovalInteraction(
+      isRepeatedInteraction(
         lastApprovalIntentRef,
         `reject:${target.id}:${approvalPanelRef.current.selectedIndex}`
       )
@@ -2278,7 +2343,7 @@ export const useChatApp = ({
     if (key.return) {
       const selected = pendingReviewsRef.current[approvalPanelRef.current.selectedIndex];
       const token = `enter-hint:${selected?.id ?? "none"}:${approvalPanelRef.current.selectedIndex}`;
-      if (isRepeatedApprovalInteraction(lastApprovalHintRef, token, 1500)) {
+      if (isRepeatedInteraction(lastApprovalHintRef, token, 1500)) {
         return;
       }
       pushSystemMessage(
@@ -2405,6 +2470,9 @@ export const useChatApp = ({
           pushSystemMessage("Usage: /provider <base_url> | /provider refresh");
           return;
         }
+        if (isRepeatedActionInteraction(`command:provider:${nextProvider}`)) {
+          return;
+        }
         const result = await transport.setProvider(nextProvider);
         updateCurrentProviderState(transport.getProvider());
         updateCurrentModelState(transport.getModel());
@@ -2466,6 +2534,9 @@ export const useChatApp = ({
       enqueueTask(async () => {
         if (!nextModel) {
           pushSystemMessage("Usage: /model <model_name>");
+          return;
+        }
+        if (isRepeatedActionInteraction(`command:model:${nextModel}`)) {
           return;
         }
         const result = await transport.setModel(nextModel);
@@ -2975,7 +3046,6 @@ export const useChatApp = ({
       setInput("");
 
       const session = await ensureActiveSession(query);
-      await maybeRefreshSessionSummary(session);
       const promptContext = await sessionStore.getPromptContext(session.id, query);
       const now = new Date().toISOString();
       await sessionStore.appendMessage(session.id, {

@@ -1,0 +1,18 @@
+services:
+  cyrene:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cyrene:local
+    container_name: cyrene
+    working_dir: /workspace
+    command: ["bun", "run", "start"]
+    stdin_open: true
+    tty: true
+    environment:
+      CYRENE_ROOT: /workspace
+      CYRENE_BASE_URL: ${CYRENE_BASE_URL:-}
+      CYRENE_API_KEY: ${CYRENE_API_KEY:-}
+      CYRENE_MODEL: ${CYRENE_MODEL:-gpt-4o-mini}
+      CYRENE_SYSTEM_PROMPT: ${CYRENE_SYSTEM_PROMPT:-}
+      CYRENE_ANIMATE_STREAMING: ${CYRENE_ANIMATE_STREAMING:-0}

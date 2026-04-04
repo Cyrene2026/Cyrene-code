@@ -2461,10 +2461,27 @@ export class FileMcpService {
   }
 
   private toWorkspaceDisplayPath(inputPath: string) {
+    const trimmed = inputPath.trim();
+    if (!trimmed) {
+      return ".";
+    }
+
+    const workspaceRoot = resolve(this.rules.workspaceRoot);
+    if (isAbsolute(trimmed)) {
+      const absolute = resolve(trimmed);
+      if (!isPathInsideWorkspaceRoot(absolute, workspaceRoot)) {
+        return trimmed.replace(/\\/g, "/");
+      }
+      const normalized = relative(workspaceRoot, absolute)
+        .replace(/\\/g, "/")
+        .replace(/^\.\/+/, "");
+      return normalized || ".";
+    }
+
     try {
-      return this.normalizeWorkspacePath(inputPath);
+      return this.normalizeWorkspacePath(trimmed);
     } catch {
-      return inputPath;
+      return trimmed.replace(/\\/g, "/");
     }
   }
 

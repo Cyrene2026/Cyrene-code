@@ -38,6 +38,13 @@ type ConfirmedFileMutation = {
   path: string;
 };
 
+type MultiFileProgressLedger = {
+  expectedFileCount?: number;
+  targetPaths: string[];
+  completedPaths: string[];
+  lastCompletedPath?: string;
+};
+
 const getToolAction = (toolName: string, input: unknown) => {
   if (
     input &&
@@ -156,6 +163,228 @@ const normalizeComparedPath = (path: string) =>
     .replace(/\/+/g, "/")
     .replace(/^\.\//, "")
     .replace(/\/$/, "");
+
+const FILE_PATH_PATTERN =
+  /(?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+\.[A-Za-z0-9_-]+/g;
+
+const ENGLISH_FILE_COUNT_WORDS: Record<string, number> = {
+  a: 1,
+  an: 1,
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+};
+
+const CHINESE_DIGITS: Record<string, number> = {
+  零: 0,
+  〇: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+
+const normalizeUniquePaths = (paths: string[]) => {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const path of paths) {
+    const candidate = normalizeComparedPath(path);
+    if (!candidate || seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    normalized.push(candidate);
+  }
+  return normalized;
+};
+
+const parseChineseNumber = (token: string) => {
+  const normalized = token.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "十") {
+    return 10;
+  }
+  if (normalized.includes("十")) {
+    const [left, right] = normalized.split("十");
+    const tens = left ? (CHINESE_DIGITS[left] ?? 0) : 1;
+    const ones = right ? (CHINESE_DIGITS[right] ?? 0) : 0;
+    const value = tens * 10 + ones;
+    return value > 0 ? value : undefined;
+  }
+  if (normalized.length === 1) {
+    const digit = CHINESE_DIGITS[normalized];
+    return typeof digit === "number" ? digit : undefined;
+  }
+  return undefined;
+};
+
+const parseLooseFileCount = (token: string) => {
+  const normalized = token.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (/^\d+$/.test(normalized)) {
+    return Number(normalized);
+  }
+  if (normalized in ENGLISH_FILE_COUNT_WORDS) {
+    return ENGLISH_FILE_COUNT_WORDS[normalized];
+  }
+  return parseChineseNumber(token);
+};
+
+const extractExplicitTaskPaths = (task: string) =>
+  normalizeUniquePaths(task.match(FILE_PATH_PATTERN) ?? []);
+
+const extractExpectedFileCount = (task: string, explicitPaths: string[]) => {
+  const patterns = [
+    /(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:new\s+|additional\s+)?(?:[a-z]+\s+)?files?\b/i,
+    /(\d+|[零〇一二两三四五六七八九十]+)\s*个?\s*(?:[a-z]+\s*)?(?:文件|脚本|组件|模块)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = task.match(pattern);
+    if (!match?.[1]) {
+      continue;
+    }
+    const parsed = parseLooseFileCount(match[1]);
+    if (typeof parsed === "number" && parsed > 0) {
+      return Math.max(parsed, explicitPaths.length);
+    }
+  }
+  return explicitPaths.length > 1 ? explicitPaths.length : undefined;
+};
+
+const createInitialMultiFileProgressLedger = (
+  task: string
+): MultiFileProgressLedger => {
+  const targetPaths = extractExplicitTaskPaths(task);
+  return {
+    expectedFileCount: extractExpectedFileCount(task, targetPaths),
+    targetPaths,
+    completedPaths: [],
+  };
+};
+
+const getLedgerExpectedFileCount = (ledger: MultiFileProgressLedger) =>
+  Math.max(ledger.expectedFileCount ?? 0, ledger.targetPaths.length);
+
+const getLedgerRemainingPaths = (ledger: MultiFileProgressLedger) => {
+  const completed = new Set(ledger.completedPaths.map(normalizeComparedPath));
+  return ledger.targetPaths.filter(path => !completed.has(normalizeComparedPath(path)));
+};
+
+const getLedgerRemainingCount = (ledger: MultiFileProgressLedger) => {
+  const expected = getLedgerExpectedFileCount(ledger);
+  if (expected > 0) {
+    return Math.max(0, expected - ledger.completedPaths.length);
+  }
+  return getLedgerRemainingPaths(ledger).length;
+};
+
+const isMeaningfulMultiFileLedger = (ledger: MultiFileProgressLedger) => {
+  const expected = getLedgerExpectedFileCount(ledger);
+  return (
+    expected > 1 ||
+    ledger.targetPaths.length > 1 ||
+    ledger.completedPaths.length > 1
+  );
+};
+
+const pushCompletedPathToLedger = (
+  ledger: MultiFileProgressLedger,
+  path: string
+): MultiFileProgressLedger => {
+  const normalizedPath = normalizeComparedPath(path);
+  if (!normalizedPath) {
+    return ledger;
+  }
+  const completedPaths = normalizeUniquePaths([
+    ...ledger.completedPaths,
+    normalizedPath,
+  ]);
+  const expected = getLedgerExpectedFileCount(ledger);
+  return {
+    ...ledger,
+    expectedFileCount:
+      expected > 0 ? Math.max(expected, completedPaths.length) : undefined,
+    completedPaths,
+    lastCompletedPath: normalizedPath,
+  };
+};
+
+const formatPathList = (paths: string[], maxItems = 5) => {
+  if (paths.length === 0) {
+    return "(none)";
+  }
+  const visible = paths.slice(0, maxItems).join(", ");
+  const hidden = paths.length - Math.min(paths.length, maxItems);
+  return hidden > 0 ? `${visible} (+${hidden} more)` : visible;
+};
+
+const formatMultiFileProgressLedger = (ledger: MultiFileProgressLedger) => {
+  if (!isMeaningfulMultiFileLedger(ledger)) {
+    return "";
+  }
+
+  const expected = getLedgerExpectedFileCount(ledger);
+  const completedCount = ledger.completedPaths.length;
+  const remainingPaths = getLedgerRemainingPaths(ledger);
+  const remainingCount = getLedgerRemainingCount(ledger);
+  const extraUnnamedRemaining = Math.max(0, remainingCount - remainingPaths.length);
+  const lines: string[] = [];
+
+  if (expected > 0) {
+    lines.push(`expected files: ${expected}`);
+  }
+
+  if (completedCount > 0) {
+    lines.push(
+      expected > 0
+        ? `completed (${completedCount}/${expected}): ${formatPathList(
+            ledger.completedPaths
+          )}`
+        : `completed (${completedCount}): ${formatPathList(ledger.completedPaths)}`
+    );
+  } else if (expected > 0) {
+    lines.push(`completed (0/${expected}): (none yet)`);
+  }
+
+  if (remainingPaths.length > 0) {
+    lines.push(
+      `remaining known paths (${remainingPaths.length}): ${formatPathList(
+        remainingPaths
+      )}`
+    );
+  }
+
+  if (remainingCount > 0 && remainingPaths.length === 0) {
+    lines.push(`remaining count: ${remainingCount}`);
+  } else if (extraUnnamedRemaining > 0) {
+    lines.push(`remaining additional file count: ${extraUnnamedRemaining}`);
+  }
+
+  if (ledger.lastCompletedPath) {
+    lines.push(`last completed file: ${ledger.lastCompletedPath}`);
+  }
+
+  return lines.join("\n");
+};
 
 const getConfirmedFileMutation = (
   toolName: string,
@@ -536,7 +765,8 @@ const formatRecentConfirmedFileMutations = (
 const buildHeuristicNudges = (
   originalTask: string,
   toolResults: string[],
-  recentConfirmedFileMutations: ConfirmedFileMutation[]
+  recentConfirmedFileMutations: ConfirmedFileMutation[],
+  progressLedger: MultiFileProgressLedger
 ) => {
   if (toolResults.length === 0) {
     return "";
@@ -547,6 +777,9 @@ const buildHeuristicNudges = (
   const wantsWrite = taskSuggestsWriting(normalizedTask);
   const mentionsEmptyIssue = taskMentionsEmptyOrMissingContent(normalizedTask);
   const wantsVerification = taskSuggestsPostWriteVerification(originalTask);
+  const remainingPaths = getLedgerRemainingPaths(progressLedger);
+  const remainingCount = getLedgerRemainingCount(progressLedger);
+  const completedCount = progressLedger.completedPaths.length;
   const nudges: string[] = [
     "Continue from the confirmed facts in the tool results above. Do not restart exploration from scratch.",
   ];
@@ -556,6 +789,27 @@ const buildHeuristicNudges = (
     nudges.push(
       `The latest successful file mutation already confirmed ${latestConfirmedMutation.path}. Continue the task and do not call read_file on the same path just to verify the write.`
     );
+  }
+
+  if (
+    wantsWrite &&
+    !wantsVerification &&
+    isMeaningfulMultiFileLedger(progressLedger) &&
+    remainingCount > 0
+  ) {
+    if (remainingPaths.length > 0) {
+      nudges.push(
+        `This is a multi-file task. Continue with the remaining target files directly: ${formatPathList(
+          remainingPaths,
+          4
+        )}. Do not reread completed files or relist directories just to confirm progress.`
+      );
+    } else {
+      const expected = getLedgerExpectedFileCount(progressLedger);
+      nudges.push(
+        `This is a multi-file task. ${completedCount}/${expected} files are already complete. Continue with the remaining ${remainingCount} file(s) instead of rereading finished ones.`
+      );
+    }
   }
 
   if (wantsWrite && recentResults.includes("[confirmed directory state]")) {
@@ -600,16 +854,19 @@ const buildRoundPrompt = (
   originalTask: string,
   toolResults: string[],
   loopCorrection: string,
-  recentConfirmedFileMutations: ConfirmedFileMutation[]
+  recentConfirmedFileMutations: ConfirmedFileMutation[],
+  progressLedger: MultiFileProgressLedger
 ) => {
   const heuristicNudges = buildHeuristicNudges(
     originalTask,
     toolResults,
-    recentConfirmedFileMutations
+    recentConfirmedFileMutations,
+    progressLedger
   );
   const recentMutationFacts = formatRecentConfirmedFileMutations(
     recentConfirmedFileMutations
   );
+  const multiFileProgressFacts = formatMultiFileProgressLedger(progressLedger);
   return [
     "Original user task:",
     originalTask,
@@ -627,6 +884,9 @@ const buildRoundPrompt = (
     "- Keep assistant wording in the same language as the user request unless the user asks to switch.",
     recentMutationFacts
       ? `Recent confirmed file mutations:\n${recentMutationFacts}`
+      : "",
+    multiFileProgressFacts
+      ? `Multi-file progress ledger:\n${multiFileProgressFacts}`
       : "",
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
     loopCorrection ? `\n${loopCorrection}\n` : "",
@@ -656,6 +916,7 @@ export const runQuerySession = async ({
   const task = originalTask ?? query;
   let filesystemMutationRevision = 0;
   let recentConfirmedFileMutations: ConfirmedFileMutation[] = [];
+  let progressLedger = createInitialMultiFileProgressLedger(task);
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
   let repeatedImmediatePostWriteReadCount = 0;
   const maxToolSteps =
@@ -843,6 +1104,10 @@ export const runQuerySession = async ({
               recentConfirmedFileMutations,
               confirmedFileMutation
             );
+            progressLedger = pushCompletedPathToLedger(
+              progressLedger,
+              confirmedFileMutation.path
+            );
             latestConfirmedFileMutation = confirmedFileMutation;
             repeatedImmediatePostWriteReadCount = 0;
           }
@@ -865,6 +1130,10 @@ export const runQuerySession = async ({
                     recentConfirmedFileMutations,
                     resumedConfirmedFileMutation
                   );
+                  progressLedger = pushCompletedPathToLedger(
+                    progressLedger,
+                    resumedConfirmedFileMutation.path
+                  );
                   latestConfirmedFileMutation = resumedConfirmedFileMutation;
                   repeatedImmediatePostWriteReadCount = 0;
                 }
@@ -877,7 +1146,8 @@ export const runQuerySession = async ({
                   task,
                   nextToolResults,
                   loopCorrection,
-                  recentConfirmedFileMutations
+                  recentConfirmedFileMutations,
+                  progressLedger
                 );
                 return runRounds(
                   nextPrompt,
@@ -931,7 +1201,8 @@ export const runQuerySession = async ({
       task,
       accumulatedToolResults,
       loopCorrection,
-      recentConfirmedFileMutations
+      recentConfirmedFileMutations,
+      progressLedger
     );
     return runRounds(
       nextPrompt,

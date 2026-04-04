@@ -678,6 +678,156 @@ describe("runQuerySession", () => {
     );
   });
 
+  test("injects completed and remaining paths into the multi-file progress ledger", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask:
+        "请创建 test_files/a.py、test_files/b.py、test_files/c.py，并分别写入演示内容",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: [
+          "[tool result] create_file test_files/a.py",
+          "Created file: test_files/a.py",
+          "[confirmed file mutation] create_file test_files/a.py",
+          "postcondition: file now exists and content was written successfully",
+        ].join("\n"),
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[1]).toContain("Multi-file progress ledger:");
+    expect(prompts[1]).toContain("expected files: 3");
+    expect(prompts[1]).toContain("completed (1/3): test_files/a.py");
+    expect(prompts[1]).toContain(
+      "remaining known paths (2): test_files/b.py, test_files/c.py"
+    );
+  });
+
+  test("falls back to count-based ledger when target filenames are unknown", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "create_file", path: "test_files/u1.py", content: "print('1')\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "create_file", path: "test_files/u2.py", content: "print('2')\n" },
+      },
+      null,
+    ]);
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "请在 test_files 里创建 5 个 py 文件并写入示例内容",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const path =
+          input && typeof input === "object" && "path" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).path)
+            : "unknown.py";
+        return {
+          message: [
+            `[tool result] create_file ${path}`,
+            `Created file: ${path}`,
+            `[confirmed file mutation] create_file ${path}`,
+            "postcondition: file now exists and content was written successfully",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[1]).toContain("expected files: 5");
+    expect(prompts[1]).toContain("completed (1/5): test_files/u1.py");
+    expect(prompts[1]).toContain("remaining count: 4");
+    expect(prompts[2]).toContain("completed (2/5): test_files/u1.py, test_files/u2.py");
+    expect(prompts[2]).toContain("remaining count: 3");
+  });
+
+  test("nudges the model to continue remaining files instead of rereading completed ones", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask:
+        "创建 test_files/a.py、test_files/b.py、test_files/c.py，并把三个文件都写好",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: [
+          "[tool result] create_file test_files/a.py",
+          "Created file: test_files/a.py",
+          "[confirmed file mutation] create_file test_files/a.py",
+          "postcondition: file now exists and content was written successfully",
+        ].join("\n"),
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[1]).toContain("This is a multi-file task. Continue with the remaining target files directly");
+    expect(prompts[1]).toContain(
+      "Do not reread completed files or relist directories just to confirm progress"
+    );
+  });
+
+  test("does not double-count repeated writes to the same path in the ledger", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "write_file", path: "test_files/a.py", content: "v1\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "write_file", path: "test_files/a.py", content: "v2\n" },
+      },
+      null,
+    ]);
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask:
+        "创建 test_files/a.py、test_files/b.py、test_files/c.py，并全部写入内容",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const path =
+          input && typeof input === "object" && "path" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).path)
+            : "unknown.py";
+        return {
+          message: [
+            `[tool result] write_file ${path}`,
+            `Wrote file: ${path}`,
+            `[confirmed file mutation] write_file ${path}`,
+            "postcondition: file content was updated successfully",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[2]).toContain("completed (1/3): test_files/a.py");
+    expect(prompts[2]).not.toContain("completed (2/3)");
+  });
+
   test("skips immediate read_file on the same path after a confirmed write", async () => {
     const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
       {
@@ -767,6 +917,54 @@ describe("runQuerySession", () => {
 
     expect(result.status).toBe("completed");
     expect(toolCalls).toEqual(["write_file", "read_file"]);
+  });
+
+  test("allows verification-oriented rereads in a multi-file task", async () => {
+    const transport = createRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "test_files/a.py" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask:
+        "创建 test_files/a.py、test_files/b.py，然后检查每个文件的内容是否正确",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        if (action === "read_file") {
+          return {
+            message: "[tool result] read_file test_files/a.py\nprint('a')",
+          };
+        }
+        return {
+          message: [
+            "[tool result] create_file test_files/a.py",
+            "Created file: test_files/a.py",
+            "[confirmed file mutation] create_file test_files/a.py",
+            "postcondition: file now exists and content was written successfully",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["create_file", "read_file"]);
   });
 
   test("stops repeated failed run_command earlier than generic loop guard", async () => {

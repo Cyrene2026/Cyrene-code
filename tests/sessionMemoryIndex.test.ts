@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
 import { createFileSessionStore } from "../src/infra/session/createFileSessionStore";
 
 const tempRoots: string[] = [];
@@ -17,6 +18,7 @@ const createStore = async () => {
 };
 
 afterEach(async () => {
+  resetConfiguredAppRoot();
   if (originalRootEnv === undefined) {
     delete process.env.CYRENE_ROOT;
   } else {

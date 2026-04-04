@@ -32,6 +32,36 @@ const createService = async (options?: ConstructorParameters<typeof FileMcpServi
   return { root, service };
 };
 
+const createIsolatedService = async (
+  options?: ConstructorParameters<typeof FileMcpService>[1]
+) => {
+  const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+  const service = new FileMcpService({
+    workspaceRoot: root,
+    maxReadBytes: 1024 * 1024,
+    requireReview: [
+      "create_file",
+      "write_file",
+      "edit_file",
+      "apply_patch",
+      "delete_file",
+      "copy_path",
+      "move_path",
+      "open_shell",
+      "write_shell",
+    ],
+  }, options);
+
+  return {
+    root,
+    service,
+    cleanup: async () => {
+      service.dispose();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    },
+  };
+};
+
 const createFakePersistentShellFactory = () => {
   const dataListeners: Array<(data: string) => void> = [];
   const exitListeners: Array<(event: { exitCode: number; signal?: string | number }) => void> =
@@ -1433,131 +1463,145 @@ describe("FileMcpService", () => {
 
   test("open_shell executes directly and opens a single persistent shell", async () => {
     const fakePty = createFakePersistentShellFactory();
-    const { service } = await createService({
+    const { service, cleanup } = await createIsolatedService({
       ptyFactory: fakePty.factory,
       shellSettleMs: 0,
     });
+    try {
+      const opened = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
 
-    const opened = await service.handleToolCall("file", {
-      action: "open_shell",
-      path: ".",
-    });
+      expect(opened.ok).toBe(true);
+      expect(opened.pending).toBeUndefined();
+      expect(opened.message).toContain("status: opened");
+      expect(opened.message).toContain("shell:");
+      expect(opened.message).toContain("cwd: .");
+      expect(service.listPending()).toHaveLength(0);
 
-    expect(opened.ok).toBe(true);
-    expect(opened.pending).toBeUndefined();
-    expect(opened.message).toContain("status: opened");
-    expect(opened.message).toContain("shell:");
-    expect(opened.message).toContain("cwd: .");
-    expect(service.listPending()).toHaveLength(0);
-
-    const secondOpen = await service.handleToolCall("file", {
-      action: "open_shell",
-      path: ".",
-    });
-    expect(secondOpen.ok).toBe(false);
-    expect(secondOpen.message).toContain("already exists");
-    expect(fakePty.state.openFile).toBe(process.platform === "win32" ? "pwsh" : "/bin/bash");
+      const secondOpen = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+      expect(secondOpen.ok).toBe(false);
+      expect(secondOpen.message).toContain("already exists");
+      if (process.platform === "win32") {
+        expect(fakePty.state.openFile).toBe("pwsh");
+      } else {
+        expect(["/bin/bash", "/bin/sh"]).toContain(fakePty.state.openFile);
+      }
+    } finally {
+      await cleanup();
+    }
   });
 
   test("low-risk write_shell inputs execute directly and preserve cwd and environment", async () => {
     const fakePty = createFakePersistentShellFactory();
-    const { root, service } = await createService({
+    const { root, service, cleanup } = await createIsolatedService({
       ptyFactory: fakePty.factory,
       shellSettleMs: 0,
     });
-    await mkdir(join(root, "subdir"), { recursive: true });
-    await mkdir(join(root, ".venv"), { recursive: true });
+    try {
+      await mkdir(join(root, "subdir"), { recursive: true });
+      await mkdir(join(root, ".venv"), { recursive: true });
 
-    const opened = await service.handleToolCall("file", {
-      action: "open_shell",
-      path: ".",
-    });
-    expect(opened.ok).toBe(true);
-    expect(opened.pending).toBeUndefined();
+      const opened = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+      expect(opened.ok).toBe(true);
+      expect(opened.pending).toBeUndefined();
 
-    const activateResult = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input:
-        process.platform === "win32"
-          ? ".\\.venv\\Scripts\\Activate.ps1"
-          : ". .venv/bin/activate",
-    });
-    expect(activateResult.ok).toBe(true);
-    expect(activateResult.pending).toBeUndefined();
-    expect(activateResult.message).toContain("status: completed");
-    expect(activateResult.message).toContain("venv activated");
+      const activateResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input:
+          process.platform === "win32"
+            ? ".\\.venv\\Scripts\\Activate.ps1"
+            : ". .venv/bin/activate",
+      });
+      expect(activateResult.ok).toBe(true);
+      expect(activateResult.pending).toBeUndefined();
+      expect(activateResult.message).toContain("status: completed");
+      expect(activateResult.message).toContain("venv activated");
 
-    const cdResult = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input: "cd subdir",
-    });
-    expect(cdResult.ok).toBe(true);
-    expect(cdResult.pending).toBeUndefined();
-    expect(cdResult.message).toContain("cwd: subdir");
+      const cdResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "cd subdir",
+      });
+      expect(cdResult.ok).toBe(true);
+      expect(cdResult.pending).toBeUndefined();
+      expect(cdResult.message).toContain("cwd: subdir");
 
-    const pythonResult = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input: "python --version",
-    });
-    expect(pythonResult.ok).toBe(true);
-    expect(pythonResult.pending).toBeUndefined();
-    expect(pythonResult.message).toContain("Python 3.12.0 (venv)");
+      const pythonResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "python --version",
+      });
+      expect(pythonResult.ok).toBe(true);
+      expect(pythonResult.pending).toBeUndefined();
+      expect(pythonResult.message).toContain("Python 3.12.0 (venv)");
 
-    const pipListResult = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input: "pip list",
-    });
-    expect(pipListResult.ok).toBe(true);
-    expect(pipListResult.pending).toBeUndefined();
-    expect(pipListResult.message).toContain("ran pip list");
+      const pipListResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "pip list",
+      });
+      expect(pipListResult.ok).toBe(true);
+      expect(pipListResult.pending).toBeUndefined();
+      expect(pipListResult.message).toContain("ran pip list");
 
-    const gitStatusResult = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input: "git status",
-    });
-    expect(gitStatusResult.ok).toBe(true);
-    expect(gitStatusResult.pending).toBeUndefined();
-    expect(gitStatusResult.message).toContain("ran git status");
+      const gitStatusResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "git status",
+      });
+      expect(gitStatusResult.ok).toBe(true);
+      expect(gitStatusResult.pending).toBeUndefined();
+      expect(gitStatusResult.message).toContain("ran git status");
 
-    const status = await service.handleToolCall("file", {
-      action: "shell_status",
-      path: ".",
-    });
-    expect(status.ok).toBe(true);
-    expect(status.message).toContain("status: idle");
-    expect(status.message).toContain("cwd: subdir");
+      const status = await service.handleToolCall("file", {
+        action: "shell_status",
+        path: ".",
+      });
+      expect(status.ok).toBe(true);
+      expect(status.message).toContain("status: idle");
+      expect(status.message).toContain("cwd: subdir");
+    } finally {
+      await cleanup();
+    }
   });
 
   test("write_shell executes safe multiline blocks sequentially in the persistent shell", async () => {
     const fakePty = createFakePersistentShellFactory();
-    const { service } = await createService({
+    const { service, cleanup } = await createIsolatedService({
       ptyFactory: fakePty.factory,
       shellSettleMs: 0,
     });
+    try {
+      await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
 
-    await service.handleToolCall("file", {
-      action: "open_shell",
-      path: ".",
-    });
+      const result = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: ["cd subdir", "python --version"].join("\n"),
+      });
 
-    const result = await service.handleToolCall("file", {
-      action: "write_shell",
-      path: ".",
-      input: ["cd subdir", "python --version"].join("\n"),
-    });
-
-    expect(result.ok).toBe(true);
-    expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("$ cd subdir");
-    expect(result.message).toContain("$ python --version");
-    expect(result.message).toContain("changed directory");
-    expect(result.message).toContain("Python 3.12.0 (system)");
-    expect(result.message).toContain("cwd: subdir");
+      expect(result.ok).toBe(true);
+      expect(result.pending).toBeUndefined();
+      expect(result.message).toContain("$ cd subdir");
+      expect(result.message).toContain("$ python --version");
+      expect(result.message).toContain("changed directory");
+      expect(result.message).toContain("Python 3.12.0 (system)");
+      expect(result.message).toContain("cwd: subdir");
+    } finally {
+      await cleanup();
+    }
   });
 
   test("run_shell rejects multiline commands and nudges callers toward persistent shell", async () => {

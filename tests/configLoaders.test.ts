@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadRuleConfig } from "../src/core/tools/mcp/loadRuleConfig";
+import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
 
 const originalCwd = process.cwd();
@@ -11,6 +12,7 @@ const tempRoots: string[] = [];
 
 afterEach(async () => {
   process.chdir(originalCwd);
+  resetConfiguredAppRoot();
   if (originalRootEnv === undefined) {
     delete process.env.CYRENE_ROOT;
   } else {

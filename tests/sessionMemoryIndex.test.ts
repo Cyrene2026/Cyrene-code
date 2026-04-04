@@ -166,6 +166,118 @@ describe("session memory index", () => {
     expect(context.pins[0]).toBe("Always preserve dynamic programming examples");
     expect(context.relevantMemories.some(item => item.includes("test_files/u4.py"))).toBe(true);
     expect(context.relevantMemories[0]?.includes("u4.py")).toBe(true);
+    expect(context.archiveSections?.COMPLETED?.some(item => item.includes("u4.py"))).toBe(
+      true
+    );
+    expect(context.archiveSections?.["KNOWN PATHS"]).toContain("test_files/u4.py");
+  });
+
+  test("working-state remaining/known-path signals help archive retrieval even for generic follow-up queries", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("continue task");
+
+    await store.recordMemory(session.id, {
+      kind: "tool_result",
+      text: "Tool: write_file src/auth/oauth.ts | Wrote file: src/auth/oauth.ts",
+      priority: 78,
+      entities: {
+        path: ["src/auth/oauth.ts"],
+        action: ["write_file"],
+        toolName: ["write_file"],
+        status: ["ok"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "error",
+      text: "Approval error\npath: src/auth/oauth.ts\npending review still required",
+      priority: 88,
+      entities: {
+        path: ["src/auth/oauth.ts"],
+        action: ["edit_file"],
+        status: ["error"],
+      },
+    });
+    await store.updateSummary(
+      session.id,
+      [
+        "OBJECTIVE:",
+        "- continue oauth follow-up",
+        "",
+        "CONFIRMED FACTS:",
+        "- src/auth/oauth.ts was already edited once",
+        "",
+        "CONSTRAINTS:",
+        "- approval is still required before further mutation",
+        "",
+        "COMPLETED:",
+        "- initial oauth file write finished",
+        "",
+        "REMAINING:",
+        "- continue work in src/auth/oauth.ts",
+        "",
+        "KNOWN PATHS:",
+        "- src/auth/oauth.ts",
+        "",
+        "RECENT FAILURES:",
+        "- approval error on src/auth/oauth.ts",
+        "",
+        "NEXT BEST ACTIONS:",
+        "- resume the oauth task without re-scanning unrelated files",
+      ].join("\n")
+    );
+
+    const context = await store.getPromptContext(session.id, "continue");
+
+    expect(context.archiveSections?.["KNOWN PATHS"]).toContain("src/auth/oauth.ts");
+    expect(
+      context.archiveSections?.["RECENT FAILURES"]?.some(item =>
+        item.includes("oauth.ts")
+      )
+    ).toBe(true);
+    expect(context.relevantMemories.some(item => item.includes("src/auth/oauth.ts"))).toBe(true);
+  });
+
+  test("compacts oversized memory indexes while preserving high-signal entries", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("compaction");
+
+    for (let index = 0; index < 210; index += 1) {
+      await store.recordMemory(session.id, {
+        kind: "fact",
+        text: `generic note ${index + 1}`,
+        priority: 10,
+        createdAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      });
+    }
+
+    await store.recordMemory(session.id, {
+      kind: "tool_result",
+      text: "Tool: write_file src/critical/path.ts | Wrote file: src/critical/path.ts",
+      priority: 85,
+      entities: {
+        path: ["src/critical/path.ts"],
+        action: ["write_file"],
+        toolName: ["write_file"],
+        status: ["ok"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "error",
+      text: "Approval error\npath: src/critical/path.ts\npermission denied",
+      priority: 92,
+      entities: {
+        path: ["src/critical/path.ts"],
+        action: ["edit_file"],
+        status: ["error"],
+      },
+    });
+
+    const index = await store.getMemoryIndex(session.id);
+
+    expect(index.entries.length).toBeLessThanOrEqual(140);
+    expect(
+      index.entries.some(entry => entry.text.includes("src/critical/path.ts"))
+    ).toBe(true);
   });
 
   test("removeFocus updates derived pin memory without corrupting prompt context", async () => {

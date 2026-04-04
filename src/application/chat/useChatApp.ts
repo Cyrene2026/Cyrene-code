@@ -7,6 +7,10 @@ import type { TokenUsage } from "../../core/query/tokenUsage";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
 import { compressContext } from "../../core/session/contextCompression";
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
+import {
+  WORKING_STATE_SECTION_ORDER,
+  repairWorkingStateSummary,
+} from "../../core/session/workingState";
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type { QueryTransport } from "../../core/query/transport";
@@ -129,6 +133,7 @@ const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
 const SUMMARY_TRIGGER_CHAR_THRESHOLD = 1200;
 const SUMMARY_RECENT_MESSAGE_LIMIT = 16;
 const SUMMARY_RECENT_CHAR_BUDGET = 12000;
+const SUMMARY_RECENT_LINE_LIMIT = 320;
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
   { command: "/provider", description: "open provider picker" },
@@ -231,6 +236,14 @@ const shouldRefreshSessionSummary = (session: SessionRecord) => {
   return totalChars >= SUMMARY_TRIGGER_CHAR_THRESHOLD;
 };
 
+const clipSummaryPromptLine = (text: string, max = SUMMARY_RECENT_LINE_LIMIT) => {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) {
+    return normalized;
+  }
+  return `${normalized.slice(0, max)}...`;
+};
+
 const buildSummaryPrompt = (session: SessionRecord) => {
   const compressed = compressContext(session.messages, SUMMARY_RECENT_KEEP, 6);
   const recentMessages = session.messages
@@ -244,7 +257,7 @@ const buildSummaryPrompt = (session: SessionRecord) => {
     if (!normalized) {
       continue;
     }
-    const line = `${message.role.toUpperCase()}: ${normalized}`;
+    const line = `${message.role.toUpperCase()}: ${clipSummaryPromptLine(normalized)}`;
     if (
       recentLines.length > 0 &&
       charBudget + line.length > SUMMARY_RECENT_CHAR_BUDGET
@@ -256,15 +269,18 @@ const buildSummaryPrompt = (session: SessionRecord) => {
   }
 
   return [
-    "Summarize the prior conversation into 4-6 short Markdown bullet points.",
-    "Keep only the task goal, confirmed facts, constraints, key decisions, and unfinished work.",
-    "Do not add headings, prose paragraphs, code fences, speculation, or any new information.",
-    "Prefer concrete nouns and file/tool names when they were explicitly mentioned.",
+    "Reduce the prior conversation into a durable working-state record.",
+    "Output Markdown only. Use exactly these section headings, in this exact order:",
+    ...WORKING_STATE_SECTION_ORDER.map(section => `- ${section}:`),
+    "Under each heading, write 1-5 short bullet points. If nothing is known, write `- (none)`.",
+    "This is a state reducer, not a narrative summary.",
+    "Preserve explicit counts, filenames, tool names, approvals, failures, completed work, and remaining work when known.",
+    "Prefer confirmed facts over guesses. Do not add prose paragraphs, code fences, speculation, or any new information.",
     "",
     "Deterministic fallback summary:",
     compressed.summary || "(none)",
     "",
-    "Recent conversation:",
+    "Recent conversation tail:",
     recentLines.join("\n") || "(none)",
   ].join("\n");
 };
@@ -279,6 +295,9 @@ const buildSummaryUsageHint = (
   usage
     ? `summary updated | prompt ${usage.promptTokens} | completion ${usage.completionTokens} | total ${usage.totalTokens}`
     : "summary updated";
+
+const buildSummaryRepairFallback = (session: SessionRecord) =>
+  compressContext(session.messages, SUMMARY_RECENT_KEEP, 6).summary;
 
 const isLikelyLegacyCompressedMarkdown = (text: string) => {
   if (text.includes("\n")) {
@@ -964,21 +983,39 @@ export const useChatApp = ({
   };
 
   const maybeRefreshSessionSummary = async (session: SessionRecord) => {
-    if (!transport.summarizeText || !shouldRefreshSessionSummary(session)) {
-      return session;
+    let nextSession = session;
+    const existingSummary = session.summary.trim();
+    if (existingSummary) {
+      const repairedExisting = repairWorkingStateSummary(
+        existingSummary,
+        buildSummaryRepairFallback(session)
+      );
+      if (repairedExisting !== existingSummary) {
+        nextSession = await sessionStore.updateSummary(session.id, repairedExisting);
+      }
     }
 
-    const summaryResult = await transport.summarizeText(buildSummaryPrompt(session));
+    if (!transport.summarizeText || !shouldRefreshSessionSummary(nextSession)) {
+      return nextSession;
+    }
+
+    const summaryResult = await transport.summarizeText(
+      buildSummaryPrompt(nextSession)
+    );
     if (summaryResult.usage) {
       accumulateRuntimeUsage(summaryResult.usage, "summary");
     }
     if (!summaryResult.ok || !summaryResult.text?.trim()) {
-      return session;
+      return nextSession;
     }
 
+    const repairedSummary = repairWorkingStateSummary(
+      summaryResult.text.trim(),
+      buildSummaryRepairFallback(nextSession)
+    );
     const updated = await sessionStore.updateSummary(
-      session.id,
-      summaryResult.text.trim()
+      nextSession.id,
+      repairedSummary
     );
     pushSystemMessage(buildSummaryUsageHint(summaryResult.usage), {
       kind: "system_hint",

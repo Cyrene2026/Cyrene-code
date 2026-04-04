@@ -1464,6 +1464,7 @@ describe("useChatApp", () => {
   });
 
   test("refreshes AI summary lazily for long sessions, shows token hint, and invalidates stored summary after new turns", async () => {
+    const capturedSummaryPrompts: string[] = [];
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {
         summary: "",
@@ -1474,15 +1475,41 @@ describe("useChatApp", () => {
         })),
       }),
     ]) as TestSessionStore;
-    const summarizeImpl = mock(async () => ({
+    const summarizeImpl = mock(async (prompt: string) => {
+      capturedSummaryPrompts.push(prompt);
+      return {
       ok: true as const,
-      text: "- task: continue oauth work\n- fact: api behavior confirmed",
+      text: [
+        "OBJECTIVE:",
+        "- continue oauth work",
+        "",
+        "CONFIRMED FACTS:",
+        "- api behavior confirmed",
+        "",
+        "CONSTRAINTS:",
+        "- (none)",
+        "",
+        "COMPLETED:",
+        "- previous oauth investigation finished",
+        "",
+        "REMAINING:",
+        "- respond to the current task",
+        "",
+        "KNOWN PATHS:",
+        "- (none)",
+        "",
+        "RECENT FAILURES:",
+        "- (none)",
+        "",
+        "NEXT BEST ACTIONS:",
+        "- answer the next user request",
+      ].join("\n"),
       usage: {
         promptTokens: 21,
         completionTokens: 9,
         totalTokens: 30,
       },
-    }));
+    }});
     const baseUpdateSummary = sessionStore.updateSummary;
     const updateSummary = mock((id: string, summary: string) =>
       baseUpdateSummary(id, summary)
@@ -1514,6 +1541,14 @@ describe("useChatApp", () => {
     await flushMicrotasks();
 
     expect(summarizeImpl).toHaveBeenCalledTimes(1);
+    expect(capturedSummaryPrompts[0]).toContain(
+      "Reduce the prior conversation into a durable working-state record."
+    );
+    expect(capturedSummaryPrompts[0]).toContain("- OBJECTIVE:");
+    expect(capturedSummaryPrompts[0]).toContain("- NEXT BEST ACTIONS:");
+    expect(capturedSummaryPrompts[0]).not.toContain(
+      "Summarize the prior conversation into 4-6 short Markdown bullet points."
+    );
     expect(updateSummary).toHaveBeenCalledTimes(1);
     expect(getTexts(app.getLatest().items).some(text => text.includes("summary updated | prompt 21 | completion 9 | total 30"))).toBe(true);
 
@@ -1544,6 +1579,10 @@ describe("useChatApp", () => {
         })),
       }),
     ]);
+    const baseUpdateSummary = sessionStore.updateSummary;
+    const updateSummary = mock((id: string, summary: string) =>
+      baseUpdateSummary(id, summary)
+    );
     const summarizeExisting = mock(async () => ({
       ok: true as const,
       text: "- should not run",
@@ -1558,7 +1597,10 @@ describe("useChatApp", () => {
     const existingApp = renderHookHarness(() =>
       useChatAppWithTestInput({
         transport: createTestTransport({ summarizeImpl: summarizeExisting }),
-        sessionStore,
+        sessionStore: {
+          ...sessionStore,
+          updateSummary,
+        },
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
@@ -1572,6 +1614,9 @@ describe("useChatApp", () => {
     await flushMicrotasks();
 
     expect(summarizeExisting).toHaveBeenCalledTimes(0);
+    expect(updateSummary).toHaveBeenCalledTimes(1);
+    expect(updateSummary.mock.calls[0]?.[1]).toContain("OBJECTIVE:");
+    expect(updateSummary.mock.calls[0]?.[1]).toContain("CONFIRMED FACTS:");
     expect(getTexts(existingApp.getLatest().items)).toContain("done existing");
     existingApp.cleanup();
 
@@ -1609,6 +1654,64 @@ describe("useChatApp", () => {
       getTexts(failureApp.getLatest().items).some(text => text.includes("summary updated"))
     ).toBe(false);
     failureApp.cleanup();
+  });
+
+  test("repairs malformed AI summary output into structured working state before storing", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        summary: "",
+        messages: Array.from({ length: 10 }, (_, index) => ({
+          role: index % 2 === 0 ? "user" : "assistant",
+          text: `message ${index + 1} about auth follow-up`,
+          createdAt: `2026-05-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+        })),
+      }),
+    ]) as TestSessionStore;
+    const baseUpdateSummary = sessionStore.updateSummary;
+    const updateSummary = mock((id: string, summary: string) =>
+      baseUpdateSummary(id, summary)
+    );
+    const summarizeImpl = mock(async () => ({
+      ok: true as const,
+      text: "- continue auth follow-up\n- src/auth/oauth.ts already exists\n- next: verify approval",
+      usage: {
+        promptTokens: 11,
+        completionTokens: 7,
+        totalTokens: 18,
+      },
+    }));
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("done malformed summary repair");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({ summarizeImpl }),
+        sessionStore: {
+          ...sessionStore,
+          updateSummary,
+        },
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "continue auth");
+    await flushMicrotasks();
+
+    expect(summarizeImpl).toHaveBeenCalledTimes(1);
+    expect(updateSummary).toHaveBeenCalledTimes(1);
+    expect(updateSummary.mock.calls[0]?.[1]).toContain("OBJECTIVE:");
+    expect(updateSummary.mock.calls[0]?.[1]).toContain("KNOWN PATHS:");
+    expect(updateSummary.mock.calls[0]?.[1]).toContain("NEXT BEST ACTIONS:");
+    app.cleanup();
   });
 
   test("exitSummary accumulates query and summary usage across resume and new session flows", async () => {

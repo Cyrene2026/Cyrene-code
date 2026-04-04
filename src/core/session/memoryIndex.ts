@@ -1,4 +1,10 @@
 import type { SessionMessage } from "./types";
+import {
+  WORKING_STATE_SECTION_ORDER,
+  parseWorkingStateSummary,
+  type WorkingStateSectionMap,
+  type WorkingStateSectionName,
+} from "./workingState";
 
 export type MemoryKind =
   | "pin"
@@ -64,6 +70,7 @@ export type SessionMemoryInput = {
 export type SessionPromptContext = {
   pins: string[];
   relevantMemories: string[];
+  archiveSections?: WorkingStateSectionMap;
   recent: SessionMessage[];
   summaryFallback: string;
 };
@@ -71,6 +78,17 @@ export type SessionPromptContext = {
 const QUERY_TOKEN_LIMIT = 12;
 const MEMORY_TEXT_LIMIT = 420;
 const SUMMARY_LINE_LIMIT = 5;
+const MEMORY_COMPACTION_HARD_LIMIT = 140;
+const MEMORY_COMPACTION_TARGET_SIZE = 140;
+const MEMORY_COMPACTION_RECENT_KEEP = 36;
+const DEFAULT_ARCHIVE_SECTION_LIMIT = 2;
+const KNOWN_PATH_ARCHIVE_LIMIT = 4;
+const CONSTRAINT_SIGNAL =
+  /\b(must|should|cannot|can't|do not|don't|avoid|blocked|pending|requires|limit|constraint)\b|必须|不能|不要|避免|受限|限制|阻塞|待审批|需要/iu;
+const COMPLETED_SIGNAL =
+  /\b(done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved)\b|完成|已写|已创建|已更新|已实现|已修复|已批准|已解决/iu;
+const FAILURE_SIGNAL =
+  /\b(fail|failed|error|denied|timeout|timed out|rejected|blocked)\b|失败|错误|拒绝|超时|阻塞/iu;
 
 const clipText = (text: string, max = MEMORY_TEXT_LIMIT) => {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -89,6 +107,39 @@ const tokenizeText = (text: string, max = QUERY_TOKEN_LIMIT) => {
       .filter(Boolean) ?? [];
 
   return Array.from(new Set(tokens)).slice(0, max);
+};
+
+const tokenMatchScore = (
+  searchable: Set<string>,
+  lowerText: string,
+  tokens: string[],
+  exactBoost: number,
+  containsBoost: number
+) => {
+  let score = 0;
+  for (const token of tokens) {
+    if (searchable.has(token)) {
+      score += exactBoost;
+    } else if (lowerText.includes(token)) {
+      score += containsBoost;
+    }
+  }
+  return score;
+};
+
+const overlapScore = (
+  values: string[] | undefined,
+  signals: string[],
+  boost: number
+) => {
+  if (!values || values.length === 0 || signals.length === 0) {
+    return 0;
+  }
+  const signalSet = new Set(signals);
+  return values.reduce(
+    (score, value) => score + (signalSet.has(value) ? boost : 0),
+    0
+  );
 };
 
 const collectPathCandidates = (text: string) =>
@@ -259,6 +310,79 @@ const sortEntriesByPriorityAndTime = (entries: SessionMemoryEntry[]) =>
     })
     .map(item => item.entry);
 
+const compactMemoryEntries = (entries: SessionMemoryEntry[]) => {
+  if (entries.length <= MEMORY_COMPACTION_HARD_LIMIT) {
+    return entries;
+  }
+
+  const sortedByTime = sortEntriesByTime(entries);
+  const protectedIds = new Set(
+    sortedByTime
+      .filter(entry => entry.kind === "pin")
+      .map(entry => entry.id)
+  );
+
+  for (const entry of sortedByTime.slice(0, MEMORY_COMPACTION_RECENT_KEEP)) {
+    protectedIds.add(entry.id);
+  }
+
+  const rankById = new Map(
+    sortedByTime.map((entry, index) => [entry.id, index] as const)
+  );
+
+  const scored = sortedByTime
+    .filter(entry => !protectedIds.has(entry.id))
+    .map(entry => {
+      const ageRank = rankById.get(entry.id) ?? sortedByTime.length;
+      let score = entry.priority + Math.min(entry.hitCount ?? 1, 6) * 8;
+      score += Math.max(0, 80 - ageRank * 2);
+
+      switch (entry.kind) {
+        case "error":
+          score += 90;
+          break;
+        case "approval":
+          score += 70;
+          break;
+        case "tool_result":
+          score += 60;
+          break;
+        case "task":
+          score += 35;
+          break;
+        case "fact":
+          score += 15;
+          break;
+      }
+
+      score += (entry.entities.path?.length ?? 0) * 18;
+      score += (entry.entities.toolName?.length ?? 0) * 12;
+      score += (entry.entities.action?.length ?? 0) * 8;
+      score += (entry.entities.status?.length ?? 0) * 10;
+      if ((entry.tags.length ?? 0) > 0) {
+        score += Math.min(entry.tags.length, 6) * 2;
+      }
+
+      return { entry, score };
+    })
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return right.entry.createdAt.localeCompare(left.entry.createdAt);
+    });
+
+  const keepIds = new Set(protectedIds);
+  for (const { entry } of scored) {
+    if (keepIds.size >= MEMORY_COMPACTION_TARGET_SIZE) {
+      break;
+    }
+    keepIds.add(entry.id);
+  }
+
+  return entries.filter(entry => keepIds.has(entry.id));
+};
+
 export const createEmptyMemoryIndex = (
   sessionId: string,
   updatedAt = new Date().toISOString()
@@ -301,7 +425,7 @@ export const rebuildMemoryLookup = (
   entries: SessionMemoryEntry[],
   updatedAt = new Date().toISOString()
 ): SessionMemoryIndex => {
-  const sortedEntries = sortEntriesByTime(entries);
+  const sortedEntries = sortEntriesByTime(compactMemoryEntries(entries));
   const byKind: SessionMemoryIndex["byKind"] = {};
   const byPath: Record<string, string[]> = {};
   const byTool: Record<string, string[]> = {};
@@ -470,6 +594,285 @@ const normalizeMemoryText = (entry: SessionMemoryEntry) => {
   return `[${entry.kind}] ${entry.text}`;
 };
 
+const createEmptyWorkingStateSectionMap = (): Record<
+  WorkingStateSectionName,
+  string[]
+> =>
+  Object.fromEntries(
+    WORKING_STATE_SECTION_ORDER.map(section => [section, [] as string[]])
+  ) as Record<WorkingStateSectionName, string[]>;
+
+const buildSearchableSet = (entry: SessionMemoryEntry) =>
+  new Set([
+    ...entry.tags,
+    ...(entry.entities.path ?? []),
+    ...(entry.entities.toolName ?? []),
+    ...(entry.entities.action ?? []),
+    ...(entry.entities.queryTerms ?? []),
+  ]);
+
+const buildWorkingStateSignalTokens = (summaryFallback: string) => {
+  const parsed = parseWorkingStateSummary(summaryFallback);
+  const tokensBySection = createEmptyWorkingStateSectionMap();
+  const pathsBySection = createEmptyWorkingStateSectionMap();
+
+  for (const section of WORKING_STATE_SECTION_ORDER) {
+    const lines = parsed[section] ?? [];
+    const joined = lines.join(" ");
+    tokensBySection[section] = tokenizeText(joined, 18);
+    pathsBySection[section] = collectPathCandidates(joined);
+  }
+
+  return {
+    parsed,
+    tokensBySection,
+    pathsBySection,
+    allTokens: Array.from(
+      new Set(
+        WORKING_STATE_SECTION_ORDER.flatMap(section => tokensBySection[section])
+      )
+    ).slice(0, 24),
+    allPaths: Array.from(
+      new Set(
+        WORKING_STATE_SECTION_ORDER.flatMap(section => pathsBySection[section])
+      )
+    ).slice(0, 12),
+  };
+};
+
+const isConstraintLikeEntry = (entry: SessionMemoryEntry) =>
+  entry.kind === "error" || CONSTRAINT_SIGNAL.test(entry.text);
+
+const isFailureLikeEntry = (entry: SessionMemoryEntry) =>
+  entry.kind === "error" ||
+  entry.entities.status?.includes("error") === true ||
+  entry.entities.status?.includes("rejected") === true ||
+  FAILURE_SIGNAL.test(entry.text);
+
+const isCompletedLikeEntry = (entry: SessionMemoryEntry) =>
+  entry.kind === "tool_result" ||
+  entry.entities.status?.includes("ok") === true ||
+  entry.entities.status?.includes("approved") === true ||
+  COMPLETED_SIGNAL.test(entry.text);
+
+const formatArchiveSectionItem = (
+  section: WorkingStateSectionName,
+  entry: SessionMemoryEntry
+) => {
+  if (
+    section === "OBJECTIVE" ||
+    section === "REMAINING" ||
+    section === "NEXT BEST ACTIONS"
+  ) {
+    if (entry.kind === "task") {
+      return clipText(entry.text, 180);
+    }
+  }
+  return normalizeMemoryText(entry);
+};
+
+const flattenArchiveSections = (sections: WorkingStateSectionMap) =>
+  WORKING_STATE_SECTION_ORDER.flatMap(section =>
+    (sections[section] ?? []).map(item => `[${section}] ${item}`)
+  );
+
+const buildAgeRankById = (entries: SessionMemoryEntry[]) =>
+  new Map(entries.map((entry, index) => [entry.id, index] as const));
+
+const scoreEntryForArchiveSection = (
+  entry: SessionMemoryEntry,
+  section: WorkingStateSectionName,
+  queryTokens: string[],
+  queryPaths: string[],
+  workingStateSignals: ReturnType<typeof buildWorkingStateSignalTokens>,
+  ageRankById: Map<string, number>
+) => {
+  const searchable = buildSearchableSet(entry);
+  const lowerText = entry.text.toLowerCase();
+  let score = entry.priority + Math.min(entry.hitCount ?? 1, 5) * 2;
+  const ageRank = ageRankById.get(entry.id) ?? 0;
+
+  score += tokenMatchScore(searchable, lowerText, queryTokens, 60, 25);
+  score += tokenMatchScore(
+    searchable,
+    lowerText,
+    workingStateSignals.allTokens,
+    12,
+    6
+  );
+  score += tokenMatchScore(
+    searchable,
+    lowerText,
+    workingStateSignals.tokensBySection[section],
+    24,
+    10
+  );
+
+  score += overlapScore(entry.entities.path, queryPaths, 80);
+  score += overlapScore(entry.entities.path, workingStateSignals.allPaths, 18);
+  score += overlapScore(
+    entry.entities.path,
+    workingStateSignals.pathsBySection[section],
+    40
+  );
+  score -= Math.floor(ageRank / 18) * 6;
+  if (ageRank > 72) {
+    score -= 10;
+  }
+  if ((entry.entities.path?.length ?? 0) > 0 || (entry.hitCount ?? 1) >= 3) {
+    score += 8;
+  }
+
+  switch (section) {
+    case "OBJECTIVE":
+      if (entry.kind === "task") {
+        score += 90;
+      }
+      if (entry.kind === "fact") {
+        score += 20;
+      }
+      break;
+    case "CONFIRMED FACTS":
+      if (entry.kind === "fact") {
+        score += 80;
+      }
+      if (entry.kind === "tool_result" || entry.kind === "approval") {
+        score += 70;
+      }
+      if (isFailureLikeEntry(entry)) {
+        score -= 25;
+      }
+      break;
+    case "CONSTRAINTS":
+      if (isConstraintLikeEntry(entry)) {
+        score += 100;
+      } else {
+        score -= 25;
+      }
+      break;
+    case "COMPLETED":
+      if (isCompletedLikeEntry(entry)) {
+        score += 110;
+      } else {
+        score -= 25;
+      }
+      break;
+    case "REMAINING":
+      if (entry.kind === "task") {
+        score += 95;
+      }
+      if (isFailureLikeEntry(entry)) {
+        score += 20;
+      }
+      if (isCompletedLikeEntry(entry)) {
+        score -= 20;
+      }
+      break;
+    case "KNOWN PATHS":
+      if ((entry.entities.path?.length ?? 0) > 0) {
+        score += 120;
+      } else {
+        score -= 60;
+      }
+      break;
+    case "RECENT FAILURES":
+      if (isFailureLikeEntry(entry)) {
+        score += 120;
+      } else {
+        score -= 30;
+      }
+      break;
+    case "NEXT BEST ACTIONS":
+      if (entry.kind === "task") {
+        score += 85;
+      }
+      if (isConstraintLikeEntry(entry) || isFailureLikeEntry(entry)) {
+        score += 15;
+      }
+      if (isCompletedLikeEntry(entry)) {
+        score -= 15;
+      }
+      break;
+  }
+
+  return score;
+};
+
+const selectArchiveEntriesForSection = (
+  entries: SessionMemoryEntry[],
+  section: WorkingStateSectionName,
+  queryTokens: string[],
+  queryPaths: string[],
+  workingStateSignals: ReturnType<typeof buildWorkingStateSignalTokens>,
+  ageRankById: Map<string, number>,
+  limit = DEFAULT_ARCHIVE_SECTION_LIMIT
+) =>
+  entries
+    .map(entry => ({
+      entry,
+      score: scoreEntryForArchiveSection(
+        entry,
+        section,
+        queryTokens,
+        queryPaths,
+        workingStateSignals,
+        ageRankById
+      ),
+    }))
+    .filter(item => item.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return right.entry.createdAt.localeCompare(left.entry.createdAt);
+    })
+    .slice(0, limit)
+    .map(item => formatArchiveSectionItem(section, item.entry));
+
+const selectKnownPathsForArchive = (
+  entries: SessionMemoryEntry[],
+  queryTokens: string[],
+  queryPaths: string[],
+  workingStateSignals: ReturnType<typeof buildWorkingStateSignalTokens>,
+  ageRankById: Map<string, number>,
+  limit = KNOWN_PATH_ARCHIVE_LIMIT
+) => {
+  const scoredPaths = new Map<string, number>();
+
+  for (const entry of entries) {
+    const paths = entry.entities.path ?? [];
+    if (paths.length === 0) {
+      continue;
+    }
+
+    const entryScore = scoreEntryForArchiveSection(
+      entry,
+      "KNOWN PATHS",
+      queryTokens,
+      queryPaths,
+      workingStateSignals,
+      ageRankById
+    );
+
+    for (const path of paths) {
+      const nextScore =
+        entryScore +
+        (queryPaths.includes(path) ? 80 : 0) +
+        (workingStateSignals.allPaths.includes(path) ? 30 : 0) +
+        (workingStateSignals.pathsBySection["KNOWN PATHS"].includes(path) ? 40 : 0);
+      const previous = scoredPaths.get(path) ?? Number.NEGATIVE_INFINITY;
+      if (nextScore > previous) {
+        scoredPaths.set(path, nextScore);
+      }
+    }
+  }
+
+  return [...scoredPaths.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([path]) => path);
+};
+
 export const getPromptContextFromMemoryIndex = (
   index: SessionMemoryIndex,
   query: string,
@@ -478,50 +881,64 @@ export const getPromptContextFromMemoryIndex = (
   relevantLimit = 6
 ): SessionPromptContext => {
   const queryTokens = tokenizeText(query);
+  const queryPaths = collectPathCandidates(query);
+  const workingStateSignals = buildWorkingStateSignalTokens(summaryFallback);
   const pins = sortEntriesByPriorityAndTime(index.entries)
     .filter(entry => entry.kind === "pin")
     .slice(0, 6)
     .map(entry => entry.text);
 
-  const relevantMemories = sortEntriesByTime(index.entries)
-    .filter(entry => entry.kind !== "pin")
-    .map(entry => {
-      let score = entry.priority;
-      const searchable = new Set([
-        ...entry.tags,
-        ...(entry.entities.path ?? []),
-        ...(entry.entities.toolName ?? []),
-        ...(entry.entities.action ?? []),
-        ...(entry.entities.queryTerms ?? []),
-      ]);
+  const nonPinEntries = sortEntriesByTime(index.entries).filter(
+    entry => entry.kind !== "pin"
+  );
+  const ageRankById = buildAgeRankById(nonPinEntries);
 
-      for (const token of queryTokens) {
-        if (searchable.has(token)) {
-          score += 60;
-        } else if (entry.text.toLowerCase().includes(token)) {
-          score += 25;
+  const archiveSections = WORKING_STATE_SECTION_ORDER.reduce<WorkingStateSectionMap>(
+    (sections, section) => {
+      if (section === "KNOWN PATHS") {
+        const paths = selectKnownPathsForArchive(
+          nonPinEntries,
+          queryTokens,
+          queryPaths,
+          workingStateSignals,
+          ageRankById
+        );
+        if (paths.length > 0) {
+          sections[section] = paths;
         }
+        return sections;
       }
 
-      score += Math.min(entry.hitCount ?? 1, 5) * 2;
+      const limit =
+        section === "OBJECTIVE" ? 1 : DEFAULT_ARCHIVE_SECTION_LIMIT;
+      const items = selectArchiveEntriesForSection(
+        nonPinEntries,
+        section,
+        queryTokens,
+        queryPaths,
+        workingStateSignals,
+        ageRankById,
+        limit
+      );
 
-      return {
-        entry,
-        score,
-      };
-    })
-    .sort((left, right) => {
-      if (right.score !== left.score) {
-        return right.score - left.score;
+      if (items.length > 0) {
+        sections[section] = items;
       }
-      return right.entry.createdAt.localeCompare(left.entry.createdAt);
-    })
-    .slice(0, relevantLimit)
-    .map(item => normalizeMemoryText(item.entry));
+
+      return sections;
+    },
+    {}
+  );
+
+  const relevantMemories = flattenArchiveSections(archiveSections).slice(
+    0,
+    relevantLimit * 2
+  );
 
   return {
     pins,
     relevantMemories,
+    archiveSections,
     recent,
     summaryFallback,
   };

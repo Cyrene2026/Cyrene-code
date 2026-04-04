@@ -146,6 +146,12 @@ const buildProps = (
   resumePicker: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
   sessionsPanel: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
   modelPicker: { active: false, models: [], selectedIndex: 0, pageSize: 8 },
+  providerPicker: {
+    active: false,
+    providers: ["https://provider.test/v1"],
+    selectedIndex: 0,
+    pageSize: 8,
+  },
   pendingReviews: [],
   approvalPanel: {
     active: false,
@@ -163,6 +169,7 @@ const buildProps = (
   },
   activeSessionId: "session-1",
   currentModel: "gpt-test",
+  currentProvider: "https://provider.test/v1",
   usage: null,
   onInputChange: () => {},
   onSubmit: () => {},
@@ -286,6 +293,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("]");
     expect(output).toContain("READY");
     expect(output).toContain("model");
+    expect(output).toContain("provider");
     expect(output).toContain("queue");
     expect(output).toContain("root");
     expect(output).toContain("D:/Projects/demo-root");
@@ -315,6 +323,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("█████");
     expect(output).toContain("How can I help today?");
     expect(output).toContain("Cyrene can inspect this workspace");
+    expect(output).toContain("provider.test");
     expect(output).toContain("Explain this repository");
     expect(output).toContain("Fix something");
     expect(output).toContain("Keep going");
@@ -570,6 +579,65 @@ describe("ChatScreen", () => {
     expect(output).toContain("Get-ChildItem test_files");
   });
 
+  test("renders terminal-style tool output for direct command results", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          kind: "tool_status",
+          tone: "info",
+          text: [
+            "Tool result: run_command .",
+            "status: completed",
+            "command: bun",
+            "args: --version",
+            "cwd: .",
+            "exit: 0",
+            "output:",
+            "1.3.11",
+          ].join("\n"),
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("terminal  run_command");
+    expect(output).toContain("status completed");
+    expect(output).toContain("bun --version");
+    expect(output).toContain("1.3.11");
+  });
+
+  test("renders terminal-style transcript for approved shell input", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          kind: "review_status",
+          tone: "success",
+          text: [
+            "Approved",
+            "id: shell-1",
+            "action: write_shell",
+            "path: .",
+            "status: completed",
+            "shell: pwsh",
+            "cwd: subdir",
+            "input: python --version",
+            "last_exit: 0",
+            "output:",
+            "Python 3.12.0 (venv)",
+          ].join("\n"),
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("terminal  write_shell");
+    expect(output).toContain("PS>");
+    expect(output).toContain("python --version");
+    expect(output).toContain("Python 3.12.0 (venv)");
+  });
+
   test("renders compact model picker list", () => {
     const tree = renderScreen({
       items: [],
@@ -589,6 +657,25 @@ describe("ChatScreen", () => {
     expect(output).toContain("interactive lane");
     expect(output).toContain("Panel active...");
     expect(output).toContain("panel active  |  close current panel to type");
+  });
+
+  test("renders compact provider picker list", () => {
+    const tree = renderScreen({
+      items: [],
+      providerPicker: {
+        active: true,
+        providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
+        selectedIndex: 1,
+        pageSize: 8,
+      },
+      currentProvider: "https://provider-a.test/v1",
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Providers  page 1/1  total 2");
+    expect(output).toContain("provider-b.test");
+    expect(output).toContain("[current]");
+    expect(output).toContain("Panel active...");
   });
 
   test("renders slash command hints in the input card helper line", () => {

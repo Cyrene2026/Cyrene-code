@@ -21,6 +21,7 @@ import type {
 import type {
   ModelRefreshResult,
   ModelSetResult,
+  ProviderSetResult,
   QueryTransport,
 } from "../../src/core/query/transport";
 
@@ -300,7 +301,10 @@ export const createTestTransport = (
   options?: {
     initialModel?: string;
     models?: string[];
+    initialProvider?: string;
+    providers?: string[];
     setModelImpl?: (model: string) => Promise<ModelSetResult>;
+    setProviderImpl?: (provider: string) => Promise<ProviderSetResult>;
     refreshImpl?: () => Promise<ModelRefreshResult>;
     summarizeImpl?: (prompt: string) => Promise<{
       ok: boolean;
@@ -315,10 +319,14 @@ export const createTestTransport = (
   }
 ): QueryTransport => {
   let currentModel = options?.initialModel ?? "gpt-test";
+  let currentProvider =
+    options?.initialProvider ?? "https://provider.test/v1";
   const models = options?.models ?? ["gpt-test", "gpt-next"];
+  const providers = options?.providers ?? [currentProvider];
 
   return {
     getModel: () => currentModel,
+    getProvider: () => currentProvider,
     setModel: async model => {
       if (options?.setModelImpl) {
         const result = await options.setModelImpl(model);
@@ -329,6 +337,27 @@ export const createTestTransport = (
       }
       currentModel = model;
       return { ok: true, message: `Model switched to ${model}` };
+    },
+    listProviders: async () => [...providers],
+    setProvider: async provider => {
+      if (options?.setProviderImpl) {
+        const result = await options.setProviderImpl(provider);
+        if (result.ok) {
+          currentProvider = result.currentProvider ?? provider;
+        }
+        return result;
+      }
+      currentProvider = provider;
+      if (!providers.includes(provider)) {
+        providers.push(provider);
+      }
+      return {
+        ok: true,
+        message: `Provider switched to: ${provider}`,
+        currentProvider: provider,
+        providers: [...providers],
+        models: [...models],
+      };
     },
     listModels: async () => [...models],
     refreshModels: async () =>

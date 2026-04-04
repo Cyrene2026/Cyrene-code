@@ -169,7 +169,8 @@ export const FILE_TOOL = {
         command: { type: "string" },
         input: {
           type: "string",
-          description: "One line of shell input for write_shell. Omit when unused.",
+          description:
+            "Shell input for write_shell. Prefer one command, but safe reviewed multiline paste blocks are also allowed there. Omit when unused.",
         },
         args: {
           type: "array",
@@ -245,7 +246,8 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Use close_shell to terminate the active persistent shell session when it is no longer needed.",
   "- Do not put shell syntax such as pipes, redirection, chaining, or subshells into run_command.",
   "- run_shell currently supports only a safe single-command subset. Do not use pipes, redirection, chaining, background execution, or subshell syntax.",
-  "- write_shell also supports only a safe single-line subset. Do not send multiline shell scripts or placeholder input.",
+  "- run_shell does not accept multiline shell input. If the user pasted multiple shell lines, use open_shell plus write_shell instead.",
+  "- write_shell supports a safe reviewed subset. Multiline paste blocks are allowed there, but pipes, redirection, chaining, subshells, and background execution are still forbidden.",
   "Avoid repetitive list_dir/read_file probing when search_text or find_files can answer directly.",
   "Directory-state rules:",
   "- If list_dir already returned a confirmed directory state for the same path, treat that result as authoritative until a mutation happens.",
@@ -710,16 +712,41 @@ export const createHttpQueryTransport = (): QueryTransport => {
   let currentModel = env.success
     ? env.data.CYRENE_MODEL ?? "gpt-4o-mini"
     : "gpt-4o-mini";
+  let currentProvider = resolveProviderBaseUrl(baseUrl);
   let availableModels: string[] = [];
+  let providerCatalog = currentProvider ? [currentProvider] : ([] as string[]);
   let initializationError: string | null = null;
   const sessionQueries = new Map<string, string>();
-  const providerBaseUrl = resolveProviderBaseUrl(baseUrl);
+  const dedupeProviders = (providers: Array<string | undefined>) =>
+    Array.from(new Set(providers.map(provider => resolveProviderBaseUrl(provider)).filter(Boolean))) as string[];
+  const resolvePersistedModels = () =>
+    availableModels.length > 0
+      ? [...availableModels]
+      : currentModel.trim()
+        ? [currentModel]
+        : ["gpt-4o-mini"];
+  const persistCatalog = async (
+    models: string[],
+    selectedModel: string,
+    provider: string | undefined
+  ) => {
+    providerCatalog = dedupeProviders([...providerCatalog, provider]);
+    await saveModelYaml(models, selectedModel, {
+      lastUsedModel: selectedModel,
+      providerBaseUrl: provider,
+      providers: providerCatalog,
+    });
+  };
 
-  const refreshFromApi = async (preferredModel?: string) => {
-    if (!baseUrl || !apiKey) {
+  const refreshFromApi = async (
+    preferredModel?: string,
+    providerOverride?: string
+  ) => {
+    const targetProvider = resolveProviderBaseUrl(providerOverride ?? currentProvider ?? baseUrl);
+    if (!targetProvider || !apiKey) {
       throw new Error("Missing CYRENE_BASE_URL or CYRENE_API_KEY.");
     }
-    const response = await fetch(resolveModelsUrl(baseUrl), {
+    const response = await fetch(resolveModelsUrl(targetProvider), {
       method: "GET",
       headers: {
         Accept: "application/json",
@@ -742,12 +769,10 @@ export const createHttpQueryTransport = (): QueryTransport => {
         : undefined) ??
       (models.includes(currentModel) ? currentModel : undefined) ??
       firstModel;
-    await saveModelYaml(models, selectedModel, {
-      lastUsedModel: selectedModel,
-      providerBaseUrl,
-    });
+    await persistCatalog(models, selectedModel, targetProvider);
     availableModels = models;
     currentModel = selectedModel;
+    currentProvider = targetProvider;
     initializationError = null;
 
     return models;
@@ -756,14 +781,23 @@ export const createHttpQueryTransport = (): QueryTransport => {
   const initializeModels = async () => {
     try {
       const local = await loadModelYaml();
+      providerCatalog = dedupeProviders([
+        ...local.providers,
+        local.providerBaseUrl,
+        currentProvider,
+      ]);
       const providerChanged =
-        Boolean(providerBaseUrl) &&
+        Boolean(currentProvider) &&
         Boolean(local.providerBaseUrl) &&
-        local.providerBaseUrl !== providerBaseUrl;
+        local.providerBaseUrl !== currentProvider;
       if (providerChanged) {
-        await refreshFromApi(local.lastUsedModel ?? local.defaultModel ?? currentModel);
+        await refreshFromApi(
+          local.lastUsedModel ?? local.defaultModel ?? currentModel,
+          currentProvider
+        );
         return;
       }
+      currentProvider = currentProvider ?? local.providerBaseUrl;
       availableModels = local.models;
       currentModel =
         (local.lastUsedModel && local.models.includes(local.lastUsedModel)
@@ -776,13 +810,16 @@ export const createHttpQueryTransport = (): QueryTransport => {
           ? currentModel
           : (local.models[0] ?? currentModel));
       initializationError = null;
+      if (providerCatalog.length > 0) {
+        await persistCatalog(local.models, currentModel, currentProvider);
+      }
       return;
     } catch {
       // Fall through to remote fetch.
     }
 
     try {
-      await refreshFromApi();
+      await refreshFromApi(undefined, currentProvider);
     } catch (error) {
       initializationError =
         error instanceof Error ? error.message : String(error);
@@ -793,6 +830,7 @@ export const createHttpQueryTransport = (): QueryTransport => {
 
   return {
     getModel: () => currentModel,
+    getProvider: () => currentProvider ?? "none",
     setModel: async (model: string) => {
       await modelInit;
       const next = model.trim();
@@ -819,10 +857,7 @@ export const createHttpQueryTransport = (): QueryTransport => {
       const previousModel = currentModel;
       currentModel = next;
       try {
-        await saveModelYaml(availableModels, next, {
-          lastUsedModel: next,
-          providerBaseUrl,
-        });
+        await persistCatalog(availableModels, next, currentProvider);
       } catch (error) {
         currentModel = previousModel;
         return {
@@ -840,9 +875,56 @@ export const createHttpQueryTransport = (): QueryTransport => {
       await modelInit;
       return [...availableModels];
     },
+    listProviders: async () => {
+      await modelInit;
+      providerCatalog = dedupeProviders([...providerCatalog, currentProvider]);
+      return [...providerCatalog];
+    },
+    setProvider: async (provider: string) => {
+      await modelInit;
+      const nextProvider = resolveProviderBaseUrl(provider.trim());
+      if (!nextProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+      if (!apiKey) {
+        return {
+          ok: false,
+          message: "Missing CYRENE_API_KEY for HTTP transport.",
+        };
+      }
+      if (currentProvider === nextProvider) {
+        providerCatalog = dedupeProviders([...providerCatalog, currentProvider]);
+        return {
+          ok: true,
+          message: `Provider already active: ${nextProvider}`,
+          currentProvider: nextProvider,
+          providers: [...providerCatalog],
+          models: [...availableModels],
+        };
+      }
+      try {
+        const models = await refreshFromApi(undefined, nextProvider);
+        return {
+          ok: true,
+          message: `Provider switched to: ${nextProvider}\nCurrent model: ${currentModel}`,
+          currentProvider: currentProvider ?? nextProvider,
+          providers: [...providerCatalog],
+          models,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          message,
+        };
+      }
+    },
     refreshModels: async () => {
       try {
-        const models = await refreshFromApi();
+        const models = await refreshFromApi(undefined, currentProvider);
         return {
           ok: true,
           message: `Model list refreshed: ${models.length} models`,
@@ -858,7 +940,8 @@ export const createHttpQueryTransport = (): QueryTransport => {
     },
     summarizeText: async (prompt: string) => {
       await modelInit;
-      if (!baseUrl || !apiKey) {
+      const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
+      if (!targetProvider || !apiKey) {
         return {
           ok: false,
           message: "Missing CYRENE_BASE_URL or CYRENE_API_KEY for HTTP transport.",
@@ -877,11 +960,17 @@ export const createHttpQueryTransport = (): QueryTransport => {
           message: "Summary prompt cannot be empty.",
         };
       }
-      return completeTextOpenAI(baseUrl, apiKey, currentModel, normalizedPrompt);
+      return completeTextOpenAI(
+        targetProvider,
+        apiKey,
+        currentModel,
+        normalizedPrompt
+      );
     },
     requestStreamUrl: async (query: string) => {
       await modelInit;
-      if (!baseUrl || !apiKey) {
+      const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
+      if (!targetProvider || !apiKey) {
         throw new Error(
           "Missing CYRENE_BASE_URL or CYRENE_API_KEY for HTTP transport."
         );
@@ -900,12 +989,17 @@ export const createHttpQueryTransport = (): QueryTransport => {
       const query = sessionQueries.get(sessionId);
       sessionQueries.delete(sessionId);
 
-      if (!query || !baseUrl || !apiKey) {
+      if (!query || !apiKey) {
+        throw new Error("Invalid HTTP stream session.");
+      }
+      const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
+
+      if (!targetProvider) {
         throw new Error("Invalid HTTP stream session.");
       }
 
       for await (const event of streamSseOpenAI(
-        baseUrl,
+        targetProvider,
         apiKey,
         currentModel,
         query

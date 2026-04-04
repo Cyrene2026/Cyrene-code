@@ -1533,6 +1533,47 @@ describe("FileMcpService", () => {
     expect(status.message).toContain("cwd: subdir");
   });
 
+  test("write_shell executes safe multiline blocks sequentially in the persistent shell", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    const result = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: ["cd subdir", "python --version"].join("\n"),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("$ cd subdir");
+    expect(result.message).toContain("$ python --version");
+    expect(result.message).toContain("changed directory");
+    expect(result.message).toContain("Python 3.12.0 (system)");
+    expect(result.message).toContain("cwd: subdir");
+  });
+
+  test("run_shell rejects multiline commands and nudges callers toward persistent shell", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "echo one\necho two",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("does not accept multiline");
+    expect(result.message).toContain("open_shell plus write_shell");
+  });
+
   test("write_shell blocks workspace-escaping cd before review", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { service } = await createService({

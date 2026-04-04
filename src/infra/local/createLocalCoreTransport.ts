@@ -28,9 +28,11 @@ const buildAssistantReply = (query: string) => {
 export const createLocalCoreTransport = (): QueryTransport => {
   const sessionQueries = new Map<string, string>();
   let currentModel = "local-core";
+  let currentProvider = "local-core";
 
   return {
     getModel: () => currentModel,
+    getProvider: () => currentProvider,
     setModel: async (model: string) => {
       const next = model.trim();
       if (!next) {
@@ -49,6 +51,30 @@ export const createLocalCoreTransport = (): QueryTransport => {
       return {
         ok: true,
         message: `Model switched to: ${currentModel}`,
+      };
+    },
+    listProviders: async () => [currentProvider],
+    setProvider: async (provider: string) => {
+      const next = provider.trim();
+      if (!next) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+      if (next !== "local-core") {
+        return {
+          ok: false,
+          message: `Provider "${next}" is not available in local transport.`,
+        };
+      }
+      currentProvider = next;
+      return {
+        ok: true,
+        message: `Provider switched to: ${currentProvider}`,
+        currentProvider,
+        providers: [currentProvider],
+        models: [currentModel],
       };
     },
     listModels: async () => ["local-core"],

@@ -1,5 +1,16 @@
 import type { ChatItem } from "../../shared/types/chat";
 
+const TERMINAL_TOOL_ACTIONS = new Set([
+  "run_command",
+  "run_shell",
+  "open_shell",
+  "write_shell",
+  "read_shell",
+  "shell_status",
+  "interrupt_shell",
+  "close_shell",
+]);
+
 export const normalizeMcpMessage = (raw: string): {
   text: string;
   kind: ChatItem["kind"];
@@ -117,6 +128,13 @@ export const summarizeToolMessage = (raw: string): {
 
   if (firstLine.startsWith("Tool result:")) {
     const detail = firstLine.replace("Tool result:", "").trim();
+    const action = detail.split(/\s+/, 1)[0] ?? "";
+    if (TERMINAL_TOOL_ACTIONS.has(action)) {
+      return {
+        ...normalized,
+        text: normalized.text,
+      };
+    }
     if (detail.startsWith("list_dir ")) {
       const { confirmation, entrySummary } = parseListDirBody(body);
       return {
@@ -152,6 +170,13 @@ export const summarizeToolMessage = (raw: string): {
 
   if (firstLine.startsWith("Tool error:")) {
     const detail = firstLine.replace("Tool error:", "").trim();
+    const action = detail.split(/\s+/, 1)[0] ?? "";
+    if (TERMINAL_TOOL_ACTIONS.has(action)) {
+      return {
+        ...normalized,
+        text: normalized.text,
+      };
+    }
     const reason = body.split("\n").find(line => line.trim().length > 0)?.trim();
     return {
       ...normalized,

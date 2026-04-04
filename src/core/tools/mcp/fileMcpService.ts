@@ -726,6 +726,13 @@ const tokenizeSafeShellCommand = (
   return { ok: true, tokens };
 };
 
+const splitShellInputBlock = (input: string) =>
+  input
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean);
+
 const looksLikeUrl = (value: string) => /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
 
 const isShellNonFileSystemTarget = (value: string) =>
@@ -1507,6 +1514,9 @@ const validateRequest = (request: ToolRequest): string | null => {
     if (!request.command.trim()) {
       return "run_shell requires `command`.";
     }
+    if (/[\r\n]/.test(request.command)) {
+      return "run_shell does not accept multiline `command`. Use open_shell plus write_shell for multiline shell input.";
+    }
     return null;
   }
 
@@ -1517,9 +1527,6 @@ const validateRequest = (request: ToolRequest): string | null => {
   if (request.action === "write_shell") {
     if (!request.input.trim()) {
       return "write_shell requires `input`.";
-    }
-    if (/[\r\n]/.test(request.input)) {
-      return "write_shell requires a single-line `input`.";
     }
     return null;
   }
@@ -2075,10 +2082,10 @@ export class FileMcpService {
     };
   }
 
-  private auditShellSessionWrite(request: WriteShellToolRequest): ShellSessionWriteAuditResult {
+  private auditSingleShellSessionInput(rawInput: string): ShellSessionWriteAuditResult {
     const session = this.shellSession;
     const shell = session?.shell ?? (process.platform === "win32" ? "pwsh" : "bash");
-    const tokenized = tokenizeSafeShellCommand(request.input);
+    const tokenized = tokenizeSafeShellCommand(rawInput);
     if (!tokenized.ok) {
       return {
         ok: false,
@@ -2087,12 +2094,11 @@ export class FileMcpService {
         policy: "blocked",
         risk: "high",
         reason: tokenized.reason.replace(/^run_shell\b/, "write_shell"),
-        notes: ["Only a safe reviewed single-line shell subset is allowed."],
+        notes: ["Only a safe reviewed shell subset is allowed."],
       };
     }
 
     const tokens = tokenized.tokens;
-    const rawInput = request.input.trim();
     const commandName = (tokens[0] ?? "").toLowerCase();
     const cwd = session?.cwd ?? resolve(this.rules.workspaceRoot);
     const targetTokens = getShellTargetOperands(commandName, tokens);
@@ -2384,11 +2390,65 @@ export class FileMcpService {
       policy: "review",
       risk: SHELL_MUTATING_COMMANDS.has(commandName) ? "medium" : "low",
       notes: [
-        "Only a safe reviewed single-line shell subset is allowed.",
+        "Only a safe reviewed shell subset is allowed.",
         SHELL_MUTATING_COMMANDS.has(commandName)
           ? "This shell input may mutate workspace files and still requires review."
           : "This shell input is not in the low-risk direct allowlist, so it requires review.",
       ],
+    };
+  }
+
+  private auditShellSessionWrite(request: WriteShellToolRequest): ShellSessionWriteAuditResult {
+    const inputs = splitShellInputBlock(request.input);
+    const shell = this.shellSession?.shell ?? (process.platform === "win32" ? "pwsh" : "bash");
+
+    if (inputs.length === 0) {
+      return {
+        ok: false,
+        shell,
+        tokens: [],
+        policy: "blocked",
+        risk: "high",
+        reason: "write_shell requires `input`.",
+        notes: ["Provide at least one shell line to execute."],
+      };
+    }
+
+    const audits = inputs.map(input => this.auditSingleShellSessionInput(input));
+    const blocked = audits.find(audit => !audit.ok || audit.policy === "blocked");
+    if (blocked) {
+      return {
+        ...blocked,
+        notes:
+          inputs.length > 1
+            ? [`Multiline shell block with ${inputs.length} lines failed audit.`, ...blocked.notes]
+            : blocked.notes,
+      };
+    }
+
+    const review = audits.find(audit => audit.policy === "review");
+    if (review) {
+      return {
+        ...review,
+        notes:
+          inputs.length > 1
+            ? [
+                `Multiline shell block with ${inputs.length} lines will be reviewed as one unit.`,
+                ...review.notes,
+              ]
+            : review.notes,
+      };
+    }
+
+    return {
+      ...audits[audits.length - 1]!,
+      notes:
+        inputs.length > 1
+          ? [
+              `Multiline shell block with ${inputs.length} lines is allowlisted for direct execution.`,
+              ...audits[audits.length - 1]!.notes,
+            ]
+          : audits[audits.length - 1]!.notes,
     };
   }
 
@@ -2680,6 +2740,27 @@ export class FileMcpService {
     return session;
   }
 
+  private async executeSingleShellInput(
+    session: ActiveShellSession,
+    input: string
+  ): Promise<{ status: "completed" | "running"; output: string; truncated: boolean }> {
+    const commandId = crypto.randomUUID().slice(0, 8);
+    session.busy = true;
+    session.pendingCommandId = commandId;
+    session.pendingExitCode = null;
+    session.pendingCwd = null;
+    session.lastActivityAt = new Date().toISOString();
+    session.handle.write(buildShellCommandWrapper(session.shell, input, commandId));
+    await this.waitForShellSettle();
+    this.consumeShellControlBuffer(session);
+    const { output, truncated } = this.flushUnreadShellOutput(session);
+    return {
+      status: session.busy ? "running" : "completed",
+      output,
+      truncated,
+    };
+  }
+
   private async executeWriteShell(request: WriteShellToolRequest): Promise<string> {
     const session = this.getActiveShellSession();
     if (session.busy) {
@@ -2693,20 +2774,30 @@ export class FileMcpService {
       throw new Error(audit.reason ?? "write_shell blocked by shell auditor.");
     }
 
-    const commandId = crypto.randomUUID().slice(0, 8);
-    session.busy = true;
-    session.pendingCommandId = commandId;
-    session.pendingExitCode = null;
-    session.pendingCwd = null;
-    session.lastActivityAt = new Date().toISOString();
-    session.handle.write(buildShellCommandWrapper(session.shell, request.input, commandId));
-    await this.waitForShellSettle();
-    this.consumeShellControlBuffer(session);
-    const { output, truncated } = this.flushUnreadShellOutput(session);
+    const inputs = splitShellInputBlock(request.input);
+    const transcriptLines: string[] = [];
+    let truncated = false;
+    let status: "completed" | "running" = "completed";
+
+    for (const input of inputs) {
+      const result = await this.executeSingleShellInput(session, input);
+      transcriptLines.push(`$ ${input}`);
+      transcriptLines.push(result.output.trim() ? result.output : "(no new output)");
+      truncated = truncated || result.truncated;
+      status = result.status;
+      if (result.status === "running") {
+        break;
+      }
+    }
+
     return [
-      `status: ${session.busy ? "running" : "completed"}`,
+      `status: ${status}`,
       `input: ${request.input}`,
-      this.formatShellSessionState(session, output, truncated),
+      this.formatShellSessionState(
+        session,
+        transcriptLines.join("\n"),
+        truncated
+      ),
     ].join("\n");
   }
 

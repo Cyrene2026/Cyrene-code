@@ -11,6 +11,14 @@ export type ModelSetResult = {
   message: string;
 };
 
+export type ProviderSetResult = {
+  ok: boolean;
+  message: string;
+  providers?: string[];
+  currentProvider?: string;
+  models?: string[];
+};
+
 export type SummarizeTextResult = {
   ok: boolean;
   text?: string;
@@ -20,8 +28,11 @@ export type SummarizeTextResult = {
 
 export type QueryTransport = {
   getModel: () => string;
+  getProvider: () => string;
   setModel: (model: string) => Promise<ModelSetResult>;
   listModels: () => Promise<string[]>;
+  listProviders: () => Promise<string[]>;
+  setProvider: (provider: string) => Promise<ProviderSetResult>;
   refreshModels: () => Promise<ModelRefreshResult>;
   summarizeText?: (prompt: string) => Promise<SummarizeTextResult>;
   requestStreamUrl: (query: string) => Promise<string>;

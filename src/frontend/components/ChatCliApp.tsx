@@ -48,10 +48,12 @@ export const ChatCliApp = ({
     resumePicker,
     sessionsPanel,
     modelPicker,
+    providerPicker,
     pendingReviews,
     approvalPanel,
     activeSessionId,
     currentModel,
+    currentProvider,
     exitSummary,
     usage,
     setInput,
@@ -115,10 +117,12 @@ export const ChatCliApp = ({
       resumePicker={resumePicker}
       sessionsPanel={sessionsPanel}
       modelPicker={modelPicker}
+      providerPicker={providerPicker}
       pendingReviews={pendingReviews}
       approvalPanel={approvalPanel}
       activeSessionId={activeSessionId}
       currentModel={currentModel}
+      currentProvider={currentProvider}
       usage={usage}
       onInputChange={setInput}
       onSubmit={submit}

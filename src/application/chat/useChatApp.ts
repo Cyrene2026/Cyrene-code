@@ -60,6 +60,13 @@ type ModelPickerState = {
   pageSize: number;
 };
 
+type ProviderPickerState = {
+  active: boolean;
+  providers: string[];
+  selectedIndex: number;
+  pageSize: number;
+};
+
 type ApprovalPreviewMode = "summary" | "full";
 type ApprovalActionKind = "approve" | "reject";
 
@@ -112,7 +119,9 @@ const defaultSystemText =
   "Type /help to view commands. Use /resume to open session picker.";
 const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
+const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
+const MULTILINE_DISPLAY_TOKEN = " ↩ ";
 const SUMMARY_RECENT_KEEP = 8;
 const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
 const SUMMARY_TRIGGER_CHAR_THRESHOLD = 1200;
@@ -120,6 +129,9 @@ const SUMMARY_RECENT_MESSAGE_LIMIT = 16;
 const SUMMARY_RECENT_CHAR_BUDGET = 12000;
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
+  { command: "/provider", description: "open provider picker" },
+  { command: "/provider refresh", description: "refresh current provider models" },
+  { command: "/provider <url>", description: "switch provider directly" },
   { command: "/model", description: "open model picker" },
   { command: "/model refresh", description: "refresh available models" },
   { command: "/model <name>", description: "switch model directly" },
@@ -408,6 +420,16 @@ const addUsageToRuntimeSummary = (
   totalTokens: summary.totalTokens + usage.totalTokens,
 });
 
+const encodeInputForDisplay = (value: string) =>
+  value.replace(/\r?\n/g, MULTILINE_DISPLAY_TOKEN);
+
+const decodeInputFromDisplay = (value: string) =>
+  value.split(MULTILINE_DISPLAY_TOKEN).join("\n");
+
+const isMultilinePasteChunk = (value: string, key: Record<string, boolean>) =>
+  /[\r\n]/.test(value) &&
+  !Object.values(key).some(Boolean);
+
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -434,6 +456,7 @@ export const useChatApp = ({
     null
   );
   const [currentModel, setCurrentModel] = useState(() => transport.getModel());
+  const [currentProvider, setCurrentProvider] = useState(() => transport.getProvider());
   const [runtimeUsageSummary, setRuntimeUsageSummary] = useState<RuntimeUsageSummary>(
     () => createRuntimeUsageSummary(transport.getModel())
   );
@@ -459,6 +482,12 @@ export const useChatApp = ({
     selectedIndex: 0,
     pageSize: MODEL_PAGE_SIZE,
   });
+  const [providerPicker, setProviderPicker] = useState<ProviderPickerState>({
+    active: false,
+    providers: [],
+    selectedIndex: 0,
+    pageSize: PROVIDER_PAGE_SIZE,
+  });
   const [pendingReviews, setPendingReviews] = useState<PendingReviewItem[]>([]);
   const [approvalPanel, setApprovalPanel] = useState<ApprovalPanelState>({
     active: false,
@@ -480,6 +509,7 @@ export const useChatApp = ({
   const resumePickerRef = useRef(resumePicker);
   const sessionsPanelRef = useRef(sessionsPanel);
   const modelPickerRef = useRef(modelPicker);
+  const providerPickerRef = useRef(providerPicker);
   const approvalPanelRef = useRef(approvalPanel);
   const pendingReviewsRef = useRef(pendingReviews);
   const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
@@ -494,6 +524,7 @@ export const useChatApp = ({
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
   modelPickerRef.current = modelPicker;
+  providerPickerRef.current = providerPicker;
   approvalPanelRef.current = approvalPanel;
   pendingReviewsRef.current = pendingReviews;
   inputHistoryRef.current = inputHistory;
@@ -505,13 +536,12 @@ export const useChatApp = ({
     const syncCurrentModel = () => {
       if (!cancelled) {
         updateCurrentModelState(transport.getModel());
+        updateCurrentProviderState(transport.getProvider());
       }
     };
 
     syncCurrentModel();
-    void transport
-      .listModels()
-      .catch(() => {})
+    void Promise.allSettled([transport.listModels(), transport.listProviders()])
       .then(() => {
         syncCurrentModel();
       });
@@ -529,8 +559,12 @@ export const useChatApp = ({
         : {
             ...previous,
             currentModel: model,
-          }
+        }
     );
+  };
+
+  const updateCurrentProviderState = (provider: string) => {
+    setCurrentProvider(provider);
   };
 
   const updateActiveSessionIdState = (sessionId: string | null) => {
@@ -581,12 +615,13 @@ export const useChatApp = ({
   };
 
   const setInputValue = (next: string) => {
-    inputDraftRef.current = next;
+    const decoded = decodeInputFromDisplay(next);
+    inputDraftRef.current = decoded;
     if (historyCursorRef.current !== -1) {
       historyCursorRef.current = -1;
       setHistoryCursor(-1);
     }
-    setInput(next);
+    setInput(decoded);
   };
 
   const pushInputHistory = (query: string) => {
@@ -938,6 +973,17 @@ export const useChatApp = ({
     setModelPicker(nextState);
   };
 
+  const closeProviderPicker = () => {
+    const nextState = {
+      active: false,
+      providers: [],
+      selectedIndex: 0,
+      pageSize: PROVIDER_PAGE_SIZE,
+    };
+    providerPickerRef.current = nextState;
+    setProviderPicker(nextState);
+  };
+
   const closeResumePicker = () => {
     const nextState = {
       active: false,
@@ -963,11 +1009,15 @@ export const useChatApp = ({
   const closeAllOverlayPanels = (options?: {
     keepApproval?: boolean;
     keepModelPicker?: boolean;
+    keepProviderPicker?: boolean;
     keepResumePicker?: boolean;
     keepSessionsPanel?: boolean;
   }) => {
     if (!options?.keepModelPicker) {
       closeModelPicker();
+    }
+    if (!options?.keepProviderPicker) {
+      closeProviderPicker();
     }
     if (!options?.keepResumePicker) {
       closeResumePicker();
@@ -1027,6 +1077,37 @@ export const useChatApp = ({
         closeModelPicker();
       } else {
         pushSystemMessage(`[model switch failed] ${result.message}`, {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+      }
+    });
+  };
+
+  const confirmProviderPickerSelection = () => {
+    enqueueTask(async () => {
+      const selected = providerPicker.providers[providerPicker.selectedIndex];
+      if (!selected) {
+        pushSystemMessage("No provider selected.", {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        return;
+      }
+      const result = await transport.setProvider(selected);
+      updateCurrentProviderState(transport.getProvider());
+      updateCurrentModelState(transport.getModel());
+      if (result.ok) {
+        pushSystemMessage(result.message, {
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        });
+        closeProviderPicker();
+      } else {
+        pushSystemMessage(`[provider switch failed] ${result.message}`, {
           kind: "error",
           tone: "danger",
           color: "red",
@@ -1293,6 +1374,18 @@ export const useChatApp = ({
           before.findIndex(item => item.id === id),
           before.length
         );
+        const wasOpen = approvalPanelRef.current.active;
+        const optimisticPending = before.filter(item => item.id !== id);
+        if (target) {
+          updatePendingState(optimisticPending, {
+            open: shouldKeepApprovalPanelOpen(optimisticPending.length, wasOpen),
+            selectedIndex: computeNextApprovalSelection(
+              currentIndex,
+              optimisticPending.length
+            ),
+            clearBlocked: true,
+          });
+        }
         const result = await mcpService.approve(id);
         const nextPending = mcpService.listPending();
 
@@ -1300,7 +1393,7 @@ export const useChatApp = ({
           updatePendingState(nextPending, {
             open: shouldKeepApprovalPanelOpen(
               nextPending.length,
-              approvalPanelRef.current.active
+              wasOpen
             ),
             selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
             clearBlocked: true,
@@ -1322,19 +1415,29 @@ export const useChatApp = ({
         }
 
         if (!result.ok) {
+          const blockedState = {
+            itemId: target.id,
+            reason: extractMessageBody(result.message) || result.message,
+            at: Date.now(),
+            lastAction: "approve" as const,
+          };
           updatePendingState(nextPending, {
             open: shouldKeepApprovalPanelOpen(
               nextPending.length,
-              approvalPanelRef.current.active
+              wasOpen
             ),
             selectedIndex: currentIndex,
-            blocked: {
-              itemId: target.id,
-              reason: extractMessageBody(result.message) || result.message,
-              at: Date.now(),
-              lastAction: "approve",
-            },
+            blocked: blockedState,
           });
+          if (nextPending.some(item => item.id === target.id)) {
+            syncApprovalPanelState(previous => ({
+              ...previous,
+              blockedItemId: blockedState.itemId,
+              blockedReason: blockedState.reason,
+              blockedAt: blockedState.at,
+              lastAction: blockedState.lastAction,
+            }));
+          }
           pushSystemMessage(
             buildApprovalMessage("Approval error", target, [
               extractMessageBody(result.message) || result.message,
@@ -1363,7 +1466,7 @@ export const useChatApp = ({
         updatePendingState(nextPending, {
           open: shouldKeepApprovalPanelOpen(
             nextPending.length,
-            approvalPanelRef.current.active
+            wasOpen
           ),
           selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
           clearBlocked: true,
@@ -1408,6 +1511,18 @@ export const useChatApp = ({
           before.findIndex(item => item.id === id),
           before.length
         );
+        const wasOpen = approvalPanelRef.current.active;
+        const optimisticPending = before.filter(item => item.id !== id);
+        if (target) {
+          updatePendingState(optimisticPending, {
+            open: shouldKeepApprovalPanelOpen(optimisticPending.length, wasOpen),
+            selectedIndex: computeNextApprovalSelection(
+              currentIndex,
+              optimisticPending.length
+            ),
+            clearBlocked: true,
+          });
+        }
         const result = mcpService.reject(id);
         const nextPending = mcpService.listPending();
 
@@ -1415,7 +1530,7 @@ export const useChatApp = ({
           updatePendingState(nextPending, {
             open: shouldKeepApprovalPanelOpen(
               nextPending.length,
-              approvalPanelRef.current.active
+              wasOpen
             ),
             selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
           });
@@ -1451,7 +1566,7 @@ export const useChatApp = ({
         updatePendingState(nextPending, {
           open: shouldKeepApprovalPanelOpen(
             nextPending.length,
-            approvalPanelRef.current.active
+            wasOpen
           ),
           selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
           clearBlocked: true,
@@ -1619,6 +1734,62 @@ export const useChatApp = ({
       return;
     }
 
+    if (providerPickerRef.current.active) {
+      if (key.escape) {
+        closeProviderPicker();
+        pushSystemMessage("Provider picker closed.");
+        return;
+      }
+
+      if (key.upArrow) {
+        setProviderPicker(previous => ({
+          ...previous,
+          selectedIndex: cycleSelection(
+            previous.selectedIndex,
+            previous.providers.length,
+            "up"
+          ),
+        }));
+        return;
+      }
+
+      if (key.downArrow) {
+        setProviderPicker(previous => ({
+          ...previous,
+          selectedIndex: cycleSelection(
+            previous.selectedIndex,
+            previous.providers.length,
+            "down"
+          ),
+        }));
+        return;
+      }
+
+      if (key.leftArrow || key.rightArrow) {
+        setProviderPicker(previous => {
+          const total = previous.providers.length;
+          if (total === 0) {
+            return previous;
+          }
+          return {
+            ...previous,
+            selectedIndex: movePagedSelection(
+              previous.selectedIndex,
+              total,
+              previous.pageSize,
+              key.leftArrow ? "left" : "right"
+            ),
+          };
+        });
+        return;
+      }
+
+      if (key.return) {
+        confirmProviderPickerSelection();
+      }
+      return;
+    }
+
     if (resumePickerRef.current.active) {
       if (key.escape) {
         closeResumePicker();
@@ -1728,6 +1899,18 @@ export const useChatApp = ({
       if (key.return) {
         confirmSessionsPanelSelection();
       }
+      return;
+    }
+
+    if (
+      !approvalPanelRef.current.active &&
+      !modelPickerRef.current.active &&
+      !providerPickerRef.current.active &&
+      !resumePickerRef.current.active &&
+      !sessionsPanelRef.current.active &&
+      isMultilinePasteChunk(inputValue, key)
+    ) {
+      setInputValue(input + inputValue);
       return;
     }
 
@@ -1882,6 +2065,11 @@ export const useChatApp = ({
       return;
     }
 
+    if (!query && providerPicker.active) {
+      confirmProviderPickerSelection();
+      return;
+    }
+
     if (!query && resumePicker.active) {
       confirmResumePickerSelection();
       return;
@@ -1894,6 +2082,7 @@ export const useChatApp = ({
 
     if (
       modelPicker.active ||
+      providerPicker.active ||
       resumePicker.active ||
       sessionsPanel.active ||
       approvalPanel.active
@@ -1918,6 +2107,70 @@ export const useChatApp = ({
           color: "gray",
         },
       ]);
+      setInput("");
+      return;
+    }
+
+    if (query === "/provider") {
+      enqueueTask(async () => {
+        const providers = await transport.listProviders();
+        updateCurrentProviderState(transport.getProvider());
+        if (providers.length === 0) {
+          pushSystemMessage("No providers available. Set CYRENE_BASE_URL or switch with /provider <url>.");
+          return;
+        }
+        const current = transport.getProvider();
+        const selectedIndex = Math.max(0, providers.indexOf(current));
+        closeAllOverlayPanels({ keepProviderPicker: true });
+        const nextState = {
+          active: true,
+          providers,
+          selectedIndex,
+          pageSize: PROVIDER_PAGE_SIZE,
+        };
+        providerPickerRef.current = nextState;
+        setProviderPicker(nextState);
+        pushSystemMessage(
+          "Provider picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
+        );
+      });
+      setInput("");
+      return;
+    }
+
+    if (query === "/provider refresh") {
+      enqueueTask(async () => {
+        const result = await transport.refreshModels();
+        updateCurrentProviderState(transport.getProvider());
+        updateCurrentModelState(transport.getModel());
+        if (result.ok) {
+          pushSystemMessage(
+            `${result.message}\nProvider: ${transport.getProvider()}\nCurrent model: ${transport.getModel()}`
+          );
+        } else {
+          pushSystemMessage(`[provider refresh failed] ${result.message}`);
+        }
+      });
+      setInput("");
+      return;
+    }
+
+    if (query.startsWith("/provider ")) {
+      const nextProvider = query.slice("/provider ".length).trim();
+      enqueueTask(async () => {
+        if (!nextProvider) {
+          pushSystemMessage("Usage: /provider <base_url> | /provider refresh");
+          return;
+        }
+        const result = await transport.setProvider(nextProvider);
+        updateCurrentProviderState(transport.getProvider());
+        updateCurrentModelState(transport.getModel());
+        if (result.ok) {
+          pushSystemMessage(result.message);
+        } else {
+          pushSystemMessage(`[provider switch failed] ${result.message}`);
+        }
+      });
       setInput("");
       return;
     }
@@ -2460,7 +2713,7 @@ export const useChatApp = ({
   }, [historyCursor, input, inputHistory.length]);
 
   return {
-    input,
+    input: encodeInputForDisplay(input),
     inputCommandState,
     items,
     liveAssistantText,
@@ -2470,10 +2723,12 @@ export const useChatApp = ({
     resumePicker,
     sessionsPanel,
     modelPicker,
+    providerPicker,
     pendingReviews,
     approvalPanel,
     activeSessionId,
     currentModel,
+    currentProvider,
     exitSummary: runtimeUsageSummary,
     closeApprovalPanel: () => closeApprovalPanel({ suppressCurrentQueue: true }),
     openApprovalPanel,

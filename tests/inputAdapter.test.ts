@@ -65,4 +65,14 @@ describe("inputAdapter", () => {
       }),
     });
   });
+
+  test("preserves multiline paste chunks instead of collapsing them into enter", () => {
+    expect(normalizeRawInputChunk("first line\nsecond line")).toEqual({
+      input: "first line\nsecond line",
+      key: expect.objectContaining({
+        return: false,
+        ctrl: false,
+      }),
+    });
+  });
 });

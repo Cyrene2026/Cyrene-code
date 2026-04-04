@@ -15,12 +15,15 @@ export const loadModelYaml = async (
   defaultModel?: string;
   lastUsedModel?: string;
   providerBaseUrl?: string;
+  providers: string[];
 }> => {
   const content = await readFile(getModelFile(appRoot), "utf8");
   const models: string[] = [];
+  const providers: string[] = [];
   let defaultModel: string | undefined;
   let lastUsedModel: string | undefined;
   let providerBaseUrl: string | undefined;
+  let section: "root" | "models" | "providers" = "root";
 
   for (const raw of content.split(/\r?\n/)) {
     const line = raw.trim();
@@ -39,10 +42,25 @@ export const loadModelYaml = async (
       providerBaseUrl = parseScalar(line.slice("provider_base_url:".length));
       continue;
     }
-    if (line.startsWith("-")) {
+    if (line === "models:") {
+      section = "models";
+      continue;
+    }
+    if (line === "providers:") {
+      section = "providers";
+      continue;
+    }
+    if (line.startsWith("-") && section === "models") {
       const model = parseScalar(line.slice(1));
       if (model) {
         models.push(model);
+      }
+      continue;
+    }
+    if (line.startsWith("-") && section === "providers") {
+      const provider = parseScalar(line.slice(1));
+      if (provider) {
+        providers.push(provider);
       }
     }
   }
@@ -56,6 +74,7 @@ export const loadModelYaml = async (
     defaultModel,
     lastUsedModel,
     providerBaseUrl,
+    providers,
   };
 };
 
@@ -65,12 +84,16 @@ export const saveModelYaml = async (
   options?: {
     lastUsedModel?: string;
     providerBaseUrl?: string;
+    providers?: string[];
   },
   appRoot = resolveAppRoot()
 ): Promise<void> => {
   const unique = Array.from(new Set(models.map(model => model.trim()))).filter(
     Boolean
   );
+  const uniqueProviders = Array.from(
+    new Set((options?.providers ?? []).map(provider => provider.trim()))
+  ).filter(Boolean);
   if (unique.length === 0) {
     throw new Error("Cannot save empty model list");
   }
@@ -89,6 +112,9 @@ export const saveModelYaml = async (
     `last_used_model: ${normalizedLastUsed}`,
     ...(options?.providerBaseUrl
       ? [`provider_base_url: ${options.providerBaseUrl}`]
+      : []),
+    ...(uniqueProviders.length > 0
+      ? ["providers:", ...uniqueProviders.map(provider => `  - ${provider}`)]
       : []),
     "models:",
     ...unique.map(model => `  - ${model}`),

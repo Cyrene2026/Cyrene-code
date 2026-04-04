@@ -490,6 +490,71 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(persisted).toContain("last_used_model: new-main");
   });
 
+  test("lists saved providers and switches to a selected provider", async () => {
+    const { modelFile } = await createWorkspace();
+    delete process.env.CYRENE_BASE_URL;
+    process.env.CYRENE_API_KEY = "test-key";
+    await writeFile(
+      modelFile,
+      [
+        "default_model: alpha-main",
+        "last_used_model: alpha-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "  - https://provider-b.test/v1",
+        "models:",
+        "  - alpha-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: string[] = [];
+    globalThis.fetch = mock(async (url: string) => {
+      fetchCalls.push(url);
+      return new Response(
+        JSON.stringify({
+          data: [{ id: "beta-main" }, { id: "beta-fast" }],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const { createHttpQueryTransport } = await import(
+      "../src/infra/http/createHttpQueryTransport"
+    );
+    const transport = createHttpQueryTransport();
+
+    expect(await transport.listProviders()).toEqual([
+      "https://provider-a.test/v1",
+      "https://provider-b.test/v1",
+    ]);
+    expect(transport.getProvider()).toBe("https://provider-a.test/v1");
+
+    expect(await transport.setProvider("https://provider-b.test/v1")).toEqual({
+      ok: true,
+      message: "Provider switched to: https://provider-b.test/v1\nCurrent model: beta-main",
+      currentProvider: "https://provider-b.test/v1",
+      providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
+      models: ["beta-main", "beta-fast"],
+    });
+    expect(fetchCalls).toEqual(["https://provider-b.test/v1/models"]);
+    expect(transport.getProvider()).toBe("https://provider-b.test/v1");
+    expect(await transport.listModels()).toEqual(["beta-main", "beta-fast"]);
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_base_url: https://provider-b.test/v1");
+    expect(persisted).toContain("providers:");
+    expect(persisted).toContain("  - https://provider-a.test/v1");
+    expect(persisted).toContain("  - https://provider-b.test/v1");
+  });
+
   test("summarizeText uses a plain completion request without tools and returns usage", async () => {
     const { modelFile } = await createWorkspace();
     process.env.CYRENE_BASE_URL = "https://example.test/v1";

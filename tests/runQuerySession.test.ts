@@ -9,6 +9,9 @@ const createTransport = (): { transport: QueryTransport; prompts: string[] } => 
     prompts,
     transport: {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -43,6 +46,9 @@ const createToolLoopTransport = (toolCallsPerStream: number[]): QueryTransport =
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -69,6 +75,9 @@ const createSameProbeTransport = (repeats: number): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -90,6 +99,9 @@ const createSameEmptyReadTransport = (repeats: number): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -117,6 +129,9 @@ const createPromptCaptureTransport = (
     prompts,
     transport: {
       getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
       setModel: async model => ({ ok: true, message: `set ${model}` }),
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -146,6 +161,9 @@ const createRepeatedRunCommandTransport = (repeats: number): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -172,6 +190,9 @@ const createRepeatedRunShellTransport = (repeats: number): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -197,6 +218,9 @@ const createSameSearchTransport = (repeats: number): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -224,6 +248,9 @@ const createRoundSequenceTransport = (
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
     setModel: async model => ({ ok: true, message: `set ${model}` }),
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
@@ -381,6 +408,9 @@ describe("runQuerySession", () => {
   test("stores usage events from the stream in session state", async () => {
     const transport: QueryTransport = {
       getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
       setModel: async model => ({ ok: true, message: `set ${model}` }),
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),

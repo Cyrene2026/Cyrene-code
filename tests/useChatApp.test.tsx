@@ -324,6 +324,45 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("/provider opens picker and /provider <url> switches provider", async () => {
+    const transport = createTestTransport({
+      initialProvider: "https://provider-a.test/v1",
+      providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
+    });
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/provider");
+
+    expect(app.getLatest().providerPicker.active).toBe(true);
+    expect(app.getLatest().providerPicker.providers).toEqual([
+      "https://provider-a.test/v1",
+      "https://provider-b.test/v1",
+    ]);
+
+    await act(async () => {
+      app.getLatest().setInput("");
+      inputHandler?.("", { escape: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await runCommand(app, "/provider https://provider-b.test/v1");
+
+    expect(app.getLatest().currentProvider).toBe("https://provider-b.test/v1");
+    app.cleanup();
+  });
+
   test("exitSummary tracks the current model after /model switch", async () => {
     const transport = createTestTransport();
     const app = renderHookHarness(() =>
@@ -350,6 +389,7 @@ describe("useChatApp", () => {
     let currentModel = "gpt-placeholder";
     const transport: QueryTransport = {
       getModel: () => currentModel,
+      getProvider: () => "https://provider.test/v1",
       setModel: async model => {
         currentModel = model;
         return { ok: true, message: `Model switched to ${model}` };
@@ -358,6 +398,14 @@ describe("useChatApp", () => {
         currentModel = "gpt-from-yaml";
         return ["gpt-from-yaml", "gpt-next"];
       },
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({
+        ok: true,
+        message: `Provider switched to: ${provider}`,
+        currentProvider: provider,
+        providers: [provider],
+        models: ["gpt-from-yaml", "gpt-next"],
+      }),
       refreshModels: async () => ({
         ok: true,
         message: "Models refreshed",
@@ -384,6 +432,49 @@ describe("useChatApp", () => {
     expect(app.getLatest().currentModel).toBe("gpt-placeholder");
     await flushMicrotasks();
     expect(app.getLatest().currentModel).toBe("gpt-from-yaml");
+    app.cleanup();
+  });
+
+  test("multiline paste is preserved for submission while showing a stable display token", async () => {
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
+      submitted.push(originalTask);
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+    const sessionStore = createTestSessionStore();
+
+    const app = renderHookHarness(() =>
+      useChatApp({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("first line\nsecond line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().input).toContain("↩");
+
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual(["first line\nsecond line"]);
+    const record = sessionStore.__listRecords()[0];
+    expect(record?.messages[0]?.text).toBe("first line\nsecond line");
     app.cleanup();
   });
 
@@ -1421,7 +1512,9 @@ describe("useChatApp", () => {
     await flushMicrotasks();
 
     expect(approve).toHaveBeenCalledTimes(1);
-    expect(app.getLatest().approvalPanel.inFlightId).toBe("trail-1");
+    expect(app.getLatest().pendingReviews).toHaveLength(0);
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(app.getLatest().approvalPanel.inFlightId).toBeNull();
     expect(getTexts(app.getLatest().items).some(text => text.includes("Approval panel closed."))).toBe(
       false
     );
@@ -1658,6 +1751,7 @@ describe("useChatApp", () => {
       inputHandler?.("a", {});
       await Promise.resolve();
     });
+    await flushMicrotasks();
     await flushMicrotasks();
 
     expect(approve).toHaveBeenCalledTimes(1);

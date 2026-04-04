@@ -40,6 +40,12 @@ type ChatScreenProps = {
     selectedIndex: number;
     pageSize: number;
   };
+  providerPicker: {
+    active: boolean;
+    providers: string[];
+    selectedIndex: number;
+    pageSize: number;
+  };
   pendingReviews: PendingReviewItem[];
   approvalPanel: {
     active: boolean;
@@ -57,6 +63,7 @@ type ChatScreenProps = {
   };
   activeSessionId: string | null;
   currentModel: string;
+  currentProvider: string;
   usage: TokenUsage | null;
   onInputChange: (next: string) => void;
   onSubmit: () => void;
@@ -100,6 +107,16 @@ type MarkdownBlock =
   | { kind: "code"; language?: string; content: string }
   | { kind: "diff"; lines: string[] }
   | { kind: "rule" };
+
+type TerminalTranscript = {
+  action: string;
+  status?: string;
+  shell?: string;
+  cwd?: string;
+  exit?: string;
+  commandLine?: string;
+  outputLines: string[];
+};
 
 type ComposerTone = {
   borderColor: "gray" | "yellow" | "magenta" | "red";
@@ -203,6 +220,19 @@ const getMessageLabel = (
 
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
+
+const formatProviderLabel = (provider: string, max = 22) => {
+  if (!provider || provider === "none") {
+    return "none";
+  }
+  try {
+    const url = new URL(provider);
+    const hostLabel = `${url.host}${url.pathname === "/" ? "" : url.pathname}`;
+    return shortenValue(hostLabel, max);
+  } catch {
+    return shortenValue(provider, max);
+  }
+};
 
 const getStatusBadge = (status: ChatStatus, spinner: string) => {
   if (status === "streaming") {
@@ -662,6 +692,135 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
   return blocks;
 };
 
+const TERMINAL_ACTIONS = new Set([
+  "run_command",
+  "run_shell",
+  "open_shell",
+  "write_shell",
+  "read_shell",
+  "shell_status",
+  "interrupt_shell",
+  "close_shell",
+]);
+
+const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
+  const lines = item.text.split("\n");
+  const firstLine = lines[0]?.trim() ?? "";
+  let action = "";
+
+  if (firstLine.startsWith("Tool result:")) {
+    action = firstLine
+      .replace("Tool result:", "")
+      .trim()
+      .split(/\s+/, 1)[0] ?? "";
+  } else if (
+    firstLine === "Approved" ||
+    firstLine.startsWith("Approval error") ||
+    firstLine === "Rejected"
+  ) {
+    const actionLine = lines.find(line => line.trim().startsWith("action:"));
+    action = actionLine?.replace(/^action:\s*/i, "").trim() ?? "";
+  }
+
+  if (!TERMINAL_ACTIONS.has(action)) {
+    return null;
+  }
+
+  const fields = new Map<string, string>();
+  const outputLines: string[] = [];
+  let readingOutput = false;
+
+  for (const line of lines.slice(1)) {
+    if (readingOutput) {
+      outputLines.push(line);
+      continue;
+    }
+    const match = /^([a-z_ ]+):\s*(.*)$/i.exec(line.trim());
+    if (!match) {
+      continue;
+    }
+    const key = (match[1] ?? "").trim().toLowerCase().replace(/\s+/g, "_");
+    const value = (match[2] ?? "").trim();
+    fields.set(key, value);
+    if (key === "output") {
+      readingOutput = true;
+      if (value) {
+        outputLines.push(value);
+      }
+    }
+  }
+
+  const args = fields.get("args");
+  const command = fields.get("command");
+  const input = fields.get("input");
+  const program = fields.get("program");
+  const commandLine =
+    input ||
+    (command
+      ? [command, args && args !== "(none)" ? args : ""].filter(Boolean).join(" ")
+      : "") ||
+    program ||
+    action;
+
+  return {
+    action,
+    status: fields.get("status"),
+    shell: fields.get("shell"),
+    cwd: fields.get("cwd"),
+    exit: fields.get("exit") ?? fields.get("last_exit"),
+    commandLine,
+    outputLines:
+      outputLines.length > 0
+        ? outputLines
+        : ["(no new output)"],
+  };
+};
+
+const renderTerminalTranscript = (
+  transcript: TerminalTranscript,
+  itemIndex: number
+) => {
+  const shellPrompt =
+    transcript.shell === "pwsh" ? "PS>" : transcript.action === "run_command" ? ">" : "$";
+  const meta = [
+    transcript.status ? `status ${transcript.status}` : "",
+    transcript.cwd ? `cwd ${transcript.cwd}` : "",
+    transcript.shell ? `shell ${transcript.shell}` : "",
+    transcript.exit ? `exit ${transcript.exit}` : "",
+  ]
+    .filter(Boolean)
+    .join("  |  ");
+
+  return (
+    <Box
+      key={`terminal-${itemIndex}`}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="gray"
+      paddingX={1}
+      marginTop={1}
+    >
+      <Text color="cyan">{`terminal  ${transcript.action}`}</Text>
+      {meta ? <Text dimColor>{meta}</Text> : null}
+      <Box marginTop={1}>
+        <Text color="green">{shellPrompt}</Text>
+        <Text> </Text>
+        <Text color="white">{transcript.commandLine}</Text>
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        {transcript.outputLines.map((line, lineIndex) => (
+          <Text
+            key={`terminal-output-${itemIndex}-${lineIndex}`}
+            color={line.startsWith("stderr") || line.startsWith("error") ? "red" : "gray"}
+          >
+            {`  ${line || " "}`}
+          </Text>
+        ))}
+      </Box>
+    </Box>
+  );
+};
+
 const renderMessageItem = (item: ChatItem, itemIndex: number) => {
   if (!item.text) {
     return null;
@@ -669,8 +828,12 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
 
   const color = resolveItemColor(item);
   const messageLabel = getMessageLabel(item);
+  const terminalTranscript = parseTerminalTranscript(item);
   const blocks = parseMarkdownBlocks(item.text);
   const nodes: React.ReactNode[] = [];
+  if (terminalTranscript) {
+    nodes.push(renderTerminalTranscript(terminalTranscript, itemIndex));
+  } else {
   blocks.forEach((block, blockIndex) => {
     if (block.kind === "paragraph") {
       nodes.push(
@@ -746,6 +909,7 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
       });
     }
   });
+  }
 
   return (
     <Box key={`item-${itemIndex}`} flexDirection="column" marginBottom={1}>
@@ -761,6 +925,7 @@ const renderShellHeader = (
   status: ChatStatus,
   activeSessionId: string | null,
   currentModel: string,
+  currentProvider: string,
   appRoot: string,
   usage: TokenUsage | null,
   pendingCount: number,
@@ -789,6 +954,8 @@ const renderShellHeader = (
         <Text> </Text>
         <Text dimColor>model </Text>
         <Text>{shortenValue(currentModel || "none", 22)}</Text>
+        <Text dimColor>{`  |  provider `}</Text>
+        <Text>{formatProviderLabel(currentProvider || "none", 18)}</Text>
         <Text dimColor>{`  |  queue `}</Text>
         <Text color={queueColor}>{String(pendingCount)}</Text>
         {activePanel !== "idle" ? (
@@ -889,7 +1056,11 @@ const renderStartupSuggestion = (title: string, detail: string) => (
   </Box>
 );
 
-const renderStartupView = (currentModel: string, activeSessionId: string | null) => (
+const renderStartupView = (
+  currentModel: string,
+  currentProvider: string,
+  activeSessionId: string | null
+) => (
   <Box marginBottom={SECTION_GAP + 1} flexDirection="column">
     <Box flexDirection="column" marginBottom={2}>
       {STARTUP_WORDMARK.map((line, index) => (
@@ -906,7 +1077,7 @@ const renderStartupView = (currentModel: string, activeSessionId: string | null)
         Cyrene can inspect this workspace, explain code, edit files, and run reviewed commands.
       </Text>
       <Text dimColor>
-        {`model ${shortenValue(currentModel || "none", 18)}  |  session ${shortenValue(
+        {`model ${shortenValue(currentModel || "none", 18)}  |  provider ${formatProviderLabel(currentProvider || "none", 18)}  |  session ${shortenValue(
           activeSessionId ?? "none",
           18
         )}`}
@@ -2012,10 +2183,12 @@ export const ChatScreen = ({
   resumePicker,
   sessionsPanel,
   modelPicker,
+  providerPicker,
   pendingReviews,
   approvalPanel,
   activeSessionId,
   currentModel,
+  currentProvider,
   usage,
   onInputChange,
   onSubmit,
@@ -2047,11 +2220,21 @@ export const ChatScreen = ({
     () => formatPaged(modelPicker.models, modelPicker.selectedIndex, modelPicker.pageSize),
     [modelPicker.models, modelPicker.pageSize, modelPicker.selectedIndex]
   );
+  const providerPage = React.useMemo(
+    () =>
+      formatPaged(
+        providerPicker.providers,
+        providerPicker.selectedIndex,
+        providerPicker.pageSize
+      ),
+    [providerPicker.pageSize, providerPicker.providers, providerPicker.selectedIndex]
+  );
 
   const isPanelActive =
     resumePicker.active ||
     sessionsPanel.active ||
     modelPicker.active ||
+    providerPicker.active ||
     approvalPanel.active;
   const activePanel = sessionsPanel.active
     ? "sessions"
@@ -2059,6 +2242,8 @@ export const ChatScreen = ({
       ? "resume"
       : modelPicker.active
         ? "models"
+        : providerPicker.active
+          ? "provider"
         : approvalPanel.active
           ? "approval"
           : "idle";
@@ -2120,6 +2305,7 @@ export const ChatScreen = ({
         status,
         activeSessionId,
         currentModel,
+        currentProvider,
         appRoot,
         usage,
         pendingReviews.length,
@@ -2127,7 +2313,9 @@ export const ChatScreen = ({
         spinner
       )}
       <Box marginBottom={SECTION_GAP} flexDirection="column">
-        {showStartupView ? renderStartupView(currentModel, activeSessionId) : null}
+        {showStartupView
+          ? renderStartupView(currentModel, currentProvider, activeSessionId)
+          : null}
         {transcriptNodes}
         {liveAssistantNode}
       </Box>
@@ -2201,6 +2389,31 @@ export const ChatScreen = ({
                   model === currentModel ? "currently active" : "",
                   selected,
                   model === currentModel ? "current" : undefined
+                )}
+              </React.Fragment>
+            );
+          }),
+          "Up/Down: select  Left/Right: page  Enter: switch  Esc: close"
+        )}
+
+      {providerPicker.active &&
+        renderCompactSimplePanel(
+          "Providers",
+          providerPage,
+          activeSessionId,
+          currentModel,
+          formatProviderLabel(currentProvider, 28),
+          providerPage.pageItems.map((provider, localIndex) => {
+            const index = providerPage.pageStart + localIndex;
+            const selected = index === providerPicker.selectedIndex;
+            const isCurrent = provider === currentProvider;
+            return (
+              <React.Fragment key={`provider-picker-${provider}-${index}`}>
+                {renderCompactPickerItem(
+                  formatProviderLabel(provider, 36),
+                  provider,
+                  selected,
+                  isCurrent ? "current" : undefined
                 )}
               </React.Fragment>
             );

@@ -7,7 +7,7 @@ import {
   TOOL_USAGE_SYSTEM_PROMPT,
   createHttpQueryTransport,
 } from "../src/infra/http/createHttpQueryTransport";
-import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
+import { resetConfiguredAppRoot, setConfiguredAppRoot } from "../src/infra/config/appRoot";
 
 const originalFetch = globalThis.fetch;
 const tempRoots: string[] = [];
@@ -441,6 +441,43 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     expect(await transport.listModels()).toEqual(["gpt-root", "gpt-alt"]);
     expect(transport.getModel()).toBe("gpt-root");
+  });
+
+  test("explicit appRoot ignores an unrelated configured app root", async () => {
+    const { root, modelFile } = await createWorkspace();
+    const unrelatedRoot = await mkdtemp(join(tmpdir(), "cyrene-http-other-root-"));
+    tempRoots.push(unrelatedRoot);
+    await mkdir(join(unrelatedRoot, ".cyrene"), { recursive: true });
+    await writeFile(
+      join(unrelatedRoot, ".cyrene", "model.yaml"),
+      [
+        "default_model: wrong-model",
+        "last_used_model: wrong-model",
+        "models:",
+        "  - wrong-model",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    setConfiguredAppRoot(unrelatedRoot);
+
+    await writeFile(
+      modelFile,
+      [
+        "default_model: right-model",
+        "last_used_model: right-model",
+        "models:",
+        "  - right-model",
+        "  - right-fast",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({ appRoot: root });
+
+    expect(await transport.listModels()).toEqual(["right-model", "right-fast"]);
+    expect(transport.getModel()).toBe("right-model");
   });
 
   test("provider change refreshes catalog before restoring current model", async () => {

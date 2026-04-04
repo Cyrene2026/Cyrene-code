@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resetConfiguredAppRoot } from "../src/infra/config/appRoot";
+import { resetConfiguredAppRoot, setConfiguredAppRoot } from "../src/infra/config/appRoot";
 import { createFileSessionStore } from "../src/infra/session/createFileSessionStore";
 
 const tempRoots: string[] = [];
@@ -234,5 +234,28 @@ describe("session memory index", () => {
     );
 
     expect(persisted).toContain("\"title\": \"root aware\"");
+  });
+
+  test("session store context ignores unrelated configured app root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
+    const unrelatedRoot = await mkdtemp(join(tmpdir(), "cyrene-session-other-root-"));
+    tempRoots.push(root, unrelatedRoot);
+    await mkdir(join(root, ".cyrene"), { recursive: true });
+    await mkdir(join(unrelatedRoot, ".cyrene"), { recursive: true });
+    setConfiguredAppRoot(unrelatedRoot);
+
+    const store = createFileSessionStore(undefined, {
+      cwd: root,
+      env: { CYRENE_ROOT: root },
+    });
+    const session = await store.createSession("scoped root");
+
+    const expectedPath = join(root, ".cyrene", "session", `${session.id}.json`);
+    const unexpectedPath = join(unrelatedRoot, ".cyrene", "session", `${session.id}.json`);
+
+    const persisted = await readFile(expectedPath, "utf8");
+    expect(persisted).toContain("\"title\": \"scoped root\"");
+
+    await expect(stat(unexpectedPath)).rejects.toBeTruthy();
   });
 });

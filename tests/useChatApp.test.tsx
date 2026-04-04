@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { act } from "react-test-renderer";
 import type { FileAction, PendingReviewItem, ToolRequest } from "../src/core/tools/mcp/types";
 import type { QueryTransport } from "../src/core/query/transport";
+import { useChatApp } from "../src/application/chat/useChatApp";
 import {
   createSessionRecord,
   createTestSessionStore,
@@ -15,13 +16,15 @@ let inputHandler:
   | ((input: string, key: Record<string, boolean>) => void)
   | null = null;
 
-mock.module("../src/application/chat/inputAdapter", () => ({
-  useInputAdapter: (handler: typeof inputHandler) => {
-    inputHandler = handler;
-  },
-}));
-
-const { useChatApp } = await import("../src/application/chat/useChatApp");
+const useChatAppWithTestInput = (
+  params: Parameters<typeof useChatApp>[0]
+) =>
+  useChatApp({
+    ...params,
+    inputAdapterHook: handler => {
+      inputHandler = handler as typeof inputHandler;
+    },
+  });
 
 const createPending = (
   id: string,
@@ -188,13 +191,9 @@ describe("useChatApp", () => {
     inputHandler = null;
   });
 
-  afterEach(() => {
-    mock.restore();
-  });
-
   test("/help appends help text", async () => {
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -214,7 +213,7 @@ describe("useChatApp", () => {
 
   test("free input supports terminal-style history with up/down arrows", async () => {
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -267,7 +266,7 @@ describe("useChatApp", () => {
 
   test("slash command suggestions prefer the most specific matching command", async () => {
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -294,7 +293,7 @@ describe("useChatApp", () => {
   test("/model opens picker and /model <name> switches model", async () => {
     const transport = createTestTransport();
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -330,7 +329,7 @@ describe("useChatApp", () => {
       providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
     });
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -366,7 +365,7 @@ describe("useChatApp", () => {
   test("exitSummary tracks the current model after /model switch", async () => {
     const transport = createTestTransport();
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -417,7 +416,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -445,7 +444,7 @@ describe("useChatApp", () => {
     const sessionStore = createTestSessionStore();
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -504,7 +503,7 @@ describe("useChatApp", () => {
     ]);
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -556,7 +555,7 @@ describe("useChatApp", () => {
     ]);
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -595,7 +594,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -648,7 +647,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -692,7 +691,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -760,7 +759,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -801,7 +800,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -837,7 +836,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -883,7 +882,7 @@ describe("useChatApp", () => {
     ]);
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -907,7 +906,7 @@ describe("useChatApp", () => {
 
   test("/system, /system reset, /new and /pins work across session lifecycle", async () => {
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "default system",
@@ -953,7 +952,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -991,7 +990,7 @@ describe("useChatApp", () => {
     ];
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1057,7 +1056,7 @@ describe("useChatApp", () => {
     });
 
     const successApp = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: successTransport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1083,7 +1082,7 @@ describe("useChatApp", () => {
     });
 
     const failureApp = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: failureTransport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1116,7 +1115,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1163,7 +1162,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -1218,7 +1217,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport({ summarizeImpl }),
         sessionStore: {
           ...sessionStore,
@@ -1279,7 +1278,7 @@ describe("useChatApp", () => {
     });
 
     const existingApp = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport({ summarizeImpl: summarizeExisting }),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -1310,7 +1309,7 @@ describe("useChatApp", () => {
     });
 
     const failureApp = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport({ summarizeImpl: summarizeFailure }),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -1386,7 +1385,7 @@ describe("useChatApp", () => {
     );
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport({
           initialModel: "gpt-test",
           models: ["gpt-test", "gpt-next"],
@@ -1443,7 +1442,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1487,7 +1486,7 @@ describe("useChatApp", () => {
     );
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1532,7 +1531,7 @@ describe("useChatApp", () => {
   test("approval enter hint is rate-limited", async () => {
     const pending = [createPending("enter-1")];
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1576,7 +1575,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1626,7 +1625,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1689,7 +1688,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1729,7 +1728,7 @@ describe("useChatApp", () => {
     }));
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1775,7 +1774,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1849,7 +1848,7 @@ describe("useChatApp", () => {
     };
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1890,7 +1889,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1934,7 +1933,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -1975,7 +1974,7 @@ describe("useChatApp", () => {
     });
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport,
         sessionStore: createTestSessionStore(),
         defaultSystemPrompt: "system",
@@ -2022,7 +2021,7 @@ describe("useChatApp", () => {
     );
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(sessions),
         defaultSystemPrompt: "system",
@@ -2068,7 +2067,7 @@ describe("useChatApp", () => {
     );
 
     const app = renderHookHarness(() =>
-      useChatApp({
+      useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(sessions),
         defaultSystemPrompt: "system",

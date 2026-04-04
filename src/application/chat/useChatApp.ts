@@ -37,6 +37,7 @@ type UseChatAppParams = {
   queryMaxToolSteps?: number;
   mcpService: FileMcpService;
   runQuerySessionImpl?: typeof runQuerySession;
+  inputAdapterHook?: typeof useInputAdapter;
 };
 
 type ResumePickerState = {
@@ -439,6 +440,7 @@ export const useChatApp = ({
   queryMaxToolSteps = 24,
   mcpService,
   runQuerySessionImpl = runQuerySession,
+  inputAdapterHook = useInputAdapter,
 }: UseChatAppParams) => {
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<ChatStatus>("idle");
@@ -1677,7 +1679,7 @@ export const useChatApp = ({
     rejectPendingReview(target.id);
   };
 
-  useInputAdapter((inputValue, key) => {
+  inputAdapterHook((inputValue, key) => {
     if (modelPickerRef.current.active) {
       if (key.escape) {
         closeModelPicker();

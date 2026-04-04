@@ -9,6 +9,8 @@ on:
     branches:
       - master
       - main
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -69,8 +71,8 @@ jobs:
       - name: Run test suite
         run: bun test
 
-  stability:
-    name: Stability (randomized)
+  stability_fast:
+    name: Stability Fast (randomized)
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -86,5 +88,26 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Run randomized repeat test suite
-        run: bun test --randomize --rerun-each 3 --max-concurrency 1
+      - name: Run randomized repeat test suite (fast)
+        run: bun test --randomize --rerun-each 2 --max-concurrency 1
+
+  stability_deep:
+    name: Stability Deep (randomized)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run randomized repeat test suite (deep)
+        run: bun test --randomize --rerun-each 5 --max-concurrency 1

@@ -1,6 +1,10 @@
 import React from "react";
 import { Box, Text } from "ink";
-import TextInput from "ink-text-input";
+import {
+  clampCursorOffset,
+  getCursorPosition,
+  getInputLines,
+} from "../../application/chat/multilineInput";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { SessionListItem } from "../../core/session/types";
 import type { PendingReviewItem } from "../../core/tools/mcp/types";
@@ -12,6 +16,7 @@ type ChatScreenProps = {
   status: ChatStatus;
   appRoot: string;
   input: string;
+  inputCursorOffset: number;
   inputCommandState: {
     active: boolean;
     currentCommand: string | null;
@@ -130,14 +135,20 @@ type RenderClipOptions = {
 };
 
 type ComposerTone = {
-  borderColor: "gray" | "yellow" | "magenta" | "red";
+  borderColor: "gray" | "cyan" | "yellow" | "magenta" | "red";
   panelBorderColor: "cyan" | "yellow" | "magenta" | "red";
   chipBackground: "cyan" | "yellow" | "magenta" | "red";
   chipText: "black";
-  chipLabel: "READY" | "WORKING" | "REVIEW" | "ERROR";
+  chipLabel:
+    | "READY"
+    | "PREPARING"
+    | "REQUESTING"
+    | "WORKING"
+    | "REVIEW"
+    | "ERROR";
   metaLabel: string;
   promptColor: "cyan" | "yellow" | "magenta" | "red";
-  helperColor: "gray" | "yellow" | "magenta" | "red";
+  helperColor: "gray" | "cyan" | "yellow" | "magenta" | "red";
 };
 
 const BRAND_NAME = "CYRENE";
@@ -156,7 +167,9 @@ const STREAMING_IDLE_GLYPH = "●";
 const ENABLE_STREAMING_ANIMATION =
   process.env.CYRENE_ANIMATE_STREAMING === "1" ||
   (process.env.CYRENE_ANIMATE_STREAMING !== "0" && process.platform !== "win32");
-const DEFAULT_COMPOSER_HINT = "Enter send  |  / commands  |  Up/Down history";
+const DEFAULT_COMPOSER_HINT = "Ctrl+D send  |  Enter newline  |  / commands";
+const MAX_COMPOSER_VISIBLE_LINES = 6;
+const COMPOSER_CURSOR_GLYPH = "█";
 const APPROVAL_DIFF_ADD_FOREGROUND = "#dcfce7";
 const APPROVAL_DIFF_ADD_BACKGROUND = "#14532d";
 const APPROVAL_DIFF_REMOVE_FOREGROUND = "#fee2e2";
@@ -309,6 +322,26 @@ const formatProviderLabel = (provider: string, max = 22) => {
 };
 
 const getStatusBadge = (status: ChatStatus, spinner: string) => {
+  if (status === "preparing") {
+    return {
+      textColor: "black" as const,
+      backgroundColor: "yellow" as const,
+      headerLabel: `${spinner} PREPARING`,
+      inputLabel: `${spinner} Preparing context`,
+      inputColor: "yellow" as const,
+    };
+  }
+
+  if (status === "requesting") {
+    return {
+      textColor: "black" as const,
+      backgroundColor: "cyan" as const,
+      headerLabel: `${spinner} REQUESTING`,
+      inputLabel: `${spinner} Requesting model`,
+      inputColor: "cyan" as const,
+    };
+  }
+
   if (status === "streaming") {
     return {
       textColor: "black" as const,
@@ -1215,6 +1248,32 @@ const renderShellHeader = (
 };
 
 const getComposerTone = (status: ChatStatus): ComposerTone => {
+  if (status === "preparing") {
+    return {
+      borderColor: "yellow",
+      panelBorderColor: "yellow",
+      chipBackground: "yellow",
+      chipText: "black",
+      chipLabel: "PREPARING",
+      metaLabel: "building prompt context",
+      promptColor: "yellow",
+      helperColor: "yellow",
+    };
+  }
+
+  if (status === "requesting") {
+    return {
+      borderColor: "cyan",
+      panelBorderColor: "cyan",
+      chipBackground: "cyan",
+      chipText: "black",
+      chipLabel: "REQUESTING",
+      metaLabel: "opening model stream",
+      promptColor: "cyan",
+      helperColor: "cyan",
+    };
+  }
+
   if (status === "streaming") {
     return {
       borderColor: "yellow",
@@ -1282,10 +1341,51 @@ const getComposerHelperText = (
   }
 
   if (inputCommandState.historyPosition !== null) {
-    return `history ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  Up/Down recall input`;
+    return `history ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  empty composer: Up/Down recall`;
   }
 
   return DEFAULT_COMPOSER_HINT;
+};
+
+const getComposerWindow = (input: string, inputCursorOffset: number) => {
+  const lines = getInputLines(input);
+  const clampedCursorOffset = clampCursorOffset(input, inputCursorOffset);
+  const cursorPosition = getCursorPosition(input, clampedCursorOffset);
+  const visibleCount = Math.min(MAX_COMPOSER_VISIBLE_LINES, lines.length);
+  const maxStart = Math.max(0, lines.length - visibleCount);
+  const startLine = Math.min(
+    Math.max(0, cursorPosition.line - visibleCount + 1),
+    maxStart
+  );
+  const endLine = startLine + visibleCount;
+
+  return {
+    lines: lines.slice(startLine, endLine),
+    startLine,
+    cursorLine: cursorPosition.line,
+    cursorColumn: cursorPosition.column,
+  };
+};
+
+const renderComposerCursorLine = (
+  line: string,
+  cursorColumn: number,
+  color: ComposerTone["promptColor"]
+) => {
+  const safeColumn = Math.max(0, Math.min(cursorColumn, line.length));
+  const cursorChar = line[safeColumn] ?? " ";
+  const before = line.slice(0, safeColumn);
+  const after = line.slice(cursorChar === " " ? safeColumn : safeColumn + 1);
+
+  return (
+    <Box>
+      {before ? <Text>{before}</Text> : null}
+      <Text color="black" backgroundColor={color}>
+        {cursorChar === " " ? COMPOSER_CURSOR_GLYPH : cursorChar}
+      </Text>
+      {after ? <Text>{after}</Text> : null}
+    </Box>
+  );
 };
 
 const renderStartupSuggestion = (title: string, detail: string) => (
@@ -1339,8 +1439,9 @@ const renderStartupView = (
 const renderMainComposer = (
   status: ChatStatus,
   input: string,
-  onInputChange: (next: string) => void,
-  onSubmit: () => void,
+  inputCursorOffset: number,
+  _onInputChange: (next: string) => void,
+  _onSubmit: () => void,
   isPanelActive: boolean,
   showStartupView: boolean,
   inputCommandState: ChatScreenProps["inputCommandState"],
@@ -1352,6 +1453,12 @@ const renderMainComposer = (
     96
   );
   const railSegments = ["██", "██", "██"];
+  const placeholder = isPanelActive
+    ? "Panel active..."
+    : showStartupView
+      ? "Ask Cyrene..."
+      : "Message Cyrene...";
+  const composerWindow = getComposerWindow(input, inputCursorOffset);
 
   return (
     <Box
@@ -1380,26 +1487,48 @@ const renderMainComposer = (
           borderStyle="single"
           borderColor={tone.panelBorderColor}
           paddingX={1}
+          flexDirection="column"
         >
-          <Text bold color={tone.promptColor}>
-            {">"}
-          </Text>
-          <Text> </Text>
-          <Box flexGrow={1}>
-            <TextInput
-              value={input}
-              focus={!isPanelActive}
-              onChange={onInputChange}
-              onSubmit={onSubmit}
-              placeholder={
-                isPanelActive
-                  ? "Panel active..."
-                  : showStartupView
-                    ? "Ask Cyrene..."
-                    : "Message Cyrene..."
-              }
-            />
-          </Box>
+          {input ? (
+            composerWindow.lines.map((line, visibleIndex) => {
+              const actualLineIndex = composerWindow.startLine + visibleIndex;
+              const isCursorLine = actualLineIndex === composerWindow.cursorLine;
+              const prefix = actualLineIndex === 0 ? ">" : "│";
+
+              return (
+                <Box key={`composer-line-${actualLineIndex}`}>
+                  <Text bold color={tone.promptColor}>
+                    {prefix}
+                  </Text>
+                  <Text> </Text>
+                  <Box flexGrow={1}>
+                    {isCursorLine ? (
+                      renderComposerCursorLine(
+                        line,
+                        composerWindow.cursorColumn,
+                        tone.promptColor
+                      )
+                    ) : (
+                      <Text>{line || " "}</Text>
+                    )}
+                  </Box>
+                </Box>
+              );
+            })
+          ) : (
+            <Box>
+              <Text bold color={tone.promptColor}>
+                {">"}
+              </Text>
+              <Text> </Text>
+              <Box flexGrow={1}>
+                <Text color="black" backgroundColor={tone.promptColor}>
+                  {COMPOSER_CURSOR_GLYPH}
+                </Text>
+                <Text dimColor>{placeholder}</Text>
+              </Box>
+            </Box>
+          )}
         </Box>
         <Box marginTop={1}>
           <Text color={tone.helperColor} dimColor={tone.helperColor === "gray"}>
@@ -2489,6 +2618,7 @@ export const ChatScreen = ({
   status,
   appRoot,
   input,
+  inputCursorOffset,
   inputCommandState,
   resumePicker,
   sessionsPanel,
@@ -2506,9 +2636,11 @@ export const ChatScreen = ({
   const [spinnerIndex, setSpinnerIndex] = React.useState(0);
   const approvalModeActive = approvalPanel.active;
   const shouldAnimateStreaming = ENABLE_STREAMING_ANIMATION && !approvalModeActive;
+  const isAnimatedWaitingStatus =
+    status === "preparing" || status === "requesting" || status === "streaming";
 
   React.useEffect(() => {
-    if (status !== "streaming" || !shouldAnimateStreaming) {
+    if (!isAnimatedWaitingStatus || !shouldAnimateStreaming) {
       setSpinnerIndex(0);
       return;
     }
@@ -2516,7 +2648,7 @@ export const ChatScreen = ({
       setSpinnerIndex(previous => (previous + 1) % SPINNER_FRAMES.length);
     }, 220);
     return () => clearInterval(timer);
-  }, [shouldAnimateStreaming, status]);
+  }, [isAnimatedWaitingStatus, shouldAnimateStreaming, status]);
 
   const resumePage = React.useMemo(
     () => formatPaged(resumePicker.sessions, resumePicker.selectedIndex, resumePicker.pageSize),
@@ -2763,6 +2895,7 @@ export const ChatScreen = ({
       {renderMainComposer(
         status,
         input,
+        inputCursorOffset,
         onInputChange,
         onSubmit,
         isPanelActive,

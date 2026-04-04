@@ -64,6 +64,13 @@ describe("inputAdapter", () => {
         ctrl: true,
       }),
     });
+
+    expect(normalizeRawInputChunk("\u0004")).toEqual({
+      input: "d",
+      key: expect.objectContaining({
+        ctrl: true,
+      }),
+    });
   });
 
   test("preserves multiline paste chunks instead of collapsing them into enter", () => {

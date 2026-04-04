@@ -941,11 +941,17 @@ export const runQuerySession = async ({
     const streamUrl = await transport.requestStreamUrl(roundPrompt);
     let completed = false;
     let sawToolCall = false;
+    let streamOpened = false;
     const toolResults: string[] = [];
 
     for await (const chunk of transport.stream(streamUrl)) {
       const events = parseStreamChunk(chunk);
       for (const event of events) {
+        if (!streamOpened && event.type !== "done") {
+          dispatch({ type: "stream_open" });
+          streamOpened = true;
+        }
+
         if (event.type === "text_delta") {
           dispatch({ type: "text_delta", text: event.text });
           onTextDelta(event.text);

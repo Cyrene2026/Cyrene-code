@@ -161,6 +161,7 @@ const buildProps = (
   status: "idle" as const,
   appRoot: "D:/Projects/demo-root",
   input: "",
+  inputCursorOffset: 0,
   inputCommandState: {
     active: false,
     currentCommand: null,
@@ -342,7 +343,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("Message Cyrene...");
     expect(output).toContain("interactive lane");
     expect(output).toContain("guide");
-    expect(output).toContain("Enter send  |  / commands  |  Up/Down history");
+    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands");
     expect(output).not.toContain("Conversation");
   });
 
@@ -370,8 +371,38 @@ describe("ChatScreen", () => {
     expect(output).toContain("Keep going");
     expect(output).toContain("Type `/` for commands");
     expect(output).toContain("Ask Cyrene...");
-    expect(output).toContain("Enter send  |  / commands  |  Up/Down history");
+    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands");
     expect(output).not.toContain("Type /help to view commands. Use /resume to open session picker.");
+  });
+
+  test("renders multiline composer content and grows beyond one logical line", () => {
+    const tree = renderScreen({
+      items: [],
+      input: "first line\nsecond line",
+      inputCursorOffset: "first line\nsecond line".length,
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("first line");
+    expect(output).toContain("second line");
+    expect(output).toContain(">");
+    expect(output).toContain("│");
+    expect(output).not.toContain("Ask Cyrene...");
+  });
+
+  test("shows only the visible composer window when input exceeds six lines", () => {
+    const input = Array.from({ length: 8 }, (_, index) => `line-${index + 1}`).join("\n");
+    const tree = renderScreen({
+      items: [],
+      input,
+      inputCursorOffset: input.length,
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("line-8");
+    expect(output).toContain("line-3");
+    expect(output).not.toContain("line-1");
+    expect(output).not.toContain("line-2");
   });
 
   test("renders token metrics when usage is available", () => {
@@ -404,17 +435,35 @@ describe("ChatScreen", () => {
     expect(output).toContain("Total -");
   });
 
-  test("streaming mode shows working status and spinner text", () => {
-    const tree = renderScreen({
-      items: [],
-      liveAssistantText: "working",
-      status: "streaming",
-    });
-    const output = JSON.stringify(tree);
+  test("preparing, requesting, and streaming states show phased waiting labels", () => {
+    const preparingOutput = JSON.stringify(
+      renderScreen({
+        items: [],
+        status: "preparing",
+      })
+    );
+    expect(preparingOutput).toContain("PREPARING");
+    expect(preparingOutput).toContain("building prompt context");
 
-    expect(output).toContain("WORKING");
-    expect(output).toContain("model streaming");
-    expect(output).toContain("Message Cyrene...");
+    const requestingOutput = JSON.stringify(
+      renderScreen({
+        items: [],
+        status: "requesting",
+      })
+    );
+    expect(requestingOutput).toContain("REQUESTING");
+    expect(requestingOutput).toContain("opening model stream");
+
+    const streamingOutput = JSON.stringify(
+      renderScreen({
+        items: [],
+        liveAssistantText: "working",
+        status: "streaming",
+      })
+    );
+    expect(streamingOutput).toContain("WORKING");
+    expect(streamingOutput).toContain("model streaming");
+    expect(streamingOutput).toContain("Message Cyrene...");
   });
 
   test("review and error states remain visible in the flagship composer", () => {
@@ -779,6 +828,7 @@ describe("ChatScreen", () => {
     const output = JSON.stringify(tree);
 
     expect(output).toContain("history 2/5");
+    expect(output).toContain("empty composer: Up/Down recall");
   });
 
   test("clips oversized transcript blocks and shows render clip notice", () => {

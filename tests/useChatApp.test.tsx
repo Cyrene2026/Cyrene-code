@@ -317,7 +317,7 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("free input supports terminal-style history with up/down arrows", async () => {
+  test("empty composer up arrow recalls the latest history entry", async () => {
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
         transport: createTestTransport(),
@@ -335,36 +335,54 @@ describe("useChatApp", () => {
     await runCommand(app, "second command");
 
     await act(async () => {
-      app.getLatest().setInput("draft");
-      await Promise.resolve();
-    });
-    await flushMicrotasks();
-
-    await act(async () => {
       inputHandler?.("", { upArrow: true } as any);
       await Promise.resolve();
     });
     expect(app.getLatest().input).toBe("second command");
     expect(app.getLatest().inputCommandState.historyPosition).toBe(2);
 
+    app.cleanup();
+  });
+
+  test("up/down move the multiline cursor instead of recalling history when input is not empty", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "first command");
+    await runCommand(app, "second command");
+
+    await act(async () => {
+      app.getLatest().setInput("alpha\nbeta\ngamma");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCursorOffset).toBe("alpha\nbeta\ngamma".length);
+
     await act(async () => {
       inputHandler?.("", { upArrow: true } as any);
       await Promise.resolve();
     });
-    expect(app.getLatest().input).toBe("first command");
-    expect(app.getLatest().inputCommandState.historyPosition).toBe(1);
+    expect(app.getLatest().input).toBe("alpha\nbeta\ngamma");
+    expect(app.getLatest().inputCursorOffset).toBe(10);
+    expect(app.getLatest().inputCommandState.historyPosition).toBeNull();
 
     await act(async () => {
       inputHandler?.("", { downArrow: true } as any);
       await Promise.resolve();
     });
-    expect(app.getLatest().input).toBe("second command");
-
-    await act(async () => {
-      inputHandler?.("", { downArrow: true } as any);
-      await Promise.resolve();
-    });
-    expect(app.getLatest().input).toBe("draft");
+    expect(app.getLatest().input).toBe("alpha\nbeta\ngamma");
+    expect(app.getLatest().inputCursorOffset).toBe("alpha\nbeta\ngamma".length);
     expect(app.getLatest().inputCommandState.historyPosition).toBeNull();
 
     app.cleanup();
@@ -581,7 +599,7 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("multiline paste is preserved for submission while showing a stable display token", async () => {
+  test("enter inserts a newline and ctrl+d submits the full multiline input", async () => {
     const submitted: string[] = [];
     const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
       submitted.push(originalTask);
@@ -605,15 +623,31 @@ describe("useChatApp", () => {
     );
 
     await act(async () => {
-      inputHandler?.("first line\nsecond line", {} as any);
+      inputHandler?.("first line", {} as any);
       await Promise.resolve();
     });
     await flushMicrotasks();
 
-    expect(app.getLatest().input).toContain("↩");
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual([]);
+    expect(app.getLatest().input).toBe("first line\n");
+    expect(app.getLatest().inputCursorOffset).toBe("first line\n".length);
 
     await act(async () => {
-      app.getLatest().submit();
+      inputHandler?.("second line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().input).toBe("first line\nsecond line");
+
+    await act(async () => {
+      inputHandler?.("d", { ctrl: true } as any);
       await Promise.resolve();
     });
     await flushMicrotasks();
@@ -621,6 +655,125 @@ describe("useChatApp", () => {
     expect(submitted).toEqual(["first line\nsecond line"]);
     const record = sessionStore.__listRecords()[0];
     expect(record?.messages[0]?.text).toBe("first line\nsecond line");
+    app.cleanup();
+  });
+
+  test("ctrl+d with empty composer does not submit or exit", async () => {
+    const runQuerySessionImpl = mock(async () => ({ status: "completed" as const }));
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("d", { ctrl: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).not.toHaveBeenCalled();
+    expect(app.getLatest().input).toBe("");
+    expect(app.getLatest().status).toBe("idle");
+    app.cleanup();
+  });
+
+  test("submit moves through preparing, requesting, then streaming without extra transcript noise", async () => {
+    let releasePromptContext!: () => void;
+    const promptContextReady = new Promise<void>(resolve => {
+      releasePromptContext = resolve;
+    });
+    let releaseStreaming!: () => void;
+    const allowStreaming = new Promise<void>(resolve => {
+      releaseStreaming = resolve;
+    });
+    let finishRun!: () => void;
+    const finishStreaming = new Promise<void>(resolve => {
+      finishRun = resolve;
+    });
+
+    const sessionStore = createTestSessionStore();
+    const getPromptContext = sessionStore.getPromptContext.bind(sessionStore);
+    sessionStore.getPromptContext = mock(async (sessionId, query) => {
+      await promptContextReady;
+      return getPromptContext(sessionId, query);
+    });
+
+    const runQuerySessionImpl = mock(async ({ onState }: any) => {
+      await allowStreaming;
+      onState({ status: "streaming" });
+      await finishStreaming;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("hello");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("preparing");
+    expect(
+      getTexts(app.getLatest().items).filter(text => text.includes("Preparing context"))
+    ).toHaveLength(0);
+
+    await act(async () => {
+      releasePromptContext();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+    expect(app.getLatest().status).toBe("requesting");
+
+    await act(async () => {
+      releaseStreaming();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("streaming");
+
+    await act(async () => {
+      finishRun();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("idle");
+    expect(
+      getTexts(app.getLatest().items).filter(text => text.includes("Requesting model"))
+    ).toHaveLength(0);
+    expect(getTexts(app.getLatest().items).filter(text => text.includes("Thinking"))).toHaveLength(0);
     app.cleanup();
   });
 

@@ -23,6 +23,16 @@ import { createApprovalActionLock } from "./approvalActionLock";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import { useInputAdapter } from "./inputAdapter";
 import {
+  clampCursorOffset,
+  deleteBackwardAtCursor,
+  deleteForwardAtCursor,
+  insertTextAtCursor,
+  moveCursorLeft,
+  moveCursorRight,
+  moveCursorVertical,
+  type MultilineEditorState,
+} from "./multilineInput";
+import {
   canRetryBlockedApproval,
   clampPreviewOffset,
   clearApprovalBlockOnSelectionChange,
@@ -127,7 +137,6 @@ const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
-const MULTILINE_DISPLAY_TOKEN = " ↩ ";
 const SUMMARY_RECENT_KEEP = 8;
 const STREAMING_RENDER_BATCH_MS = 40;
 const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
@@ -480,16 +489,6 @@ const addUsageToRuntimeSummary = (
   totalTokens: summary.totalTokens + usage.totalTokens,
 });
 
-const encodeInputForDisplay = (value: string) =>
-  value.replace(/\r?\n/g, MULTILINE_DISPLAY_TOKEN);
-
-const decodeInputFromDisplay = (value: string) =>
-  value.split(MULTILINE_DISPLAY_TOKEN).join("\n");
-
-const isMultilinePasteChunk = (value: string, key: Record<string, boolean>) =>
-  /[\r\n]/.test(value) &&
-  !Object.values(key).some(Boolean);
-
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -502,6 +501,7 @@ export const useChatApp = ({
   inputAdapterHook = useInputAdapter,
 }: UseChatAppParams) => {
   const [input, setInput] = useState("");
+  const [inputCursorOffset, setInputCursorOffset] = useState(0);
   const [status, setStatus] = useState<ChatStatus>("idle");
   const [items, setItems] = useState<ChatItem[]>([
     {
@@ -582,6 +582,7 @@ export const useChatApp = ({
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
   const inputDraftRef = useRef("");
+  const preferredInputColumnRef = useRef<number | null>(null);
   const liveAssistantTextRef = useRef("");
   const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveAssistantRenderedTextRef = useRef("");
@@ -690,14 +691,63 @@ export const useChatApp = ({
       });
   };
 
-  const setInputValue = (next: string) => {
-    const decoded = decodeInputFromDisplay(next);
-    inputDraftRef.current = decoded;
-    if (historyCursorRef.current !== -1) {
+  const commitEditorState = (
+    next: MultilineEditorState,
+    options?: {
+      clearHistoryCursor?: boolean;
+      updateDraft?: boolean;
+      preferredColumn?: number | null;
+    }
+  ) => {
+    const clearHistoryCursor = options?.clearHistoryCursor ?? true;
+    const updateDraft = options?.updateDraft ?? true;
+    const cursorOffset = clampCursorOffset(next.value, next.cursorOffset);
+
+    preferredInputColumnRef.current =
+      options?.preferredColumn === undefined ? null : options.preferredColumn;
+
+    if (clearHistoryCursor && historyCursorRef.current !== -1) {
       historyCursorRef.current = -1;
       setHistoryCursor(-1);
     }
-    setInput(decoded);
+
+    if (updateDraft) {
+      inputDraftRef.current = next.value;
+    }
+
+    setInput(next.value);
+    setInputCursorOffset(cursorOffset);
+  };
+
+  const setInputValue = (next: string) => {
+    commitEditorState({
+      value: next,
+      cursorOffset: next.length,
+    });
+  };
+
+  const clearInput = () => {
+    commitEditorState({
+      value: "",
+      cursorOffset: 0,
+    });
+  };
+
+  const applyEditorTransform = (
+    transform: (state: MultilineEditorState) => MultilineEditorState,
+    options?: {
+      preferredColumn?: number | null;
+    }
+  ) => {
+    commitEditorState(
+      transform({
+        value: input,
+        cursorOffset: inputCursorOffset,
+      }),
+      {
+        preferredColumn: options?.preferredColumn,
+      }
+    );
   };
 
   const pushInputHistory = (query: string) => {
@@ -730,13 +780,19 @@ export const useChatApp = ({
         const nextIndex = history.length - 1;
         historyCursorRef.current = nextIndex;
         setHistoryCursor(nextIndex);
-        setInput(history[nextIndex] ?? "");
+        const nextValue = history[nextIndex] ?? "";
+        setInput(nextValue);
+        setInputCursorOffset(nextValue.length);
+        preferredInputColumnRef.current = null;
         return;
       }
       const nextIndex = Math.max(0, historyCursorRef.current - 1);
       historyCursorRef.current = nextIndex;
       setHistoryCursor(nextIndex);
-      setInput(history[nextIndex] ?? "");
+      const nextValue = history[nextIndex] ?? "";
+      setInput(nextValue);
+      setInputCursorOffset(nextValue.length);
+      preferredInputColumnRef.current = null;
       return;
     }
 
@@ -747,12 +803,17 @@ export const useChatApp = ({
       historyCursorRef.current = -1;
       setHistoryCursor(-1);
       setInput(inputDraftRef.current);
+      setInputCursorOffset(inputDraftRef.current.length);
+      preferredInputColumnRef.current = null;
       return;
     }
     const nextIndex = historyCursorRef.current + 1;
     historyCursorRef.current = nextIndex;
     setHistoryCursor(nextIndex);
-    setInput(history[nextIndex] ?? "");
+    const nextValue = history[nextIndex] ?? "";
+    setInput(nextValue);
+    setInputCursorOffset(nextValue.length);
+    preferredInputColumnRef.current = null;
   };
 
   const pushSystemMessage = (
@@ -2210,26 +2271,77 @@ export const useChatApp = ({
       return;
     }
 
-    if (
-      !approvalPanelRef.current.active &&
-      !modelPickerRef.current.active &&
-      !providerPickerRef.current.active &&
-      !resumePickerRef.current.active &&
-      !sessionsPanelRef.current.active &&
-      isMultilinePasteChunk(inputValue, key)
-    ) {
-      setInputValue(input + inputValue);
-      return;
-    }
-
     if (!approvalPanelRef.current.active) {
       if (key.upArrow) {
-        recallInputHistory("up");
+        if (!input) {
+          recallInputHistory("up");
+          return;
+        }
+        const moved = moveCursorVertical(
+          {
+            value: input,
+            cursorOffset: inputCursorOffset,
+          },
+          "up",
+          preferredInputColumnRef.current
+        );
+        commitEditorState(moved.state, {
+          preferredColumn: moved.preferredColumn,
+        });
         return;
       }
 
       if (key.downArrow) {
-        recallInputHistory("down");
+        if (!input) {
+          recallInputHistory("down");
+          return;
+        }
+        const moved = moveCursorVertical(
+          {
+            value: input,
+            cursorOffset: inputCursorOffset,
+          },
+          "down",
+          preferredInputColumnRef.current
+        );
+        commitEditorState(moved.state, {
+          preferredColumn: moved.preferredColumn,
+        });
+        return;
+      }
+
+      if (key.leftArrow) {
+        applyEditorTransform(moveCursorLeft);
+        return;
+      }
+
+      if (key.rightArrow) {
+        applyEditorTransform(moveCursorRight);
+        return;
+      }
+
+      if (key.backspace) {
+        applyEditorTransform(deleteBackwardAtCursor);
+        return;
+      }
+
+      if (key.delete) {
+        applyEditorTransform(deleteForwardAtCursor);
+        return;
+      }
+
+      if (key.return) {
+        applyEditorTransform(state => insertTextAtCursor(state, "\n"));
+        return;
+      }
+
+      if (key.ctrl && inputValue.toLowerCase() === "d") {
+        submit();
+        return;
+      }
+
+      if (inputValue && !key.ctrl && !key.meta) {
+        applyEditorTransform(state => insertTextAtCursor(state, inputValue));
         return;
       }
     }
@@ -2335,7 +2447,7 @@ export const useChatApp = ({
       return;
     }
 
-    if (inputValue.toLowerCase() === "a") {
+    if (!key.ctrl && inputValue.toLowerCase() === "a") {
       approveCurrentPendingReview();
       return;
     }
@@ -2357,14 +2469,22 @@ export const useChatApp = ({
       return;
     }
 
-    if (inputValue.toLowerCase() === "r" || inputValue.toLowerCase() === "d") {
+    if (
+      !key.ctrl &&
+      (inputValue.toLowerCase() === "r" || inputValue.toLowerCase() === "d")
+    ) {
       rejectCurrentPendingReview();
     }
   });
 
   const submit = () => {
-    const query = input.trim();
-    if (status === "streaming") {
+    const rawInput = input;
+    const query = rawInput.trim();
+    if (
+      status === "preparing" ||
+      status === "requesting" ||
+      status === "streaming"
+    ) {
       return;
     }
 
@@ -2402,7 +2522,7 @@ export const useChatApp = ({
       return;
     }
 
-    pushInputHistory(query);
+    pushInputHistory(rawInput);
 
     if (query === "/help") {
       setItems(previous => [
@@ -2415,7 +2535,7 @@ export const useChatApp = ({
           color: "gray",
         },
       ]);
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2442,7 +2562,7 @@ export const useChatApp = ({
           "Provider picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
         );
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2459,7 +2579,7 @@ export const useChatApp = ({
           pushSystemMessage(`[provider refresh failed] ${result.message}`);
         }
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2482,7 +2602,7 @@ export const useChatApp = ({
           pushSystemMessage(`[provider switch failed] ${result.message}`);
         }
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2509,7 +2629,7 @@ export const useChatApp = ({
           "Model picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
         );
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2525,7 +2645,7 @@ export const useChatApp = ({
           pushSystemMessage(`[model refresh failed] ${result.message}`);
         }
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2547,7 +2667,7 @@ export const useChatApp = ({
           pushSystemMessage(`[model switch failed] ${result.message}`);
         }
       });
-      setInput("");
+      clearInput();
       return;
     }
 
@@ -2572,7 +2692,7 @@ export const useChatApp = ({
             color: "cyan",
           },
         ]);
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2583,13 +2703,13 @@ export const useChatApp = ({
           tone: result.ok ? "info" : "danger",
           color: result.ok ? "cyan" : "red",
         });
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/search-session") {
         pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2597,7 +2717,7 @@ export const useChatApp = ({
         const raw = query.slice("/search-session ".length).trim();
         if (!raw) {
           pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
-          setInput("");
+          clearInput();
           return;
         }
 
@@ -2618,7 +2738,7 @@ export const useChatApp = ({
           pushSystemMessage(
             `No sessions matched.${tag ? ` (tag: ${tag})` : ""}`
           );
-          setInput("");
+          clearInput();
           return;
         }
         pushSystemMessage(
@@ -2631,13 +2751,13 @@ export const useChatApp = ({
             }),
           ].join("\n")
         );
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/tag") {
         pushSystemMessage("Usage: /tag list | /tag add <tag> | /tag remove <tag>");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2648,7 +2768,7 @@ export const useChatApp = ({
         } else {
           pushSystemMessage(`Session tags:\n${session.tags.map(tag => `#${tag}`).join("\n")}`);
         }
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2656,7 +2776,7 @@ export const useChatApp = ({
         const tag = query.slice("/tag add ".length).trim();
         if (!tag) {
           pushSystemMessage("Usage: /tag add <tag>");
-          setInput("");
+          clearInput();
           return;
         }
         const session = await ensureActiveSession();
@@ -2666,7 +2786,7 @@ export const useChatApp = ({
             ? `Tag added. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`
             : "Tag was not added."
         );
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2674,7 +2794,7 @@ export const useChatApp = ({
         const tag = query.slice("/tag remove ".length).trim();
         if (!tag) {
           pushSystemMessage("Usage: /tag remove <tag>");
-          setInput("");
+          clearInput();
           return;
         }
         const session = await ensureActiveSession();
@@ -2684,20 +2804,20 @@ export const useChatApp = ({
         } else {
           pushSystemMessage(`Tag removed. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`);
         }
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/system") {
         pushSystemMessage(`Current system prompt:\n${systemPrompt}`);
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/system reset") {
         setSystemPrompt(defaultSystemPrompt);
         pushSystemMessage("System prompt reset to default.");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2705,12 +2825,12 @@ export const useChatApp = ({
         const nextPrompt = query.slice("/system ".length).trim();
         if (!nextPrompt) {
           pushSystemMessage("Usage: /system <prompt_text> | /system reset");
-          setInput("");
+          clearInput();
           return;
         }
         setSystemPrompt(nextPrompt);
         pushSystemMessage("System prompt updated for current runtime.");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2733,7 +2853,7 @@ export const useChatApp = ({
             { kind: "system_hint", tone: "info", color: "cyan" }
           );
         }
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2761,7 +2881,7 @@ export const useChatApp = ({
               previewMode: "summary",
             });
           }
-          setInput("");
+          clearInput();
           return;
         }
 
@@ -2769,7 +2889,7 @@ export const useChatApp = ({
         const id = query.slice("/review ".length).trim();
         if (!id) {
           pushSystemMessage("Usage: /review <id>");
-          setInput("");
+          clearInput();
           return;
         }
 
@@ -2783,7 +2903,7 @@ export const useChatApp = ({
             tone: "danger",
             color: "red",
           });
-          setInput("");
+          clearInput();
           return;
         }
 
@@ -2798,7 +2918,7 @@ export const useChatApp = ({
           selectId: target.id,
           previewMode: "full",
         });
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2809,7 +2929,7 @@ export const useChatApp = ({
             "No pending operations to approve.",
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         if (pending.length > 1) {
@@ -2822,7 +2942,7 @@ export const useChatApp = ({
             ]),
             { kind: "review_status", tone: "warning", color: "yellow" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         const only = pending[0];
@@ -2831,11 +2951,11 @@ export const useChatApp = ({
             "No pending operations to approve.",
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         approvePendingReview(only.id);
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2845,13 +2965,13 @@ export const useChatApp = ({
           item => getApprovalRisk(item.request.action) !== "high",
           "low-and-medium"
         );
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/approve all") {
         processPendingBatch("approve", () => true, "all");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2859,11 +2979,11 @@ export const useChatApp = ({
         const id = query.slice("/approve ".length).trim();
         if (!id) {
           pushSystemMessage("Usage: /approve <id> | /approve low | /approve all");
-          setInput("");
+          clearInput();
           return;
         }
         approvePendingReview(id);
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2874,7 +2994,7 @@ export const useChatApp = ({
             "No pending operations to reject.",
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         if (pending.length > 1) {
@@ -2887,7 +3007,7 @@ export const useChatApp = ({
             ]),
             { kind: "review_status", tone: "warning", color: "yellow" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         const only = pending[0];
@@ -2896,17 +3016,17 @@ export const useChatApp = ({
             "No pending operations to reject.",
             { kind: "system_hint", tone: "neutral", color: "white" }
           );
-          setInput("");
+          clearInput();
           return;
         }
         rejectPendingReview(only.id);
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/reject all") {
         processPendingBatch("reject", () => true, "all");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2914,11 +3034,11 @@ export const useChatApp = ({
         const id = query.slice("/reject ".length).trim();
         if (!id) {
           pushSystemMessage("Usage: /reject <id> | /reject all");
-          setInput("");
+          clearInput();
           return;
         }
         rejectPendingReview(id);
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2933,13 +3053,13 @@ export const useChatApp = ({
               .join("\n")}`
           );
         }
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/pin") {
         pushSystemMessage("Usage: /pin <important_note>");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2947,7 +3067,7 @@ export const useChatApp = ({
         const note = query.slice("/pin ".length).trim();
         if (!note) {
           pushSystemMessage("Usage: /pin <important_note>");
-          setInput("");
+          clearInput();
           return;
         }
         const session = await ensureActiveSession();
@@ -2955,20 +3075,20 @@ export const useChatApp = ({
           pushSystemMessage(
             `Pin limit reached (${pinMaxCount}). Remove low-value pins with /unpin <index> before adding more.`
           );
-          setInput("");
+          clearInput();
           return;
         }
         const next = await sessionStore.addFocus(session.id, note);
         pushSystemMessage(
           `Pinned to session focus (${next.focus.length}): ${note}`
         );
-        setInput("");
+        clearInput();
         return;
       }
 
       if (query === "/unpin") {
         pushSystemMessage("Usage: /unpin <index>");
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -2977,20 +3097,20 @@ export const useChatApp = ({
         const index = Number(raw);
         if (!Number.isInteger(index) || index <= 0) {
           pushSystemMessage("Usage: /unpin <index> (1-based)");
-          setInput("");
+          clearInput();
           return;
         }
         const session = await ensureActiveSession();
         if (session.focus.length === 0) {
           pushSystemMessage("No pinned focus to remove.");
-          setInput("");
+          clearInput();
           return;
         }
         if (index > session.focus.length) {
           pushSystemMessage(
             `Index out of range. Current pin count: ${session.focus.length}`
           );
-          setInput("");
+          clearInput();
           return;
         }
         const removed = session.focus[index - 1];
@@ -2998,7 +3118,7 @@ export const useChatApp = ({
         pushSystemMessage(
           `Unpinned #${index}: ${removed}\nRemaining pins: ${next.focus.length}`
         );
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -3021,7 +3141,7 @@ export const useChatApp = ({
             { kind: "system_hint", tone: "info", color: "cyan" }
           );
         }
-        setInput("");
+        clearInput();
         return;
       }
 
@@ -3029,126 +3149,140 @@ export const useChatApp = ({
         const targetId = query.slice("/resume ".length).trim();
         if (!targetId) {
           pushSystemMessage("Usage: /resume <session_id>");
-          setInput("");
+          clearInput();
           return;
         }
 
         await loadSessionIntoChat(targetId);
-        setInput("");
+        clearInput();
         return;
       }
 
       setItems(previous => [
         ...previous,
-        { role: "user", text: query, kind: "transcript", tone: "neutral" },
+        { role: "user", text: rawInput, kind: "transcript", tone: "neutral" },
       ]);
       clearLiveAssistantSegment();
-      setInput("");
+      clearInput();
+      setInputCursorOffset(0);
+      preferredInputColumnRef.current = null;
+      setSessionState(null);
+      setStatus("preparing");
 
-      const session = await ensureActiveSession(query);
-      const promptContext = await sessionStore.getPromptContext(session.id, query);
-      const now = new Date().toISOString();
-      await sessionStore.appendMessage(session.id, {
-        role: "user",
-        text: query,
-        createdAt: now,
-      });
+      try {
+        const session = await ensureActiveSession(query);
+        const promptContext = await sessionStore.getPromptContext(
+          session.id,
+          rawInput
+        );
+        const now = new Date().toISOString();
+        await sessionStore.appendMessage(session.id, {
+          role: "user",
+          text: rawInput,
+          createdAt: now,
+        });
 
-      const prompt = buildPromptWithContext(
-        query,
-        systemPrompt,
-        projectPrompt,
-        promptContext
-      );
-      const assistantBufferRef = { current: "" };
+        setStatus("requesting");
+        const prompt = buildPromptWithContext(
+          rawInput,
+          systemPrompt,
+          projectPrompt,
+          promptContext
+        );
+        const assistantBufferRef = { current: "" };
 
-      const runResult = await runQuerySessionImpl({
-        query: prompt,
-        originalTask: query,
-        queryMaxToolSteps,
-        transport,
-        onState: next => {
-          setSessionState(next);
-          setStatus(next.status as ChatStatus);
-        },
-        onTextDelta: text => {
-          assistantBufferRef.current += text;
-          appendToLiveAssistant(text);
-        },
-        onUsage: usage => {
-          accumulateRuntimeUsage(usage, "query");
-        },
-        onToolStatus: message => {
-          pushStreamingSystemMessage(message, {
-            kind: "tool_status",
-            tone: "info",
-            color: "cyan",
-          });
-        },
-        onToolCall: async (toolName, toolInput) => {
-          const result = await mcpService.handleToolCall(toolName, toolInput);
-          if (result.pending) {
-            const reviewMode = isHighRiskReviewAction(result.pending.request.action)
-              ? "block"
-              : "queue";
+        const runResult = await runQuerySessionImpl({
+          query: prompt,
+          originalTask: rawInput,
+          queryMaxToolSteps,
+          transport,
+          onState: next => {
+            setSessionState(next);
+            setStatus(next.status as ChatStatus);
+          },
+          onTextDelta: text => {
+            assistantBufferRef.current += text;
+            appendToLiveAssistant(text);
+          },
+          onUsage: usage => {
+            accumulateRuntimeUsage(usage, "query");
+          },
+          onToolStatus: message => {
+            pushStreamingSystemMessage(message, {
+              kind: "tool_status",
+              tone: "info",
+              color: "cyan",
+            });
+          },
+          onToolCall: async (toolName, toolInput) => {
+            const result = await mcpService.handleToolCall(toolName, toolInput);
+            if (result.pending) {
+              const reviewMode = isHighRiskReviewAction(result.pending.request.action)
+                ? "block"
+                : "queue";
+              pushStreamingSystemMessage(
+                `Approval required | ${result.pending.request.action} ${result.pending.request.path} | ${result.pending.id} | panel opened`,
+                {
+                  kind: "review_status",
+                  tone: reviewMode === "block" ? "warning" : "info",
+                  color: reviewMode === "block" ? "red" : "yellow",
+                }
+              );
+              openApprovalPanel(mcpService.listPending(), {
+                focusLatest: true,
+                previewMode: "summary",
+              });
+              return {
+                message: `Approval required ${result.pending.id} | ${result.pending.request.action} | ${result.pending.request.path}`,
+                reviewMode,
+              };
+            }
+            const summarized = summarizeToolMessage(result.message);
+            pushStreamingSystemMessage(summarized.text, {
+              kind: summarized.kind,
+              tone: summarized.tone,
+              color: summarized.color,
+            });
+            const detail = parseToolDetail(result.message);
+            await recordSessionMemory(session.id, {
+              kind: result.ok ? "tool_result" : "error",
+              text: summarized.text,
+              priority: result.ok ? 72 : 88,
+              entities: {
+                path: detail.path ? [detail.path] : undefined,
+                toolName: detail.action ? [detail.action] : toolName ? [toolName] : undefined,
+                action: detail.action ? [detail.action] : undefined,
+                status: [result.ok ? "ok" : "error"],
+              },
+            });
+            return { message: result.message };
+          },
+          onError: async message => {
             pushStreamingSystemMessage(
-              `Approval required | ${result.pending.request.action} ${result.pending.request.path} | ${result.pending.id} | panel opened`,
+              `Stream error: ${message}`,
               {
-                kind: "review_status",
-                tone: reviewMode === "block" ? "warning" : "info",
-                color: reviewMode === "block" ? "red" : "yellow",
+                kind: "error",
+                tone: "danger",
+                color: "red",
               }
             );
-            openApprovalPanel(mcpService.listPending(), {
-              focusLatest: true,
-              previewMode: "summary",
-            });
-            return {
-              message: `Approval required ${result.pending.id} | ${result.pending.request.action} | ${result.pending.request.path}`,
-              reviewMode,
-            };
-          }
-          const summarized = summarizeToolMessage(result.message);
-          pushStreamingSystemMessage(summarized.text, {
-            kind: summarized.kind,
-            tone: summarized.tone,
-            color: summarized.color,
-          });
-          const detail = parseToolDetail(result.message);
-          await recordSessionMemory(session.id, {
-            kind: result.ok ? "tool_result" : "error",
-            text: summarized.text,
-            priority: result.ok ? 72 : 88,
-            entities: {
-              path: detail.path ? [detail.path] : undefined,
-              toolName: detail.action ? [detail.action] : toolName ? [toolName] : undefined,
-              action: detail.action ? [detail.action] : undefined,
-              status: [result.ok ? "ok" : "error"],
-            },
-          });
-          return { message: result.message };
-        },
-        onError: async message => {
-          pushStreamingSystemMessage(
-            `Stream error: ${message}`,
-            {
+            await recordSessionMemory(session.id, {
               kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          await recordSessionMemory(session.id, {
-            kind: "error",
-            text: `Stream error: ${message}`,
-            priority: 92,
-            entities: {
-              status: ["error"],
-              queryTerms: [query],
-            },
-          });
-        },
-      });
-      await consumeQueryRunResult(session.id, assistantBufferRef, runResult);
+              text: `Stream error: ${message}`,
+              priority: 92,
+              entities: {
+                status: ["error"],
+                queryTerms: [rawInput],
+              },
+            });
+          },
+        });
+        await consumeQueryRunResult(session.id, assistantBufferRef, runResult);
+      } catch (error) {
+        setSessionState(null);
+        setStatus("idle");
+        throw error;
+      }
     });
   };
 
@@ -3167,7 +3301,8 @@ export const useChatApp = ({
   }, [historyCursor, input, inputHistory.length]);
 
   return {
-    input: encodeInputForDisplay(input),
+    input,
+    inputCursorOffset,
     inputCommandState,
     items,
     liveAssistantText,

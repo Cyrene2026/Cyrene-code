@@ -43,6 +43,7 @@ export const ChatCliApp = ({
     items,
     liveAssistantText,
     input,
+    inputCursorOffset,
     inputCommandState,
     status,
     resumePicker,
@@ -117,6 +118,7 @@ export const ChatCliApp = ({
       liveAssistantText={liveAssistantText}
       appRoot={appRoot}
       input={input}
+      inputCursorOffset={inputCursorOffset}
       inputCommandState={inputCommandState}
       status={status}
       resumePicker={resumePicker}

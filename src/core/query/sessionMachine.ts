@@ -1,6 +1,11 @@
 import type { TokenUsage } from "./tokenUsage";
 
-export type QuerySessionStatus = "idle" | "streaming" | "awaiting_review" | "error";
+export type QuerySessionStatus =
+  | "idle"
+  | "requesting"
+  | "streaming"
+  | "awaiting_review"
+  | "error";
 
 export type ToolCallLog = {
   toolName: string;
@@ -17,6 +22,7 @@ export type QuerySessionState = {
 
 type QuerySessionEvent =
   | { type: "start" }
+  | { type: "stream_open" }
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
   | ({ type: "usage" } & TokenUsage)
@@ -39,11 +45,16 @@ export const querySessionReducer = (
   switch (event.type) {
     case "start":
       return {
-        status: "streaming",
+        status: "requesting",
         assistantText: "",
         toolCalls: [],
         errorMessage: null,
         usage: null,
+      };
+    case "stream_open":
+      return {
+        ...state,
+        status: "streaming",
       };
     case "text_delta":
       return {

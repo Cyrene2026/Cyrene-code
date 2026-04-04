@@ -482,8 +482,47 @@ describe("runQuerySession", () => {
     });
 
     expect(result.status).toBe("completed");
+    expect(states[0]).toEqual({ status: "requesting", totalTokens: null });
     expect(states).toContainEqual({ status: "streaming", totalTokens: 19 });
     expect(states.at(-1)).toEqual({ status: "idle", totalTokens: 19 });
+  });
+
+  test("returns from requesting to idle when the stream completes without content chunks", async () => {
+    const transport: QueryTransport = {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({
+        ok: true,
+        message: `provider ${provider}`,
+        currentProvider: provider,
+        providers: [provider],
+        models: ["gpt-test"],
+      }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async () => "stream://1",
+      stream: async function* () {
+        yield JSON.stringify({ type: "done" });
+      },
+    };
+
+    const states: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      transport,
+      onState: state => {
+        states.push(state.status);
+      },
+      onTextDelta: () => {},
+      onToolCall: async () => ({ message: "ok" }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(states).toEqual(["requesting", "idle"]);
   });
 
   test("emits a visible tool status before awaiting tool execution", async () => {

@@ -33,6 +33,11 @@ export type RunQuerySessionResult =
       resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
     };
 
+type ConfirmedFileMutation = {
+  action: "create_file" | "write_file" | "edit_file" | "apply_patch";
+  path: string;
+};
+
 const getToolAction = (toolName: string, input: unknown) => {
   if (
     input &&
@@ -93,6 +98,13 @@ const MUTATING_FILE_ACTIONS = new Set([
   "move_path",
 ]);
 
+const CONTENT_MUTATING_FILE_ACTIONS = new Set([
+  "create_file",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+]);
+
 const MUTATION_RESULT_MARKERS = [
   "Created file:",
   "Created directory:",
@@ -126,6 +138,9 @@ const isFilesystemBoundFileAction = (toolName: string, input: unknown) =>
 const isMutatingFileAction = (toolName: string, input: unknown) =>
   MUTATING_FILE_ACTIONS.has(getToolAction(toolName, input));
 
+const isContentMutatingFileAction = (toolName: string, input: unknown) =>
+  CONTENT_MUTATING_FILE_ACTIONS.has(getToolAction(toolName, input));
+
 const didApplyFileMutation = (
   toolName: string,
   input: unknown,
@@ -133,6 +148,49 @@ const didApplyFileMutation = (
 ) =>
   isMutatingFileAction(toolName, input) &&
   MUTATION_RESULT_MARKERS.some(marker => message.includes(marker));
+
+const normalizeComparedPath = (path: string) =>
+  path
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\/$/, "");
+
+const getConfirmedFileMutation = (
+  toolName: string,
+  input: unknown,
+  message: string
+): ConfirmedFileMutation | null => {
+  if (
+    !didApplyFileMutation(toolName, input, message) ||
+    !isContentMutatingFileAction(toolName, input)
+  ) {
+    return null;
+  }
+
+  const path = getToolPath(input);
+  const action = getToolAction(toolName, input);
+  if (!path || !CONTENT_MUTATING_FILE_ACTIONS.has(action)) {
+    return null;
+  }
+
+  return {
+    action: action as ConfirmedFileMutation["action"],
+    path,
+  };
+};
+
+const pushRecentConfirmedFileMutation = (
+  recentMutations: ConfirmedFileMutation[],
+  mutation: ConfirmedFileMutation
+) => {
+  const normalizedPath = normalizeComparedPath(mutation.path);
+  const filtered = recentMutations.filter(
+    entry => normalizeComparedPath(entry.path) !== normalizedPath
+  );
+  return [...filtered, mutation].slice(-4);
+};
 
 const stableSerialize = (value: unknown): string => {
   if (Array.isArray(value)) {
@@ -430,7 +488,56 @@ const taskMentionsEmptyOrMissingContent = (task: string) =>
     task
   );
 
-const buildHeuristicNudges = (originalTask: string, toolResults: string[]) => {
+const taskSuggestsPostWriteVerification = (task: string) =>
+  /(verify|verification|validate|check|inspect|review|show|display|print|confirm|read back|double-check|look at|look over|确认|检查|验证|查看|看看|显示|展示|读一下|读取|核对)/i.test(
+    task
+  );
+
+const isImmediateRedundantPostWriteRead = (
+  toolName: string,
+  input: unknown,
+  latestConfirmedFileMutation: ConfirmedFileMutation | null,
+  originalTask: string
+) => {
+  if (
+    !latestConfirmedFileMutation ||
+    taskSuggestsPostWriteVerification(originalTask) ||
+    !isReadFileAction(toolName, input)
+  ) {
+    return false;
+  }
+
+  const path = getToolPath(input);
+  if (!path) {
+    return false;
+  }
+
+  return (
+    normalizeComparedPath(path) ===
+    normalizeComparedPath(latestConfirmedFileMutation.path)
+  );
+};
+
+const formatRecentConfirmedFileMutations = (
+  recentMutations: ConfirmedFileMutation[]
+) => {
+  if (recentMutations.length === 0) {
+    return "";
+  }
+
+  return recentMutations
+    .map(
+      (mutation, index) =>
+        `${index + 1}. ${mutation.action} ${mutation.path} (confirmed written or updated; continue instead of rereading just to check)`
+    )
+    .join("\n");
+};
+
+const buildHeuristicNudges = (
+  originalTask: string,
+  toolResults: string[],
+  recentConfirmedFileMutations: ConfirmedFileMutation[]
+) => {
   if (toolResults.length === 0) {
     return "";
   }
@@ -439,9 +546,17 @@ const buildHeuristicNudges = (originalTask: string, toolResults: string[]) => {
   const normalizedTask = normalizeForIntent(originalTask);
   const wantsWrite = taskSuggestsWriting(normalizedTask);
   const mentionsEmptyIssue = taskMentionsEmptyOrMissingContent(normalizedTask);
+  const wantsVerification = taskSuggestsPostWriteVerification(originalTask);
   const nudges: string[] = [
     "Continue from the confirmed facts in the tool results above. Do not restart exploration from scratch.",
   ];
+
+  const latestConfirmedMutation = recentConfirmedFileMutations.at(-1);
+  if (latestConfirmedMutation && !wantsVerification) {
+    nudges.push(
+      `The latest successful file mutation already confirmed ${latestConfirmedMutation.path}. Continue the task and do not call read_file on the same path just to verify the write.`
+    );
+  }
 
   if (wantsWrite && recentResults.includes("[confirmed directory state]")) {
     nudges.push(
@@ -484,9 +599,17 @@ const buildHeuristicNudges = (originalTask: string, toolResults: string[]) => {
 const buildRoundPrompt = (
   originalTask: string,
   toolResults: string[],
-  loopCorrection: string
+  loopCorrection: string,
+  recentConfirmedFileMutations: ConfirmedFileMutation[]
 ) => {
-  const heuristicNudges = buildHeuristicNudges(originalTask, toolResults);
+  const heuristicNudges = buildHeuristicNudges(
+    originalTask,
+    toolResults,
+    recentConfirmedFileMutations
+  );
+  const recentMutationFacts = formatRecentConfirmedFileMutations(
+    recentConfirmedFileMutations
+  );
   return [
     "Original user task:",
     originalTask,
@@ -496,11 +619,15 @@ const buildRoundPrompt = (
     "Treat a confirmed directory state as authoritative until a mutation changes it.",
     "Do not call list_dir again for the same path immediately after it was already confirmed.",
     "Treat `(empty file)` from read_file as a confirmed result and do not re-read the same file unless something changed it.",
+    "Treat successful create_file/write_file/edit_file/apply_patch results as confirmed file mutations. Do not immediately call read_file on the same path just to confirm the write unless the user explicitly asked to inspect or verify that file.",
     "Execution style rules:",
     "- Continue directly from the latest confirmed result; do not re-announce the whole plan each step.",
     "- Keep progress narration minimal and non-repetitive. Avoid repeated lines like 'I will now...'.",
     "- For multi-file create/edit tasks, batch similar writes naturally and move forward without repeated preambles.",
     "- Keep assistant wording in the same language as the user request unless the user asks to switch.",
+    recentMutationFacts
+      ? `Recent confirmed file mutations:\n${recentMutationFacts}`
+      : "",
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
     loopCorrection ? `\n${loopCorrection}\n` : "",
     "Tool results:",
@@ -528,6 +655,9 @@ export const runQuerySession = async ({
   let state = createQuerySessionState();
   const task = originalTask ?? query;
   let filesystemMutationRevision = 0;
+  let recentConfirmedFileMutations: ConfirmedFileMutation[] = [];
+  let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
+  let repeatedImmediatePostWriteReadCount = 0;
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
       ? Math.floor(queryMaxToolSteps)
@@ -630,6 +760,44 @@ export const runQuerySession = async ({
             dispatch({ type: "complete" });
             return { status: "completed" };
           }
+          if (
+            isImmediateRedundantPostWriteRead(
+              event.toolName,
+              event.input,
+              latestConfirmedFileMutation,
+              task
+            )
+          ) {
+            const repeatedPath =
+              getToolPath(event.input) ?? latestConfirmedFileMutation?.path ?? ".";
+            repeatedImmediatePostWriteReadCount += 1;
+            const sourceAction = latestConfirmedFileMutation?.action ?? "write_file";
+            loopCorrection = [
+              "Immediate post-write read blocked:",
+              `${repeatedPath} was just updated successfully via ${sourceAction}.`,
+              "Do NOT call read_file on the same path just to confirm the write.",
+              "Continue to the next concrete step unless the user explicitly asked to inspect or verify that file.",
+            ].join("\n");
+            toolResults.push(
+              [
+                `[tool skipped] read_file ${repeatedPath}`,
+                `Skipped redundant read_file for ${repeatedPath} because it was just updated successfully via ${sourceAction}.`,
+                "Treat the successful write result as authoritative and continue the task unless explicit verification is required.",
+              ].join("\n")
+            );
+            if (repeatedImmediatePostWriteReadCount >= 2) {
+              onTextDelta(
+                `\n[tool loop detected] read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write. Stopping to prevent needless rereads.\n`
+              );
+              dispatch({ type: "complete" });
+              return { status: "completed" };
+            }
+            continue;
+          }
+          if (latestConfirmedFileMutation) {
+            latestConfirmedFileMutation = null;
+            repeatedImmediatePostWriteReadCount = 0;
+          }
           dispatch({
             type: "tool_call",
             toolName: event.toolName,
@@ -665,6 +833,19 @@ export const runQuerySession = async ({
             filesystemMutationRevision += 1;
             loopCorrection = "";
           }
+          const confirmedFileMutation = getConfirmedFileMutation(
+            event.toolName,
+            event.input,
+            toolResult.message
+          );
+          if (confirmedFileMutation) {
+            recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
+              recentConfirmedFileMutations,
+              confirmedFileMutation
+            );
+            latestConfirmedFileMutation = confirmedFileMutation;
+            repeatedImmediatePostWriteReadCount = 0;
+          }
           if (toolResult.reviewMode) {
             dispatch({ type: "suspended" });
             return {
@@ -674,6 +855,19 @@ export const runQuerySession = async ({
                   filesystemMutationRevision += 1;
                   loopCorrection = "";
                 }
+                const resumedConfirmedFileMutation = getConfirmedFileMutation(
+                  event.toolName,
+                  event.input,
+                  toolResultMessage
+                );
+                if (resumedConfirmedFileMutation) {
+                  recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
+                    recentConfirmedFileMutations,
+                    resumedConfirmedFileMutation
+                  );
+                  latestConfirmedFileMutation = resumedConfirmedFileMutation;
+                  repeatedImmediatePostWriteReadCount = 0;
+                }
                 const nextToolResults = [
                   ...accumulatedToolResults,
                   ...toolResults,
@@ -682,7 +876,8 @@ export const runQuerySession = async ({
                 const nextPrompt = buildRoundPrompt(
                   task,
                   nextToolResults,
-                  loopCorrection
+                  loopCorrection,
+                  recentConfirmedFileMutations
                 );
                 return runRounds(
                   nextPrompt,
@@ -732,7 +927,12 @@ export const runQuerySession = async ({
     }
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
-    const nextPrompt = buildRoundPrompt(task, accumulatedToolResults, loopCorrection);
+    const nextPrompt = buildRoundPrompt(
+      task,
+      accumulatedToolResults,
+      loopCorrection,
+      recentConfirmedFileMutations
+    );
     return runRounds(
       nextPrompt,
       repeatedToolCallCount,

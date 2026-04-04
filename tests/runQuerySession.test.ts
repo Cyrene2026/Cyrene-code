@@ -272,6 +272,44 @@ const createRoundSequenceTransport = (
   };
 };
 
+const createPromptCaptureRoundSequenceTransport = (
+  rounds: Array<{ toolName: string; input: unknown } | null>
+): { transport: QueryTransport; prompts: string[] } => {
+  const prompts: string[] = [];
+  let streamCount = 0;
+
+  return {
+    prompts,
+    transport: {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async prompt => {
+        prompts.push(prompt);
+        return `stream://${++streamCount}`;
+      },
+      stream: async function* (streamUrl: string) {
+        const index = Number(streamUrl.replace("stream://", "")) - 1;
+        const round = rounds[index] ?? null;
+        if (round) {
+          yield JSON.stringify({
+            type: "tool_call",
+            toolName: round.toolName,
+            input: round.input,
+          });
+        } else {
+          yield JSON.stringify({ type: "text_delta", text: "done" });
+        }
+        yield JSON.stringify({ type: "done" });
+      },
+    },
+  };
+};
+
 describe("runQuerySession", () => {
   test("suspends on pending review and resumes same task with approval result", async () => {
     const { transport, prompts } = createTransport();
@@ -607,6 +645,128 @@ describe("runQuerySession", () => {
 
     expect(result.status).toBe("completed");
     expect(prompts[1]).toContain("Use the discovered path or search hit directly");
+  });
+
+  test("injects confirmed file mutation facts after a successful write", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "write_file", path: "src/app.ts", content: "export const updated = true;\n" },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts and continue the task",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: [
+          "[tool result] write_file src/app.ts",
+          "Wrote file: src/app.ts",
+          "[confirmed file mutation] write_file src/app.ts",
+          "postcondition: file content was updated successfully",
+        ].join("\n"),
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[1]).toContain("Recent confirmed file mutations:");
+    expect(prompts[1]).toContain("write_file src/app.ts");
+    expect(prompts[1]).toContain(
+      "Treat successful create_file/write_file/edit_file/apply_patch results as confirmed file mutations"
+    );
+  });
+
+  test("skips immediate read_file on the same path after a confirmed write", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/app.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts and continue editing other files",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: [
+            "[tool result] write_file src/app.ts",
+            "Wrote file: src/app.ts",
+            "[confirmed file mutation] write_file src/app.ts",
+            "postcondition: file content was updated successfully",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(prompts[2]).toContain("[tool skipped] read_file src/app.ts");
+    expect(prompts[2]).toContain("Skipped redundant read_file for src/app.ts");
+  });
+
+  test("allows immediate read_file after write when the task explicitly asks to verify", async () => {
+    const transport = createRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/app.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "写完 src/app.ts 之后检查内容是否正确",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        if (action === "read_file") {
+          return {
+            message: "[tool result] read_file src/app.ts\nexport const updated = true;",
+          };
+        }
+        return {
+          message: [
+            "[tool result] write_file src/app.ts",
+            "Wrote file: src/app.ts",
+            "[confirmed file mutation] write_file src/app.ts",
+            "postcondition: file content was updated successfully",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file", "read_file"]);
   });
 
   test("stops repeated failed run_command earlier than generic loop guard", async () => {

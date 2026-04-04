@@ -345,6 +345,8 @@ describe("FileMcpService", () => {
 
     expect(approved.ok).toBe(true);
     expect(approved.message).toContain("[approved]");
+    expect(approved.message).toContain("[confirmed file mutation] create_file nested/example.py");
+    expect(approved.message).toContain("postcondition: file now exists and content was written successfully");
     expect(service.listPending()).toHaveLength(0);
 
     const content = await readFile(join(root, "nested", "example.py"), "utf8");
@@ -730,6 +732,8 @@ describe("FileMcpService", () => {
     const approved = await service.approve(queued.pending!.id);
 
     expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("[confirmed file mutation] write_file new-write.txt");
+    expect(approved.message).toContain("next: do not call read_file on this path just to confirm the write");
     expect(await readFile(join(root, "new-write.txt"), "utf8")).toBe("written\n");
   });
 
@@ -1362,6 +1366,7 @@ describe("FileMcpService", () => {
 
     expect(approved.ok).toBe(true);
     expect(approved.message).toContain("Patched file: patch-me.ts");
+    expect(approved.message).toContain("[confirmed file mutation] apply_patch patch-me.ts");
     expect(await readFile(join(root, "patch-me.ts"), "utf8")).toBe("const label = 'after';\n");
   });
 

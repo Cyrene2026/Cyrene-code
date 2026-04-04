@@ -258,6 +258,7 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "Read-file rules:",
   "- If read_file returns `(empty file)`, treat that as a confirmed result rather than retrying the same read.",
   "- Do not repeat read_file for the same path unless a write or edit actually changed that file.",
+  "- After successful create_file, write_file, edit_file, or apply_patch, treat that result as a confirmed mutation. Do not immediately call read_file on the same path just to confirm the write unless the user explicitly asked to inspect or verify it.",
   "Anti-loop rules:",
   "- Do not repeat the same tool call with the same input unless task state materially changed.",
   "- Do not alternate between list_dir and read_file without learning anything new.",

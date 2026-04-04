@@ -277,6 +277,39 @@ const lineNoWidth = 4;
 const clip = (text: string, max = 320) =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
 
+const countTextLines = (text: string) => {
+  if (text.length === 0) {
+    return 0;
+  }
+  const normalized = text.replace(/\r\n/g, "\n");
+  return normalized.endsWith("\n")
+    ? normalized.slice(0, -1).split("\n").length
+    : normalized.split("\n").length;
+};
+
+const formatConfirmedFileMutationReceipt = (
+  action: "create_file" | "write_file" | "edit_file" | "apply_patch",
+  path: string,
+  content: string,
+  postcondition: string
+) =>
+  [
+    `${
+      action === "create_file"
+        ? "Created file"
+        : action === "write_file"
+          ? "Wrote file"
+          : action === "edit_file"
+            ? "Edited file"
+            : "Patched file"
+    }: ${path}`,
+    `[confirmed file mutation] ${action} ${path}`,
+    `postcondition: ${postcondition}`,
+    `bytes: ${Buffer.byteLength(content, "utf8")}`,
+    `lines: ${countTextLines(content)}`,
+    "next: do not call read_file on this path just to confirm the write; continue unless explicit verification is required",
+  ].join("\n");
+
 const lineNumberAtIndex = (text: string, index: number) =>
   text.slice(0, Math.max(0, index)).split("\n").length;
 
@@ -4504,15 +4537,21 @@ export class FileMcpService {
       case "git_blame":
         return this.executeGitBlame(request);
       case "create_file": {
+        const content = request.content ?? "";
         await mkdir(dirname(abs), { recursive: true });
-        await writeFile(abs, request.content ?? "", { flag: "wx" });
+        await writeFile(abs, content, { flag: "wx" });
         this.pushUndoEntry({
           kind: "delete_path",
           path: this.normalizeWorkspacePath(request.path),
           sourceAction: request.action,
         });
         this.noteFilesystemMutation();
-        return `Created file: ${request.path}`;
+        return formatConfirmedFileMutationReceipt(
+          request.action,
+          request.path,
+          content,
+          "file now exists and content was written successfully"
+        );
       }
       case "create_dir": {
         const existedBefore = await this.pathExists(request.path);
@@ -4530,8 +4569,9 @@ export class FileMcpService {
       case "write_file": {
         const existedBefore = await this.pathExists(request.path);
         const before = existedBefore ? await readFile(abs) : new Uint8Array();
+        const content = request.content ?? "";
         await mkdir(dirname(abs), { recursive: true });
-        await writeFile(abs, request.content ?? "", "utf8");
+        await writeFile(abs, content, "utf8");
         this.pushUndoEntry({
           kind: "restore_file",
           path: this.normalizeWorkspacePath(request.path),
@@ -4540,7 +4580,14 @@ export class FileMcpService {
           sourceAction: request.action,
         });
         this.noteFilesystemMutation();
-        return `Wrote file: ${request.path}`;
+        return formatConfirmedFileMutationReceipt(
+          request.action,
+          request.path,
+          content,
+          existedBefore
+            ? "file content was overwritten successfully"
+            : "new file was created and written successfully"
+        );
       }
       case "edit_file": {
         const before = await readFile(abs, "utf8");
@@ -4563,7 +4610,12 @@ export class FileMcpService {
           sourceAction: request.action,
         });
         this.noteFilesystemMutation();
-        return `Edited file: ${request.path}`;
+        return formatConfirmedFileMutationReceipt(
+          request.action,
+          request.path,
+          after,
+          "file content was updated successfully"
+        );
       }
       case "apply_patch": {
         const before = await readFile(abs, "utf8");
@@ -4586,7 +4638,12 @@ export class FileMcpService {
           sourceAction: request.action,
         });
         this.noteFilesystemMutation();
-        return `Patched file: ${request.path}`;
+        return formatConfirmedFileMutationReceipt(
+          request.action,
+          request.path,
+          after,
+          "patch was applied successfully and file content was updated"
+        );
       }
       case "delete_file": {
         const before = await readFile(abs);

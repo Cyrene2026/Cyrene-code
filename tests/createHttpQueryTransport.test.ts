@@ -167,6 +167,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If the user asked to create files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Stop exploring once you have enough information to act");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If read_file returns `(empty file)`");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "After successful create_file, write_file, edit_file, or apply_patch, treat that result as a confirmed mutation"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain('set `path` to `"."`');
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Omit every optional field you do not need");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("`args` is only for run_command");

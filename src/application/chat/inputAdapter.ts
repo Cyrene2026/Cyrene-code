@@ -52,6 +52,22 @@ const buildSignature = (event: NormalizedInputEvent) =>
 const isCtrlCharacter = (raw: string) =>
   raw.length === 1 && raw.charCodeAt(0) > 0 && raw.charCodeAt(0) <= 26;
 
+const hasSpecialKey = (key: InputKeyState) =>
+  key.upArrow ||
+  key.downArrow ||
+  key.leftArrow ||
+  key.rightArrow ||
+  key.pageDown ||
+  key.pageUp ||
+  key.return ||
+  key.escape ||
+  key.ctrl ||
+  key.shift ||
+  key.tab ||
+  key.backspace ||
+  key.delete ||
+  key.meta;
+
 export const normalizeRawInputChunk = (
   chunk: Buffer | string
 ): NormalizedInputEvent | null => {
@@ -124,6 +140,18 @@ export const normalizeRawInputChunk = (
   return null;
 };
 
+export const shouldDispatchRawInputEvent = (event: NormalizedInputEvent) => {
+  if (hasSpecialKey(event.key)) {
+    return true;
+  }
+
+  if (!event.input) {
+    return false;
+  }
+
+  return /[\r\n]/.test(event.input);
+};
+
 export const useInputAdapter = (
   handler: InputHandler,
   options?: InputAdapterOptions
@@ -192,7 +220,7 @@ export const useInputAdapter = (
 
     const onData = (data: Buffer | string) => {
       const normalized = normalizeRawInputChunk(data);
-      if (normalized) {
+      if (normalized && shouldDispatchRawInputEvent(normalized)) {
         dispatch(normalized);
       }
     };

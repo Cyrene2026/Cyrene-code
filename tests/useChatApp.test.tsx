@@ -777,6 +777,39 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("does not fire an automatic summary request after a normal turn by default", async () => {
+    const summarizeImpl = mock(async () => ({
+      ok: true as const,
+      text: "OBJECTIVE:\n- should not run",
+    }));
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("single reply");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({ summarizeImpl }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "hello once");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+    expect(summarizeImpl).toHaveBeenCalledTimes(0);
+    expect(app.getLatest().exitSummary.summaryRequestCount).toBe(0);
+    app.cleanup();
+  });
+
   test("/sessions and /resume handle empty and populated session lists", async () => {
     const markdownReply = [
       "## Heading",
@@ -1727,6 +1760,7 @@ describe("useChatApp", () => {
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
+        autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
         runQuerySessionImpl,
       })
@@ -1803,6 +1837,7 @@ describe("useChatApp", () => {
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
+        autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
         runQuerySessionImpl: runExisting,
       })
@@ -1837,6 +1872,7 @@ describe("useChatApp", () => {
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
+        autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
         runQuerySessionImpl: runFailure,
       })
@@ -1896,6 +1932,7 @@ describe("useChatApp", () => {
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
+        autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
         runQuerySessionImpl,
       })
@@ -1975,6 +2012,7 @@ describe("useChatApp", () => {
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
+        autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
         runQuerySessionImpl,
       })

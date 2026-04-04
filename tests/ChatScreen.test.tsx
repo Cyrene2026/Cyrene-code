@@ -405,6 +405,32 @@ describe("ChatScreen", () => {
     expect(output).not.toContain("line-2");
   });
 
+  test("wraps long pasted composer lines into continuation rows", () => {
+    const input = "x".repeat(180);
+    const tree = renderScreen({
+      items: [],
+      input,
+      inputCursorOffset: input.length,
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain(">");
+    expect(output).toContain("│");
+  });
+
+  test("wraps mixed-width pasted composer lines without losing CJK text", () => {
+    const input = "这是一个很长的中文粘贴段落".repeat(12);
+    const tree = renderScreen({
+      items: [],
+      input,
+      inputCursorOffset: input.length,
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("这是一个很长的中文粘贴段落");
+    expect(output).toContain("│");
+  });
+
   test("renders token metrics when usage is available", () => {
     const tree = renderScreen({
       usage: {

@@ -1,5 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
+import stringWidth from "string-width";
 import {
   clampCursorOffset,
   getCursorPosition,
@@ -134,6 +135,19 @@ type RenderClipOptions = {
   preferTail?: boolean;
 };
 
+type WrappedComposerSegment = {
+  text: string;
+  startOffset: number;
+  endOffset: number;
+};
+
+type ComposerVisualRow = {
+  prefix: string;
+  text: string;
+  isCursorRow: boolean;
+  cursorColumn: number;
+};
+
 type ComposerTone = {
   borderColor: "gray" | "cyan" | "yellow" | "magenta" | "red";
   panelBorderColor: "cyan" | "yellow" | "magenta" | "red";
@@ -170,6 +184,10 @@ const ENABLE_STREAMING_ANIMATION =
 const DEFAULT_COMPOSER_HINT = "Ctrl+D send  |  Enter newline  |  / commands";
 const MAX_COMPOSER_VISIBLE_LINES = 6;
 const COMPOSER_CURSOR_GLYPH = "█";
+const DEFAULT_TERMINAL_COLUMNS = 80;
+const COMPOSER_CHROME_WIDTH = 24;
+const MIN_COMPOSER_WRAP_WIDTH = 16;
+const MAX_COMPOSER_WRAP_WIDTH = 96;
 const APPROVAL_DIFF_ADD_FOREGROUND = "#dcfce7";
 const APPROVAL_DIFF_ADD_BACKGROUND = "#14532d";
 const APPROVAL_DIFF_REMOVE_FOREGROUND = "#fee2e2";
@@ -1348,22 +1366,127 @@ const getComposerHelperText = (
 };
 
 const getComposerWindow = (input: string, inputCursorOffset: number) => {
+  const wrapWidth = Math.max(
+    MIN_COMPOSER_WRAP_WIDTH,
+    Math.min(
+      MAX_COMPOSER_WRAP_WIDTH,
+      (process.stdout.columns ?? DEFAULT_TERMINAL_COLUMNS) - COMPOSER_CHROME_WIDTH
+    )
+  );
   const lines = getInputLines(input);
   const clampedCursorOffset = clampCursorOffset(input, inputCursorOffset);
   const cursorPosition = getCursorPosition(input, clampedCursorOffset);
-  const visibleCount = Math.min(MAX_COMPOSER_VISIBLE_LINES, lines.length);
-  const maxStart = Math.max(0, lines.length - visibleCount);
+  const visualRows: ComposerVisualRow[] = [];
+  let cursorVisualRow = 0;
+
+  const splitIntoGraphemes = (value: string) => {
+    if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+      const segmenter = new Intl.Segmenter(undefined, {
+        granularity: "grapheme",
+      });
+      return Array.from(segmenter.segment(value), segment => segment.segment);
+    }
+
+    return Array.from(value);
+  };
+
+  const splitLine = (line: string): WrappedComposerSegment[] => {
+    if (!line) {
+      return [{ text: "", startOffset: 0, endOffset: 0 }];
+    }
+
+    const graphemes = splitIntoGraphemes(line);
+    const segments: WrappedComposerSegment[] = [];
+    let currentText = "";
+    let currentWidth = 0;
+    let currentOffset = 0;
+    let segmentStartOffset = 0;
+
+    for (const grapheme of graphemes) {
+      const graphemeWidth = Math.max(1, stringWidth(grapheme));
+      const nextOffset = currentOffset + grapheme.length;
+
+      if (currentText && currentWidth + graphemeWidth > wrapWidth) {
+        segments.push({
+          text: currentText,
+          startOffset: segmentStartOffset,
+          endOffset: currentOffset,
+        });
+        currentText = grapheme;
+        currentWidth = graphemeWidth;
+        segmentStartOffset = currentOffset;
+      } else {
+        currentText += grapheme;
+        currentWidth += graphemeWidth;
+      }
+
+      currentOffset = nextOffset;
+    }
+
+    segments.push({
+      text: currentText,
+      startOffset: segmentStartOffset,
+      endOffset: currentOffset,
+    });
+
+    if (segments.length === 0) {
+      segments.push({
+        text: "",
+        startOffset: 0,
+        endOffset: 0,
+      });
+    }
+
+    return segments;
+  };
+
+  lines.forEach((line, logicalLineIndex) => {
+    const wrappedSegments = splitLine(line);
+    const cursorSegmentIndex =
+      logicalLineIndex === cursorPosition.line
+        ? wrappedSegments.findIndex((segment, segmentIndex) => {
+            const isLastSegment = segmentIndex === wrappedSegments.length - 1;
+            return (
+              cursorPosition.column >= segment.startOffset &&
+              (cursorPosition.column < segment.endOffset ||
+                (isLastSegment && cursorPosition.column === segment.endOffset))
+            );
+          })
+        : -1;
+
+    wrappedSegments.forEach((segment, segmentIndex) => {
+      const isCursorRow =
+        logicalLineIndex === cursorPosition.line &&
+        segmentIndex === Math.max(0, cursorSegmentIndex);
+
+      if (isCursorRow) {
+        cursorVisualRow = visualRows.length;
+      }
+
+      visualRows.push({
+        prefix:
+          logicalLineIndex === 0 && segmentIndex === 0
+            ? ">"
+            : "│",
+        text: segment.text,
+        isCursorRow,
+        cursorColumn: isCursorRow
+          ? Math.max(0, cursorPosition.column - segment.startOffset)
+          : 0,
+      });
+    });
+  });
+
+  const visibleCount = Math.min(MAX_COMPOSER_VISIBLE_LINES, visualRows.length);
+  const maxStart = Math.max(0, visualRows.length - visibleCount);
   const startLine = Math.min(
-    Math.max(0, cursorPosition.line - visibleCount + 1),
+    Math.max(0, cursorVisualRow - visibleCount + 1),
     maxStart
   );
   const endLine = startLine + visibleCount;
 
   return {
-    lines: lines.slice(startLine, endLine),
-    startLine,
-    cursorLine: cursorPosition.line,
-    cursorColumn: cursorPosition.column,
+    rows: visualRows.slice(startLine, endLine),
   };
 };
 
@@ -1380,7 +1503,7 @@ const renderComposerCursorLine = (
   return (
     <Box>
       {before ? <Text>{before}</Text> : null}
-      <Text color="black" backgroundColor={color}>
+      <Text color={color} backgroundColor="white">
         {cursorChar === " " ? COMPOSER_CURSOR_GLYPH : cursorChar}
       </Text>
       {after ? <Text>{after}</Text> : null}
@@ -1490,26 +1613,22 @@ const renderMainComposer = (
           flexDirection="column"
         >
           {input ? (
-            composerWindow.lines.map((line, visibleIndex) => {
-              const actualLineIndex = composerWindow.startLine + visibleIndex;
-              const isCursorLine = actualLineIndex === composerWindow.cursorLine;
-              const prefix = actualLineIndex === 0 ? ">" : "│";
-
+            composerWindow.rows.map((row, visibleIndex) => {
               return (
-                <Box key={`composer-line-${actualLineIndex}`}>
+                <Box key={`composer-line-${visibleIndex}`}>
                   <Text bold color={tone.promptColor}>
-                    {prefix}
+                    {row.prefix}
                   </Text>
                   <Text> </Text>
                   <Box flexGrow={1}>
-                    {isCursorLine ? (
+                    {row.isCursorRow ? (
                       renderComposerCursorLine(
-                        line,
-                        composerWindow.cursorColumn,
+                        row.text,
+                        row.cursorColumn,
                         tone.promptColor
                       )
                     ) : (
-                      <Text>{line || " "}</Text>
+                      <Text>{row.text || " "}</Text>
                     )}
                   </Box>
                 </Box>
@@ -1522,7 +1641,7 @@ const renderMainComposer = (
               </Text>
               <Text> </Text>
               <Box flexGrow={1}>
-                <Text color="black" backgroundColor={tone.promptColor}>
+                <Text color={tone.promptColor} backgroundColor="white">
                   {COMPOSER_CURSOR_GLYPH}
                 </Text>
                 <Text dimColor>{placeholder}</Text>

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeRawInputChunk } from "../src/application/chat/inputAdapter";
+import {
+  normalizeRawInputChunk,
+  shouldDispatchRawInputEvent,
+} from "../src/application/chat/inputAdapter";
 
 describe("inputAdapter", () => {
   test("normalizes common approval hotkeys from raw stdin chunks", () => {
@@ -81,5 +84,75 @@ describe("inputAdapter", () => {
         ctrl: false,
       }),
     });
+  });
+
+  test("raw stdin dispatch ignores plain printable characters that ink already handles", () => {
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "你",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(false);
+  });
+
+  test("raw stdin dispatch still allows multiline paste and control chords", () => {
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "第一行\n第二行",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(true);
+
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "d",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: true,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(true);
   });
 });

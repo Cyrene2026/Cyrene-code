@@ -49,6 +49,7 @@ type UseChatAppParams = {
   defaultSystemPrompt: string;
   projectPrompt: string;
   pinMaxCount: number;
+  autoSummaryRefresh?: boolean;
   queryMaxToolSteps?: number;
   mcpService: FileMcpService;
   runQuerySessionImpl?: typeof runQuerySession;
@@ -495,6 +496,7 @@ export const useChatApp = ({
   defaultSystemPrompt,
   projectPrompt,
   pinMaxCount,
+  autoSummaryRefresh = false,
   queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   mcpService,
   runQuerySessionImpl = runQuerySession,
@@ -974,7 +976,7 @@ export const useChatApp = ({
     suspendedTaskRef.current?.sessionId ?? activeSessionId;
 
   const scheduleSessionSummaryRefresh = (sessionId: string) => {
-    if (!transport.summarizeText) {
+    if (!autoSummaryRefresh || !transport.summarizeText) {
       return;
     }
     if (summaryRefreshInFlightRef.current.has(sessionId)) {

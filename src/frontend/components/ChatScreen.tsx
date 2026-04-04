@@ -133,6 +133,7 @@ type RenderClipOptions = {
   maxLines?: number;
   maxChars?: number;
   preferTail?: boolean;
+  suppressNotice?: boolean;
 };
 
 type WrappedComposerSegment = {
@@ -178,9 +179,7 @@ const STARTUP_WORDMARK = [
 ];
 const SPINNER_FRAMES = ["·", "•", "●", "•"];
 const STREAMING_IDLE_GLYPH = "●";
-const ENABLE_STREAMING_ANIMATION =
-  process.env.CYRENE_ANIMATE_STREAMING === "1" ||
-  (process.env.CYRENE_ANIMATE_STREAMING !== "0" && process.platform !== "win32");
+const ENABLE_STREAMING_ANIMATION = process.env.CYRENE_ANIMATE_STREAMING === "1";
 const DEFAULT_COMPOSER_HINT = "Ctrl+D send  |  Enter newline  |  / commands";
 const MAX_COMPOSER_VISIBLE_LINES = 6;
 const COMPOSER_CURSOR_GLYPH = "█";
@@ -1100,7 +1099,9 @@ const renderMessageItem = (
   }
 
   const clip = clipTextForRender(item.text, clipOptions);
-  const clipNotice = formatRenderClipNotice(clip, clipOptions);
+  const clipNotice = clipOptions.suppressNotice
+    ? ""
+    : formatRenderClipNotice(clip, clipOptions);
   const color = resolveItemColor(item);
   const terminalTranscript = parseTerminalTranscript({
     ...item,
@@ -2815,6 +2816,10 @@ export const ChatScreen = ({
     () => (showStartupView ? getTranscriptWindow([]) : getTranscriptWindow(items)),
     [items, showStartupView]
   );
+  const showTranscriptWindowNotice =
+    transcriptWindow.hiddenCount > 0 &&
+    !liveAssistantText &&
+    !(status === "preparing" || status === "requesting" || status === "streaming");
   const transcriptNodes = React.useMemo(
     () =>
       transcriptWindow.items.map((item, index) =>
@@ -2837,6 +2842,7 @@ export const ChatScreen = ({
               preferTail: true,
               maxLines: MAX_STREAMING_RENDER_TEXT_LINES,
               maxChars: MAX_STREAMING_RENDER_TEXT_CHARS,
+              suppressNotice: true,
             }
           )
         : null,
@@ -2853,6 +2859,56 @@ export const ChatScreen = ({
   const pendingSummary = pendingReviews[approvalPanel.selectedIndex]
     ? `${pendingReviews[approvalPanel.selectedIndex]?.request.action}  |  ${pendingReviews[approvalPanel.selectedIndex]?.request.path}`
     : "no active review";
+  const shellHeaderNode = React.useMemo(
+    () =>
+      renderShellHeader(
+        status,
+        activeSessionId,
+        currentModel,
+        currentProvider,
+        appRoot,
+        usage,
+        pendingReviews.length,
+        activePanel,
+        spinner
+      ),
+    [
+      activePanel,
+      activeSessionId,
+      appRoot,
+      currentModel,
+      currentProvider,
+      pendingReviews.length,
+      spinner,
+      status,
+      usage,
+    ]
+  );
+  const composerNode = React.useMemo(
+    () =>
+      renderMainComposer(
+        status,
+        input,
+        inputCursorOffset,
+        onInputChange,
+        onSubmit,
+        isPanelActive,
+        showStartupView,
+        inputCommandState,
+        suggestionSummary
+      ),
+    [
+      input,
+      inputCommandState,
+      inputCursorOffset,
+      isPanelActive,
+      onInputChange,
+      onSubmit,
+      showStartupView,
+      status,
+      suggestionSummary,
+    ]
+  );
 
   if (approvalModeActive) {
     return (
@@ -2870,22 +2926,12 @@ export const ChatScreen = ({
 
   return (
     <Box flexDirection="column">
-      {renderShellHeader(
-        status,
-        activeSessionId,
-        currentModel,
-        currentProvider,
-        appRoot,
-        usage,
-        pendingReviews.length,
-        activePanel,
-        spinner
-      )}
+      {shellHeaderNode}
       <Box marginBottom={SECTION_GAP} flexDirection="column">
         {showStartupView
           ? renderStartupView(currentModel, currentProvider, activeSessionId)
           : null}
-        {transcriptWindow.hiddenCount > 0 ? (
+        {showTranscriptWindowNotice ? (
           <Text dimColor>
             {`[render window] showing latest ${transcriptWindow.items.length} of ${items.length} messages`}
           </Text>
@@ -3011,17 +3057,7 @@ export const ChatScreen = ({
           )
         : null}
 
-      {renderMainComposer(
-        status,
-        input,
-        inputCursorOffset,
-        onInputChange,
-        onSubmit,
-        isPanelActive,
-        showStartupView,
-        inputCommandState,
-        suggestionSummary
-      )}
+      {composerNode}
     </Box>
   );
 };

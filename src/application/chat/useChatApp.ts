@@ -5,18 +5,22 @@ import {
 } from "../../core/query/runQuerySession";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
-import { compressContext } from "../../core/session/contextCompression";
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
 import {
-  WORKING_STATE_SECTION_ORDER,
-  repairWorkingStateSummary,
-} from "../../core/session/workingState";
+  applyParsedStateUpdate,
+  parseAssistantStateUpdate,
+  type ReducerMode,
+} from "../../core/session/stateReducer";
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type { QueryTransport } from "../../core/query/transport";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
-import type { SessionListItem, SessionRecord } from "../../core/session/types";
+import type {
+  SessionListItem,
+  SessionRecord,
+  SessionStateUpdateDiagnostic,
+} from "../../core/session/types";
 import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
 import type { MpcAction, PendingReviewItem } from "../../core/tools/mcp/types";
 import { createApprovalActionLock } from "./approvalActionLock";
@@ -126,7 +130,7 @@ type RuntimeUsageSummary = {
   activeSessionId: string | null;
   currentModel: string;
   requestCount: number;
-  summaryRequestCount: number;
+  stateUpdateCount: number;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
@@ -138,13 +142,7 @@ const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
-const SUMMARY_RECENT_KEEP = 8;
 const STREAMING_RENDER_BATCH_MS = 40;
-const SUMMARY_TRIGGER_MESSAGE_COUNT = SUMMARY_RECENT_KEEP + 1;
-const SUMMARY_TRIGGER_CHAR_THRESHOLD = 1200;
-const SUMMARY_RECENT_MESSAGE_LIMIT = 16;
-const SUMMARY_RECENT_CHAR_BUDGET = 12000;
-const SUMMARY_RECENT_LINE_LIMIT = 320;
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
   { command: "/provider", description: "open provider picker" },
@@ -229,86 +227,6 @@ const getSlashSuggestions = (rawInput: string) => {
 
   return matches.slice(0, 6);
 };
-
-const shouldRefreshSessionSummary = (session: SessionRecord) => {
-  if (session.summary.trim()) {
-    return false;
-  }
-
-  const nonSystemMessages = session.messages.filter(message => message.role !== "system");
-  if (nonSystemMessages.length >= SUMMARY_TRIGGER_MESSAGE_COUNT) {
-    return true;
-  }
-
-  const totalChars = nonSystemMessages.reduce(
-    (count, message) => count + message.text.length,
-    0
-  );
-  return totalChars >= SUMMARY_TRIGGER_CHAR_THRESHOLD;
-};
-
-const clipSummaryPromptLine = (text: string, max = SUMMARY_RECENT_LINE_LIMIT) => {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (normalized.length <= max) {
-    return normalized;
-  }
-  return `${normalized.slice(0, max)}...`;
-};
-
-const buildSummaryPrompt = (session: SessionRecord) => {
-  const compressed = compressContext(session.messages, SUMMARY_RECENT_KEEP, 6);
-  const recentMessages = session.messages
-    .filter(message => message.role !== "system")
-    .slice(-SUMMARY_RECENT_MESSAGE_LIMIT);
-  const recentLines: string[] = [];
-  let charBudget = 0;
-
-  for (const message of recentMessages) {
-    const normalized = message.text.trim();
-    if (!normalized) {
-      continue;
-    }
-    const line = `${message.role.toUpperCase()}: ${clipSummaryPromptLine(normalized)}`;
-    if (
-      recentLines.length > 0 &&
-      charBudget + line.length > SUMMARY_RECENT_CHAR_BUDGET
-    ) {
-      break;
-    }
-    recentLines.push(line);
-    charBudget += line.length;
-  }
-
-  return [
-    "Reduce the prior conversation into a durable working-state record.",
-    "Output Markdown only. Use exactly these section headings, in this exact order:",
-    ...WORKING_STATE_SECTION_ORDER.map(section => `- ${section}:`),
-    "Under each heading, write 1-5 short bullet points. If nothing is known, write `- (none)`.",
-    "This is a state reducer, not a narrative summary.",
-    "Preserve explicit counts, filenames, tool names, approvals, failures, completed work, and remaining work when known.",
-    "Prefer confirmed facts over guesses. Do not add prose paragraphs, code fences, speculation, or any new information.",
-    "",
-    "Deterministic fallback summary:",
-    compressed.summary || "(none)",
-    "",
-    "Recent conversation tail:",
-    recentLines.join("\n") || "(none)",
-  ].join("\n");
-};
-
-const buildSummaryUsageHint = (
-  usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  } | null
-) =>
-  usage
-    ? `summary updated | prompt ${usage.promptTokens} | completion ${usage.completionTokens} | total ${usage.totalTokens}`
-    : "summary updated";
-
-const buildSummaryRepairFallback = (session: SessionRecord) =>
-  compressContext(session.messages, SUMMARY_RECENT_KEEP, 6).summary;
 
 const isLikelyLegacyCompressedMarkdown = (text: string) => {
   if (text.includes("\n")) {
@@ -471,7 +389,7 @@ const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
   activeSessionId: null,
   currentModel: model,
   requestCount: 0,
-  summaryRequestCount: 0,
+  stateUpdateCount: 0,
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
@@ -479,12 +397,10 @@ const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
 
 const addUsageToRuntimeSummary = (
   summary: RuntimeUsageSummary,
-  usage: TokenUsage,
-  source: "query" | "summary"
+  usage: TokenUsage
 ): RuntimeUsageSummary => ({
   ...summary,
-  requestCount: summary.requestCount + (source === "query" ? 1 : 0),
-  summaryRequestCount: summary.summaryRequestCount + (source === "summary" ? 1 : 0),
+  requestCount: summary.requestCount + 1,
   promptTokens: summary.promptTokens + usage.promptTokens,
   completionTokens: summary.completionTokens + usage.completionTokens,
   totalTokens: summary.totalTokens + usage.totalTokens,
@@ -579,12 +495,12 @@ export const useChatApp = ({
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
-  const summaryRefreshInFlightRef = useRef(new Set<string>());
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
   const inputDraftRef = useRef("");
   const preferredInputColumnRef = useRef<number | null>(null);
+  const liveAssistantRawTextRef = useRef("");
   const liveAssistantTextRef = useRef("");
   const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveAssistantRenderedTextRef = useRef("");
@@ -658,10 +574,15 @@ export const useChatApp = ({
     );
   };
 
-  const accumulateRuntimeUsage = (usage: TokenUsage, source: "query" | "summary") => {
-    setRuntimeUsageSummary(previous =>
-      addUsageToRuntimeSummary(previous, usage, source)
-    );
+  const accumulateRuntimeUsage = (usage: TokenUsage) => {
+    setRuntimeUsageSummary(previous => addUsageToRuntimeSummary(previous, usage));
+  };
+
+  const incrementStateUpdateCount = () => {
+    setRuntimeUsageSummary(previous => ({
+      ...previous,
+      stateUpdateCount: previous.stateUpdateCount + 1,
+    }));
   };
 
   const enqueueTask = (task: () => Promise<void> | void) => {
@@ -869,6 +790,7 @@ export const useChatApp = ({
 
   const clearLiveAssistantSegment = () => {
     cancelLiveAssistantRender();
+    liveAssistantRawTextRef.current = "";
     liveAssistantTextRef.current = "";
     liveAssistantRenderedTextRef.current = "";
     liveAssistantLastFlushAtRef.current = 0;
@@ -975,42 +897,107 @@ export const useChatApp = ({
   const getMemorySessionId = () =>
     suspendedTaskRef.current?.sessionId ?? activeSessionId;
 
-  const scheduleSessionSummaryRefresh = (sessionId: string) => {
-    if (!autoSummaryRefresh || !transport.summarizeText) {
-      return;
+  const syncInFlightTurn = async (
+    sessionId: string,
+    inFlightTurn: SessionRecord["inFlightTurn"]
+  ) => {
+    try {
+      await sessionStore.updateInFlightTurn(sessionId, inFlightTurn);
+    } catch {
+      // Recovery snapshots should not break the main chat flow.
     }
-    if (summaryRefreshInFlightRef.current.has(sessionId)) {
-      return;
-    }
-    summaryRefreshInFlightRef.current.add(sessionId);
-    void (async () => {
-      try {
-        const latest = await sessionStore.loadSession(sessionId);
-        if (!latest) {
-          return;
-        }
-        await maybeRefreshSessionSummary(latest);
-      } catch {
-        // Summary refresh is best-effort and must never block the main chat flow.
-      } finally {
-        summaryRefreshInFlightRef.current.delete(sessionId);
-      }
-    })();
   };
 
   const finalizeAssistantBuffer = async (
     sessionId: string,
     assistantBuffer: string
   ) => {
-    if (!assistantBuffer.trim()) {
-      return;
+    const parsed = parseAssistantStateUpdate(assistantBuffer);
+    const visibleAssistantText = parsed.visibleText.trim();
+    const diagnosticTime = new Date().toISOString();
+
+    if (visibleAssistantText) {
+      await sessionStore.appendMessage(sessionId, {
+        role: "assistant",
+        text: visibleAssistantText,
+        createdAt: diagnosticTime,
+      });
     }
 
-    await sessionStore.appendMessage(sessionId, {
-      role: "assistant",
-      text: assistantBuffer,
-      createdAt: new Date().toISOString(),
-    });
+    const latest = await sessionStore.loadSession(sessionId);
+    if (latest) {
+      let nextSummary = latest.summary;
+      let nextPendingDigest = latest.pendingDigest;
+      let diagnostic: SessionStateUpdateDiagnostic;
+
+      const createDiagnostic = (
+        code: SessionStateUpdateDiagnostic["code"],
+        message: string,
+        reducerMode?: SessionStateUpdateDiagnostic["reducerMode"]
+      ): SessionStateUpdateDiagnostic => ({
+        code,
+        message,
+        updatedAt: diagnosticTime,
+        reducerMode,
+        summaryLength: nextSummary.trim().length,
+        pendingDigestLength: nextPendingDigest.trim().length,
+      });
+
+      if (!autoSummaryRefresh) {
+        diagnostic = createDiagnostic(
+          "disabled",
+          "Reducer disabled for this turn because autoSummaryRefresh=false."
+        );
+      } else if (parsed.parseStatus === "missing_tag") {
+        diagnostic = createDiagnostic(
+          "missing_tag",
+          "Assistant reply finished without a <cyrene_state_update> block."
+        );
+      } else if (parsed.parseStatus === "incomplete_tag") {
+        diagnostic = createDiagnostic(
+          "incomplete_tag",
+          "Assistant reply started a <cyrene_state_update> block, but it did not complete before the turn ended."
+        );
+      } else if (parsed.parseStatus === "empty_payload") {
+        diagnostic = createDiagnostic(
+          "empty_payload",
+          "Assistant reply included an empty <cyrene_state_update> payload."
+        );
+      } else if (parsed.parseStatus === "invalid_payload") {
+        diagnostic = createDiagnostic(
+          "invalid_payload",
+          "Assistant reply included a <cyrene_state_update> block, but the JSON payload was invalid."
+        );
+      } else {
+        const applied = applyParsedStateUpdate({
+          durableSummary: latest.summary,
+          pendingDigest: latest.pendingDigest,
+          update: parsed.update,
+        });
+        nextSummary = applied.summary;
+        nextPendingDigest = applied.pendingDigest;
+        diagnostic = createDiagnostic(
+          nextSummary.trim() || nextPendingDigest.trim()
+            ? "applied"
+            : "applied_empty_state",
+          nextSummary.trim() || nextPendingDigest.trim()
+            ? `State update applied in ${parsed.update?.mode}.`
+            : `State update applied in ${parsed.update?.mode}, but it produced empty durable state.`,
+          parsed.update?.mode
+        );
+        if (applied.updated) {
+          incrementStateUpdateCount();
+        }
+      }
+
+      await sessionStore.updateWorkingState(sessionId, {
+        summary: nextSummary,
+        pendingDigest: nextPendingDigest,
+        lastStateUpdate: diagnostic,
+      });
+    }
+
+    await syncInFlightTurn(sessionId, null);
   };
 
   const consumeQueryRunResult = async (
@@ -1033,7 +1020,6 @@ export const useChatApp = ({
         clearLiveAssistantSegment();
       }
       await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
-      scheduleSessionSummaryRefresh(sessionId);
       return;
     }
 
@@ -1078,63 +1064,25 @@ export const useChatApp = ({
     return created;
   };
 
-  const maybeRefreshSessionSummary = async (session: SessionRecord) => {
-    let nextSession = session;
-    const existingSummary = session.summary.trim();
-    if (existingSummary) {
-      const repairedExisting = repairWorkingStateSummary(
-        existingSummary,
-        buildSummaryRepairFallback(session)
-      );
-      if (repairedExisting !== existingSummary) {
-        nextSession = await sessionStore.updateSummary(session.id, repairedExisting);
-      }
-    }
-
-    if (!transport.summarizeText || !shouldRefreshSessionSummary(nextSession)) {
-      return nextSession;
-    }
-
-    const summaryResult = await transport.summarizeText(
-      buildSummaryPrompt(nextSession)
-    );
-    if (summaryResult.usage) {
-      accumulateRuntimeUsage(summaryResult.usage, "summary");
-    }
-    if (!summaryResult.ok || !summaryResult.text?.trim()) {
-      return nextSession;
-    }
-
-    const repairedSummary = repairWorkingStateSummary(
-      summaryResult.text.trim(),
-      buildSummaryRepairFallback(nextSession)
-    );
-    const updated = await sessionStore.updateSummary(
-      nextSession.id,
-      repairedSummary
-    );
-    pushSystemMessage(buildSummaryUsageHint(summaryResult.usage), {
-      kind: "system_hint",
-      tone: "neutral",
-      color: "gray",
-    });
-    return updated;
-  };
-
-  const appendToLiveAssistant = (text: string) => {
-    if (!text) {
+  const appendToLiveAssistant = (rawAssistantText: string) => {
+    if (!rawAssistantText) {
       return;
     }
-    liveAssistantTextRef.current += text;
+    liveAssistantRawTextRef.current = rawAssistantText;
+    const nextVisible = parseAssistantStateUpdate(rawAssistantText).visibleText;
+    if (nextVisible === liveAssistantTextRef.current) {
+      return;
+    }
+    liveAssistantTextRef.current = nextVisible;
 
     if (!liveAssistantRenderedTextRef.current) {
-      flushLiveAssistantSegment();
+      flushLiveAssistantSegment(nextVisible);
       return;
     }
 
     const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
     if (elapsed >= STREAMING_RENDER_BATCH_MS) {
-      flushLiveAssistantSegment();
+      flushLiveAssistantSegment(nextVisible);
       return;
     }
 
@@ -3171,17 +3119,79 @@ export const useChatApp = ({
       setSessionState(null);
       setStatus("preparing");
 
+      const assistantBufferRef = { current: "" };
+      let recoverySessionId: string | null = null;
+      let recoveryStartedAt = "";
+      let recoveryUserText = rawInput;
+      let inFlightUpdateChain = Promise.resolve();
+      let lastPersistedAssistantText = "";
+      let lastPersistedAt = 0;
+
+      const queueInFlightUpdate = (
+        inFlightTurn: SessionRecord["inFlightTurn"]
+      ) => {
+        if (!recoverySessionId) {
+          return inFlightUpdateChain;
+        }
+        inFlightUpdateChain = inFlightUpdateChain.then(() =>
+          syncInFlightTurn(recoverySessionId!, inFlightTurn)
+        );
+        return inFlightUpdateChain;
+      };
+
+      const getVisibleAssistantText = () =>
+        parseAssistantStateUpdate(assistantBufferRef.current).visibleText.trim();
+
+      const persistInFlightAssistant = async (force = false) => {
+        if (!recoverySessionId || !recoveryStartedAt) {
+          return;
+        }
+
+        const assistantText = getVisibleAssistantText();
+        const nowMs = Date.now();
+        if (
+          !force &&
+          (assistantText === lastPersistedAssistantText ||
+            nowMs - lastPersistedAt < 500)
+        ) {
+          return;
+        }
+
+        lastPersistedAssistantText = assistantText;
+        lastPersistedAt = nowMs;
+        await queueInFlightUpdate({
+          userText: recoveryUserText,
+          assistantText,
+          startedAt: recoveryStartedAt,
+          updatedAt: new Date(nowMs).toISOString(),
+        });
+      };
+
       try {
         const session = await ensureActiveSession(query);
-        const promptContext = await sessionStore.getPromptContext(
+        const promptContextBase = await sessionStore.getPromptContext(
           session.id,
           rawInput
         );
+        const promptContext = autoSummaryRefresh
+          ? promptContextBase
+          : {
+              ...promptContextBase,
+              reducerMode: "disabled" as ReducerMode,
+            };
         const now = new Date().toISOString();
         await sessionStore.appendMessage(session.id, {
           role: "user",
           text: rawInput,
           createdAt: now,
+        });
+        recoverySessionId = session.id;
+        recoveryStartedAt = now;
+        await queueInFlightUpdate({
+          userText: recoveryUserText,
+          assistantText: "",
+          startedAt: now,
+          updatedAt: now,
         });
 
         setStatus("requesting");
@@ -3191,7 +3201,6 @@ export const useChatApp = ({
           projectPrompt,
           promptContext
         );
-        const assistantBufferRef = { current: "" };
 
         const runResult = await runQuerySessionImpl({
           query: prompt,
@@ -3204,10 +3213,11 @@ export const useChatApp = ({
           },
           onTextDelta: text => {
             assistantBufferRef.current += text;
-            appendToLiveAssistant(text);
+            appendToLiveAssistant(assistantBufferRef.current);
+            void persistInFlightAssistant();
           },
           onUsage: usage => {
-            accumulateRuntimeUsage(usage, "query");
+            accumulateRuntimeUsage(usage);
           },
           onToolStatus: message => {
             pushStreamingSystemMessage(message, {
@@ -3275,12 +3285,15 @@ export const useChatApp = ({
               entities: {
                 status: ["error"],
                 queryTerms: [rawInput],
-              },
-            });
+                },
+              });
+            await persistInFlightAssistant(true);
           },
         });
+        await inFlightUpdateChain;
         await consumeQueryRunResult(session.id, assistantBufferRef, runResult);
       } catch (error) {
+        await persistInFlightAssistant(true);
         setSessionState(null);
         setStatus("idle");
         throw error;

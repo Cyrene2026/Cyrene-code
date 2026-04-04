@@ -34,7 +34,7 @@ export const ChatCliApp = ({
     activeSessionId: null,
     currentModel: transport.getModel(),
     requestCount: 0,
-    summaryRequestCount: 0,
+    stateUpdateCount: 0,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
@@ -67,6 +67,7 @@ export const ChatCliApp = ({
     pinMaxCount,
     queryMaxToolSteps,
     mcpService,
+    autoSummaryRefresh: true,
   });
 
   exitSnapshotRef.current = {

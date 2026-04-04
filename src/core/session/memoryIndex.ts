@@ -1,4 +1,6 @@
 import type { SessionMessage } from "./types";
+import type { SessionInFlightTurn } from "./types";
+import type { ReducerMode } from "./stateReducer";
 import {
   WORKING_STATE_SECTION_ORDER,
   parseWorkingStateSummary,
@@ -72,7 +74,12 @@ export type SessionPromptContext = {
   relevantMemories: string[];
   archiveSections?: WorkingStateSectionMap;
   recent: SessionMessage[];
+  durableSummary: string;
+  pendingDigest: string;
   summaryFallback: string;
+  reducerMode: ReducerMode;
+  summaryRecoveryNeeded: boolean;
+  interruptedTurn: SessionInFlightTurn | null;
 };
 
 const QUERY_TOKEN_LIMIT = 12;
@@ -846,13 +853,17 @@ const buildSearchableSet = (entry: SessionMemoryEntry) =>
     ...(entry.entities.queryTerms ?? []),
   ]);
 
-const buildWorkingStateSignalTokens = (summaryFallback: string) => {
+const buildWorkingStateSignalTokens = (
+  summaryFallback: string,
+  pendingDigest: string
+) => {
   const parsed = parseWorkingStateSummary(summaryFallback);
+  const pendingParsed = parseWorkingStateSummary(pendingDigest);
   const tokensBySection = createEmptyWorkingStateSectionMap();
   const pathsBySection = createEmptyWorkingStateSectionMap();
 
   for (const section of WORKING_STATE_SECTION_ORDER) {
-    const lines = parsed[section] ?? [];
+    const lines = [...(parsed[section] ?? []), ...(pendingParsed[section] ?? [])];
     const joined = lines.join(" ");
     tokensBySection[section] = tokenizeText(joined, 18);
     pathsBySection[section] = collectPathCandidates(joined);
@@ -1115,12 +1126,22 @@ export const getPromptContextFromMemoryIndex = (
   index: SessionMemoryIndex,
   query: string,
   recent: SessionMessage[],
-  summaryFallback: string,
+  options: {
+    durableSummary: string;
+    summaryFallback: string;
+    pendingDigest: string;
+    reducerMode?: ReducerMode;
+    summaryRecoveryNeeded?: boolean;
+    interruptedTurn?: SessionInFlightTurn | null;
+  },
   relevantLimit = 6
 ): SessionPromptContext => {
   const queryTokens = tokenizeText(query);
   const queryPaths = collectPathCandidates(query);
-  const workingStateSignals = buildWorkingStateSignalTokens(summaryFallback);
+  const workingStateSignals = buildWorkingStateSignalTokens(
+    options.summaryFallback,
+    options.pendingDigest
+  );
   const pins = sortEntriesByPriorityAndTime(index.entries)
     .filter(entry => entry.kind === "pin")
     .slice(0, 6)
@@ -1178,6 +1199,11 @@ export const getPromptContextFromMemoryIndex = (
     relevantMemories,
     archiveSections,
     recent,
-    summaryFallback,
+    durableSummary: options.durableSummary,
+    pendingDigest: options.pendingDigest,
+    summaryFallback: options.summaryFallback,
+    reducerMode: options.reducerMode ?? "disabled",
+    summaryRecoveryNeeded: options.summaryRecoveryNeeded ?? false,
+    interruptedTurn: options.interruptedTurn ?? null,
   };
 };

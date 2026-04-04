@@ -9,7 +9,7 @@ const baseSnapshot = {
   activeSessionId: "session-42",
   currentModel: "gpt-5.4",
   requestCount: 2,
-  summaryRequestCount: 1,
+  stateUpdateCount: 1,
   promptTokens: 12,
   completionTokens: 5,
   totalTokens: 17,
@@ -58,7 +58,7 @@ describe("exitSummary", () => {
         activeSessionId: "session-42",
         currentModel: "gpt-5.4",
         requestCount: 3,
-        summaryRequestCount: 1,
+        stateUpdateCount: 1,
         promptTokens: 120,
         completionTokens: 45,
         totalTokens: 165,
@@ -74,7 +74,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/model\s+gpt-5\.4/);
     expect(screen).toMatch(/runtime\s+2m 5s/);
     expect(screen).toMatch(/requests\s+3/);
-    expect(screen).toMatch(/summary calls\s+1/);
+    expect(screen).toMatch(/state updates\s+1/);
     expect(screen).toMatch(/prompt\s+120/);
     expect(screen).toMatch(/completion\s+45/);
     expect(screen).toMatch(/total\s+165/);
@@ -88,7 +88,7 @@ describe("exitSummary", () => {
         activeSessionId: null,
         currentModel: "",
         requestCount: 0,
-        summaryRequestCount: 0,
+        stateUpdateCount: 0,
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
@@ -103,7 +103,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/model\s+-/);
     expect(screen).toMatch(/runtime\s+0s/);
     expect(screen).toMatch(/requests\s+0/);
-    expect(screen).toMatch(/summary calls\s+0/);
+    expect(screen).toMatch(/state updates\s+0/);
     expect(screen).toMatch(/prompt\s+0/);
     expect(screen).toMatch(/completion\s+0/);
     expect(screen).toMatch(/total\s+0/);

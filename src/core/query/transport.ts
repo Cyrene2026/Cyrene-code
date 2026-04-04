@@ -1,5 +1,3 @@
-import type { TokenUsage } from "./tokenUsage";
-
 export type ModelRefreshResult = {
   ok: boolean;
   message: string;
@@ -19,13 +17,6 @@ export type ProviderSetResult = {
   models?: string[];
 };
 
-export type SummarizeTextResult = {
-  ok: boolean;
-  text?: string;
-  usage?: TokenUsage;
-  message?: string;
-};
-
 export type QueryTransport = {
   getModel: () => string;
   getProvider: () => string;
@@ -34,7 +25,6 @@ export type QueryTransport = {
   listProviders: () => Promise<string[]>;
   setProvider: (provider: string) => Promise<ProviderSetResult>;
   refreshModels: () => Promise<ModelRefreshResult>;
-  summarizeText?: (prompt: string) => Promise<SummarizeTextResult>;
   requestStreamUrl: (query: string) => Promise<string>;
   stream: (streamUrl: string) => AsyncGenerator<string>;
 };

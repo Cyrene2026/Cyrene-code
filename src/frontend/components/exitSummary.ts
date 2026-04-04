@@ -10,7 +10,7 @@ export type ExitSummarySnapshot = {
   activeSessionId: string | null;
   currentModel: string;
   requestCount: number;
-  summaryRequestCount: number;
+  stateUpdateCount: number;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
@@ -104,7 +104,7 @@ export const buildExitScreen = (
     ["model", modelLabel],
     ["runtime", runtimeLabel],
     ["requests", String(summary.requestCount)],
-    ["summary calls", String(summary.summaryRequestCount)],
+    ["state updates", String(summary.stateUpdateCount)],
     ["prompt", String(summary.promptTokens)],
     ["completion", String(summary.completionTokens)],
     ["total", String(summary.totalTokens)],

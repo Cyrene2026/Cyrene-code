@@ -2,6 +2,10 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { act } from "react-test-renderer";
 import type { FileAction, PendingReviewItem, ToolRequest } from "../src/core/tools/mcp/types";
 import type { QueryTransport } from "../src/core/query/transport";
+import {
+  CYRENE_STATE_UPDATE_END_TAG,
+  CYRENE_STATE_UPDATE_START_TAG,
+} from "../src/core/session/stateReducer";
 import { useChatApp } from "../src/application/chat/useChatApp";
 import {
   createSessionRecord,
@@ -155,6 +159,9 @@ const createPending = (
 };
 
 const getTexts = (items: Array<{ text: string }>) => items.map(item => item.text);
+
+const withStateUpdate = (visible: string, update: Record<string, unknown>) =>
+  `${visible}${CYRENE_STATE_UPDATE_START_TAG}${JSON.stringify(update)}${CYRENE_STATE_UPDATE_END_TAG}`;
 
 const runCommand = async (
   app: ReturnType<typeof renderHookHarness<ReturnType<typeof useChatApp>>>,
@@ -575,7 +582,6 @@ describe("useChatApp", () => {
         message: "Models refreshed",
         models: ["gpt-from-yaml", "gpt-next"],
       }),
-      summarizeText: async () => ({ ok: false, message: "summary unavailable" }),
       requestStreamUrl: async query => `stream://${query}`,
       stream: async function* () {},
     };
@@ -777,22 +783,27 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("does not fire an automatic summary request after a normal turn by default", async () => {
-    const summarizeImpl = mock(async () => ({
-      ok: true as const,
-      text: "OBJECTIVE:\n- should not run",
-    }));
+  test("autoSummaryRefresh=false ignores hidden reducer updates and keeps state updates at zero", async () => {
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
       onState({ status: "streaming" });
-      onTextDelta("single reply");
+      onTextDelta(
+        withStateUpdate("single reply", {
+          version: 1,
+          mode: "digest_only",
+          nextPendingDigest: {
+            OBJECTIVE: ["should stay hidden"],
+          },
+        })
+      );
       onState({ status: "idle" });
       return { status: "completed" as const };
     });
+    const sessionStore = createTestSessionStore();
 
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
-        transport: createTestTransport({ summarizeImpl }),
-        sessionStore: createTestSessionStore(),
+        transport: createTestTransport(),
+        sessionStore,
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
@@ -805,8 +816,14 @@ describe("useChatApp", () => {
     await flushMicrotasks();
 
     expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
-    expect(summarizeImpl).toHaveBeenCalledTimes(0);
-    expect(app.getLatest().exitSummary.summaryRequestCount).toBe(0);
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(0);
+    const stored = sessionStore.__getRecord("session-1");
+    expect(stored?.pendingDigest).toBe("");
+    expect(stored?.summary).toBe("");
+    expect(stored?.lastStateUpdate?.code).toBe("disabled");
+    expect(
+      stored?.messages.findLast(message => message.role === "assistant")?.text
+    ).toBe("single reply");
     app.cleanup();
   });
 
@@ -1690,245 +1707,213 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("refreshes AI summary lazily after the turn completes, shows token hint, and preserves stored summary for reuse", async () => {
-    const capturedSummaryPrompts: string[] = [];
-    const sessionStore = createTestSessionStore([
-      createSessionRecord("session-a", {
-        summary: "",
-        messages: Array.from({ length: 10 }, (_, index) => ({
-          role: index % 2 === 0 ? "user" : "assistant",
-          text: `message ${index + 1} about oauth and api behavior`,
-          createdAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
-        })),
-      }),
-    ]) as TestSessionStore;
-    const summarizeImpl = mock(async (prompt: string) => {
-      capturedSummaryPrompts.push(prompt);
-      return {
-      ok: true as const,
-      text: [
-        "OBJECTIVE:",
-        "- continue oauth work",
-        "",
-        "CONFIRMED FACTS:",
-        "- api behavior confirmed",
-        "",
-        "CONSTRAINTS:",
-        "- (none)",
-        "",
-        "COMPLETED:",
-        "- previous oauth investigation finished",
-        "",
-        "REMAINING:",
-        "- respond to the current task",
-        "",
-        "KNOWN PATHS:",
-        "- (none)",
-        "",
-        "RECENT FAILURES:",
-        "- (none)",
-        "",
-        "NEXT BEST ACTIONS:",
-        "- answer the next user request",
-      ].join("\n"),
-      usage: {
-        promptTokens: 21,
-        completionTokens: 9,
-        totalTokens: 30,
-      },
-    }});
-    const baseUpdateSummary = sessionStore.updateSummary;
-    const updateSummary = mock((id: string, summary: string) =>
-      baseUpdateSummary(id, summary)
-    );
-    const runStartedBeforeSummary = { current: false };
+  test("first reducer-enabled turn stores pendingDigest only and strips the hidden tail from transcript", async () => {
+    const sessionStore = createTestSessionStore();
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
-      runStartedBeforeSummary.current = capturedSummaryPrompts.length === 0;
       onState({ status: "streaming" });
-      onTextDelta("reply\n- keeps markdown");
+      onTextDelta(
+        withStateUpdate("reply\n- keeps markdown", {
+          version: 1,
+          mode: "digest_only",
+          nextPendingDigest: {
+            OBJECTIVE: ["continue oauth work"],
+            "CONFIRMED FACTS": ["api behavior confirmed"],
+            REMAINING: ["verify approval flow"],
+          },
+        })
+      );
       onState({ status: "idle" });
       return { status: "completed" as const };
     });
 
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
-        transport: createTestTransport({ summarizeImpl }),
-        sessionStore: {
-          ...sessionStore,
-          updateSummary,
-        },
-        defaultSystemPrompt: "system",
-        projectPrompt: "project",
-        pinMaxCount: 3,
-        autoSummaryRefresh: true,
-        mcpService: { listPending: () => [] } as any,
-        runQuerySessionImpl,
-      })
-    );
-
-    await runCommand(app, "/resume session-a");
-    await runCommand(app, "continue the oauth task");
-    await flushMicrotasks();
-    await flushMicrotasks();
-
-    expect(summarizeImpl).toHaveBeenCalledTimes(1);
-    expect(runStartedBeforeSummary.current).toBe(true);
-    expect(capturedSummaryPrompts[0]).toContain(
-      "Reduce the prior conversation into a durable working-state record."
-    );
-    expect(capturedSummaryPrompts[0]).toContain("- OBJECTIVE:");
-    expect(capturedSummaryPrompts[0]).toContain("- NEXT BEST ACTIONS:");
-    expect(capturedSummaryPrompts[0]).not.toContain(
-      "Summarize the prior conversation into 4-6 short Markdown bullet points."
-    );
-    expect(updateSummary).toHaveBeenCalledTimes(1);
-    expect(getTexts(app.getLatest().items).some(text => text.includes("summary updated | prompt 21 | completion 9 | total 30"))).toBe(true);
-
-    const stored = sessionStore.__getRecord("session-a");
-    expect(stored?.summary).toContain("OBJECTIVE:");
-    expect(stored?.summary).toContain("NEXT BEST ACTIONS:");
-    expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
-      "reply\n- keeps markdown"
-    );
-    app.cleanup();
-  });
-
-  test("existing persisted summary skips AI refresh and summary failure does not block the turn", async () => {
-    const sessionStore = createTestSessionStore([
-      createSessionRecord("session-a", {
-        summary: "- existing summary",
-        messages: Array.from({ length: 10 }, (_, index) => ({
-          role: index % 2 === 0 ? "user" : "assistant",
-          text: `message ${index + 1}`,
-          createdAt: `2026-02-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
-        })),
-      }),
-      createSessionRecord("session-b", {
-        summary: "",
-        messages: Array.from({ length: 10 }, (_, index) => ({
-          role: index % 2 === 0 ? "user" : "assistant",
-          text: `other message ${index + 1}`,
-          createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
-        })),
-      }),
-    ]);
-    const baseUpdateSummary = sessionStore.updateSummary;
-    const updateSummary = mock((id: string, summary: string) =>
-      baseUpdateSummary(id, summary)
-    );
-    const summarizeExisting = mock(async () => ({
-      ok: true as const,
-      text: "- should not run",
-    }));
-    const runExisting = mock(async ({ onState, onTextDelta }: any) => {
-      onState({ status: "streaming" });
-      onTextDelta("done existing");
-      onState({ status: "idle" });
-      return { status: "completed" as const };
-    });
-
-    const existingApp = renderHookHarness(() =>
-      useChatAppWithTestInput({
-        transport: createTestTransport({ summarizeImpl: summarizeExisting }),
-        sessionStore: {
-          ...sessionStore,
-          updateSummary,
-        },
-        defaultSystemPrompt: "system",
-        projectPrompt: "project",
-        pinMaxCount: 3,
-        autoSummaryRefresh: true,
-        mcpService: { listPending: () => [] } as any,
-        runQuerySessionImpl: runExisting,
-      })
-    );
-
-    await runCommand(existingApp, "/resume session-a");
-    await runCommand(existingApp, "continue");
-    await flushMicrotasks();
-
-    expect(summarizeExisting).toHaveBeenCalledTimes(0);
-    expect(updateSummary).toHaveBeenCalledTimes(1);
-    expect(updateSummary.mock.calls[0]?.[1]).toContain("OBJECTIVE:");
-    expect(updateSummary.mock.calls[0]?.[1]).toContain("CONFIRMED FACTS:");
-    expect(getTexts(existingApp.getLatest().items)).toContain("done existing");
-    existingApp.cleanup();
-
-    const summarizeFailure = mock(async () => ({
-      ok: false as const,
-      message: "provider unavailable",
-    }));
-    const runFailure = mock(async ({ onState, onTextDelta }: any) => {
-      onState({ status: "streaming" });
-      onTextDelta("done after summary failure");
-      onState({ status: "idle" });
-      return { status: "completed" as const };
-    });
-
-    const failureApp = renderHookHarness(() =>
-      useChatAppWithTestInput({
-        transport: createTestTransport({ summarizeImpl: summarizeFailure }),
+        transport: createTestTransport(),
         sessionStore,
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
         autoSummaryRefresh: true,
         mcpService: { listPending: () => [] } as any,
-        runQuerySessionImpl: runFailure,
+        runQuerySessionImpl,
       })
     );
 
-    await runCommand(failureApp, "/resume session-b");
-    await runCommand(failureApp, "continue despite failure");
+    await runCommand(app, "continue the oauth task");
     await flushMicrotasks();
 
-    expect(summarizeFailure).toHaveBeenCalledTimes(1);
-    expect(runFailure).toHaveBeenCalledTimes(1);
-    expect(getTexts(failureApp.getLatest().items)).toContain("done after summary failure");
-    expect(
-      getTexts(failureApp.getLatest().items).some(text => text.includes("summary updated"))
-    ).toBe(false);
-    failureApp.cleanup();
+    const stored = sessionStore.__getRecord("session-1");
+    expect(stored?.summary).toBe("");
+    expect(stored?.pendingDigest).toContain("OBJECTIVE:");
+    expect(stored?.pendingDigest).toContain("- continue oauth work");
+    expect(stored?.pendingDigest).toContain("REMAINING:");
+    expect(stored?.pendingDigest).toContain("- verify approval flow");
+    expect(stored?.lastStateUpdate?.code).toBe("applied");
+    expect(stored?.lastStateUpdate?.summaryLength).toBe(0);
+    expect((stored?.lastStateUpdate?.pendingDigestLength ?? 0) > 0).toBe(true);
+    expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
+      "reply\n- keeps markdown"
+    );
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(1);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("summary updated"))).toBe(
+      false
+    );
+    app.cleanup();
   });
 
-  test("repairs malformed AI summary output into structured working state before storing", async () => {
-    const sessionStore = createTestSessionStore([
-      createSessionRecord("session-a", {
-        summary: "",
-        messages: Array.from({ length: 10 }, (_, index) => ({
-          role: index % 2 === 0 ? "user" : "assistant",
-          text: `message ${index + 1} about auth follow-up`,
-          createdAt: `2026-05-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
-        })),
-      }),
-    ]) as TestSessionStore;
-    const baseUpdateSummary = sessionStore.updateSummary;
-    const updateSummary = mock((id: string, summary: string) =>
-      baseUpdateSummary(id, summary)
-    );
-    const summarizeImpl = mock(async () => ({
-      ok: true as const,
-      text: "- continue auth follow-up\n- src/auth/oauth.ts already exists\n- next: verify approval",
-      usage: {
-        promptTokens: 11,
-        completionTokens: 7,
-        totalTokens: 18,
-      },
-    }));
+  test("records missing_tag when a completed reply has no hidden reducer block", async () => {
+    const sessionStore = createTestSessionStore();
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
       onState({ status: "streaming" });
-      onTextDelta("done malformed summary repair");
+      onTextDelta("plain visible answer only");
       onState({ status: "idle" });
       return { status: "completed" as const };
     });
 
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
-        transport: createTestTransport({ summarizeImpl }),
-        sessionStore: {
-          ...sessionStore,
-          updateSummary,
-        },
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "inspect the project");
+    await flushMicrotasks();
+
+    const stored = sessionStore.__getRecord("session-1");
+    expect(stored?.summary).toBe("");
+    expect(stored?.pendingDigest).toBe("");
+    expect(stored?.lastStateUpdate?.code).toBe("missing_tag");
+    expect(stored?.lastStateUpdate?.message).toContain(
+      "without a <cyrene_state_update> block"
+    );
+    app.cleanup();
+  });
+
+  test("later reducer-enabled turns merge the prior pending digest into durable summary and replace pendingDigest", async () => {
+    const sessionStore = createTestSessionStore();
+    let turn = 0;
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      if (turn === 0) {
+        onTextDelta(
+          withStateUpdate("first visible reply", {
+            version: 1,
+            mode: "digest_only",
+            nextPendingDigest: {
+              OBJECTIVE: ["continue oauth work"],
+              "CONFIRMED FACTS": ["api behavior confirmed"],
+              REMAINING: ["verify approval flow"],
+            },
+          })
+        );
+      } else {
+        onTextDelta(
+          withStateUpdate("second visible reply", {
+            version: 1,
+            mode: "merge_and_digest",
+            summaryPatch: {
+              OBJECTIVE: {
+                op: "replace",
+                set: ["continue oauth work"],
+              },
+              "CONFIRMED FACTS": {
+                op: "merge",
+                add: ["api behavior confirmed"],
+              },
+              REMAINING: {
+                op: "merge",
+                add: ["verify approval flow"],
+              },
+              COMPLETED: {
+                op: "merge",
+                add: ["answered the oauth follow-up"],
+              },
+              "KNOWN PATHS": {
+                op: "merge",
+                add: ["src/auth/oauth.ts"],
+              },
+            },
+            nextPendingDigest: {
+              COMPLETED: ["answered the latest user request"],
+              "NEXT BEST ACTIONS": ["wait for the next user instruction"],
+            },
+          })
+        );
+      }
+      turn += 1;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "continue the oauth task");
+    await runCommand(app, "finish it");
+    await flushMicrotasks();
+
+    const stored = sessionStore.__getRecord("session-1");
+    expect(stored?.summary).toContain("OBJECTIVE:");
+    expect(stored?.summary).toContain("- continue oauth work");
+    expect(stored?.summary).toContain("CONFIRMED FACTS:");
+    expect(stored?.summary).toContain("- api behavior confirmed");
+    expect(stored?.summary).toContain("COMPLETED:");
+    expect(stored?.summary).toContain("- answered the oauth follow-up");
+    expect(stored?.summary).toContain("KNOWN PATHS:");
+    expect(stored?.summary).toContain("- src/auth/oauth.ts");
+    expect(stored?.pendingDigest).toContain("COMPLETED:");
+    expect(stored?.pendingDigest).toContain("- answered the latest user request");
+    expect(stored?.pendingDigest).not.toContain("verify approval flow");
+    expect(
+      stored?.messages.filter(message => message.role === "assistant").map(message => message.text)
+    ).toEqual(["first visible reply", "second visible reply"]);
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(2);
+    app.cleanup();
+  });
+
+  test("invalid reducer tails keep the visible answer and preserve the prior pending digest", async () => {
+    const previousPendingDigest = [
+      "OBJECTIVE:",
+      "- existing pending work",
+      "",
+      "REMAINING:",
+      "- verify approval flow",
+    ].join("\n");
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        pendingDigest: previousPendingDigest,
+      }),
+    ]);
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta(
+        `visible answer${CYRENE_STATE_UPDATE_START_TAG}{"version":1,"mode":"digest_only",`
+      );
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
@@ -1939,18 +1924,79 @@ describe("useChatApp", () => {
     );
 
     await runCommand(app, "/resume session-a");
-    await runCommand(app, "continue auth");
+    await runCommand(app, "continue despite reducer issue");
     await flushMicrotasks();
 
-    expect(summarizeImpl).toHaveBeenCalledTimes(1);
-    expect(updateSummary).toHaveBeenCalledTimes(1);
-    expect(updateSummary.mock.calls[0]?.[1]).toContain("OBJECTIVE:");
-    expect(updateSummary.mock.calls[0]?.[1]).toContain("KNOWN PATHS:");
-    expect(updateSummary.mock.calls[0]?.[1]).toContain("NEXT BEST ACTIONS:");
+    const stored = sessionStore.__getRecord("session-a");
+    expect(stored?.pendingDigest).toBe(previousPendingDigest);
+    expect(stored?.summary).toBe("");
+    expect(stored?.lastStateUpdate?.code).toBe("incomplete_tag");
+    expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
+      "visible answer"
+    );
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(0);
     app.cleanup();
   });
 
-  test("exitSummary accumulates query and summary usage across resume and new session flows", async () => {
+  test("failed turns keep an inFlightTurn snapshot and the next completed turn clears it", async () => {
+    const sessionStore = createTestSessionStore();
+    let turn = 0;
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta, onError }: any) => {
+      onState({ status: "streaming" });
+      if (turn === 0) {
+        turn += 1;
+        onTextDelta("partial reply before failure");
+        await onError?.("stream exploded");
+        throw new Error("stream exploded");
+      }
+
+      turn += 1;
+      onTextDelta(
+        withStateUpdate("recovered reply", {
+          version: 1,
+          mode: "digest_only",
+          nextPendingDigest: {
+            COMPLETED: ["recovered after interrupted turn"],
+          },
+        })
+      );
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "first task");
+    await flushMicrotasks();
+
+    let stored = sessionStore.__getRecord("session-1");
+    expect(stored?.inFlightTurn?.userText).toBe("first task");
+    expect(stored?.inFlightTurn?.assistantText).toBe("partial reply before failure");
+    expect(getTexts(app.getLatest().items).some(text => text.includes("Queued action failed"))).toBe(
+      true
+    );
+
+    await runCommand(app, "retry after failure");
+    await flushMicrotasks();
+
+    stored = sessionStore.__getRecord("session-1");
+    expect(stored?.inFlightTurn).toBeNull();
+    expect(stored?.pendingDigest).toContain("- recovered after interrupted turn");
+    app.cleanup();
+  });
+
+  test("exitSummary accumulates query usage and reducer state updates across resume and new session flows", async () => {
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {
         summary: "",
@@ -1961,15 +2007,6 @@ describe("useChatApp", () => {
         })),
       }),
     ]) as TestSessionStore;
-    const summarizeImpl = mock(async () => ({
-      ok: true as const,
-      text: "- task: continue oauth work\n- fact: previous steps confirmed",
-      usage: {
-        promptTokens: 21,
-        completionTokens: 9,
-        totalTokens: 30,
-      },
-    }));
     let turn = 0;
     const runQuerySessionImpl = mock(
       async ({ onState, onTextDelta, onUsage }: any) => {
@@ -1978,13 +2015,35 @@ describe("useChatApp", () => {
             promptTokens: 10,
             completionTokens: 4,
             totalTokens: 14,
-            reply: "first reply",
+            reply: withStateUpdate("first reply", {
+              version: 1,
+              mode: "full_rebuild_and_digest",
+              summaryPatch: {
+                OBJECTIVE: {
+                  op: "replace",
+                  set: ["continue oauth work"],
+                },
+                "CONFIRMED FACTS": {
+                  op: "merge",
+                  add: ["previous steps confirmed"],
+                },
+              },
+              nextPendingDigest: {
+                REMAINING: ["finish the oauth response"],
+              },
+            }),
           },
           {
             promptTokens: 8,
             completionTokens: 3,
             totalTokens: 11,
-            reply: "second reply",
+            reply: withStateUpdate("second reply", {
+              version: 1,
+              mode: "digest_only",
+              nextPendingDigest: {
+                COMPLETED: ["fresh turn completed"],
+              },
+            }),
           },
         ];
         const current = usageByTurn[turn] ?? usageByTurn[usageByTurn.length - 1]!;
@@ -2006,7 +2065,6 @@ describe("useChatApp", () => {
         transport: createTestTransport({
           initialModel: "gpt-test",
           models: ["gpt-test", "gpt-next"],
-          summarizeImpl,
         }),
         sessionStore,
         defaultSystemPrompt: "system",
@@ -2026,10 +2084,10 @@ describe("useChatApp", () => {
       activeSessionId: "session-a",
       currentModel: "gpt-test",
       requestCount: 1,
-      summaryRequestCount: 1,
-      promptTokens: 31,
-      completionTokens: 13,
-      totalTokens: 44,
+      stateUpdateCount: 1,
+      promptTokens: 10,
+      completionTokens: 4,
+      totalTokens: 14,
     });
 
     await runCommand(app, "/new");
@@ -2040,10 +2098,10 @@ describe("useChatApp", () => {
       activeSessionId: "session-2",
       currentModel: "gpt-test",
       requestCount: 2,
-      summaryRequestCount: 1,
-      promptTokens: 39,
-      completionTokens: 16,
-      totalTokens: 55,
+      stateUpdateCount: 2,
+      promptTokens: 18,
+      completionTokens: 7,
+      totalTokens: 25,
     });
     app.cleanup();
   });

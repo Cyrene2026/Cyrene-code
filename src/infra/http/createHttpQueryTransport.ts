@@ -444,28 +444,6 @@ const extractVisibleDeltaText = (delta: unknown) => {
   ]);
 };
 
-const parseCompletionTextPayload = (payload: unknown): string => {
-  if (!payload || typeof payload !== "object" || !("choices" in payload)) {
-    return "";
-  }
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices) || choices.length === 0) {
-    return "";
-  }
-
-  const firstChoice = choices[0];
-  if (!firstChoice || typeof firstChoice !== "object" || !("message" in firstChoice)) {
-    return "";
-  }
-
-  const message = (firstChoice as { message?: unknown }).message;
-  if (!message || typeof message !== "object" || !("content" in message)) {
-    return "";
-  }
-
-  return extractTextContent((message as { content?: unknown }).content).trim();
-};
-
 async function* streamSseOpenAI(
   baseUrl: string,
   apiKey: string,
@@ -641,48 +619,6 @@ async function* streamSseOpenAI(
 
   yield DONE_EVENT;
 }
-
-const completeTextOpenAI = async (
-  baseUrl: string,
-  apiKey: string,
-  model: string,
-  prompt: string
-) => {
-  const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    return {
-      ok: false as const,
-      message: `Summary request failed: ${response.status} ${response.statusText}`,
-    };
-  }
-
-  const payload = (await response.json()) as unknown;
-  const text = parseCompletionTextPayload(payload);
-  if (!text) {
-    return {
-      ok: false as const,
-      message: "Summary response was empty.",
-    };
-  }
-
-  return {
-    ok: true as const,
-    text,
-    usage: extractUsage(payload) ?? undefined,
-  };
-};
 
 const parseModelsPayload = (payload: unknown): string[] => {
   if (
@@ -960,35 +896,6 @@ export const createHttpQueryTransport = (
           message,
         };
       }
-    },
-    summarizeText: async (prompt: string) => {
-      await modelInit;
-      const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
-      if (!targetProvider || !apiKey) {
-        return {
-          ok: false,
-          message: "Missing CYRENE_BASE_URL or CYRENE_API_KEY for HTTP transport.",
-        };
-      }
-      if (initializationError && availableModels.length === 0) {
-        return {
-          ok: false,
-          message: `Model initialization failed: ${initializationError}. Run /model refresh after fixing API/base URL.`,
-        };
-      }
-      const normalizedPrompt = prompt.trim();
-      if (!normalizedPrompt) {
-        return {
-          ok: false,
-          message: "Summary prompt cannot be empty.",
-        };
-      }
-      return completeTextOpenAI(
-        targetProvider,
-        apiKey,
-        currentModel,
-        normalizedPrompt
-      );
     },
     requestStreamUrl: async (query: string) => {
       await modelInit;

@@ -12,11 +12,14 @@ import {
   type SessionMemoryIndex,
   type SessionMemoryInput,
 } from "../../src/core/session/memoryIndex";
+import { deriveReducerMode } from "../../src/core/session/stateReducer";
 import type { SessionStore } from "../../src/core/session/store";
 import type {
   SessionListItem,
+  SessionInFlightTurn,
   SessionMessage,
   SessionRecord,
+  SessionStateUpdateDiagnostic,
 } from "../../src/core/session/types";
 import type {
   ModelRefreshResult,
@@ -90,6 +93,9 @@ const normalizeTag = (tag: string) =>
 
 const cloneRecord = (record: SessionRecord): SessionRecord => ({
   ...record,
+  lastStateUpdate: record.lastStateUpdate
+    ? { ...record.lastStateUpdate }
+    : null,
   focus: [...record.focus],
   tags: [...record.tags],
   messages: record.messages.map(message => ({ ...message })),
@@ -104,6 +110,11 @@ export const createSessionRecord = (
   createdAt: overrides?.createdAt ?? now(),
   updatedAt: overrides?.updatedAt ?? now(),
   summary: overrides?.summary ?? "",
+  pendingDigest: overrides?.pendingDigest ?? "",
+  lastStateUpdate: overrides?.lastStateUpdate
+    ? { ...overrides.lastStateUpdate }
+    : null,
+  inFlightTurn: overrides?.inFlightTurn ?? null,
   focus: overrides?.focus ? [...overrides.focus] : [],
   tags: overrides?.tags ? [...overrides.tags] : [],
   messages: overrides?.messages ? overrides.messages.map(message => ({ ...message })) : [],
@@ -125,6 +136,7 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
     return {
       ...record,
       summary: record.summary.trim(),
+      pendingDigest: record.pendingDigest.trim(),
       focus: deriveFocusFromMemoryIndex(index),
     };
   };
@@ -182,6 +194,9 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
             }
             if (synced.summary.toLowerCase().includes(normalizedQuery)) {
               score += 5;
+            }
+            if (synced.pendingDigest.toLowerCase().includes(normalizedQuery)) {
+              score += 4;
             }
             if (synced.tags.some(tag => tag.includes(normalizedQuery))) {
               score += 8;
@@ -256,6 +271,43 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
         throw new Error(`Missing session ${id}`);
       }
       const next = { ...record, summary, updatedAt: now() };
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    updateWorkingState: async (id, state) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const next: SessionRecord = {
+        ...record,
+        summary:
+          typeof state.summary === "string" ? state.summary.trim() : record.summary,
+        pendingDigest:
+          typeof state.pendingDigest === "string"
+            ? state.pendingDigest.trim()
+            : record.pendingDigest,
+        lastStateUpdate:
+          state.lastStateUpdate === undefined
+            ? record.lastStateUpdate
+            : state.lastStateUpdate
+              ? ({ ...state.lastStateUpdate } as SessionStateUpdateDiagnostic)
+              : null,
+        updatedAt: now(),
+      };
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    updateInFlightTurn: async (id, inFlightTurn: SessionInFlightTurn | null) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const next: SessionRecord = {
+        ...record,
+        inFlightTurn,
+        updatedAt: now(),
+      };
       records.set(id, next);
       return cloneRecord(next);
     },
@@ -375,11 +427,33 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       }
       const index = ensureIndex(record);
       const compressed = compressContext(record.messages);
+      const durableSummary = record.summary.trim();
+      const pendingDigest = record.pendingDigest.trim();
+      const priorMessages = record.messages.filter(message => message.role !== "system");
+      const priorAssistantMessages = priorMessages.filter(
+        message => message.role === "assistant"
+      );
       return getPromptContextFromMemoryIndex(
         index,
         query,
         compressed.recent,
-        record.summary.trim() || compressed.summary
+        {
+          durableSummary,
+          summaryFallback: durableSummary || compressed.summary,
+          pendingDigest,
+          reducerMode: deriveReducerMode({
+            enabled: true,
+            durableSummary,
+            pendingDigest,
+            priorMessageCount: priorMessages.length,
+            priorAssistantMessageCount: priorAssistantMessages.length,
+          }),
+          summaryRecoveryNeeded:
+            !durableSummary &&
+            !pendingDigest &&
+            priorAssistantMessages.length > 0,
+          interruptedTurn: record.inFlightTurn,
+        }
       );
     },
     __getRecord: (id: string) => {
@@ -400,16 +474,6 @@ export const createTestTransport = (
     setModelImpl?: (model: string) => Promise<ModelSetResult>;
     setProviderImpl?: (provider: string) => Promise<ProviderSetResult>;
     refreshImpl?: () => Promise<ModelRefreshResult>;
-    summarizeImpl?: (prompt: string) => Promise<{
-      ok: boolean;
-      text?: string;
-      usage?: {
-        promptTokens: number;
-        completionTokens: number;
-        totalTokens: number;
-      };
-      message?: string;
-    }>;
   }
 ): QueryTransport => {
   let currentModel = options?.initialModel ?? "gpt-test";
@@ -458,10 +522,6 @@ export const createTestTransport = (
       options?.refreshImpl
         ? options.refreshImpl()
         : { ok: true, message: "Models refreshed", models: [...models] },
-    summarizeText: async prompt =>
-      options?.summarizeImpl
-        ? options.summarizeImpl(prompt)
-        : { ok: false, message: "summary unavailable" },
     requestStreamUrl: async query => `stream://${query}`,
     stream: async function* () {},
   };

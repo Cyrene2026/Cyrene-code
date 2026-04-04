@@ -899,7 +899,7 @@ describe("ChatScreen", () => {
     expect(output).not.toContain("session-msg-000");
   });
 
-  test("shows only the latest slice of oversized live streaming output", () => {
+  test("shows only the latest slice of oversized live streaming output without extra clip chatter", () => {
     const hugeStreamingBlock = [
       "```txt",
       ...Array.from(
@@ -916,7 +916,7 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("[render clipped] showing latest slice");
+    expect(output).not.toContain("[render clipped]");
     expect(output).toContain("stream-220");
     expect(output).not.toContain("stream-001");
   });

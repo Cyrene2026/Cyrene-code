@@ -15,11 +15,14 @@ import {
   type SessionMemoryIndex,
   type SessionMemoryInput,
 } from "../../core/session/memoryIndex";
+import { deriveReducerMode } from "../../core/session/stateReducer";
 import type { SessionStore } from "../../core/session/store";
 import type {
+  SessionInFlightTurn,
   SessionListItem,
   SessionMessage,
   SessionRecord,
+  SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
 
 type SessionStoreContext = {
@@ -33,12 +36,41 @@ const messageSchema = z.object({
   createdAt: z.string(),
 });
 
+const inFlightTurnSchema: z.ZodType<SessionInFlightTurn> = z.object({
+  userText: z.string(),
+  assistantText: z.string(),
+  startedAt: z.string(),
+  updatedAt: z.string(),
+});
+
+const stateUpdateDiagnosticSchema: z.ZodType<SessionStateUpdateDiagnostic> = z.object({
+  code: z.enum([
+    "disabled",
+    "missing_tag",
+    "incomplete_tag",
+    "empty_payload",
+    "invalid_payload",
+    "applied",
+    "applied_empty_state",
+  ]),
+  message: z.string(),
+  updatedAt: z.string(),
+  reducerMode: z
+    .enum(["digest_only", "merge_and_digest", "full_rebuild_and_digest"])
+    .optional(),
+  summaryLength: z.number(),
+  pendingDigestLength: z.number(),
+});
+
 const sessionSchema = z.object({
   id: z.string(),
   title: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
   summary: z.string().optional(),
+  pendingDigest: z.string().optional(),
+  lastStateUpdate: stateUpdateDiagnosticSchema.nullable().optional(),
+  inFlightTurn: inFlightTurnSchema.nullable().optional(),
   focus: z.array(z.string()).optional(),
   tags: z.array(z.string()).optional(),
   messages: z.array(messageSchema),
@@ -141,6 +173,9 @@ export const createFileSessionStore = (
       return {
         ...normalized,
         summary: normalized.summary ?? "",
+        pendingDigest: normalized.pendingDigest ?? "",
+        lastStateUpdate: normalized.lastStateUpdate ?? null,
+        inFlightTurn: normalized.inFlightTurn ?? null,
         focus: normalized.focus ?? [],
         tags: normalizeTagSet(normalized.tags ?? []),
       };
@@ -174,6 +209,8 @@ export const createFileSessionStore = (
     return {
       ...session,
       summary: session.summary.trim(),
+      pendingDigest: session.pendingDigest.trim(),
+      lastStateUpdate: session.lastStateUpdate ?? null,
       focus: deriveFocusFromMemoryIndex(index),
     };
   };
@@ -249,6 +286,9 @@ export const createFileSessionStore = (
     if (session.summary.toLowerCase().includes(query)) {
       score += 5;
     }
+    if (session.pendingDigest.toLowerCase().includes(query)) {
+      score += 4;
+    }
     if (session.tags.some(tag => tag.toLowerCase().includes(query))) {
       score += 8;
     }
@@ -289,6 +329,9 @@ export const createFileSessionStore = (
         createdAt: now,
         updatedAt: now,
         summary: "",
+        pendingDigest: "",
+        lastStateUpdate: null,
+        inFlightTurn: null,
         focus: [],
         tags: [],
         messages: [],
@@ -423,6 +466,43 @@ export const createFileSessionStore = (
       await writeSession(next);
       return next;
     },
+    updateWorkingState: async (id, state) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const next: SessionRecord = {
+        ...loaded.session,
+        summary:
+          typeof state.summary === "string"
+            ? state.summary.trim()
+            : loaded.session.summary,
+        pendingDigest:
+          typeof state.pendingDigest === "string"
+            ? state.pendingDigest.trim()
+            : loaded.session.pendingDigest,
+        lastStateUpdate:
+          state.lastStateUpdate === undefined
+            ? loaded.session.lastStateUpdate
+            : state.lastStateUpdate,
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
+    },
+    updateInFlightTurn: async (id, inFlightTurn) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const next: SessionRecord = {
+        ...loaded.session,
+        inFlightTurn,
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
+    },
     addFocus: async (id, note) => {
       const normalized = note.replace(/\s+/g, " ").trim();
       if (!normalized) {
@@ -527,11 +607,36 @@ export const createFileSessionStore = (
         throw new Error(`Session not found: ${id}`);
       }
       const compressed = compressContext(loaded.session.messages);
+      const durableSummary = loaded.session.summary.trim();
+      const pendingDigest = loaded.session.pendingDigest.trim();
+      const summaryFallback = durableSummary || compressed.summary;
+      const priorMessages = loaded.session.messages.filter(
+        message => message.role !== "system"
+      );
+      const priorAssistantMessages = priorMessages.filter(
+        message => message.role === "assistant"
+      );
       return getPromptContextFromMemoryIndex(
         loaded.index,
         query,
         compressed.recent,
-        loaded.session.summary.trim() || compressed.summary
+        {
+          durableSummary,
+          summaryFallback,
+          pendingDigest,
+          reducerMode: deriveReducerMode({
+            enabled: true,
+            durableSummary,
+            pendingDigest,
+            priorMessageCount: priorMessages.length,
+            priorAssistantMessageCount: priorAssistantMessages.length,
+          }),
+          summaryRecoveryNeeded:
+            !durableSummary &&
+            !pendingDigest &&
+            priorAssistantMessages.length > 0,
+          interruptedTurn: loaded.session.inFlightTurn,
+        }
       );
     },
   };

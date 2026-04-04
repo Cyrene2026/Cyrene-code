@@ -83,10 +83,6 @@ export const createLocalCoreTransport = (): QueryTransport => {
       message: "Local transport uses static model; nothing to refresh.",
       models: [currentModel],
     }),
-    summarizeText: async () => ({
-      ok: false,
-      message: "Local transport does not support AI summaries.",
-    }),
     requestStreamUrl: async (query: string) => {
       const id = crypto.randomUUID();
       sessionQueries.set(id, query);

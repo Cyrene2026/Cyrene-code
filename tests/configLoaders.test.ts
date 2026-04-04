@@ -9,18 +9,10 @@ import {
 } from "../src/infra/config/appRoot";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
 
-const originalCwd = process.cwd();
-const originalRootEnv = process.env.CYRENE_ROOT;
 const tempRoots: string[] = [];
 
 afterEach(async () => {
-  process.chdir(originalCwd);
   resetConfiguredAppRoot();
-  if (originalRootEnv === undefined) {
-    delete process.env.CYRENE_ROOT;
-  } else {
-    process.env.CYRENE_ROOT = originalRootEnv;
-  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -33,20 +25,18 @@ const createWorkspace = async (configText: string) => {
   tempRoots.push(root);
   await mkdir(join(root, ".cyrene"), { recursive: true });
   await writeFile(join(root, ".cyrene", "config.yaml"), configText, "utf8");
-  delete process.env.CYRENE_ROOT;
-  process.chdir(root);
   return root;
 };
 
 describe("config loaders", () => {
   test("loadCyreneConfig reads key runtime params from config.yaml", async () => {
-    await createWorkspace([
+    const root = await createWorkspace([
       "pin_max_count: 9",
       "query_max_tool_steps: 31",
       'system_prompt: "focus on tests"',
     ].join("\n"));
 
-    const config = await loadCyreneConfig();
+    const config = await loadCyreneConfig(root);
 
     expect(config.pinMaxCount).toBe(9);
     expect(config.queryMaxToolSteps).toBe(31);
@@ -63,7 +53,7 @@ describe("config loaders", () => {
       "  - run_command",
     ].join("\n"));
 
-    const config = await loadRuleConfig();
+    const config = await loadRuleConfig(root);
 
     expect(config.workspaceRoot).toBe(root);
     expect(config.maxReadBytes).toBe(4096);
@@ -77,7 +67,7 @@ describe("config loaders", () => {
   test("loadRuleConfig default review list keeps write_shell but not open_shell", async () => {
     const root = await createWorkspace("");
 
-    const config = await loadRuleConfig();
+    const config = await loadRuleConfig(root);
 
     expect(config.workspaceRoot).toBe(root);
     expect(config.requireReview).toContain("write_shell");
@@ -100,8 +90,14 @@ describe("config loaders", () => {
       env: {},
     });
 
-    const cyreneConfig = await loadCyreneConfig();
-    const ruleConfig = await loadRuleConfig();
+    const cyreneConfig = await loadCyreneConfig(undefined, {
+      cwd: root,
+      env: {},
+    });
+    const ruleConfig = await loadRuleConfig(undefined, {
+      cwd: root,
+      env: {},
+    });
 
     expect(cyreneConfig.pinMaxCount).toBe(9);
     expect(ruleConfig.workspaceRoot).toBe(root);
@@ -118,11 +114,15 @@ describe("config loaders", () => {
     ].join("\n"));
 
     await mkdir(join(root, "workspace"), { recursive: true });
-    process.chdir(join(root, "workspace"));
-    process.env.CYRENE_ROOT = root;
 
-    const cyreneConfig = await loadCyreneConfig();
-    const ruleConfig = await loadRuleConfig();
+    const cyreneConfig = await loadCyreneConfig(undefined, {
+      cwd: join(root, "workspace"),
+      env: { CYRENE_ROOT: root },
+    });
+    const ruleConfig = await loadRuleConfig(undefined, {
+      cwd: join(root, "workspace"),
+      env: { CYRENE_ROOT: root },
+    });
 
     expect(cyreneConfig.pinMaxCount).toBe(11);
     expect(cyreneConfig.queryMaxToolSteps).toBe(42);

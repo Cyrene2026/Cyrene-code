@@ -8,6 +8,11 @@ export type CyreneConfig = {
   systemPrompt?: string;
 };
 
+type CyreneConfigLoadContext = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
 const DEFAULT_CONFIG: CyreneConfig = {
   pinMaxCount: 6,
   queryMaxToolSteps: 24,
@@ -26,9 +31,11 @@ const parseValue = (raw: string): string | number => {
 };
 
 export const loadCyreneConfig = async (
-  appRoot = resolveAmbientAppRoot()
+  appRoot?: string,
+  context?: CyreneConfigLoadContext
 ): Promise<CyreneConfig> => {
-  const path = join(appRoot, ".cyrene", "config.yaml");
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const path = join(resolvedAppRoot, ".cyrene", "config.yaml");
   let content = "";
   try {
     content = await readFile(path, "utf8");

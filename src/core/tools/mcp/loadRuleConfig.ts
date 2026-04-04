@@ -6,6 +6,11 @@ import {
 } from "../../../infra/config/appRoot";
 import type { MpcAction, RuleConfig } from "./types";
 
+type RuleConfigLoadContext = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
 const createDefaultRules = (appRoot: string): RuleConfig => ({
   workspaceRoot: appRoot,
   maxReadBytes: 120_000,
@@ -74,10 +79,12 @@ const readConfigFile = async (path: string) => {
 };
 
 export const loadRuleConfig = async (
-  appRoot = resolveAmbientAppRoot()
+  appRoot?: string,
+  context?: RuleConfigLoadContext
 ): Promise<RuleConfig> => {
-  const defaultRules = createDefaultRules(appRoot);
-  const configDir = getCyreneConfigDir(appRoot);
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const defaultRules = createDefaultRules(resolvedAppRoot);
+  const configDir = getCyreneConfigDir(resolvedAppRoot);
   const configPath = join(configDir, "config.yaml");
   const rulePath = join(configDir, "rule.yaml");
   const content = (await readConfigFile(configPath)) || (await readConfigFile(rulePath));
@@ -98,7 +105,7 @@ export const loadRuleConfig = async (
 
     if (line.startsWith("workspace_root:")) {
       const rawPath = parseScalar(line.slice("workspace_root:".length));
-      workspaceRoot = resolve(appRoot, rawPath || ".");
+      workspaceRoot = resolve(resolvedAppRoot, rawPath || ".");
       inRequireReview = false;
       continue;
     }

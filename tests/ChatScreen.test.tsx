@@ -601,10 +601,14 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("terminal  run_command");
-    expect(output).toContain("status completed");
+    expect(output).toContain("run_command  |  status completed");
+    expect(output).toContain("cwd .");
+    expect(output).toContain("exit 0");
     expect(output).toContain("bun --version");
     expect(output).toContain("1.3.11");
+    expect(output).not.toContain("terminal  run_command");
+    expect(output).not.toContain("Tool result: run_command .");
+    expect(output).not.toContain("\"tool\"");
   });
 
   test("renders terminal-style transcript for approved shell input", () => {
@@ -615,9 +619,7 @@ describe("ChatScreen", () => {
           kind: "review_status",
           tone: "success",
           text: [
-            "Approved",
-            "id: shell-1",
-            "action: write_shell",
+            "Approved shell-1",
             "path: .",
             "status: completed",
             "shell: pwsh",
@@ -625,6 +627,7 @@ describe("ChatScreen", () => {
             "input: python --version",
             "last_exit: 0",
             "output:",
+            "$ python --version",
             "Python 3.12.0 (venv)",
           ].join("\n"),
         },
@@ -632,10 +635,12 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("terminal  write_shell");
+    expect(output).toContain("write_shell  |  status completed");
     expect(output).toContain("PS>");
     expect(output).toContain("python --version");
     expect(output).toContain("Python 3.12.0 (venv)");
+    expect(output).not.toContain("terminal  write_shell");
+    expect(output).not.toContain("\"review\"");
   });
 
   test("renders compact model picker list", () => {

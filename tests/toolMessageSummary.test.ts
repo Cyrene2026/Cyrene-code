@@ -75,4 +75,35 @@ describe("toolMessageSummary", () => {
 
     expect(result.text).toBe("Tool: read_file test_files/u5.py | (empty file)");
   });
+
+  test("preserves approved terminal transcript bodies for shell actions", () => {
+    const raw = [
+      "[approved] shell-1",
+      "status: completed",
+      "shell: pwsh",
+      "cwd: .",
+      "input: python --version",
+      "last_exit: 0",
+      "output:",
+      "$ python --version",
+      "Python 3.12.0",
+    ].join("\n");
+
+    const result = summarizeToolMessage(raw);
+
+    expect(result.kind).toBe("review_status");
+    expect(result.text).toBe(
+      [
+        "Approved shell-1",
+        "status: completed",
+        "shell: pwsh",
+        "cwd: .",
+        "input: python --version",
+        "last_exit: 0",
+        "output:",
+        "$ python --version",
+        "Python 3.12.0",
+      ].join("\n")
+    );
+  });
 });

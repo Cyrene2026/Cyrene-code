@@ -110,11 +110,9 @@ type MarkdownBlock =
 
 type TerminalTranscript = {
   action: string;
-  status?: string;
   shell?: string;
-  cwd?: string;
-  exit?: string;
-  commandLine?: string;
+  commandLine: string;
+  metaParts: string[];
   outputLines: string[];
 };
 
@@ -703,9 +701,122 @@ const TERMINAL_ACTIONS = new Set([
   "close_shell",
 ]);
 
+const getTerminalFieldValue = (lines: string[], key: string) =>
+  lines
+    .map(line => line.trim())
+    .find(line => line.toLowerCase().startsWith(`${key.toLowerCase()}:`))
+    ?.replace(new RegExp(`^${key}:\\s*`, "i"), "")
+    .trim() ?? "";
+
+const inferApprovalTerminalAction = (lines: string[]) => {
+  const explicitAction = getTerminalFieldValue(lines, "action");
+  if (TERMINAL_ACTIONS.has(explicitAction)) {
+    return explicitAction;
+  }
+
+  const status = getTerminalFieldValue(lines, "status").toLowerCase();
+  const hasCommand = Boolean(getTerminalFieldValue(lines, "command"));
+  const hasShell = Boolean(getTerminalFieldValue(lines, "shell"));
+  const hasInput = Boolean(getTerminalFieldValue(lines, "input"));
+  const hasProgram = Boolean(getTerminalFieldValue(lines, "program"));
+  const hasBusy = Boolean(getTerminalFieldValue(lines, "busy"));
+  const hasAlive = Boolean(getTerminalFieldValue(lines, "alive"));
+  const hasPendingOutput = Boolean(getTerminalFieldValue(lines, "pending_output"));
+  const hasOutput = lines.some(line => line.trim().toLowerCase() === "output:");
+
+  if (hasInput) {
+    return "write_shell";
+  }
+  if (hasCommand) {
+    return hasShell ? "run_shell" : "run_command";
+  }
+  if (hasProgram || status === "opened") {
+    return "open_shell";
+  }
+  if (status === "interrupted") {
+    return "interrupt_shell";
+  }
+  if (status === "closed") {
+    return "close_shell";
+  }
+  if (hasOutput) {
+    return "read_shell";
+  }
+  if (hasBusy || hasAlive || hasPendingOutput) {
+    return "shell_status";
+  }
+  return "";
+};
+
+const getTerminalPrompt = (action: string, shell?: string) =>
+  shell === "pwsh" ? "PS>" : action === "run_command" ? ">" : "$";
+
+const normalizeTranscriptPromptLine = (
+  line: string,
+  action: string,
+  shell?: string
+) => {
+  const match = /^(PS>|>|[$])\s*(.*)$/.exec(line.trim());
+  if (!match) {
+    return null;
+  }
+  return {
+    prompt: getTerminalPrompt(action, shell),
+    text: match[2] ?? "",
+  };
+};
+
+const getTerminalCommandPreview = (
+  action: string,
+  fields: Map<string, string>,
+  outputLines: string[]
+) => {
+  if (action === "write_shell") {
+    const hasPromptInOutput = outputLines.some(line =>
+      /^(PS>|>|[$])\s+/.test(line.trim())
+    );
+    if (hasPromptInOutput) {
+      return "";
+    }
+  }
+
+  const args = fields.get("args");
+  const command = fields.get("command");
+  const input = fields.get("input");
+  const program = fields.get("program");
+
+  if (input) {
+    return input;
+  }
+  if (command) {
+    return [command, args && args !== "(none)" ? args : ""].filter(Boolean).join(" ");
+  }
+  if (action === "open_shell") {
+    return "(shell opened)";
+  }
+  if (action === "interrupt_shell") {
+    return "^C";
+  }
+  if (action === "close_shell") {
+    return "(shell closed)";
+  }
+  if (action === "shell_status") {
+    return "(shell status)";
+  }
+  if (action === "read_shell") {
+    return "(read pending output)";
+  }
+  return program || "";
+};
+
 const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
   const lines = item.text.split("\n");
   const firstLine = lines[0]?.trim() ?? "";
+  const approvalLike =
+    firstLine.startsWith("Approved") ||
+    firstLine.startsWith("Approve failed") ||
+    firstLine.startsWith("Approval error") ||
+    firstLine.startsWith("Rejected");
   let action = "";
 
   if (firstLine.startsWith("Tool result:")) {
@@ -713,21 +824,18 @@ const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
       .replace("Tool result:", "")
       .trim()
       .split(/\s+/, 1)[0] ?? "";
-  } else if (
-    firstLine === "Approved" ||
-    firstLine.startsWith("Approval error") ||
-    firstLine === "Rejected"
-  ) {
-    const actionLine = lines.find(line => line.trim().startsWith("action:"));
-    action = actionLine?.replace(/^action:\s*/i, "").trim() ?? "";
-  }
-
-  if (!TERMINAL_ACTIONS.has(action)) {
-    return null;
+  } else if (firstLine.startsWith("Tool error:")) {
+    action = firstLine
+      .replace("Tool error:", "")
+      .trim()
+      .split(/\s+/, 1)[0] ?? "";
+  } else if (approvalLike) {
+    action = inferApprovalTerminalAction(lines.slice(1));
   }
 
   const fields = new Map<string, string>();
   const outputLines: string[] = [];
+  const looseLines: string[] = [];
   let readingOutput = false;
 
   for (const line of lines.slice(1)) {
@@ -737,6 +845,9 @@ const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
     }
     const match = /^([a-z_ ]+):\s*(.*)$/i.exec(line.trim());
     if (!match) {
+      if (line.trim()) {
+        looseLines.push(line);
+      }
       continue;
     }
     const key = (match[1] ?? "").trim().toLowerCase().replace(/\s+/g, "_");
@@ -750,29 +861,35 @@ const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
     }
   }
 
-  const args = fields.get("args");
-  const command = fields.get("command");
-  const input = fields.get("input");
-  const program = fields.get("program");
-  const commandLine =
-    input ||
-    (command
-      ? [command, args && args !== "(none)" ? args : ""].filter(Boolean).join(" ")
-      : "") ||
-    program ||
-    action;
+  if (!TERMINAL_ACTIONS.has(action)) {
+    return null;
+  }
+
+  const resolvedOutputLines =
+    outputLines.length > 0
+      ? outputLines
+      : looseLines.length > 0
+        ? looseLines
+        : ["(no new output)"];
+  const metaParts = [
+    action,
+    fields.get("status") ? `status ${fields.get("status")}` : "",
+    fields.get("shell") ? `shell ${fields.get("shell")}` : "",
+    fields.get("cwd") ? `cwd ${fields.get("cwd")}` : "",
+    fields.get("exit") || fields.get("last_exit")
+      ? `exit ${fields.get("exit") ?? fields.get("last_exit")}`
+      : "",
+    fields.get("busy") ? `busy ${fields.get("busy")}` : "",
+    fields.get("alive") ? `alive ${fields.get("alive")}` : "",
+    fields.get("pending_output") ? `pending ${fields.get("pending_output")}` : "",
+  ].filter(Boolean);
 
   return {
     action,
-    status: fields.get("status"),
     shell: fields.get("shell"),
-    cwd: fields.get("cwd"),
-    exit: fields.get("exit") ?? fields.get("last_exit"),
-    commandLine,
-    outputLines:
-      outputLines.length > 0
-        ? outputLines
-        : ["(no new output)"],
+    commandLine: getTerminalCommandPreview(action, fields, resolvedOutputLines),
+    metaParts,
+    outputLines: resolvedOutputLines,
   };
 };
 
@@ -780,41 +897,54 @@ const renderTerminalTranscript = (
   transcript: TerminalTranscript,
   itemIndex: number
 ) => {
-  const shellPrompt =
-    transcript.shell === "pwsh" ? "PS>" : transcript.action === "run_command" ? ">" : "$";
-  const meta = [
-    transcript.status ? `status ${transcript.status}` : "",
-    transcript.cwd ? `cwd ${transcript.cwd}` : "",
-    transcript.shell ? `shell ${transcript.shell}` : "",
-    transcript.exit ? `exit ${transcript.exit}` : "",
-  ]
-    .filter(Boolean)
-    .join("  |  ");
+  const shellPrompt = getTerminalPrompt(transcript.action, transcript.shell);
+  const meta = transcript.metaParts.join("  |  ");
 
   return (
-    <Box
-      key={`terminal-${itemIndex}`}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor="gray"
-      paddingX={1}
-      marginTop={1}
-    >
-      <Text color="cyan">{`terminal  ${transcript.action}`}</Text>
+    <Box key={`terminal-${itemIndex}`} flexDirection="column" marginBottom={1}>
       {meta ? <Text dimColor>{meta}</Text> : null}
-      <Box marginTop={1}>
-        <Text color="green">{shellPrompt}</Text>
-        <Text> </Text>
-        <Text color="white">{transcript.commandLine}</Text>
-      </Box>
-      <Box flexDirection="column" marginTop={1}>
+      {transcript.commandLine ? (
+        <Box>
+          <Text color="green">{shellPrompt}</Text>
+          <Text> </Text>
+          <Text color="white">{transcript.commandLine}</Text>
+        </Box>
+      ) : null}
+      <Box flexDirection="column">
         {transcript.outputLines.map((line, lineIndex) => (
-          <Text
-            key={`terminal-output-${itemIndex}-${lineIndex}`}
-            color={line.startsWith("stderr") || line.startsWith("error") ? "red" : "gray"}
-          >
-            {`  ${line || " "}`}
-          </Text>
+          (() => {
+            const promptLine = normalizeTranscriptPromptLine(
+              line,
+              transcript.action,
+              transcript.shell
+            );
+            if (promptLine) {
+              return (
+                <Box key={`terminal-output-${itemIndex}-${lineIndex}`}>
+                  <Text color="green">{promptLine.prompt}</Text>
+                  <Text> </Text>
+                  <Text color="white">{promptLine.text || " "}</Text>
+                </Box>
+              );
+            }
+
+            const normalized = line.trim().toLowerCase();
+            const lineColor =
+              normalized.startsWith("[stderr]") ||
+              normalized.startsWith("stderr") ||
+              normalized.startsWith("error") ||
+              normalized.startsWith("exception")
+                ? "red"
+                : line.trim() === "(no new output)"
+                  ? "gray"
+                  : "white";
+
+            return (
+              <Text key={`terminal-output-${itemIndex}-${lineIndex}`} color={lineColor}>
+                {line || " "}
+              </Text>
+            );
+          })()
         ))}
       </Box>
     </Box>
@@ -827,7 +957,6 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
   }
 
   const color = resolveItemColor(item);
-  const messageLabel = getMessageLabel(item);
   const terminalTranscript = parseTerminalTranscript(item);
   const blocks = parseMarkdownBlocks(item.text);
   const nodes: React.ReactNode[] = [];
@@ -911,6 +1040,15 @@ const renderMessageItem = (item: ChatItem, itemIndex: number) => {
   });
   }
 
+  if (terminalTranscript) {
+    return (
+      <Box key={`item-${itemIndex}`} flexDirection="column">
+        {nodes}
+      </Box>
+    );
+  }
+
+  const messageLabel = getMessageLabel(item);
   return (
     <Box key={`item-${itemIndex}`} flexDirection="column" marginBottom={1}>
       <Text bold color={messageLabel.color}>

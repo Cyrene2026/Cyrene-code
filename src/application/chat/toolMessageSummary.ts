@@ -11,6 +11,54 @@ const TERMINAL_TOOL_ACTIONS = new Set([
   "close_shell",
 ]);
 
+const getFieldValue = (lines: string[], key: string) =>
+  lines
+    .map(line => line.trim())
+    .find(line => line.toLowerCase().startsWith(`${key.toLowerCase()}:`))
+    ?.replace(new RegExp(`^${key}:\\s*`, "i"), "")
+    .trim() ?? "";
+
+const inferApprovalTerminalAction = (body: string) => {
+  const lines = body.split("\n");
+  const explicitAction = getFieldValue(lines, "action");
+  if (TERMINAL_TOOL_ACTIONS.has(explicitAction)) {
+    return explicitAction;
+  }
+
+  const status = getFieldValue(lines, "status").toLowerCase();
+  const hasCommand = Boolean(getFieldValue(lines, "command"));
+  const hasShell = Boolean(getFieldValue(lines, "shell"));
+  const hasInput = Boolean(getFieldValue(lines, "input"));
+  const hasProgram = Boolean(getFieldValue(lines, "program"));
+  const hasBusy = Boolean(getFieldValue(lines, "busy"));
+  const hasAlive = Boolean(getFieldValue(lines, "alive"));
+  const hasPendingOutput = Boolean(getFieldValue(lines, "pending_output"));
+  const hasOutput = lines.some(line => line.trim().toLowerCase() === "output:");
+
+  if (hasInput) {
+    return "write_shell";
+  }
+  if (hasCommand) {
+    return hasShell ? "run_shell" : "run_command";
+  }
+  if (hasProgram || status === "opened") {
+    return "open_shell";
+  }
+  if (status === "interrupted") {
+    return "interrupt_shell";
+  }
+  if (status === "closed") {
+    return "close_shell";
+  }
+  if (hasOutput) {
+    return "read_shell";
+  }
+  if (hasBusy || hasAlive || hasPendingOutput) {
+    return "shell_status";
+  }
+  return "";
+};
+
 export const normalizeMcpMessage = (raw: string): {
   text: string;
   kind: ChatItem["kind"];
@@ -185,6 +233,13 @@ export const summarizeToolMessage = (raw: string): {
   }
 
   if (firstLine.startsWith("Approved")) {
+    const action = inferApprovalTerminalAction(body);
+    if (TERMINAL_TOOL_ACTIONS.has(action)) {
+      return {
+        ...normalized,
+        text: normalized.text,
+      };
+    }
     const detail = firstLine.replace("Approved", "").trim();
     const resultLine = body.split("\n").find(line => line.trim().length > 0)?.trim();
     return {
@@ -193,8 +248,18 @@ export const summarizeToolMessage = (raw: string): {
     };
   }
 
-  if (firstLine.startsWith("Approve failed")) {
-    const detail = firstLine.replace("Approve failed", "").trim();
+  if (firstLine.startsWith("Approve failed") || firstLine.startsWith("Approval error")) {
+    const action = inferApprovalTerminalAction(body);
+    if (TERMINAL_TOOL_ACTIONS.has(action)) {
+      return {
+        ...normalized,
+        text: normalized.text,
+      };
+    }
+    const detail = firstLine
+      .replace("Approve failed", "")
+      .replace("Approval error", "")
+      .trim();
     const reason = body.split("\n").find(line => line.trim().length > 0)?.trim();
     return {
       ...normalized,

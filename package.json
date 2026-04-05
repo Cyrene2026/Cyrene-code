@@ -1,6 +1,6 @@
 {
   "name": "cyrenecode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Terminal-first coding assistant with reviewable tool calls and rolling session state.",
   "license": "MIT",
   "private": false,
@@ -44,7 +44,6 @@
   "dependencies": {
     "axios": "^1.7.7",
     "ink": "^5.0.1",
-    "ink-text-input": "^5.0.1",
     "node-pty": "^1.0.0",
     "react": "^18.3.1",
     "zod": "^3.23.8"

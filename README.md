@@ -8,11 +8,25 @@ Terminal-first coding assistant built with Bun, React Ink, and a reviewable quer
 
 ## Install
 
+### Global CLI
+
+```bash
+npm install -g cyrenecode
+```
+
+Or run it without a global install:
+
+```bash
+npx cyrenecode
+```
+
+### From source
+
 ```bash
 bun install
 ```
 
-## Run
+## Run from source
 
 ```bash
 bun dev

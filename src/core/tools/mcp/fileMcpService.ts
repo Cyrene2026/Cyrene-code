@@ -4124,21 +4124,39 @@ export class FileMcpService {
     if (!info.isFile()) {
       throw new Error(`read_range only supports files: ${request.path}`);
     }
-    if (info.size > this.rules.maxReadBytes) {
-      throw new Error(
-        `read_range target too large: ${request.path} (${info.size} bytes). max_read_bytes=${this.rules.maxReadBytes}`
-      );
-    }
+    let selectedLines: string[];
+    const usedLargeFileMode = info.size > this.rules.maxReadBytes;
 
-    const content = await readFile(abs, "utf8");
-    const allLines = splitFileLines(content);
-    const selectedLines = allLines.slice(request.startLine - 1, request.endLine);
+    if (usedLargeFileMode) {
+      selectedLines = [];
+      await this.scanTextFileLines(abs, info.size, (line, lineNumber) => {
+        if (lineNumber < request.startLine) {
+          return false;
+        }
+        if (lineNumber > request.endLine) {
+          return true;
+        }
+        selectedLines.push(clipContextLine(line));
+        return lineNumber >= request.endLine;
+      });
+    } else {
+      const content = await readFile(abs, "utf8");
+      const allLines = splitFileLines(content);
+      selectedLines = allLines
+        .slice(request.startLine - 1, request.endLine)
+        .map(line => clipContextLine(line));
+    }
 
     return [
       `path: ${request.path}`,
       `lines: ${request.startLine}-${request.endLine}`,
+      ...(usedLargeFileMode
+        ? [
+            `note: large-file mode streamed requested lines from oversized file (${info.size} bytes)`,
+          ]
+        : []),
       selectedLines.length > 0
-        ? formatNumberedLines(selectedLines.map(line => clipContextLine(line)), request.startLine)
+        ? formatNumberedLines(selectedLines, request.startLine)
         : "(no lines in requested range)",
     ].join("\n");
   }

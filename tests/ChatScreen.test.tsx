@@ -255,8 +255,19 @@ describe("ChatScreen", () => {
       { kind: "heading", level: 2, text: "创建 FastAPI 应用" },
       { kind: "paragraph", text: "这是一段说明， 下一行应并入同一段。" },
       { kind: "rule" },
-      { kind: "list", ordered: true, items: ["第一项", "第二项"] },
-      { kind: "list", ordered: false, items: ["普通列表", "`Token` 模型"] },
+      {
+        kind: "list",
+        ordered: true,
+        items: [
+          { text: "第一项", marker: "1. " },
+          { text: "第二项", marker: "2. " },
+        ],
+      },
+      {
+        kind: "list",
+        ordered: false,
+        items: [{ text: "普通列表" }, { text: "`Token` 模型" }],
+      },
       { kind: "code", language: "py", content: "app = FastAPI()" },
     ]);
   });
@@ -857,7 +868,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("empty composer: Up/Down recall");
   });
 
-  test("clips oversized transcript blocks and shows render clip notice", () => {
+  test("clips oversized assistant transcript blocks and keeps the latest slice visible", () => {
     const hugeCodeBlock = [
       "```txt",
       ...Array.from({ length: 460 }, (_, index) => `line-${String(index + 1).padStart(3, "0")}`),
@@ -877,8 +888,37 @@ describe("ChatScreen", () => {
     const output = JSON.stringify(tree);
 
     expect(output).toContain("[render clipped]");
-    expect(output).toContain("\"001\"");
-    expect(output).not.toContain("\"460\"");
+    expect(output).toContain("showing latest slice");
+    expect(output).toContain("code | txt");
+    expect(output).toContain("\"460\"");
+    expect(output).not.toContain("\"001\"");
+  });
+
+  test("keeps the tail of long ordered assistant output after it is committed", () => {
+    const longList = Array.from(
+      { length: 460 },
+      (_, index) => `${index + 1}. point-${String(index + 1).padStart(3, "0")}`
+    ).join("\n");
+
+    const tree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: longList,
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("[render clipped]");
+    expect(output).toContain("showing latest slice");
+    expect(output).toContain("\"  41. \"");
+    expect(output).toContain("point-041");
+    expect(output).toContain("\"  460. \"");
+    expect(output).toContain("point-460");
+    expect(output).not.toContain("point-001");
   });
 
   test("shows only a recent transcript window for very long sessions", () => {

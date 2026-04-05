@@ -146,9 +146,15 @@ const SELF_TALK_PREFIXES = [
   "我将",
   "我继续",
   "我再",
+  "我就能",
   "先让我",
   "先看一下",
   "再看一下",
+  "继续看",
+  "再往下看",
+  "继续抓",
+  "继续顺着",
+  "顺着",
   "接下来我会",
   "let me",
   "i'll",
@@ -181,10 +187,12 @@ const TASK_LEADIN_PREFIXES = [
   "然后",
   "下一步",
   "接下来",
+  "先",
+  "再",
 ] as const;
 
 const EXECUTABLE_TASK_SIGNAL =
-  /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate)\b|(?:看一下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查)/iu;
+  /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate|clarify|confirm|locate|trace)\b|(?:看一下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查|澄清|确认|定位|走查|梳理)/iu;
 
 const STABLE_FACT_SIGNAL =
   /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态)/iu;
@@ -206,6 +214,26 @@ const META_FAILURE_PREFIX =
 
 const QUESTION_OR_OPTION_SIGNAL =
   /[?？]|\b(?:if you want|would you like|you can ask|next i can|do you want)\b|(?:如果你愿意|你要我|下一步可以)/iu;
+
+const META_NARRATION_PREFIX =
+  /^(?:已确认结果|搜索模式|当前状态|结论|说明|也就是|所以|因此|我就能|如果你愿意|下一步可以|继续看|再往下看|继续抓|继续顺着|顺着)/iu;
+
+const LOW_SIGNAL_TASK_LINE =
+  /^(?:查看|继续|梳理|分析|检查|确认|定位|阅读|走查)(?:主线|细节|结构|逻辑|代码|内容|部分|附近|后面|前面|更多内容|关键调用点)?$|^(?:做|继续做|进行)(?:详细)?(?:分析|梳理|检查)$/u;
+
+const ACTION_META_PREFIX =
+  /^(?:这里|下面|当前|本轮|这说明|这意味着|也就是|所以|因此|已确认结果|搜索模式)/iu;
+
+const FACT_META_PREFIX =
+  /^(?:已确认结果|搜索模式|当前状态|结论|说明|真正的首入口)/iu;
+
+const CONDITIONAL_PREFIX = /^(?:当|如果|若|when\b|if\b)/iu;
+const CONDITIONAL_OUTCOME_SIGNAL =
+  /\b(?:then|will|would|returns?|uses?|loads?|stores?|reads?|writes?|ensures?|maps?|injects?|falls back|points to)\b|(?:会|将|则|负责|用于|用来|读取|写入|注入|映射|加载|返回|确保|指向|生效)/iu;
+const INCOMPLETE_CLAUSE_END =
+  /(?:[：:，,、]|→|->|且|并且|而是|以及|and|or)$/iu;
+const CONSTRAINT_MODAL_SIGNAL =
+  /\b(?:must|should|cannot|can't|do not|don't|avoid|pending approval|requires|limit|constraint|read-only|blocked|must not|no code changes)\b|(?:必须|不能|不要|避免|待审批|需要|限制|约束|只读|阻塞|不改|不准)/iu;
 
 const trimLeadingSeparators = (value: string) =>
   value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
@@ -230,6 +258,59 @@ const sanitizeCandidatePrefix = (value: string) =>
     stripLeadingPhrases(value, SELF_TALK_PREFIXES),
     POLITE_REQUEST_PREFIXES
   );
+
+const splitIntoClauses = (value: string) =>
+  value
+    .split(/[，,；;。！？!?]\s*/u)
+    .map(part => part.trim())
+    .filter(Boolean);
+
+const takePrimaryClause = (value: string) =>
+  value
+    .split(/[。！？!?；;]\s*/u)
+    .map(part => part.trim())
+    .find(Boolean) ?? "";
+
+const normalizeTaskClause = (value: string) => {
+  const clause = takePrimaryClause(value).replace(/[：:]+$/u, "").trim();
+  if (!clause) {
+    return "";
+  }
+
+  if (/^看(?:(?=\s)|(?=`)|(?=[A-Za-z0-9_\u4e00-\u9fff]))/u.test(clause)) {
+    return clause.replace(/^看/u, "查看");
+  }
+
+  return clause;
+};
+
+const pickExecutableClause = (value: string) => {
+  const clauses = splitIntoClauses(value);
+  for (const clause of clauses) {
+    const normalized = normalizeTaskClause(clause);
+    if (!normalized || ACTION_META_PREFIX.test(normalized)) {
+      continue;
+    }
+    if (isExecutableTaskLine(normalized)) {
+      return normalized;
+    }
+  }
+  return normalizeTaskClause(value);
+};
+
+const isBareSymbolLikeLine = (line: string) => {
+  const withoutTicks = line.replace(/`/g, "").trim();
+  if (!withoutTicks) {
+    return false;
+  }
+  if (/\s/.test(withoutTicks)) {
+    return false;
+  }
+  return /^[A-Za-z_$][\w$.-]*(?:\(\))?$/.test(withoutTicks);
+};
+
+const isIncompleteConditionalLine = (line: string) =>
+  CONDITIONAL_PREFIX.test(line) && !CONDITIONAL_OUTCOME_SIGNAL.test(line);
 
 const isPurePathLine = (line: string) => {
   const paths = collectPathCandidates(line);
@@ -260,6 +341,9 @@ const isRealFailureLine = (line: string) =>
   !META_FAILURE_SIGNAL.test(line) &&
   !QUESTION_OR_OPTION_SIGNAL.test(line);
 
+const isAnchoredTaskLine = (line: string) =>
+  collectPathCandidates(line).length > 0 || /`[^`]+`/.test(line) || line.length >= 8;
+
 const normalizeSectionLine = (
   section: WorkingStateSectionName,
   line: string
@@ -270,17 +354,28 @@ const normalizeSectionLine = (
   }
 
   const candidate = sanitizeCandidatePrefix(rawCandidate);
-  if (!candidate || candidate === "(none)") {
+  if (
+    !candidate ||
+    candidate === "(none)" ||
+    META_NARRATION_PREFIX.test(candidate)
+  ) {
     return null;
   }
 
   switch (section) {
     case "OBJECTIVE": {
-      const objective = stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES);
+      const objective = pickExecutableClause(
+        stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
+      );
       if (!objective || QUESTION_OR_OPTION_SIGNAL.test(objective)) {
         return null;
       }
-      if (!isExecutableTaskLine(objective) || isStableFactLine(objective)) {
+      if (
+        !isExecutableTaskLine(objective) ||
+        isStableFactLine(objective) ||
+        ACTION_META_PREFIX.test(objective) ||
+        (LOW_SIGNAL_TASK_LINE.test(objective) && !isAnchoredTaskLine(objective))
+      ) {
         return null;
       }
       return objective;
@@ -288,23 +383,42 @@ const normalizeSectionLine = (
     case "CONFIRMED FACTS":
       if (
         candidate.length < 4 ||
+        FACT_META_PREFIX.test(candidate) ||
+        isIncompleteConditionalLine(candidate) ||
+        INCOMPLETE_CLAUSE_END.test(candidate) ||
+        isBareSymbolLikeLine(candidate) ||
+        /[：:]$/.test(candidate) ||
         isPurePathLine(candidate) ||
         !isStableFactLine(candidate)
       ) {
         return null;
       }
       return candidate;
-    case "CONSTRAINTS":
-      return CONSTRAINT_SECTION_SIGNAL.test(candidate) ? candidate : null;
+    case "CONSTRAINTS": {
+      const clause =
+        splitIntoClauses(candidate).find(part => CONSTRAINT_MODAL_SIGNAL.test(part)) ??
+        candidate;
+      return CONSTRAINT_SECTION_SIGNAL.test(clause) &&
+        !ACTION_META_PREFIX.test(clause) &&
+        !/[：:]$/.test(clause)
+        ? clause
+        : null;
+    }
     case "COMPLETED":
-      return COMPLETED_SECTION_SIGNAL.test(candidate) ? candidate : null;
+      return COMPLETED_SECTION_SIGNAL.test(candidate) && !/[：:]$/.test(candidate)
+        ? takePrimaryClause(candidate)
+        : null;
     case "REMAINING":
     case "NEXT BEST ACTIONS": {
-      const action = stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES);
+      const action = pickExecutableClause(
+        stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
+      );
       if (
         !action ||
         QUESTION_OR_OPTION_SIGNAL.test(action) ||
-        COMPLETED_SECTION_SIGNAL.test(action)
+        COMPLETED_SECTION_SIGNAL.test(action) ||
+        ACTION_META_PREFIX.test(action) ||
+        (LOW_SIGNAL_TASK_LINE.test(action) && !isAnchoredTaskLine(action))
       ) {
         return null;
       }
@@ -351,7 +465,8 @@ const normalizeUniqueLines = (
 
 const finalizeSectionMap = (
   sections: WorkingStateSectionMap,
-  pending = false
+  pending = false,
+  allowedPaths?: ReadonlySet<string>
 ) => {
   const finalized = createEmptySectionMap();
 
@@ -369,6 +484,12 @@ const finalizeSectionMap = (
     );
     finalized["NEXT BEST ACTIONS"] = finalized["NEXT BEST ACTIONS"].filter(
       line => !completedSet.has(normalizeLooseLine(line))
+    );
+  }
+
+  if (allowedPaths && allowedPaths.size > 0) {
+    finalized["KNOWN PATHS"] = finalized["KNOWN PATHS"].filter(path =>
+      allowedPaths.has(path)
     );
   }
 
@@ -456,6 +577,45 @@ const normalizeSectionMapInput = (
   sectionMap: WorkingStateSectionMap | undefined,
   pending = false
 ) => finalizeSectionMap(sectionMap ?? createEmptySectionMap(), pending);
+
+const normalizeAllowedPaths = (paths?: Iterable<string>) => {
+  const normalized = new Set<string>();
+  if (!paths) {
+    return normalized;
+  }
+
+  for (const path of paths) {
+    const candidate = path.replace(/\\/g, "/").trim();
+    if (candidate) {
+      normalized.add(candidate);
+    }
+  }
+
+  return normalized;
+};
+
+export const sanitizeStoredWorkingState = (params: {
+  summary: string;
+  pendingDigest: string;
+  allowedPaths?: Iterable<string>;
+}) => {
+  const allowedPaths = normalizeAllowedPaths(params.allowedPaths);
+  const summarySections = params.summary.trim()
+    ? finalizeSectionMap(parseStructuredStateText(params.summary), false, allowedPaths)
+    : createEmptySectionMap();
+  const pendingSections = params.pendingDigest.trim()
+    ? finalizeSectionMap(parseStructuredStateText(params.pendingDigest), true, allowedPaths)
+    : createEmptySectionMap();
+
+  return {
+    summary: hasMeaningfulSectionContent(summarySections)
+      ? renderSectionMap(summarySections, { preserveEmpty: true })
+      : "",
+    pendingDigest: hasMeaningfulSectionContent(pendingSections)
+      ? renderSectionMap(pendingSections, { pending: true })
+      : "",
+  };
+};
 
 const normalizeForComparison = (lines: string[]) =>
   new Set(lines.map(line => normalizeLooseLine(line)).filter(Boolean));
@@ -680,7 +840,9 @@ export const buildStateReducerPrompt = ({
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
     "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
     "Hard rules: never copy the user's raw request into CONFIRMED FACTS. CONFIRMED FACTS only stores stable, durable facts.",
+    "Hard rules: CONFIRMED FACTS must be complete factual statements. Do not emit bare identifiers, headings, search metadata, or incomplete conditional fragments.",
     "Hard rules: OBJECTIVE must be one executable task sentence, not narration or a bare topic fragment.",
+    "Hard rules: CONSTRAINTS stores only actual requirements/prohibitions. Drop explanatory preambles and keep the concrete rule clause.",
     "Hard rules: RECENT FAILURES only stores real failures, conflicts, or blockers. Explanations about error handling do not belong there.",
     "Hard rules: COMPLETED and REMAINING must stay mutually exclusive. Remove finished items from REMAINING and NEXT BEST ACTIONS.",
     "Hard rules: KNOWN PATHS only stores concrete repo paths.",

@@ -109,7 +109,14 @@ type MarkdownInlineSegment = {
 type MarkdownBlock =
   | { kind: "paragraph"; text: string }
   | { kind: "heading"; level: number; text: string }
-  | { kind: "list"; ordered: boolean; items: string[] }
+  | {
+      kind: "list";
+      ordered: boolean;
+      items: Array<{
+        text: string;
+        marker?: string;
+      }>;
+    }
   | { kind: "code"; language?: string; content: string }
   | { kind: "diff"; lines: string[] }
   | { kind: "rule" };
@@ -274,6 +281,55 @@ const getMessageLabel = (
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
 
+const fitLinesToCharBudget = (
+  lines: string[],
+  maxChars: number,
+  preferTail: boolean
+) => {
+  if (lines.length === 0) {
+    return lines;
+  }
+
+  const kept: string[] = [];
+  let usedChars = 0;
+  const iterate = preferTail ? [...lines].reverse() : lines;
+
+  for (const line of iterate) {
+    const additional = kept.length === 0 ? line.length : line.length + 1;
+    if (kept.length > 0 && usedChars + additional > maxChars) {
+      break;
+    }
+    if (kept.length === 0 && additional > maxChars) {
+      const clippedLine = preferTail
+        ? line.slice(-maxChars)
+        : line.slice(0, maxChars);
+      kept.push(clippedLine);
+      usedChars = clippedLine.length;
+      break;
+    }
+    kept.push(line);
+    usedChars += additional;
+  }
+
+  return preferTail ? kept.reverse() : kept;
+};
+
+const countCodeFenceLines = (lines: string[]) =>
+  lines.reduce(
+    (count, line) => count + (line.trim().startsWith("```") ? 1 : 0),
+    0
+  );
+
+const getLastCodeFenceLine = (lines: string[]) => {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const candidate = lines[index]?.trim();
+    if (candidate?.startsWith("```")) {
+      return candidate;
+    }
+  }
+  return "```";
+};
+
 const clipTextForRender = (
   text: string,
   options: RenderClipOptions = {}
@@ -282,18 +338,30 @@ const clipTextForRender = (
   const maxChars = Math.max(1, options.maxChars ?? MAX_RENDER_TEXT_CHARS);
   const preferTail = options.preferTail ?? false;
   const allLines = text.split("\n");
-  const visibleLines = preferTail
+  const initialVisibleLines = preferTail
     ? allLines.slice(-maxLines)
     : allLines.slice(0, maxLines);
-  let clippedText = visibleLines.join("\n");
-
-  if (clippedText.length > maxChars) {
-    clippedText = preferTail
-      ? clippedText.slice(-maxChars)
-      : clippedText.slice(0, maxChars);
+  const initialVisibleLineCount = initialVisibleLines.length;
+  let visibleLines = fitLinesToCharBudget(
+    initialVisibleLines,
+    maxChars,
+    preferTail
+  );
+  const visibleStartIndex = preferTail
+    ? Math.max(0, allLines.length - visibleLines.length)
+    : 0;
+  if (preferTail && visibleLines.length > 0) {
+    const hiddenPrefix = allLines.slice(0, visibleStartIndex);
+    const insideCodeBlock = countCodeFenceLines(hiddenPrefix) % 2 === 1;
+    if (insideCodeBlock && !visibleLines[0]?.trim().startsWith("```")) {
+      visibleLines = [getLastCodeFenceLine(hiddenPrefix), ...visibleLines];
+    }
   }
+  const clippedText = visibleLines.join("\n");
 
-  const hiddenLines = Math.max(0, allLines.length - visibleLines.length);
+  const hiddenLines = preferTail
+    ? Math.max(0, allLines.length - initialVisibleLineCount)
+    : Math.max(0, allLines.length - visibleLines.length);
   const hiddenChars = Math.max(0, text.length - clippedText.length);
   return {
     text: clippedText,
@@ -317,6 +385,13 @@ const formatRenderClipNotice = (
   const prefix = options.preferTail ? "showing latest slice, " : "";
   return `[render clipped] ${prefix}omitted ${parts.join(" / ")} to keep terminal stable`;
 };
+
+const getMessageClipOptions = (item: ChatItem): RenderClipOptions =>
+  item.role === "assistant" && item.kind === "transcript"
+    ? {
+        preferTail: true,
+      }
+    : {};
 
 const getTranscriptWindow = (items: ChatItem[]) => {
   if (items.length <= MAX_RENDERED_TRANSCRIPT_ITEMS) {
@@ -702,7 +777,12 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
   const lines = text.split("\n");
   const blocks: MarkdownBlock[] = [];
   let paragraphLines: string[] = [];
-  let listState: { ordered: boolean; items: string[] } | null = null;
+  let listState:
+    | {
+        ordered: boolean;
+        items: Array<{ text: string; marker?: string }>;
+      }
+    | null = null;
   let diffLines: string[] = [];
   let inCode = false;
   let codeLanguage = "";
@@ -823,20 +903,24 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
         flushList();
         listState = { ordered: false, items: [] };
       }
-      listState.items.push(itemText);
+      listState.items.push({ text: itemText });
       return;
     }
 
-    const orderedMatch = /^\d+\.\s+(.+)$/.exec(trimmed);
+    const orderedMatch = /^(\d+)\.\s+(.+)$/.exec(trimmed);
     if (orderedMatch) {
-      const itemText = orderedMatch[1] ?? "";
+      const markerNumber = orderedMatch[1] ?? "";
+      const itemText = orderedMatch[2] ?? "";
       flushParagraph();
       flushDiff();
       if (!listState || !listState.ordered) {
         flushList();
         listState = { ordered: true, items: [] };
       }
-      listState.items.push(itemText);
+      listState.items.push({
+        text: itemText,
+        marker: markerNumber ? `${markerNumber}. ` : undefined,
+      });
       return;
     }
 
@@ -1188,10 +1272,10 @@ const renderMessageItem = (
 
     if (block.kind === "list") {
       block.items.forEach((entry, entryIndex) => {
-        const marker = block.ordered ? `${entryIndex + 1}. ` : "• ";
+        const marker = block.ordered ? (entry.marker ?? `${entryIndex + 1}. `) : "• ";
         nodes.push(
           renderInlineMarkdownLine(
-            entry,
+            entry.text,
             `list-${itemIndex}-${blockIndex}-${entryIndex}`,
             color,
             `  ${marker}`
@@ -2897,7 +2981,7 @@ export const ChatScreen = ({
   const transcriptNodes = React.useMemo(
     () =>
       transcriptWindow.items.map((item, index) =>
-        renderMessageItem(item, index + transcriptWindow.hiddenCount)
+        renderMessageItem(item, index + transcriptWindow.hiddenCount, getMessageClipOptions(item))
       ),
     [transcriptWindow.hiddenCount, transcriptWindow.items]
   );

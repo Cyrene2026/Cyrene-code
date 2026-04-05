@@ -3,6 +3,7 @@ import {
   applyParsedStateUpdate,
   buildFallbackPendingDigest,
   buildStateReducerPrompt,
+  sanitizeStoredWorkingState,
 } from "../src/core/session/stateReducer";
 
 describe("stateReducer", () => {
@@ -134,5 +135,73 @@ describe("stateReducer", () => {
     expect(digest).toContain("KNOWN PATHS:\n- src/query.ts");
     expect(digest).not.toContain("我来看看这个项目");
     expect(digest).not.toContain("plain visible answer only");
+  });
+
+  test("sanitizeStoredWorkingState repairs polluted persisted state and drops unknown paths", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: [
+        "OBJECTIVE:",
+        "- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点",
+        "",
+        "CONFIRMED FACTS:",
+        "- 项目名是 `@anthropic-ai/claude-code`。",
+        "- `dev` / `start` / `version` → `src/bootstrap-entry.ts`",
+        "- 当有自定义 system prompt，且设置了 `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`",
+        "- `truncateEntrypointContent`",
+        "",
+        "CONSTRAINTS:",
+        "- 这是个兼容性修复，避免 `yarnpkg` 被自动写进用户 `package.json`。",
+        "",
+        "KNOWN PATHS:",
+        "- package.json",
+        "- src/bootstrap-entry.ts",
+        "- src/entrypoints/cli.tsx",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- 下面基于已经拿到的 `src/memdir/memdir.ts` 结果，继续做详细分析",
+        "",
+        "CONFIRMED FACTS:",
+        "- `ensureMemoryDirExists`",
+        "",
+        "REMAINING:",
+        "- 这说明它的职责不是“执行记忆写入”，而是",
+        "- 沿 `src/memdir/memdir.ts` 继续看 memory 文件读取、截断和 prompt 组装",
+        "",
+        "KNOWN PATHS:",
+        "- src/memdir/memdir.ts",
+        "- src/entrypoints/cli.tsx",
+      ].join("\n"),
+      allowedPaths: [
+        "package.json",
+        "src/bootstrap-entry.ts",
+        "src/memdir/memdir.ts",
+      ],
+    });
+
+    expect(sanitized.summary).toContain(
+      "OBJECTIVE:\n- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点"
+    );
+    expect(sanitized.summary).toContain(
+      "CONFIRMED FACTS:\n- 项目名是 `@anthropic-ai/claude-code`。"
+    );
+    expect(sanitized.summary).toContain(
+      "CONSTRAINTS:\n- 避免 `yarnpkg` 被自动写进用户 `package.json`"
+    );
+    expect(sanitized.summary).toContain(
+      "KNOWN PATHS:\n- package.json\n- src/bootstrap-entry.ts"
+    );
+    expect(sanitized.summary).not.toContain("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE");
+    expect(sanitized.summary).not.toContain("truncateEntrypointContent");
+    expect(sanitized.summary).not.toContain("src/entrypoints/cli.tsx");
+
+    expect(sanitized.pendingDigest).toContain("OBJECTIVE:\n- (none)");
+    expect(sanitized.pendingDigest).toContain(
+      "REMAINING:\n- 沿 `src/memdir/memdir.ts` 继续看 memory 文件读取"
+    );
+    expect(sanitized.pendingDigest).toContain("KNOWN PATHS:\n- src/memdir/memdir.ts");
+    expect(sanitized.pendingDigest).not.toContain("ensureMemoryDirExists");
+    expect(sanitized.pendingDigest).not.toContain("这说明它的职责不是");
+    expect(sanitized.pendingDigest).not.toContain("下面基于已经拿到的");
   });
 });

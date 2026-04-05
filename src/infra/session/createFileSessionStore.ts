@@ -15,7 +15,10 @@ import {
   type SessionMemoryIndex,
   type SessionMemoryInput,
 } from "../../core/session/memoryIndex";
-import { deriveReducerMode } from "../../core/session/stateReducer";
+import {
+  deriveReducerMode,
+  sanitizeStoredWorkingState,
+} from "../../core/session/stateReducer";
 import type { SessionStore } from "../../core/session/store";
 import type {
   SessionInFlightTurn,
@@ -149,6 +152,21 @@ const indexFileNameFor = (id: string) => `${id}.index.json`;
 const isSessionDataFile = (fileName: string) =>
   fileName.endsWith(".json") && !fileName.endsWith(".index.json");
 
+const deriveWorkingStateAllowedPaths = (index: SessionMemoryIndex) => {
+  const allowed = new Set<string>();
+
+  for (const entry of index.entries) {
+    if (entry.kind === "fact") {
+      continue;
+    }
+    for (const path of entry.entities.path ?? []) {
+      allowed.add(path);
+    }
+  }
+
+  return allowed;
+};
+
 export const createFileSessionStore = (
   sessionDir?: string,
   context?: SessionStoreContext
@@ -206,10 +224,16 @@ export const createFileSessionStore = (
   };
 
   const syncSessionCaches = (session: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
+    const normalizedWorkingState = sanitizeStoredWorkingState({
+      summary: session.summary,
+      pendingDigest: session.pendingDigest,
+      allowedPaths: deriveWorkingStateAllowedPaths(index),
+    });
+
     return {
       ...session,
-      summary: session.summary.trim(),
-      pendingDigest: session.pendingDigest.trim(),
+      summary: normalizedWorkingState.summary,
+      pendingDigest: normalizedWorkingState.pendingDigest,
       lastStateUpdate: session.lastStateUpdate ?? null,
       focus: deriveFocusFromMemoryIndex(index),
     };
@@ -471,22 +495,25 @@ export const createFileSessionStore = (
       if (!loaded) {
         throw new Error(`Session not found: ${id}`);
       }
-      const next: SessionRecord = {
-        ...loaded.session,
-        summary:
-          typeof state.summary === "string"
-            ? state.summary.trim()
-            : loaded.session.summary,
-        pendingDigest:
-          typeof state.pendingDigest === "string"
-            ? state.pendingDigest.trim()
-            : loaded.session.pendingDigest,
-        lastStateUpdate:
-          state.lastStateUpdate === undefined
-            ? loaded.session.lastStateUpdate
-            : state.lastStateUpdate,
-        updatedAt: new Date().toISOString(),
-      };
+      const next = syncSessionCaches(
+        {
+          ...loaded.session,
+          summary:
+            typeof state.summary === "string"
+              ? state.summary.trim()
+              : loaded.session.summary,
+          pendingDigest:
+            typeof state.pendingDigest === "string"
+              ? state.pendingDigest.trim()
+              : loaded.session.pendingDigest,
+          lastStateUpdate:
+            state.lastStateUpdate === undefined
+              ? loaded.session.lastStateUpdate
+              : state.lastStateUpdate,
+          updatedAt: new Date().toISOString(),
+        },
+        loaded.index
+      );
       await writeSession(next);
       return next;
     },

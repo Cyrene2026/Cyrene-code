@@ -129,6 +129,95 @@ describe("session memory index", () => {
     ).toBe(true);
   });
 
+  test("loading an existing session self-repairs polluted working state and unknown paths", async () => {
+    const { root, store } = await createStore();
+    const legacyId = "legacy-working-state";
+
+    await writeFile(
+      join(root, `${legacyId}.json`),
+      JSON.stringify(
+        {
+          id: legacyId,
+          title: "legacy state",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          summary: [
+            "OBJECTIVE:",
+            "- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点",
+            "",
+            "CONFIRMED FACTS:",
+            "- 项目名是 `@anthropic-ai/claude-code`。",
+            "- `truncateEntrypointContent`",
+            "",
+            "KNOWN PATHS:",
+            "- package.json",
+            "- src/bootstrap-entry.ts",
+            "- src/entrypoints/cli.tsx",
+          ].join("\n"),
+          pendingDigest: [
+            "OBJECTIVE:",
+            "- 下面基于已经拿到的 `src/memdir/memdir.ts` 结果，继续做详细分析",
+            "",
+            "REMAINING:",
+            "- 这说明它的职责不是“执行记忆写入”，而是",
+            "- 沿 `src/memdir/memdir.ts` 继续看 memory 文件读取、截断和 prompt 组装",
+            "",
+            "KNOWN PATHS:",
+            "- src/memdir/memdir.ts",
+            "- src/entrypoints/cli.tsx",
+          ].join("\n"),
+          focus: [],
+          tags: [],
+          messages: [
+            {
+              role: "user",
+              text: "inspect package.json and src/bootstrap-entry.ts",
+              createdAt: "2026-01-01T00:00:01.000Z",
+            },
+            {
+              role: "assistant",
+              text: "package.json points to src/bootstrap-entry.ts",
+              createdAt: "2026-01-01T00:00:02.000Z",
+            },
+            {
+              role: "user",
+              text: "trace src/memdir/memdir.ts",
+              createdAt: "2026-01-01T00:00:03.000Z",
+            },
+            {
+              role: "assistant",
+              text: "src/entrypoints/cli.tsx looks relevant",
+              createdAt: "2026-01-01T00:00:04.000Z",
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const loaded = await store.loadSession(legacyId);
+
+    expect(loaded?.summary).toContain(
+      "OBJECTIVE:\n- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点"
+    );
+    expect(loaded?.summary).toContain(
+      "CONFIRMED FACTS:\n- 项目名是 `@anthropic-ai/claude-code`。"
+    );
+    expect(loaded?.summary).toContain(
+      "KNOWN PATHS:\n- package.json\n- src/bootstrap-entry.ts"
+    );
+    expect(loaded?.summary).not.toContain("truncateEntrypointContent");
+    expect(loaded?.summary).not.toContain("src/entrypoints/cli.tsx");
+    expect(loaded?.pendingDigest).toContain(
+      "REMAINING:\n- 沿 `src/memdir/memdir.ts` 继续看 memory 文件读取"
+    );
+    expect(loaded?.pendingDigest).toContain("KNOWN PATHS:\n- src/memdir/memdir.ts");
+    expect(loaded?.pendingDigest).not.toContain("这说明它的职责不是");
+    expect(loaded?.pendingDigest).not.toContain("下面基于已经拿到的");
+  });
+
   test("dedupes repeated tool and error memories instead of appending duplicates", async () => {
     const { store } = await createStore();
     const session = await store.createSession("memory dedupe");

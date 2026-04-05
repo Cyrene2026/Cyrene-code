@@ -837,6 +837,54 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("read_range requires `startLine` to be less than or equal to `endLine`");
   });
 
+  test("read_range streams requested lines from oversized files instead of failing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+    tempRoots.push(root);
+    const service = new FileMcpService({
+      workspaceRoot: root,
+      maxReadBytes: 120_000,
+      requireReview: [
+        "create_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "copy_path",
+        "move_path",
+        "open_shell",
+        "write_shell",
+      ],
+    });
+    services.push(service);
+
+    const filler = "const filler = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';";
+    const content = [
+      "export class HugeRangeDemo {}",
+      ...Array.from({ length: 2500 }, () => filler),
+      "export function bottomMarker() {",
+      "  return true;",
+      "}",
+    ].join("\n");
+    await writeFile(join(root, "huge-range.ts"), content, "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "read_range",
+      path: "huge-range.ts",
+      startLine: 2501,
+      endLine: 2504,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] read_range huge-range.ts");
+    expect(result.message).toContain("lines: 2501-2504");
+    expect(result.message).toContain("note: large-file mode streamed requested lines");
+    expect(result.message).toContain("2501 | const filler =");
+    expect(result.message).toContain("2502 | export function bottomMarker() {");
+    expect(result.message).toContain("2503 |   return true;");
+    expect(result.message).toContain("2504 | }");
+  });
+
   test("read_json executes immediately and can return a nested jsonPath value", async () => {
     const { root, service } = await createService();
     await writeFile(

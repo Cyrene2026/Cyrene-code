@@ -67,6 +67,9 @@ describe("buildPromptWithContext", () => {
       "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll."
     );
     expect(prompt).toContain(
+      "Hard rules: CONFIRMED FACTS must be complete factual statements."
+    );
+    expect(prompt).toContain(
       "Hard rules: COMPLETED and REMAINING must stay mutually exclusive."
     );
     expect(prompt.indexOf("Working state (durable reducer):")).toBeLessThan(

@@ -1137,6 +1137,27 @@ describe("FileMcpService", () => {
     expect(result.message).not.toContain("test_files/u2.ts");
   });
 
+  test("find_files matches nested basenames when the pattern omits directories", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src", "entrypoint"), { recursive: true });
+    await writeFile(
+      join(root, "src", "entrypoint", "cli.tsx"),
+      "export const main = true;\n",
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "find_files",
+      path: ".",
+      pattern: "*cli.tsx*",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 file(s):");
+    expect(result.message).toContain("src/entrypoint/cli.tsx");
+  });
+
   test("search_text executes immediately and returns line-level matches", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "docs"), { recursive: true });

@@ -63,6 +63,12 @@ describe("buildPromptWithContext", () => {
     expect(prompt).not.toContain("b".repeat(300));
     expect(prompt).toContain("STATE REDUCER PROTOCOL:");
     expect(prompt).toContain(CYRENE_STATE_UPDATE_START_TAG);
+    expect(prompt).toContain(
+      "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll."
+    );
+    expect(prompt).toContain(
+      "Hard rules: COMPLETED and REMAINING must stay mutually exclusive."
+    );
     expect(prompt.indexOf("Working state (durable reducer):")).toBeLessThan(
       prompt.indexOf("Short transcript tail (immediate recency only):")
     );

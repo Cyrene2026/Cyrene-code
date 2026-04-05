@@ -128,12 +128,204 @@ const normalizeLooseLine = (line: string) =>
       .replace(/^\d+[.)]\s+/, "")
   );
 
+const collectPathCandidates = (text: string) =>
+  Array.from(
+    new Set(
+      (text.match(/[a-z0-9_.\\/:-]+\.[a-z0-9]+/gi) ?? []).map(candidate =>
+        candidate.replace(/\\/g, "/")
+      )
+    )
+  ).slice(0, 8);
+
+const SELF_TALK_PREFIXES = [
+  "我来",
+  "我先",
+  "让我",
+  "我需要",
+  "我会",
+  "我将",
+  "我继续",
+  "我再",
+  "先让我",
+  "先看一下",
+  "再看一下",
+  "接下来我会",
+  "let me",
+  "i'll",
+  "i will",
+  "first i'll",
+  "first, i'll",
+  "i need to",
+  "i am going to",
+  "i'm going to",
+  "next i'll",
+  "next, i'll",
+] as const;
+
+const POLITE_REQUEST_PREFIXES = [
+  "请你",
+  "请帮我",
+  "请",
+  "帮我",
+  "麻烦",
+  "please ",
+  "please,",
+  "can you ",
+  "could you ",
+] as const;
+
+const TASK_LEADIN_PREFIXES = [
+  "开始",
+  "继续",
+  "接着",
+  "然后",
+  "下一步",
+  "接下来",
+] as const;
+
+const EXECUTABLE_TASK_SIGNAL =
+  /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate)\b|(?:看一下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查)/iu;
+
+const STABLE_FACT_SIGNAL =
+  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态)/iu;
+
+const COMPLETED_SECTION_SIGNAL =
+  /\b(?:done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved|answered|added|removed|renamed|stored|persisted|recorded|marked|recovered|handled|captured|merged|rebuilt|synced)\b|(?:完成|已写|已创建|已更新|已实现|已修复|已批准|已解决|已回答|已添加|已删除|已重命名|已存储|已记录|已标记|已恢复|已处理|已合并|已重建|已同步|标记为)/iu;
+
+const CONSTRAINT_SECTION_SIGNAL =
+  /\b(?:must|should|cannot|can't|do not|don't|avoid|pending approval|requires|limit|constraint|read-only|blocked|must not|no code changes)\b|(?:必须|不能|不要|避免|待审批|需要|限制|约束|只读|阻塞|不改|不准)/iu;
+
+const REAL_FAILURE_SIGNAL =
+  /\b(?:failed|error|errored|timeout|timed out|rejected|blocked|denied|missing|exception|crash|aborted|not found|conflict)\b|(?:失败|错误|超时|拒绝|阻塞|缺失|异常|崩溃|中止|未找到|冲突)/iu;
+
+const META_FAILURE_SIGNAL =
+  /\b(?:used to|used for|helps determine|determines whether|detects whether|checks whether|classification|type)\b|(?:用于|用来|帮助判断|判断|检测|识别|类型)/iu;
+
+const META_FAILURE_PREFIX =
+  /^(?:if|when|used to|used for|helps determine|determines whether|detects whether|checks whether|判断|检测|识别|用来|用于|如果|若|当|说明)/iu;
+
+const QUESTION_OR_OPTION_SIGNAL =
+  /[?？]|\b(?:if you want|would you like|you can ask|next i can|do you want)\b|(?:如果你愿意|你要我|下一步可以)/iu;
+
+const trimLeadingSeparators = (value: string) =>
+  value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
+
+const stripLeadingPhrases = (value: string, phrases: readonly string[]) => {
+  let current = value.trim();
+
+  while (current) {
+    const lower = current.toLowerCase();
+    const matched = phrases.find(phrase => lower.startsWith(phrase));
+    if (!matched) {
+      break;
+    }
+    current = trimLeadingSeparators(current.slice(matched.length));
+  }
+
+  return current;
+};
+
+const sanitizeCandidatePrefix = (value: string) =>
+  stripLeadingPhrases(
+    stripLeadingPhrases(value, SELF_TALK_PREFIXES),
+    POLITE_REQUEST_PREFIXES
+  );
+
+const isPurePathLine = (line: string) => {
+  const paths = collectPathCandidates(line);
+  if (paths.length !== 1) {
+    return false;
+  }
+  const collapsed = line
+    .replace(/[`\s"'()[\]{}]/g, "")
+    .replace(/\\/g, "/")
+    .trim();
+  return collapsed === paths[0];
+};
+
+const isExecutableTaskLine = (line: string) =>
+  EXECUTABLE_TASK_SIGNAL.test(stripLeadingPhrases(line, TASK_LEADIN_PREFIXES));
+
+const isStableFactLine = (line: string) =>
+  !QUESTION_OR_OPTION_SIGNAL.test(line) &&
+  !isExecutableTaskLine(line) &&
+  !REAL_FAILURE_SIGNAL.test(line) &&
+  (STABLE_FACT_SIGNAL.test(line) ||
+    collectPathCandidates(line).length > 0 ||
+    /`[^`]+`/.test(line));
+
+const isRealFailureLine = (line: string) =>
+  REAL_FAILURE_SIGNAL.test(line) &&
+  !META_FAILURE_PREFIX.test(line) &&
+  !META_FAILURE_SIGNAL.test(line) &&
+  !QUESTION_OR_OPTION_SIGNAL.test(line);
+
+const normalizeSectionLine = (
+  section: WorkingStateSectionName,
+  line: string
+) => {
+  const rawCandidate = normalizeLooseLine(line);
+  if (!rawCandidate || rawCandidate === "(none)") {
+    return null;
+  }
+
+  const candidate = sanitizeCandidatePrefix(rawCandidate);
+  if (!candidate || candidate === "(none)") {
+    return null;
+  }
+
+  switch (section) {
+    case "OBJECTIVE": {
+      const objective = stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES);
+      if (!objective || QUESTION_OR_OPTION_SIGNAL.test(objective)) {
+        return null;
+      }
+      if (!isExecutableTaskLine(objective) || isStableFactLine(objective)) {
+        return null;
+      }
+      return objective;
+    }
+    case "CONFIRMED FACTS":
+      if (
+        candidate.length < 4 ||
+        isPurePathLine(candidate) ||
+        !isStableFactLine(candidate)
+      ) {
+        return null;
+      }
+      return candidate;
+    case "CONSTRAINTS":
+      return CONSTRAINT_SECTION_SIGNAL.test(candidate) ? candidate : null;
+    case "COMPLETED":
+      return COMPLETED_SECTION_SIGNAL.test(candidate) ? candidate : null;
+    case "REMAINING":
+    case "NEXT BEST ACTIONS": {
+      const action = stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES);
+      if (
+        !action ||
+        QUESTION_OR_OPTION_SIGNAL.test(action) ||
+        COMPLETED_SECTION_SIGNAL.test(action)
+      ) {
+        return null;
+      }
+      return isExecutableTaskLine(action) ? action : null;
+    }
+    case "KNOWN PATHS": {
+      const [firstPath] = collectPathCandidates(candidate);
+      return firstPath ? clipStateLine(firstPath) : null;
+    }
+    case "RECENT FAILURES":
+      return isRealFailureLine(candidate) ? candidate : null;
+  }
+};
+
 const createEmptySectionMap = (): Record<WorkingStateSectionName, string[]> =>
   Object.fromEntries(
     WORKING_STATE_SECTION_ORDER.map(section => [section, [] as string[]])
   ) as Record<WorkingStateSectionName, string[]>;
 
 const normalizeUniqueLines = (
+  section: WorkingStateSectionName,
   lines: string[] | undefined,
   limit: number
 ) => {
@@ -144,7 +336,7 @@ const normalizeUniqueLines = (
   const seen = new Set<string>();
   const normalized: string[] = [];
   for (const line of lines) {
-    const candidate = normalizeLooseLine(line);
+    const candidate = normalizeSectionLine(section, line);
     if (!candidate || candidate === "(none)" || seen.has(candidate)) {
       continue;
     }
@@ -155,6 +347,32 @@ const normalizeUniqueLines = (
     }
   }
   return normalized;
+};
+
+const finalizeSectionMap = (
+  sections: WorkingStateSectionMap,
+  pending = false
+) => {
+  const finalized = createEmptySectionMap();
+
+  for (const section of WORKING_STATE_SECTION_ORDER) {
+    const limit = pending
+      ? PENDING_SECTION_ITEM_LIMIT
+      : SECTION_ITEM_LIMITS[section];
+    finalized[section] = normalizeUniqueLines(section, sections[section], limit);
+  }
+
+  const completedSet = normalizeForComparison(finalized.COMPLETED);
+  if (completedSet.size > 0) {
+    finalized.REMAINING = finalized.REMAINING.filter(
+      line => !completedSet.has(normalizeLooseLine(line))
+    );
+    finalized["NEXT BEST ACTIONS"] = finalized["NEXT BEST ACTIONS"].filter(
+      line => !completedSet.has(normalizeLooseLine(line))
+    );
+  }
+
+  return finalized;
 };
 
 const hasMeaningfulSectionContent = (sections: WorkingStateSectionMap) =>
@@ -168,14 +386,7 @@ const renderSectionMap = (
   }
 ) => {
   const pending = options?.pending ?? false;
-  const sectionMap = createEmptySectionMap();
-
-  for (const section of WORKING_STATE_SECTION_ORDER) {
-    const limit = pending
-      ? PENDING_SECTION_ITEM_LIMIT
-      : SECTION_ITEM_LIMITS[section];
-    sectionMap[section] = normalizeUniqueLines(sections[section], limit);
-  }
+  const sectionMap = finalizeSectionMap(sections, pending);
 
   if (pending) {
     let rendered = WORKING_STATE_SECTION_ORDER.map(section => {
@@ -238,29 +449,13 @@ const parseStructuredStateText = (text: string) => {
   }
   const repaired = repairWorkingStateSummary(trimmed);
   const parsed = parseWorkingStateSummary(repaired);
-  const sectionMap = createEmptySectionMap();
-  for (const section of WORKING_STATE_SECTION_ORDER) {
-    sectionMap[section] = normalizeUniqueLines(
-      parsed[section],
-      SECTION_ITEM_LIMITS[section]
-    );
-  }
-  return sectionMap;
+  return finalizeSectionMap(parsed);
 };
 
 const normalizeSectionMapInput = (
   sectionMap: WorkingStateSectionMap | undefined,
   pending = false
-) => {
-  const normalized = createEmptySectionMap();
-  for (const section of WORKING_STATE_SECTION_ORDER) {
-    normalized[section] = normalizeUniqueLines(
-      sectionMap?.[section],
-      pending ? PENDING_SECTION_ITEM_LIMIT : SECTION_ITEM_LIMITS[section]
-    );
-  }
-  return normalized;
-};
+) => finalizeSectionMap(sectionMap ?? createEmptySectionMap(), pending);
 
 const normalizeForComparison = (lines: string[]) =>
   new Set(lines.map(line => normalizeLooseLine(line)).filter(Boolean));
@@ -483,6 +678,12 @@ export const buildStateReducerPrompt = ({
     recoveryLine,
     "Use only these section names: OBJECTIVE, CONFIRMED FACTS, CONSTRAINTS, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, NEXT BEST ACTIONS.",
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
+    "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
+    "Hard rules: never copy the user's raw request into CONFIRMED FACTS. CONFIRMED FACTS only stores stable, durable facts.",
+    "Hard rules: OBJECTIVE must be one executable task sentence, not narration or a bare topic fragment.",
+    "Hard rules: RECENT FAILURES only stores real failures, conflicts, or blockers. Explanations about error handling do not belong there.",
+    "Hard rules: COMPLETED and REMAINING must stay mutually exclusive. Remove finished items from REMAINING and NEXT BEST ACTIONS.",
+    "Hard rules: KNOWN PATHS only stores concrete repo paths.",
     "JSON shape:",
     `{"version":1,"mode":"${mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."]}}`,
   ]
@@ -597,6 +798,7 @@ export const applyParsedStateUpdate = (params: {
 
     if (patch.op === "replace") {
       baseSections[section] = normalizeUniqueLines(
+        section,
         patch.set,
         SECTION_ITEM_LIMITS[section]
       );
@@ -608,21 +810,12 @@ export const applyParsedStateUpdate = (params: {
       ...baseSections[section].filter(
         line => !removes.has(normalizeLooseLine(line))
       ),
-      ...normalizeUniqueLines(patch.add, SECTION_ITEM_LIMITS[section]),
+      ...normalizeUniqueLines(section, patch.add, SECTION_ITEM_LIMITS[section]),
     ];
     baseSections[section] = normalizeUniqueLines(
+      section,
       merged,
       SECTION_ITEM_LIMITS[section]
-    );
-  }
-
-  const completedSet = normalizeForComparison(baseSections.COMPLETED);
-  if (completedSet.size > 0) {
-    baseSections.REMAINING = baseSections.REMAINING.filter(
-      line => !completedSet.has(normalizeLooseLine(line))
-    );
-    baseSections["NEXT BEST ACTIONS"] = baseSections["NEXT BEST ACTIONS"].filter(
-      line => !completedSet.has(normalizeLooseLine(line))
     );
   }
 

@@ -3793,8 +3793,20 @@ export class FileMcpService {
   private async executeFindFiles(request: FindFilesToolRequest): Promise<string> {
     const walkResult = await this.walkFiles(request.path);
     const matcher = globToRegExp(request.pattern, request.caseSensitive ?? false);
+    const patternIncludesDirectory = /[\\/]/.test(request.pattern);
     const matches = walkResult.files
-      .filter(file => matcher.test(file.relativeToStart) || matcher.test(file.workspacePath))
+      .filter(file => {
+        if (
+          matcher.test(file.relativeToStart) ||
+          matcher.test(file.workspacePath)
+        ) {
+          return true;
+        }
+        if (patternIncludesDirectory) {
+          return false;
+        }
+        return matcher.test(basename(file.workspacePath));
+      })
       .slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS)
       .map(file => file.workspacePath);
     const notes = this.formatWalkFilesNotes(walkResult);

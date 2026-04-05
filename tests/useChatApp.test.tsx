@@ -1947,7 +1947,8 @@ describe("useChatApp", () => {
     expect(stored?.pendingDigest).toContain("OBJECTIVE:");
     expect(stored?.pendingDigest).toContain("- inspect the project");
     expect(stored?.pendingDigest).toContain("CONFIRMED FACTS:");
-    expect(stored?.pendingDigest).toContain("- plain visible answer only");
+    expect(stored?.pendingDigest).toContain("- (none)");
+    expect(stored?.pendingDigest).not.toContain("plain visible answer only");
     expect(stored?.lastStateUpdate?.code).toBe("missing_tag");
     expect(stored?.lastStateUpdate?.message).toContain(
       "without a <cyrene_state_update> block"
@@ -2009,7 +2010,8 @@ describe("useChatApp", () => {
     expect(stored?.pendingDigest).toContain("OBJECTIVE:");
     expect(stored?.pendingDigest).toContain("- finish the oauth task");
     expect(stored?.pendingDigest).toContain("CONFIRMED FACTS:");
-    expect(stored?.pendingDigest).toContain("- current turn answer only");
+    expect(stored?.pendingDigest).toContain("- (none)");
+    expect(stored?.pendingDigest).not.toContain("current turn answer only");
     expect(stored?.pendingDigest).not.toBe(previousPendingDigest);
     expect(stored?.lastStateUpdate?.code).toBe("missing_tag");
     expect(stored?.lastStateUpdate?.message).toContain(

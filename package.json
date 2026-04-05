@@ -2,7 +2,7 @@
   "name": "cyrenecode",
   "version": "0.1.0",
   "description": "Terminal-first coding assistant with reviewable tool calls and rolling session state.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": false,
   "type": "module",
   "homepage": "https://github.com/Cyrene2026/Cyrene-code#readme",
@@ -29,6 +29,7 @@
     "bin",
     "dist",
     "assets/brand",
+    "LICENSE",
     "README.md",
     "SECURITY.md"
   ],

@@ -26,6 +26,9 @@ npx cyrenecode
 bun install
 ```
 
+> The published npm package ships a prebuilt CLI bundle. If you are developing
+> from source, install Bun first.
+
 ## Run from source
 
 ```bash
@@ -91,6 +94,17 @@ delete sessions, summaries, or model/provider catalog files.
 
 When credentials are missing or incomplete, Cyrene falls back to local-core
 instead of blocking the app.
+
+#### Shell-specific persistence behavior
+
+- **zsh**: updates one managed block in `~/.zshrc`
+- **bash**: uses `~/.bashrc`, otherwise `~/.bash_profile`, otherwise creates `~/.bashrc`
+- **fish**: writes `~/.config/fish/conf.d/cyrene-auth.fish`
+- **other POSIX shells**: updates one managed block in `~/.profile`
+
+Repeated `/login` updates replace the existing Cyrene-managed entry instead of
+duplicating it. `/logout` removes only the Cyrene-managed block or file and
+does not touch unrelated shell configuration.
 
 Current request shape:
 ```json
@@ -240,3 +254,7 @@ Use `/state` during a session to inspect reducer mode, `summary` length,
 
 See [SECURITY.md](SECURITY.md) for repository security boundaries, disclosure
 guidelines, and hardening notes.
+
+## License
+
+[MIT](LICENSE)

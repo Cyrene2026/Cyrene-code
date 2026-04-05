@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { compressContext } from "../../core/session/contextCompression";
-import { getCyreneConfigDir, resolveAmbientAppRoot } from "../config/appRoot";
+import { getCyreneConfigDir, resolveAmbientAppRoot, resolveAppRoot } from "../config/appRoot";
 import {
   createEmptyMemoryIndex,
   createMessageMemoryInputs,
@@ -24,6 +24,7 @@ import type {
   SessionInFlightTurn,
   SessionListItem,
   SessionMessage,
+  SessionPendingChoice,
   SessionRecord,
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
@@ -44,6 +45,17 @@ const inFlightTurnSchema: z.ZodType<SessionInFlightTurn> = z.object({
   assistantText: z.string(),
   startedAt: z.string(),
   updatedAt: z.string(),
+});
+
+const pendingChoiceSchema: z.ZodType<SessionPendingChoice> = z.object({
+  capturedAt: z.string(),
+  sourcePreview: z.string(),
+  options: z.array(
+    z.object({
+      index: z.number().int().positive(),
+      label: z.string(),
+    })
+  ),
 });
 
 const stateUpdateDiagnosticSchema: z.ZodType<SessionStateUpdateDiagnostic> = z.object({
@@ -70,8 +82,10 @@ const sessionSchema = z.object({
   title: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
+  projectRoot: z.string().nullable().optional(),
   summary: z.string().optional(),
   pendingDigest: z.string().optional(),
+  pendingChoice: pendingChoiceSchema.nullable().optional(),
   lastStateUpdate: stateUpdateDiagnosticSchema.nullable().optional(),
   inFlightTurn: inFlightTurnSchema.nullable().optional(),
   focus: z.array(z.string()).optional(),
@@ -171,9 +185,19 @@ export const createFileSessionStore = (
   sessionDir?: string,
   context?: SessionStoreContext
 ): SessionStore => {
+  const resolvedProjectRoot = resolveAppRoot({
+    cwd: context?.cwd,
+    env: context?.env,
+  });
   const resolvedSessionDir =
     sessionDir ??
-    join(getCyreneConfigDir(resolveAmbientAppRoot(context)), "session");
+    join(
+      getCyreneConfigDir({
+        cwd: resolveAmbientAppRoot(context),
+        env: context?.env,
+      }),
+      "session"
+    );
 
   const ensureDir = async () => {
     await mkdir(resolvedSessionDir, { recursive: true });
@@ -190,8 +214,10 @@ export const createFileSessionStore = (
       const normalized = sessionSchema.parse(parsed);
       return {
         ...normalized,
+        projectRoot: normalized.projectRoot ?? null,
         summary: normalized.summary ?? "",
         pendingDigest: normalized.pendingDigest ?? "",
+        pendingChoice: normalized.pendingChoice ?? null,
         lastStateUpdate: normalized.lastStateUpdate ?? null,
         inFlightTurn: normalized.inFlightTurn ?? null,
         focus: normalized.focus ?? [],
@@ -352,8 +378,10 @@ export const createFileSessionStore = (
         title: sanitizeTitle(title ?? "New session"),
         createdAt: now,
         updatedAt: now,
+        projectRoot: resolvedProjectRoot,
         summary: "",
         pendingDigest: "",
+        pendingChoice: null,
         lastStateUpdate: null,
         inFlightTurn: null,
         focus: [],
@@ -525,6 +553,24 @@ export const createFileSessionStore = (
       const next: SessionRecord = {
         ...loaded.session,
         inFlightTurn,
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
+    },
+    updatePendingChoice: async (id, pendingChoice) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const next: SessionRecord = {
+        ...loaded.session,
+        pendingChoice: pendingChoice
+          ? {
+              ...pendingChoice,
+              options: pendingChoice.options.map(option => ({ ...option })),
+            }
+          : null,
         updatedAt: new Date().toISOString(),
       };
       await writeSession(next);

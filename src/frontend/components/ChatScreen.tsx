@@ -10,6 +10,7 @@ import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { SessionListItem } from "../../core/session/types";
 import type { PendingReviewItem } from "../../core/tools/mcp/types";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
+import type { AuthStatus } from "../../infra/auth/types";
 
 type ChatScreenProps = {
   items: ChatItem[];
@@ -67,6 +68,20 @@ type ChatScreenProps = {
     actionState?: "approve" | "reject" | null;
     resumePending?: boolean;
   };
+  authPanel: {
+    active: boolean;
+    mode: "auto_onboarding" | "manual_login";
+    step: "provider" | "api_key" | "model" | "confirm";
+    providerBaseUrl: string;
+    apiKey: string;
+    model: string;
+    cursorOffset: number;
+    error: string | null;
+    info: string | null;
+    saving: boolean;
+    persistenceTarget: AuthStatus["persistenceTarget"];
+  };
+  authStatus: AuthStatus;
   activeSessionId: string | null;
   currentModel: string;
   currentProvider: string;
@@ -1683,7 +1698,8 @@ const renderStartupSuggestion = (title: string, detail: string) => (
 const renderStartupView = (
   currentModel: string,
   currentProvider: string,
-  activeSessionId: string | null
+  activeSessionId: string | null,
+  authStatus: AuthStatus
 ) => (
   <Box marginBottom={SECTION_GAP + 1} flexDirection="column">
     <Box flexDirection="column" marginBottom={2}>
@@ -1701,7 +1717,7 @@ const renderStartupView = (
         Cyrene can inspect this workspace, explain code, edit files, and run reviewed commands.
       </Text>
       <Text dimColor>
-        {`model ${shortenValue(currentModel || "none", 18)}  |  provider ${formatProviderLabel(currentProvider || "none", 18)}  |  session ${shortenValue(
+        {`mode ${authStatus.mode}  |  model ${shortenValue(currentModel || "none", 18)}  |  provider ${formatProviderLabel(currentProvider || "none", 18)}  |  session ${shortenValue(
           activeSessionId ?? "none",
           18
         )}`}
@@ -1710,13 +1726,125 @@ const renderStartupView = (
     <Box marginTop={1} flexDirection="column">
       {renderStartupSuggestion("Explain this repository", "Summarize the structure, stack, or a file.")}
       {renderStartupSuggestion("Fix something", "Point at an error, failing test, or suspicious behavior.")}
-      {renderStartupSuggestion("Keep going", "Use /resume for a past session or /model to switch models.")}
+      {renderStartupSuggestion("Connect HTTP", "Use /login to save credentials, or skip and keep using local-core.")}
+      {renderStartupSuggestion("Keep going", "Use /resume for a past session, /auth for status, or /model to switch models.")}
     </Box>
     <Text dimColor>
-      Type `/` for commands, or just ask naturally.
+      Type `/` for commands. `/login`, `/logout`, and `/auth` manage provider access without blocking local fallback.
     </Text>
   </Box>
 );
+
+const maskSecretForRender = (value: string) =>
+  value ? "•".repeat(value.length) : "";
+
+const renderAuthWizardPanel = (
+  authPanel: ChatScreenProps["authPanel"],
+  authStatus: AuthStatus
+) => {
+  if (!authPanel.active) {
+    return null;
+  }
+
+  const currentFieldRawValue =
+    authPanel.step === "provider"
+      ? authPanel.providerBaseUrl
+      : authPanel.step === "api_key"
+        ? authPanel.apiKey
+        : authPanel.model;
+  const currentFieldValue =
+    authPanel.step === "api_key"
+      ? maskSecretForRender(currentFieldRawValue)
+      : currentFieldRawValue;
+  const inputWindow = getComposerWindow(currentFieldValue, authPanel.cursorOffset);
+  const title =
+    authPanel.mode === "auto_onboarding" ? "Login Onboarding" : "Login";
+  const stepLabel =
+    authPanel.step === "provider"
+      ? "1/4 provider base URL"
+      : authPanel.step === "api_key"
+        ? "2/4 API key"
+        : authPanel.step === "model"
+          ? "3/4 initial model"
+          : "4/4 confirm";
+  const fieldPrompt =
+    authPanel.step === "provider"
+      ? "Enter your OpenAI-compatible base URL."
+      : authPanel.step === "api_key"
+        ? "Paste the API key. It is masked and never written to the transcript."
+        : authPanel.step === "model"
+          ? "Optional initial model. Leave blank to use the current model or gpt-4o-mini."
+          : "Review the target and press Enter to connect.";
+  const effectiveModel = authPanel.model.trim() || authStatus.model || "gpt-4o-mini";
+
+  return (
+    <Box
+      marginBottom={SECTION_GAP}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      paddingX={1}
+      paddingY={1}
+    >
+      <Box justifyContent="space-between" flexWrap="wrap">
+        <Text bold color="cyan">
+          {title}
+        </Text>
+        <Text dimColor>{stepLabel}</Text>
+      </Box>
+      {authPanel.info ? <Text dimColor>{authPanel.info}</Text> : null}
+      <Text color="white">{fieldPrompt}</Text>
+
+      {authPanel.step !== "confirm" ? (
+        <Box
+          marginTop={1}
+          borderStyle="single"
+          borderColor={authPanel.error ? "red" : "cyan"}
+          paddingX={1}
+          flexDirection="column"
+        >
+          {inputWindow.rows.map((row, index) => (
+            <Box key={`auth-wizard-row-${row.prefix}-${index}`}>
+              <Text bold color="cyan">
+                {row.prefix}
+              </Text>
+              <Text> </Text>
+              <Box flexGrow={1}>
+                {row.isCursorRow ? (
+                  renderComposerCursorLine(row.text, row.cursorColumn, "cyan")
+                ) : (
+                  <Text>{row.text || " "}</Text>
+                )}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      ) : (
+        <Box marginTop={1} flexDirection="column">
+          <Text>{`1. provider  ${authPanel.providerBaseUrl || "(empty)"}`}</Text>
+          <Text>{`2. api key   ${maskSecretForRender(authPanel.apiKey) || "(empty)"}`}</Text>
+          <Text>{`3. model     ${effectiveModel}`}</Text>
+          <Text dimColor>
+            {`target  ${authPanel.persistenceTarget?.label ?? "unavailable"}  |  ${authPanel.persistenceTarget?.path ?? "(none)"}`}
+          </Text>
+          <Text dimColor>
+            Enter: connect  |  1/2/3: edit field  |  Esc: {authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}
+          </Text>
+        </Box>
+      )}
+
+      {authPanel.error ? (
+        <Text color="red">{`error: ${authPanel.error}`}</Text>
+      ) : null}
+
+      {authPanel.step !== "confirm" ? (
+        <Text dimColor>
+          Enter: next  |  Esc: {authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}
+        </Text>
+      ) : null}
+    </Box>
+  );
+};
 
 const renderMainComposer = (
   status: ChatStatus,
@@ -2904,6 +3032,8 @@ export const ChatScreen = ({
   providerPicker,
   pendingReviews,
   approvalPanel,
+  authPanel,
+  authStatus,
   activeSessionId,
   currentModel,
   currentProvider,
@@ -2951,12 +3081,15 @@ export const ChatScreen = ({
   );
 
   const isPanelActive =
+    authPanel.active ||
     resumePicker.active ||
     sessionsPanel.active ||
     modelPicker.active ||
     providerPicker.active ||
     approvalPanel.active;
-  const activePanel = sessionsPanel.active
+  const activePanel = authPanel.active
+    ? "auth"
+    : sessionsPanel.active
     ? "sessions"
     : resumePicker.active
       ? "resume"
@@ -3082,7 +3215,7 @@ export const ChatScreen = ({
       {shellHeaderNode}
       <Box marginBottom={SECTION_GAP} flexDirection="column">
         {showStartupView
-          ? renderStartupView(currentModel, currentProvider, activeSessionId)
+          ? renderStartupView(currentModel, currentProvider, activeSessionId, authStatus)
           : null}
         {showTranscriptWindowNotice ? (
           <Text dimColor>
@@ -3092,6 +3225,8 @@ export const ChatScreen = ({
         {transcriptNodes}
         {liveAssistantNode}
       </Box>
+
+      {authPanel.active ? renderAuthWizardPanel(authPanel, authStatus) : null}
 
       {sessionsPanel.active &&
         renderCompactSimplePanel(

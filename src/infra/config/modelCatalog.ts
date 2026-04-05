@@ -1,15 +1,50 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getCyreneConfigDir, resolveAppRoot } from "./appRoot";
+import {
+  getCyreneConfigDir,
+  getLegacyProjectCyreneDir,
+  resolveAppRoot,
+} from "./appRoot";
 
-const getModelFile = (appRoot = resolveAppRoot()) =>
-  join(getCyreneConfigDir(appRoot), "model.yaml");
+type ModelCatalogContext = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+const getModelFile = (
+  appRoot = resolveAppRoot(),
+  context?: ModelCatalogContext
+) =>
+  join(getCyreneConfigDir({ cwd: appRoot, env: context?.env }), "model.yaml");
+
+const getLegacyModelFile = (appRoot = resolveAppRoot()) =>
+  join(getLegacyProjectCyreneDir(appRoot), "model.yaml");
+
+const readModelFile = async (
+  appRoot = resolveAppRoot(),
+  context?: ModelCatalogContext
+) => {
+  try {
+    return await readFile(getModelFile(appRoot, context), "utf8");
+  } catch {
+    return await readFile(getLegacyModelFile(appRoot), "utf8");
+  }
+};
+
+const ensureModelDir = async (
+  appRoot = resolveAppRoot(),
+  context?: ModelCatalogContext
+) =>
+  mkdir(getCyreneConfigDir({ cwd: appRoot, env: context?.env }), {
+    recursive: true,
+  });
 
 const parseScalar = (value: string) =>
   value.replace(/^["']/, "").replace(/["']$/, "").trim();
 
 export const loadModelYaml = async (
-  appRoot = resolveAppRoot()
+  appRoot = resolveAppRoot(),
+  context?: ModelCatalogContext
 ): Promise<{
   models: string[];
   defaultModel?: string;
@@ -17,7 +52,7 @@ export const loadModelYaml = async (
   providerBaseUrl?: string;
   providers: string[];
 }> => {
-  const content = await readFile(getModelFile(appRoot), "utf8");
+  const content = await readModelFile(appRoot, context);
   const models: string[] = [];
   const providers: string[] = [];
   let defaultModel: string | undefined;
@@ -86,7 +121,8 @@ export const saveModelYaml = async (
     providerBaseUrl?: string;
     providers?: string[];
   },
-  appRoot = resolveAppRoot()
+  appRoot = resolveAppRoot(),
+  context?: ModelCatalogContext
 ): Promise<void> => {
   const unique = Array.from(new Set(models.map(model => model.trim()))).filter(
     Boolean
@@ -121,6 +157,6 @@ export const saveModelYaml = async (
     "",
   ];
 
-  await mkdir(getCyreneConfigDir(appRoot), { recursive: true });
-  await writeFile(getModelFile(appRoot), lines.join("\n"), "utf8");
+  await ensureModelDir(appRoot, context);
+  await writeFile(getModelFile(appRoot, context), lines.join("\n"), "utf8");
 };

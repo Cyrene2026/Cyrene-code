@@ -4,12 +4,17 @@ import {
   DEFAULT_PIN_MAX_COUNT,
   DEFAULT_QUERY_MAX_TOOL_STEPS,
 } from "../../shared/runtimeDefaults";
-import { resolveAmbientAppRoot } from "./appRoot";
+import {
+  getCyreneConfigDir,
+  getLegacyProjectCyreneDir,
+  resolveAmbientAppRoot,
+} from "./appRoot";
 
 export type CyreneConfig = {
   pinMaxCount: number;
   queryMaxToolSteps: number;
   autoSummaryRefresh: boolean;
+  requestTemperature: number;
   systemPrompt?: string;
 };
 
@@ -22,11 +27,12 @@ const DEFAULT_CONFIG: CyreneConfig = {
   pinMaxCount: DEFAULT_PIN_MAX_COUNT,
   queryMaxToolSteps: DEFAULT_QUERY_MAX_TOOL_STEPS,
   autoSummaryRefresh: true,
+  requestTemperature: 0.2,
 };
 
 const parseValue = (raw: string): string | number | boolean => {
   const trimmed = raw.trim();
-  if (/^-?\d+$/.test(trimmed)) {
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
     return Number(trimmed);
   }
   if (/^(true|false)$/i.test(trimmed)) {
@@ -39,16 +45,33 @@ const parseValue = (raw: string): string | number | boolean => {
   return trimmed;
 };
 
+const readFirstExistingFile = async (paths: string[]) => {
+  for (const path of paths) {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      // Try the next location.
+    }
+  }
+  return "";
+};
+
 export const loadCyreneConfig = async (
   appRoot?: string,
   context?: CyreneConfigLoadContext
 ): Promise<CyreneConfig> => {
   const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
-  const path = join(resolvedAppRoot, ".cyrene", "config.yaml");
-  let content = "";
-  try {
-    content = await readFile(path, "utf8");
-  } catch {
+  const content = await readFirstExistingFile([
+    join(
+      getCyreneConfigDir({
+        cwd: resolvedAppRoot,
+        env: context?.env,
+      }),
+      "config.yaml"
+    ),
+    join(getLegacyProjectCyreneDir(resolvedAppRoot), "config.yaml"),
+  ]);
+  if (!content) {
     return DEFAULT_CONFIG;
   }
 
@@ -85,6 +108,13 @@ export const loadCyreneConfig = async (
       ? autoSummaryRefreshRaw
       : DEFAULT_CONFIG.autoSummaryRefresh;
 
+  const requestTemperatureRaw = map.get("request_temperature");
+  const requestTemperature =
+    typeof requestTemperatureRaw === "number" &&
+    Number.isFinite(requestTemperatureRaw)
+      ? Math.min(2, Math.max(0, requestTemperatureRaw))
+      : DEFAULT_CONFIG.requestTemperature;
+
   const systemRaw = map.get("system_prompt");
   const systemPrompt =
     typeof systemRaw === "string" && systemRaw.trim()
@@ -95,6 +125,7 @@ export const loadCyreneConfig = async (
     pinMaxCount,
     queryMaxToolSteps,
     autoSummaryRefresh,
+    requestTemperature,
     systemPrompt,
   };
 };

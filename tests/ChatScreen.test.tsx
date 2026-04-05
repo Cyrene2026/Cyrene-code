@@ -193,6 +193,28 @@ const buildProps = (
     actionState: null,
     resumePending: false,
   },
+  authPanel: {
+    active: false,
+    mode: "manual_login" as const,
+    step: "provider" as const,
+    providerBaseUrl: "",
+    apiKey: "",
+    model: "gpt-test",
+    cursorOffset: 0,
+    error: null,
+    info: null,
+    saving: false,
+    persistenceTarget: null,
+  },
+  authStatus: {
+    mode: "http" as const,
+    credentialSource: "process_env" as const,
+    provider: "https://provider.test/v1",
+    model: "gpt-test",
+    persistenceTarget: null,
+    onboardingAvailable: true,
+    httpReady: true,
+  },
   activeSessionId: "session-1",
   currentModel: "gpt-test",
   currentProvider: "https://provider.test/v1",
@@ -363,7 +385,7 @@ describe("ChatScreen", () => {
       items: [
         {
           role: "system",
-          text: "Type /help to view commands. Use /resume to open session picker.",
+          text: "Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.",
           kind: "system_hint",
           tone: "neutral",
           color: "gray",
@@ -379,11 +401,12 @@ describe("ChatScreen", () => {
     expect(output).toContain("provider.test");
     expect(output).toContain("Explain this repository");
     expect(output).toContain("Fix something");
+    expect(output).toContain("Connect HTTP");
     expect(output).toContain("Keep going");
-    expect(output).toContain("Type `/` for commands");
+    expect(output).toContain("/login");
     expect(output).toContain("Ask Cyrene...");
     expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands");
-    expect(output).not.toContain("Type /help to view commands. Use /resume to open session picker.");
+    expect(output).not.toContain("Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.");
   });
 
   test("renders multiline composer content and grows beyond one logical line", () => {

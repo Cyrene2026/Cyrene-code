@@ -15,8 +15,10 @@ const tempRoots: string[] = [];
 const createTransport = (
   options: {
     appRoot: string;
+    cyreneHome?: string;
     cwd?: string;
     env?: Partial<NodeJS.ProcessEnv>;
+    requestTemperature?: number;
   }
 ) => {
   const env: NodeJS.ProcessEnv = {
@@ -24,22 +26,26 @@ const createTransport = (
     CYRENE_API_KEY: undefined,
     CYRENE_MODEL: undefined,
     CYRENE_ROOT: options.appRoot,
+    CYRENE_HOME: options.cyreneHome ?? join(options.appRoot, ".cyrene"),
     ...options.env,
   };
   return createHttpQueryTransport({
     appRoot: options.appRoot,
     cwd: options.cwd ?? options.appRoot,
     env,
+    requestTemperature: options.requestTemperature,
   });
 };
 
 const createWorkspace = async () => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-http-transport-test-"));
   tempRoots.push(root);
-  await mkdir(join(root, ".cyrene"), { recursive: true });
+  const cyreneHome = join(root, ".cyrene");
+  await mkdir(cyreneHome, { recursive: true });
   return {
     root,
-    modelFile: join(root, ".cyrene", "model.yaml"),
+    cyreneHome,
+    modelFile: join(cyreneHome, "model.yaml"),
   };
 };
 
@@ -182,7 +188,7 @@ describe("createHttpQueryTransport tool exposure", () => {
 
 describe("createHttpQueryTransport streaming usage", () => {
   test("requests include_usage and emits normalized usage events", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
 
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     await writeFile(
@@ -230,6 +236,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_BASE_URL: "https://example.test/v1",
         CYRENE_API_KEY: "test-key",
@@ -245,6 +252,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     expect(fetchCalls).toHaveLength(1);
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.temperature).toBe(0.2);
     expect(requestBody.stream_options).toEqual({ include_usage: true });
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "hello" }),
@@ -259,7 +267,7 @@ describe("createHttpQueryTransport streaming usage", () => {
   });
 
   test("prefers output_text over plain text parts in structured content array chunks", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -302,6 +310,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_BASE_URL: "https://example.test/v1",
         CYRENE_API_KEY: "test-key",
@@ -320,8 +329,64 @@ describe("createHttpQueryTransport streaming usage", () => {
     ]);
   });
 
+  test("request body uses the configured request temperature", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(["data: [DONE]", ""].join("\n"))
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      requestTemperature: 0.35,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+    const streamUrl = await transport.requestStreamUrl("hello");
+
+    for await (const _event of transport.stream(streamUrl)) {
+      // exhaust stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.temperature).toBe(0.35);
+  });
+
   test("ignores reasoning_content and thinking fields by default", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -368,6 +433,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_BASE_URL: "https://example.test/v1",
         CYRENE_API_KEY: "test-key",
@@ -384,7 +450,7 @@ describe("createHttpQueryTransport streaming usage", () => {
   });
 
   test("can include reasoning_content and thinking fields when explicitly enabled", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -431,6 +497,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_BASE_URL: "https://example.test/v1",
         CYRENE_API_KEY: "test-key",
@@ -453,7 +520,7 @@ describe("createHttpQueryTransport streaming usage", () => {
   });
 
   test("setModel persists the most recently used model for next startup", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -467,7 +534,7 @@ describe("createHttpQueryTransport streaming usage", () => {
       "utf8"
     );
 
-    const transport = createTransport({ appRoot: root });
+    const transport = createTransport({ appRoot: root, cyreneHome });
 
     expect(await transport.listModels()).toEqual(["gpt-test", "gpt-next"]);
     expect(await transport.setModel("gpt-next")).toEqual({
@@ -480,13 +547,13 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(persisted).toContain("default_model: gpt-next");
     expect(persisted).toContain("last_used_model: gpt-next");
 
-    const restartedTransport = createTransport({ appRoot: root });
+    const restartedTransport = createTransport({ appRoot: root, cyreneHome });
     expect(await restartedTransport.listModels()).toEqual(["gpt-test", "gpt-next"]);
     expect(restartedTransport.getModel()).toBe("gpt-next");
   });
 
-  test("model catalog follows CYRENE_ROOT instead of current cwd", async () => {
-    const { root, modelFile } = await createWorkspace();
+  test("model catalog follows CYRENE_HOME instead of current cwd", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     const cwdElsewhere = await mkdtemp(join(tmpdir(), "cyrene-http-cwd-"));
     tempRoots.push(cwdElsewhere);
 
@@ -506,6 +573,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     const transport = createHttpQueryTransport({
       cwd: cwdElsewhere,
       env: {
+        CYRENE_HOME: cyreneHome,
         CYRENE_ROOT: root,
       },
     });
@@ -515,7 +583,7 @@ describe("createHttpQueryTransport streaming usage", () => {
   });
 
   test("explicit appRoot ignores an unrelated configured app root", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     const unrelatedRoot = await mkdtemp(join(tmpdir(), "cyrene-http-other-root-"));
     tempRoots.push(unrelatedRoot);
     await mkdir(join(unrelatedRoot, ".cyrene"), { recursive: true });
@@ -545,14 +613,14 @@ describe("createHttpQueryTransport streaming usage", () => {
       "utf8"
     );
 
-    const transport = createTransport({ appRoot: root });
+    const transport = createTransport({ appRoot: root, cyreneHome });
 
     expect(await transport.listModels()).toEqual(["right-model", "right-fast"]);
     expect(transport.getModel()).toBe("right-model");
   });
 
   test("provider change refreshes catalog before restoring current model", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -586,6 +654,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_BASE_URL: "https://provider-b.test/v1",
         CYRENE_API_KEY: "test-key",
@@ -603,7 +672,7 @@ describe("createHttpQueryTransport streaming usage", () => {
   });
 
   test("lists saved providers and switches to a selected provider", async () => {
-    const { root, modelFile } = await createWorkspace();
+    const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
       [
@@ -638,6 +707,7 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     const transport = createTransport({
       appRoot: root,
+      cyreneHome,
       env: {
         CYRENE_API_KEY: "test-key",
       },

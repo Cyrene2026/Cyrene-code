@@ -35,6 +35,12 @@ export type RunQuerySessionResult =
     };
 
 const COMPLETED_RESULT: RunQuerySessionResult = { status: "completed" };
+const SILENT_REVIEW_RESUME_RECOVERY_NOTE = [
+  "The approved tool result above was applied successfully.",
+  "The previous continuation ended without any assistant output or further tool action.",
+  "Continue the same task now.",
+  "Either take the next concrete step or provide the final answer explicitly; do not end silently.",
+].join("\n");
 
 type ConfirmedFileMutation = {
   action: "create_file" | "write_file" | "edit_file" | "apply_patch";
@@ -48,7 +54,58 @@ type MultiFileProgressLedger = {
   lastCompletedPath?: string;
 };
 
+type RunRoundsOptions = {
+  allowSilentPostReviewRetry?: boolean;
+};
+
+type UncertaintyMode = "normal" | "simple_multi_file";
+
+type UncertaintyPhase =
+  | "discover"
+  | "collapse"
+  | "execute"
+  | "verify"
+  | "blocked";
+
+type UncertaintyState = {
+  mode: UncertaintyMode;
+  phase: UncertaintyPhase;
+  discoverBudgetUsed: number;
+  discoverBudgetMax: number;
+  nonProgressAutoContinueUsed: boolean;
+  explicitSourceReads: Set<string>;
+  explicitTaskPaths: Set<string>;
+  verifyRequested: boolean;
+  blockedReason: string | null;
+};
+
 const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
+const MAX_NON_PROGRESS_CHATTER_CHARS = 240;
+
+const BROAD_DISCOVERY_ACTIONS = new Set([
+  "list_dir",
+  "find_files",
+  "search_text",
+  "search_text_context",
+  "outline_file",
+  "find_symbol",
+  "find_references",
+  "stat_path",
+  "stat_paths",
+]);
+
+const TARGETED_SOURCE_READ_ACTIONS = new Set([
+  "read_file",
+  "read_range",
+  "read_json",
+  "read_yaml",
+]);
+
+const SIMPLE_MULTI_FILE_TASK_PATTERN =
+  /(split|modulari(?:s|z)e|module|reorganize|classify|migrate|move.+into|refactor.+files|拆分|模块化|分类|迁移|整理|拆到|拆成|拆出去)/i;
+
+const NON_PROGRESS_CHATTER_PATTERN =
+  /(继续拆分|继续补齐|我来继续|再看一下|继续完善|继续处理|继续剩余|继续模块化|i(?:'| wi)ll continue|let me continue|continue splitting|continue with the remaining|keep going with the remaining)/i;
 
 const getToolAction = (toolName: string, input: unknown) => {
   if (
@@ -254,8 +311,11 @@ const parseLooseFileCount = (token: string) => {
   return parseChineseNumber(token);
 };
 
+const extractPathsFromText = (text: string) =>
+  normalizeUniquePaths(text.match(FILE_PATH_PATTERN) ?? []);
+
 const extractExplicitTaskPaths = (task: string) =>
-  normalizeUniquePaths(task.match(FILE_PATH_PATTERN) ?? []);
+  extractPathsFromText(task);
 
 const extractExpectedFileCount = (task: string, explicitPaths: string[]) => {
   const patterns = [
@@ -278,7 +338,11 @@ const extractExpectedFileCount = (task: string, explicitPaths: string[]) => {
 const createInitialMultiFileProgressLedger = (
   task: string
 ): MultiFileProgressLedger => {
-  const targetPaths = extractExplicitTaskPaths(task);
+  const explicitPaths = extractExplicitTaskPaths(task);
+  const targetPaths =
+    explicitPaths.length === 1 && SIMPLE_MULTI_FILE_TASK_PATTERN.test(task)
+      ? []
+      : explicitPaths;
   return {
     expectedFileCount: extractExpectedFileCount(task, targetPaths),
     targetPaths,
@@ -713,7 +777,7 @@ const getLoopSignature = (
 const normalizeForIntent = (text: string) => text.toLowerCase();
 
 const taskSuggestsWriting = (task: string) =>
-  /(create|write|add|append|fill|implement|fix|update|modify|patch|save|generate|补|写|创建|修复|更新|修改|实现|填充|补充|写入)/i.test(
+  /(create|write|add|append|fill|implement|fix|update|modify|patch|save|generate|split|modulari(?:s|z)e|reorganize|classify|migrate|补|写|创建|修复|更新|修改|实现|填充|补充|写入|拆分|模块化|整理|分类|迁移)/i.test(
     task
   );
 
@@ -726,6 +790,268 @@ const taskSuggestsPostWriteVerification = (task: string) =>
   /(verify|verification|validate|check|inspect|review|show|display|print|confirm|read back|double-check|look at|look over|确认|检查|验证|查看|看看|显示|展示|读一下|读取|核对)/i.test(
     task
   );
+
+const isBroadDiscoveryAction = (toolName: string, input: unknown) =>
+  BROAD_DISCOVERY_ACTIONS.has(getToolAction(toolName, input));
+
+const isTargetedSourceReadAction = (toolName: string, input: unknown) =>
+  TARGETED_SOURCE_READ_ACTIONS.has(getToolAction(toolName, input));
+
+const taskSuggestsSimpleMultiFile = (
+  task: string,
+  ledger: MultiFileProgressLedger
+) =>
+  taskSuggestsWriting(task) &&
+  (getLedgerExpectedFileCount(ledger) > 1 ||
+    ledger.targetPaths.length >= 2 ||
+    SIMPLE_MULTI_FILE_TASK_PATTERN.test(task));
+
+const createUncertaintyState = (
+  task: string,
+  ledger: MultiFileProgressLedger
+): UncertaintyState => {
+  const mode: UncertaintyMode = taskSuggestsSimpleMultiFile(task, ledger)
+    ? "simple_multi_file"
+    : "normal";
+  return {
+    mode,
+    phase: mode === "simple_multi_file" ? "discover" : "discover",
+    discoverBudgetUsed: 0,
+    discoverBudgetMax: 4,
+    nonProgressAutoContinueUsed: false,
+    explicitSourceReads: new Set<string>(),
+    explicitTaskPaths: new Set(extractExplicitTaskPaths(task)),
+    verifyRequested: taskSuggestsPostWriteVerification(task),
+    blockedReason: null,
+  };
+};
+
+const formatExecutionState = (
+  uncertainty: UncertaintyState,
+  ledger: MultiFileProgressLedger
+) => {
+  if (uncertainty.mode !== "simple_multi_file") {
+    return "";
+  }
+
+  const expected = getLedgerExpectedFileCount(ledger);
+  const completedCount = ledger.completedPaths.length;
+  const remainingPaths = getLedgerRemainingPaths(ledger);
+  const remainingCount = getLedgerRemainingCount(ledger);
+  const lines = [
+    "Execution state:",
+    `mode: ${uncertainty.mode}`,
+    `phase: ${uncertainty.phase}`,
+    `broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
+  ];
+
+  if (expected > 0) {
+    lines.push(`completed: ${completedCount}/${expected}`);
+  }
+  if (remainingPaths.length > 0) {
+    lines.push(`remaining known paths: ${formatPathList(remainingPaths, 4)}`);
+  } else if (remainingCount > 0) {
+    lines.push(`remaining count: ${remainingCount}`);
+  }
+  if (ledger.lastCompletedPath) {
+    lines.push(`last completed file: ${ledger.lastCompletedPath}`);
+  }
+  if (uncertainty.phase === "execute") {
+    lines.push(
+      "directive: write remaining files directly; do not reread completed files or re-open broad discovery"
+    );
+  } else if (uncertainty.phase === "collapse") {
+    lines.push(
+      "directive: broad exploration is over; continue with the concrete remaining write/edit steps"
+    );
+  } else if (uncertainty.phase === "verify") {
+    lines.push(
+      "directive: verify the written files directly; avoid reopening broad discovery"
+    );
+  } else if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
+    lines.push(`blocked: ${uncertainty.blockedReason}`);
+  }
+
+  return lines.join("\n");
+};
+
+const buildInitialExecutionMemo = (
+  query: string,
+  originalTask: string,
+  uncertainty: UncertaintyState,
+  ledger: MultiFileProgressLedger
+) => {
+  if (uncertainty.mode !== "simple_multi_file") {
+    return query;
+  }
+
+  const expected = getLedgerExpectedFileCount(ledger);
+  const memo = [
+    query,
+    "",
+    "Execution memo:",
+    "- This is a simple multi-file task.",
+    `- phase: ${uncertainty.phase}`,
+    `- broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
+    expected > 0 ? `- expected files: ${expected}` : "",
+    ledger.targetPaths.length > 1
+      ? `- known target paths: ${formatPathList(ledger.targetPaths, 4)}`
+      : "",
+    "- If enough context is already clear, move straight to the remaining writes/edits.",
+    "- If several similar writes are needed, emit multiple tool_call actions in the same round before the final answer.",
+    "- Keep narration minimal and do not stop after partial progress.",
+    `Original user task: ${originalTask}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return memo;
+};
+
+const getRecentDiscoveredPaths = (
+  accumulatedToolResults: string[],
+  roundToolResults: string[]
+) => extractPathsFromText([...accumulatedToolResults.slice(-3), ...roundToolResults].join("\n"));
+
+const shouldAllowTargetedSourceRead = (
+  path: string | undefined,
+  uncertainty: UncertaintyState,
+  accumulatedToolResults: string[],
+  roundToolResults: string[]
+) => {
+  if (!path) {
+    return false;
+  }
+
+  if (uncertainty.mode !== "simple_multi_file") {
+    return true;
+  }
+
+  if (uncertainty.phase === "verify" && uncertainty.verifyRequested) {
+    return true;
+  }
+
+  const normalizedPath = normalizeComparedPath(path);
+  const recentlyDiscovered = new Set(
+    getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
+  );
+  if (recentlyDiscovered.has(normalizedPath)) {
+    return true;
+  }
+
+  return (
+    uncertainty.explicitTaskPaths.has(normalizedPath) &&
+    !uncertainty.explicitSourceReads.has(normalizedPath)
+  );
+};
+
+const maybeMarkExplicitSourceRead = (
+  uncertainty: UncertaintyState,
+  path: string | undefined
+) => {
+  if (!path) {
+    return;
+  }
+  const normalizedPath = normalizeComparedPath(path);
+  if (uncertainty.explicitTaskPaths.has(normalizedPath)) {
+    uncertainty.explicitSourceReads.add(normalizedPath);
+  }
+};
+
+const getBlockedReason = (
+  originalTask: string,
+  uncertainty: UncertaintyState,
+  ledger: MultiFileProgressLedger,
+  accumulatedToolResults: string[],
+  roundToolResults: string[]
+) => {
+  if (
+    uncertainty.mode !== "simple_multi_file" ||
+    !SIMPLE_MULTI_FILE_TASK_PATTERN.test(originalTask) ||
+    (uncertainty.phase !== "collapse" &&
+      uncertainty.discoverBudgetUsed < uncertainty.discoverBudgetMax)
+  ) {
+    return null;
+  }
+
+  const expected = getLedgerExpectedFileCount(ledger);
+  const knownPaths = new Set([
+    ...uncertainty.explicitTaskPaths,
+    ...getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults),
+  ]);
+  if (expected === 0 && knownPaths.size === 0) {
+    return "This split/modularization task still lacks a concrete source file or target file count. Stop here and ask for the entry file or target layout.";
+  }
+  return null;
+};
+
+const maybeAdvanceUncertaintyAfterToolResult = (
+  uncertainty: UncertaintyState,
+  toolName: string,
+  input: unknown,
+  ledger: MultiFileProgressLedger
+) => {
+  if (uncertainty.mode !== "simple_multi_file") {
+    return;
+  }
+
+  if (
+    uncertainty.phase === "discover" &&
+    (isBroadDiscoveryAction(toolName, input) ||
+      isTargetedSourceReadAction(toolName, input)) &&
+    (uncertainty.discoverBudgetUsed >= uncertainty.discoverBudgetMax ||
+      uncertainty.explicitSourceReads.size > 0 ||
+      isMeaningfulMultiFileLedger(ledger))
+  ) {
+    uncertainty.phase = "collapse";
+    return;
+  }
+
+  if (
+    uncertainty.phase === "execute" &&
+    getLedgerRemainingCount(ledger) === 0 &&
+    uncertainty.verifyRequested
+  ) {
+    uncertainty.phase = "verify";
+  }
+};
+
+const buildNonProgressStopMessage = (
+  ledger: MultiFileProgressLedger
+) => {
+  const remainingPaths = getLedgerRemainingPaths(ledger);
+  const remainingCount = getLedgerRemainingCount(ledger);
+  const details =
+    remainingPaths.length > 0
+      ? `Known remaining paths: ${formatPathList(remainingPaths, 5)}.`
+      : remainingCount > 0
+        ? `Remaining file count: ${remainingCount}.`
+        : "There are still unfinished file steps.";
+  return [
+    "[execution paused]",
+    "Progress narration repeated without completing the remaining files.",
+    details,
+    "Next turn: execute the remaining files directly instead of narrating progress.",
+  ].join("\n");
+};
+
+const shouldAutoContinueNonProgress = (
+  assistantText: string,
+  uncertainty: UncertaintyState,
+  ledger: MultiFileProgressLedger
+) => {
+  const visibleChars = assistantText.replace(/\s+/g, "").length;
+  return (
+    uncertainty.mode === "simple_multi_file" &&
+    uncertainty.phase === "execute" &&
+    getLedgerRemainingCount(ledger) > 0 &&
+    !uncertainty.blockedReason &&
+    visibleChars > 0 &&
+    visibleChars < MAX_NON_PROGRESS_CHATTER_CHARS &&
+    NON_PROGRESS_CHATTER_PATTERN.test(assistantText) &&
+    !uncertainty.nonProgressAutoContinueUsed
+  );
+};
 
 const isImmediateRedundantPostWriteRead = (
   toolName: string,
@@ -860,7 +1186,8 @@ const buildRoundPrompt = (
   toolResults: string[],
   loopCorrection: string,
   recentConfirmedFileMutations: ConfirmedFileMutation[],
-  progressLedger: MultiFileProgressLedger
+  progressLedger: MultiFileProgressLedger,
+  uncertainty: UncertaintyState
 ) => {
   const heuristicNudges = buildHeuristicNudges(
     originalTask,
@@ -872,6 +1199,7 @@ const buildRoundPrompt = (
     recentConfirmedFileMutations
   );
   const multiFileProgressFacts = formatMultiFileProgressLedger(progressLedger);
+  const executionState = formatExecutionState(uncertainty, progressLedger);
   return [
     "Original user task:",
     originalTask,
@@ -893,6 +1221,7 @@ const buildRoundPrompt = (
     multiFileProgressFacts
       ? `Multi-file progress ledger:\n${multiFileProgressFacts}`
       : "",
+    executionState,
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
     loopCorrection ? `\n${loopCorrection}\n` : "",
     "Tool results:",
@@ -922,6 +1251,7 @@ export const runQuerySession = async ({
   let filesystemMutationRevision = 0;
   let recentConfirmedFileMutations: ConfirmedFileMutation[] = [];
   let progressLedger = createInitialMultiFileProgressLedger(task);
+  const uncertainty = createUncertaintyState(task, progressLedger);
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
   let repeatedImmediatePostWriteReadCount = 0;
   const maxToolSteps =
@@ -933,12 +1263,65 @@ export const runQuerySession = async ({
     onState(state);
   };
 
+  const applyToolResultSideEffects = (
+    toolName: string,
+    input: unknown,
+    message: string,
+    accumulatedToolResults: string[],
+    roundToolResults: string[]
+  ) => {
+    if (isTargetedSourceReadAction(toolName, input)) {
+      maybeMarkExplicitSourceRead(uncertainty, getToolPath(input));
+    }
+    const confirmedFileMutation = getConfirmedFileMutation(
+      toolName,
+      input,
+      message
+    );
+    if (confirmedFileMutation) {
+      recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
+        recentConfirmedFileMutations,
+        confirmedFileMutation
+      );
+      progressLedger = pushCompletedPathToLedger(
+        progressLedger,
+        confirmedFileMutation.path
+      );
+      latestConfirmedFileMutation = confirmedFileMutation;
+      repeatedImmediatePostWriteReadCount = 0;
+      uncertainty.phase =
+        getLedgerRemainingCount(progressLedger) === 0 && uncertainty.verifyRequested
+          ? "verify"
+          : "execute";
+    } else {
+      maybeAdvanceUncertaintyAfterToolResult(
+        uncertainty,
+        toolName,
+        input,
+        progressLedger
+      );
+    }
+    const blockedReason = getBlockedReason(
+      task,
+      uncertainty,
+      progressLedger,
+      accumulatedToolResults,
+      roundToolResults
+    );
+    if (blockedReason) {
+      uncertainty.phase = "blocked";
+      uncertainty.blockedReason = blockedReason;
+    }
+    return confirmedFileMutation;
+  };
+
   const runRounds = async (
     roundPrompt: string,
     repeatedToolCallCount: Map<string, number>,
     loopCorrection: string,
     accumulatedToolResults: string[],
-    toolStepsUsed: number
+    toolStepsUsed: number,
+    options?: RunRoundsOptions
   ): Promise<RunQuerySessionResult> => {
     dispatch({ type: "start" });
 
@@ -948,10 +1331,22 @@ export const runQuerySession = async ({
     let streamOpened = false;
     let visibleAnswerChars = 0;
     const toolResults: string[] = [];
+    const shouldDeferRoundText =
+      uncertainty.mode === "simple_multi_file" &&
+      uncertainty.phase === "execute";
+    let deferredRoundText = "";
 
     const completeRound = () => {
       dispatch({ type: "complete" });
       return COMPLETED_RESULT;
+    };
+
+    const emitRoundText = (text: string) => {
+      if (!text) {
+        return;
+      }
+      dispatch({ type: "text_delta", text });
+      onTextDelta(text);
     };
 
     const createOneShotResume = (
@@ -982,8 +1377,11 @@ export const runQuerySession = async ({
             continue;
           }
           visibleAnswerChars += event.text.trim() ? event.text.length : 0;
-          dispatch({ type: "text_delta", text: event.text });
-          onTextDelta(event.text);
+          if (shouldDeferRoundText) {
+            deferredRoundText += event.text;
+          } else {
+            emitRoundText(event.text);
+          }
           continue;
         }
 
@@ -999,14 +1397,99 @@ export const runQuerySession = async ({
           }
           toolStepsUsed += 1;
           sawToolCall = true;
+          const action = getToolAction(event.toolName, event.input);
+          const toolPath = getToolPath(event.input);
+          const displayName = getLoopDisplayName(event.toolName, event.input);
+
+          if (
+            uncertainty.mode === "simple_multi_file" &&
+            isBroadDiscoveryAction(event.toolName, event.input)
+          ) {
+            if (uncertainty.phase === "discover") {
+              if (uncertainty.discoverBudgetUsed >= uncertainty.discoverBudgetMax) {
+                uncertainty.phase = "collapse";
+              } else {
+                uncertainty.discoverBudgetUsed += 1;
+              }
+            }
+
+            if (uncertainty.phase !== "discover") {
+              const remainingPaths = getLedgerRemainingPaths(progressLedger);
+              const skipReason =
+                uncertainty.phase === "execute" || uncertainty.phase === "verify"
+                  ? remainingPaths.length > 0 || getLedgerRemainingCount(progressLedger) > 0
+                    ? "remaining files are already known"
+                    : "completed files are authoritative"
+                  : "the broad discovery budget is already exhausted";
+              loopCorrection = [
+                "Exploration collapsed:",
+                `Skipped ${action} ${toolPath ?? "."} because ${skipReason}.`,
+                "Stop broad exploration and continue with the remaining concrete file actions directly.",
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
+                  `Skipped ${action} because ${skipReason}.`,
+                  "Continue with remaining targets directly instead of reopening broad discovery.",
+                ].join("\n")
+              );
+              const blockedReason = getBlockedReason(
+                task,
+                uncertainty,
+                progressLedger,
+                accumulatedToolResults,
+                toolResults
+              );
+              if (blockedReason) {
+                uncertainty.phase = "blocked";
+                uncertainty.blockedReason = blockedReason;
+                emitRoundText(`${blockedReason}\n`);
+                return completeRound();
+              }
+              continue;
+            }
+          }
+
+          if (
+            uncertainty.mode === "simple_multi_file" &&
+            isTargetedSourceReadAction(event.toolName, event.input) &&
+            !shouldAllowTargetedSourceRead(
+              toolPath,
+              uncertainty,
+              accumulatedToolResults,
+              toolResults
+            )
+          ) {
+            loopCorrection = [
+              "Targeted source read blocked:",
+              `Skipped ${action} ${toolPath ?? "."}.`,
+              "Read the explicitly requested source path once or use a path that was just discovered for the split/write step.",
+            ].join("\n");
+            toolResults.push(
+              [
+                `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
+                `Skipped ${action} because this path was neither explicitly requested nor just discovered for the current multi-file task.`,
+                "Continue with the concrete remaining write/edit steps instead of adding more source reads.",
+              ].join("\n")
+            );
+            continue;
+          }
+
           const signature = getLoopSignature(
             event.toolName,
             event.input,
             filesystemMutationRevision
           );
-          const displayName = getLoopDisplayName(event.toolName, event.input);
           const seen = (repeatedToolCallCount.get(signature) ?? 0) + 1;
           repeatedToolCallCount.set(signature, seen);
+          if (
+            uncertainty.mode === "simple_multi_file" &&
+            seen >= 2 &&
+            (isBroadDiscoveryAction(event.toolName, event.input) ||
+              isExploratoryProbe(event.toolName, event.input))
+          ) {
+            uncertainty.phase = uncertainty.phase === "discover" ? "collapse" : uncertainty.phase;
+          }
           if (seen >= 2 && isExploratoryProbe(event.toolName, event.input)) {
             const repeatedPath = getToolPath(event.input) ?? ".";
             loopCorrection = [
@@ -1016,7 +1499,6 @@ export const runQuerySession = async ({
               "Choose the next concrete action toward the original task.",
             ].join("\n");
           } else if (seen >= 2 && isCommandLikeAction(event.toolName, event.input)) {
-            const action = getToolAction(event.toolName, event.input);
             const commandKind = action === "run_shell" ? "shell command" : "bounded command";
             loopCorrection = [
               `Repeated ${commandKind} warning:`,
@@ -1044,7 +1526,6 @@ export const runQuerySession = async ({
             return completeRound();
           }
           if (seen >= 3 && isCommandLikeAction(event.toolName, event.input)) {
-            const action = getToolAction(event.toolName, event.input);
             onTextDelta(
               `\n[tool loop detected] ${action} was called repeatedly with the same command signature. Stopping to prevent infinite loop.\n`
             );
@@ -1116,7 +1597,6 @@ export const runQuerySession = async ({
             isCommandLikeAction(event.toolName, event.input) &&
             isFailedCommandResult(toolResult.message)
           ) {
-            const action = getToolAction(event.toolName, event.input);
             onTextDelta(
               `\n[tool loop detected] ${action} was retried after the same command already failed. Stop rerunning it unchanged and choose a new concrete step.\n`
             );
@@ -1126,22 +1606,16 @@ export const runQuerySession = async ({
             filesystemMutationRevision += 1;
             loopCorrection = "";
           }
-          const confirmedFileMutation = getConfirmedFileMutation(
+          applyToolResultSideEffects(
             event.toolName,
             event.input,
-            toolResult.message
+            toolResult.message,
+            accumulatedToolResults,
+            toolResults
           );
-          if (confirmedFileMutation) {
-            recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
-              recentConfirmedFileMutations,
-              confirmedFileMutation
-            );
-            progressLedger = pushCompletedPathToLedger(
-              progressLedger,
-              confirmedFileMutation.path
-            );
-            latestConfirmedFileMutation = confirmedFileMutation;
-            repeatedImmediatePostWriteReadCount = 0;
+          if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
+            emitRoundText(`${uncertainty.blockedReason}\n`);
+            return completeRound();
           }
           if (toolResult.reviewMode) {
             dispatch({ type: "suspended" });
@@ -1150,22 +1624,16 @@ export const runQuerySession = async ({
                   filesystemMutationRevision += 1;
                   loopCorrection = "";
                 }
-                const resumedConfirmedFileMutation = getConfirmedFileMutation(
+                applyToolResultSideEffects(
                   event.toolName,
                   event.input,
-                  toolResultMessage
+                  toolResultMessage,
+                  accumulatedToolResults,
+                  toolResults
                 );
-                if (resumedConfirmedFileMutation) {
-                  recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
-                    recentConfirmedFileMutations,
-                    resumedConfirmedFileMutation
-                  );
-                  progressLedger = pushCompletedPathToLedger(
-                    progressLedger,
-                    resumedConfirmedFileMutation.path
-                  );
-                  latestConfirmedFileMutation = resumedConfirmedFileMutation;
-                  repeatedImmediatePostWriteReadCount = 0;
+                if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
+                  emitRoundText(`${uncertainty.blockedReason}\n`);
+                  return completeRound();
                 }
                 const nextToolResults = [
                   ...accumulatedToolResults,
@@ -1177,14 +1645,16 @@ export const runQuerySession = async ({
                   nextToolResults,
                   loopCorrection,
                   recentConfirmedFileMutations,
-                  progressLedger
+                  progressLedger,
+                  uncertainty
                 );
                 return runRounds(
                   nextPrompt,
                   repeatedToolCallCount,
                   loopCorrection,
                   nextToolResults,
-                  toolStepsUsed
+                  toolStepsUsed,
+                  { allowSilentPostReviewRetry: true }
                 );
               });
           }
@@ -1221,6 +1691,65 @@ export const runQuerySession = async ({
     }
 
     if (!sawToolCall) {
+      if (shouldDeferRoundText) {
+        if (
+          shouldAutoContinueNonProgress(
+            deferredRoundText,
+            uncertainty,
+            progressLedger
+          )
+        ) {
+          uncertainty.nonProgressAutoContinueUsed = true;
+          const nextPrompt = buildRoundPrompt(
+            task,
+            accumulatedToolResults,
+            [
+              "The previous reply narrated progress without completing the remaining files.",
+              "Do not narrate. Execute the remaining files directly.",
+            ].join("\n"),
+            recentConfirmedFileMutations,
+            progressLedger,
+            uncertainty
+          );
+          return runRounds(
+            nextPrompt,
+            repeatedToolCallCount,
+            loopCorrection,
+            accumulatedToolResults,
+            toolStepsUsed
+          );
+        }
+        if (
+          uncertainty.mode === "simple_multi_file" &&
+          uncertainty.phase === "execute" &&
+          getLedgerRemainingCount(progressLedger) > 0 &&
+          NON_PROGRESS_CHATTER_PATTERN.test(deferredRoundText)
+        ) {
+          emitRoundText(buildNonProgressStopMessage(progressLedger));
+          return completeRound();
+        }
+        emitRoundText(deferredRoundText);
+      }
+      if (visibleAnswerChars === 0 && options?.allowSilentPostReviewRetry) {
+        const nextPrompt = buildRoundPrompt(
+          task,
+          accumulatedToolResults,
+          [loopCorrection, SILENT_REVIEW_RESUME_RECOVERY_NOTE]
+            .filter(Boolean)
+            .join("\n\n"),
+          recentConfirmedFileMutations,
+          progressLedger,
+          uncertainty
+        );
+        return runRounds(
+          nextPrompt,
+          repeatedToolCallCount,
+          loopCorrection,
+          accumulatedToolResults,
+          toolStepsUsed,
+          { allowSilentPostReviewRetry: false }
+        );
+      }
       return completeRound();
     }
 
@@ -1230,19 +1759,27 @@ export const runQuerySession = async ({
       accumulatedToolResults,
       loopCorrection,
       recentConfirmedFileMutations,
-      progressLedger
+      progressLedger,
+      uncertainty
     );
     return runRounds(
       nextPrompt,
       repeatedToolCallCount,
       loopCorrection,
       accumulatedToolResults,
-      toolStepsUsed
+      toolStepsUsed,
+      options
     );
   };
 
   try {
-    return await runRounds(query, new Map<string, number>(), "", [], 0);
+    return await runRounds(
+      buildInitialExecutionMemo(query, task, uncertainty, progressLedger),
+      new Map<string, number>(),
+      "",
+      [],
+      0
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     dispatch({ type: "fail", message });

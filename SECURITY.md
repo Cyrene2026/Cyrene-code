@@ -58,8 +58,15 @@ on a few core boundaries:
 ### 4. Provider boundary
 
 - HTTP transport sends prompts to an OpenAI-compatible API when configured
-- secrets such as `CYRENE_API_KEY` should be supplied through environment or a
-  protected local config flow, not hardcoded into source
+- `CYRENE_API_KEY` is intentionally excluded from transcript items, session
+  JSON, reducer state (`summary` / `pendingDigest`), and memory index storage
+- Cyrene may persist `CYRENE_API_KEY` in **user-scoped environment/profile
+  storage** through the login flow:
+  - Windows user environment
+  - managed shell-profile blocks for zsh / bash / POSIX shells
+  - managed fish config file under `~/.config/fish/conf.d/`
+- provider URL and model catalog metadata live in the global user `.cyrene`
+  directory and are treated as non-secret runtime metadata
 - model/provider switching should be explicit and visible in the UI
 
 ## Current hardening expectations
@@ -95,6 +102,8 @@ If you run Cyrene outside local experimentation:
 
 - keep API keys out of the repo and shell history
 - review `.cyrene/` config and session files before sharing them
+- remember that login persistence writes `CYRENE_API_KEY` to user-scoped shell
+  or environment storage, not to session JSON
 - treat session logs as potentially sensitive prompt/output data
 - prefer least-privilege execution contexts for shell access
 - verify Docker / CI mounts so the workspace root is exactly what you intend

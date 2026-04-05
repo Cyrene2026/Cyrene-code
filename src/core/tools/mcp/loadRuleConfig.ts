@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   getCyreneConfigDir,
+  getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
 } from "../../../infra/config/appRoot";
 import type { MpcAction, RuleConfig } from "./types";
@@ -84,10 +85,16 @@ export const loadRuleConfig = async (
 ): Promise<RuleConfig> => {
   const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
   const defaultRules = createDefaultRules(resolvedAppRoot);
-  const configDir = getCyreneConfigDir(resolvedAppRoot);
-  const configPath = join(configDir, "config.yaml");
-  const rulePath = join(configDir, "rule.yaml");
-  const content = (await readConfigFile(configPath)) || (await readConfigFile(rulePath));
+  const configDir = getCyreneConfigDir({
+    cwd: resolvedAppRoot,
+    env: context?.env,
+  });
+  const legacyConfigDir = getLegacyProjectCyreneDir(resolvedAppRoot);
+  const content =
+    (await readConfigFile(join(configDir, "config.yaml"))) ||
+    (await readConfigFile(join(configDir, "rule.yaml"))) ||
+    (await readConfigFile(join(legacyConfigDir, "config.yaml"))) ||
+    (await readConfigFile(join(legacyConfigDir, "rule.yaml")));
   if (!content) {
     return defaultRules;
   }

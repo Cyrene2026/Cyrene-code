@@ -35,6 +35,10 @@ export type SessionStore = {
     id: string,
     inFlightTurn: SessionInFlightTurn | null
   ) => Promise<SessionRecord>;
+  updatePendingChoice: (
+    id: string,
+    pendingChoice: SessionRecord["pendingChoice"]
+  ) => Promise<SessionRecord>;
   addFocus: (id: string, note: string) => Promise<SessionRecord>;
   removeFocus: (id: string, index: number) => Promise<SessionRecord>;
   addTag: (id: string, tag: string) => Promise<SessionRecord>;

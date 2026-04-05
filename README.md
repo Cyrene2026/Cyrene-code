@@ -23,7 +23,17 @@ the full query loop without any backend service.
 
 ## Configure
 
-Put these env vars in your prepared env file to enable OpenAI-compatible HTTP transport:
+Cyrene now uses a **global user config home** by default:
+
+- Windows: `C:\Users\<you>\.cyrene`
+- macOS / Linux: `~/.cyrene`
+
+Project-local `.cyrene/` is still read for backward compatibility, but global
+user scope is the primary home for model/provider metadata and session state.
+
+### HTTP credentials
+
+You can still launch with explicit environment variables:
 
 ```bash
 CYRENE_BASE_URL=https://your-openai-compatible-host
@@ -31,8 +41,42 @@ CYRENE_API_KEY=your_api_key
 CYRENE_MODEL=gpt-4o-mini
 ```
 
-When they are set, the CLI sends `POST /v1/chat/completions` with streaming enabled.
-When they are missing, the app falls back to local core transport.
+When they are present, they remain the **highest-priority source** for that run.
+Cyrene will report them as `process_env` via `/auth` and will not overwrite them
+behind your back.
+
+### First-run login onboarding
+
+If usable HTTP credentials are missing, Cyrene auto-opens a skippable login
+wizard on the initial idle screen.
+
+Wizard flow:
+
+1. provider base URL
+2. API key
+3. optional initial model
+4. confirmation + persistence target preview
+
+Skip is always allowed. If you skip, Cyrene stays fully usable in `local-core`
+mode and you can reconnect later with `/login`.
+
+### What gets persisted where
+
+- **Secret only:** `CYRENE_API_KEY`
+  - Windows: user-level environment variable
+  - macOS/Linux zsh: managed block in `~/.zshrc`
+  - macOS/Linux bash: managed block in `~/.bashrc` or `~/.bash_profile`
+  - fish: managed file in `~/.config/fish/conf.d/`
+  - other POSIX shells: managed block in `~/.profile`
+- **Non-secret provider/model metadata:** global user `.cyrene/model.yaml`
+
+Successful `/login` persists the API key at user scope and also updates the
+current CLI process so the transport can switch immediately without restart.
+`/logout` removes only the Cyrene-managed persisted API key. It does **not**
+delete sessions, summaries, or model/provider catalog files.
+
+When credentials are missing or incomplete, Cyrene falls back to local-core
+instead of blocking the app.
 
 Current request shape:
 ```json
@@ -47,6 +91,9 @@ Model switch:
 - `/model` opens model picker (Up/Down select, Left/Right page, Enter switch).
 - `/model refresh` pulls model list immediately and overwrites `.cyrene/model.yaml`.
 - `/model <name>` switches immediately only if model exists in `.cyrene/model.yaml`; otherwise it fails.
+- `/login` opens the auth wizard on demand.
+- `/logout` removes Cyrene-managed user-scoped API key persistence.
+- `/auth` shows the current mode, credential source, and persistence target.
 
 Model source priority:
 1. `.cyrene/model.yaml`
@@ -58,6 +105,7 @@ Prompt priority and customization:
 - User-facing config is centralized in `.cyrene/config.yaml`.
 - `system_prompt` can be set in `.cyrene/config.yaml` (or env fallback: `CYRENE_SYSTEM_PROMPT=...`).
 - `auto_summary_refresh` can be set in `.cyrene/config.yaml` to enable/disable the rolling reducer that updates `summary` + `pendingDigest` inside normal user turns. Default: `true`.
+- `request_temperature` can be set in `.cyrene/config.yaml` to control the HTTP main-request sampling temperature. Default: `0.2`.
 - Runtime system prompt commands:
   - `/system` show current system prompt
   - `/system <text>` set current runtime system prompt
@@ -77,6 +125,8 @@ Session and context:
 - `/pins` shows pinned key context.
 - `/unpin <index>` removes a pinned key context item.
 - `/state` shows reducer/session state diagnostics for the current runtime.
+- `/auth` shows whether the runtime is using HTTP or local-core, plus where the
+  current credential came from.
 - Pin count comes from `.cyrene/config.yaml` via `pin_max_count`.
 - Older context is tracked through the rolling working-state pair: durable `summary` + lagging `pendingDigest`, while recent turns are kept for prompt context.
 

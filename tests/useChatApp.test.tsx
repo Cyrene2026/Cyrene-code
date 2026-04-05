@@ -6,6 +6,7 @@ import {
   CYRENE_STATE_UPDATE_END_TAG,
   CYRENE_STATE_UPDATE_START_TAG,
 } from "../src/core/session/stateReducer";
+import { runQuerySession } from "../src/core/query/runQuerySession";
 import { useChatApp } from "../src/application/chat/useChatApp";
 import {
   createSessionRecord,
@@ -218,6 +219,293 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("auto onboarding opens once on startup and can be skipped without reopening", async () => {
+    const authStatus = {
+      mode: "local" as const,
+      credentialSource: "none" as const,
+      provider: "none",
+      model: "gpt-4o-mini",
+      persistenceTarget: {
+        kind: "shell_rc_block" as const,
+        shell: "zsh" as const,
+        path: "/Users/test/.zshrc",
+        label: "zsh profile",
+        managedByCyrene: true as const,
+      },
+      onboardingAvailable: true,
+      httpReady: false,
+    };
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "local-core",
+          initialProvider: "local-core",
+          models: ["local-core"],
+          providers: ["local-core"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: authStatus,
+          getStatus: async () => authStatus,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: {
+              ...authStatus,
+              mode: "http",
+              credentialSource: "user_env",
+              provider: "https://provider.test/v1",
+              httpReady: true,
+            },
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: authStatus,
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.active).toBe(true);
+    expect(app.getLatest().authPanel.mode).toBe("auto_onboarding");
+
+    await act(async () => {
+      inputHandler?.("", { escape: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.active).toBe(false);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Login skipped. Continuing in local-core mode.")
+      )
+    ).toBe(true);
+
+    app.rerender();
+    await flushMicrotasks();
+    expect(app.getLatest().authPanel.active).toBe(false);
+    app.cleanup();
+  });
+
+  test("/login opens the auth wizard without creating a session", async () => {
+    const authStatus = {
+      mode: "local" as const,
+      credentialSource: "none" as const,
+      provider: "none",
+      model: "gpt-4o-mini",
+      persistenceTarget: null,
+      onboardingAvailable: false,
+      httpReady: false,
+    };
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "local-core",
+          initialProvider: "local-core",
+          models: ["local-core"],
+          providers: ["local-core"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: authStatus,
+          getStatus: async () => authStatus,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: authStatus,
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: authStatus,
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/login");
+
+    expect(app.getLatest().authPanel.active).toBe(true);
+    expect(app.getLatest().authPanel.mode).toBe("manual_login");
+    expect(app.getLatest().activeSessionId).toBeNull();
+    app.cleanup();
+  });
+
+  test("successful login stays out of transcript/session storage and masks the API key", async () => {
+    const sessionStore = createTestSessionStore();
+    const saveLogin = mock(async (input: {
+      providerBaseUrl: string;
+      apiKey: string;
+      model?: string;
+    }) => ({
+      ok: true,
+      message: `Saved login to zsh profile (${input.providerBaseUrl}). Switched to HTTP mode.`,
+      status: {
+        mode: "http" as const,
+        credentialSource: "user_env" as const,
+        provider: input.providerBaseUrl,
+        model: input.model ?? "gpt-4o-mini",
+        persistenceTarget: {
+          kind: "shell_rc_block" as const,
+          shell: "zsh" as const,
+          path: "/Users/test/.zshrc",
+          label: "zsh profile",
+          managedByCyrene: true as const,
+        },
+        onboardingAvailable: true,
+        httpReady: true,
+      },
+    }));
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "local-core",
+          initialProvider: "local-core",
+          models: ["local-core"],
+          providers: ["local-core"],
+        }),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: {
+            mode: "local" as const,
+            credentialSource: "none" as const,
+            provider: "none",
+            model: "gpt-4o-mini",
+            persistenceTarget: {
+              kind: "shell_rc_block" as const,
+              shell: "zsh" as const,
+              path: "/Users/test/.zshrc",
+              label: "zsh profile",
+              managedByCyrene: true as const,
+            },
+            onboardingAvailable: false,
+            httpReady: false,
+          },
+          getStatus: async () => ({
+            mode: "local" as const,
+            credentialSource: "none" as const,
+            provider: "none",
+            model: "gpt-4o-mini",
+            persistenceTarget: null,
+            onboardingAvailable: false,
+            httpReady: false,
+          }),
+          saveLogin,
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: {
+              mode: "local" as const,
+              credentialSource: "none" as const,
+              provider: "none",
+              model: "gpt-4o-mini",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: false,
+            },
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/login");
+
+    await act(async () => {
+      inputHandler?.("https://provider.test/v1", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("sk-secret-login", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    expect(app.getLatest().authPanel.apiKey).toBe("sk-secret-login");
+
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(saveLogin).toHaveBeenCalledWith({
+      providerBaseUrl: "https://provider.test/v1",
+      apiKey: "sk-secret-login",
+      model: "gpt-4o-mini",
+    });
+    expect(app.getLatest().authPanel.active).toBe(false);
+    expect(getTexts(app.getLatest().items).join("\n")).not.toContain("sk-secret-login");
+    expect(sessionStore.__listRecords()).toHaveLength(0);
+    app.cleanup();
+  });
+
+type ScriptedTransportEvent =
+  | { type: "tool_call"; toolName: string; input: unknown }
+  | { type: "text_delta"; text: string };
+
+const createScriptedTransport = (
+  rounds: ScriptedTransportEvent[][]
+): QueryTransport => {
+  let streamCount = 0;
+  return {
+    getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["gpt-test"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+    requestStreamUrl: async () => `stream://${++streamCount}`,
+    stream: async function* (streamUrl: string) {
+      const index = Number(streamUrl.replace("stream://", "")) - 1;
+      const round = rounds[index] ?? [];
+      for (const event of round) {
+        yield JSON.stringify(event);
+      }
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+};
+
   test("/state shows reducer diagnostics without creating a session", async () => {
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
@@ -245,6 +533,11 @@ describe("useChatApp", () => {
         text.includes("note: no active session loaded yet.")
       )
     ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("pending choice: (none)")
+      )
+    ).toBe(true);
     expect(app.getLatest().activeSessionId).toBeNull();
     app.cleanup();
   });
@@ -254,6 +547,14 @@ describe("useChatApp", () => {
       createSessionRecord("session-a", {
         summary: "OBJECTIVE:\n- ship reducer wiring",
         pendingDigest: "COMPLETED:\n- added digest tracking",
+        pendingChoice: {
+          capturedAt: "2026-01-01T00:00:01.000Z",
+          sourcePreview: "你回复一个数字，我就继续。",
+          options: [
+            { index: 1, label: "补 README" },
+            { index: 2, label: "补 requests 示例" },
+          ],
+        },
         lastStateUpdate: {
           code: "applied",
           message: "State update applied in merge_and_digest.",
@@ -300,6 +601,11 @@ describe("useChatApp", () => {
     expect(
       getTexts(app.getLatest().items).some(text =>
         text.includes("pending digest chars:")
+      )
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("pending choice: 2 options")
       )
     ).toBe(true);
     app.cleanup();
@@ -758,6 +1064,216 @@ describe("useChatApp", () => {
       )
     ).toBe(true);
     expect(sessionStore.__listRecords()).toHaveLength(0);
+    app.cleanup();
+  });
+
+  test("number-only follow-up resolves against the latest assistant numbered options", async () => {
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    const submitted: string[] = [];
+    let callCount = 0;
+    const runQuerySessionImpl = mock(async ({ originalTask, onState, onTextDelta }: any) => {
+      submitted.push(originalTask);
+      callCount += 1;
+      onState({ status: "streaming" });
+      if (callCount === 1) {
+        onTextDelta(
+          [
+            "如果你愿意，我下一步可以继续帮你：",
+            "1. 补 README.md 的 curl 示例",
+            "2. 补 Python requests 调用示例",
+            "3. 补启动说明",
+            "你回复一个数字，我就继续写进去。",
+          ].join("\n")
+        );
+      } else {
+        onTextDelta("已继续第 1 项。");
+      }
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "先给我几个选项");
+    await flushMicrotasks();
+
+    const firstSessionId = sessionStore.__listRecords()[0]?.id;
+    expect(firstSessionId).toBeTruthy();
+    expect(sessionStore.__getRecord(firstSessionId!)?.pendingChoice?.options.map(item => item.label)).toEqual([
+      "补 README.md 的 curl 示例",
+      "补 Python requests 调用示例",
+      "补启动说明",
+    ]);
+
+    await runCommand(app, "1");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(2);
+    expect(submitted[1]).toContain("编号选项 1");
+    expect(submitted[1]).toContain("补 README.md 的 curl 示例");
+    expect(submitted[1]).not.toBe("1");
+    expect(
+      sessionStore
+        .__getRecord(firstSessionId!)!
+        .messages.map(message => message.text)
+        .some(text => text.includes("1 → 补 README.md 的 curl 示例"))
+    ).toBe(true);
+    app.cleanup();
+  });
+
+  test("number-only follow-up without an active numbered menu is blocked locally", async () => {
+    const runQuerySessionImpl = mock(async () => ({ status: "completed" as const }));
+    const sessionStore = createTestSessionStore();
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "1");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).not.toHaveBeenCalled();
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("No active numbered options to resolve")
+      )
+    ).toBe(true);
+    expect(sessionStore.__listRecords()).toHaveLength(0);
+    app.cleanup();
+  });
+
+  test("resumed sessions restore pending numbered choices for a later numeric reply", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        messages: [
+          {
+            role: "assistant",
+            text: [
+              "我可以继续：",
+              "1. 补 README.md 的 curl 示例",
+              "2. 补 Python requests 调用示例",
+            ].join("\n"),
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+        pendingChoice: {
+          capturedAt: "2026-01-01T00:00:01.000Z",
+          sourcePreview: "我可以继续：1. 补 README.md 的 curl 示例 2. 补 Python requests 调用示例",
+          options: [
+            { index: 1, label: "补 README.md 的 curl 示例" },
+            { index: 2, label: "补 Python requests 调用示例" },
+          ],
+        },
+      }),
+    ]) as TestSessionStore;
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState, onTextDelta }: any) => {
+      submitted.push(originalTask);
+      onState({ status: "streaming" });
+      onTextDelta("继续写第 1 项。");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "1");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+    expect(submitted[0]).toContain("补 README.md 的 curl 示例");
+    expect(submitted[0]).not.toBe("1");
+    expect(
+      sessionStore
+        .__getRecord("session-a")!
+        .messages.map(message => message.text)
+        .some(text => text.includes("1 → 补 README.md 的 curl 示例"))
+    ).toBe(true);
+    app.cleanup();
+  });
+
+  test("plain numbered assistant list without an explicit menu cue does not latch choices", async () => {
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    let callCount = 0;
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState, onTextDelta }: any) => {
+      callCount += 1;
+      submitted.push(originalTask);
+      onState({ status: "streaming" });
+      if (callCount === 1) {
+        onTextDelta([
+          "项目结构如下：",
+          "1. API 层",
+          "2. 服务层",
+          "3. 测试层",
+        ].join("\n"));
+      } else {
+        onTextDelta("第二轮不该发生");
+      }
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "先概括一下");
+    await runCommand(app, "1");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+    expect(submitted).toEqual(["先概括一下"]);
+    expect(sessionStore.__listRecords()[0]?.pendingChoice).toBeNull();
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("No active numbered options to resolve")
+      )
+    ).toBe(true);
     app.cleanup();
   });
 
@@ -1383,6 +1899,61 @@ describe("useChatApp", () => {
 
     expect(app.getLatest().liveAssistantText).toBe("");
     expect(getTexts(app.getLatest().items)).toContain("draft reply");
+    app.cleanup();
+  });
+
+  test("runQuerySession auto-continue does not commit intermediate non-progress chatter to transcript", async () => {
+    const sessionStore = createTestSessionStore();
+    const transport = createScriptedTransport([
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "继续拆分剩余模块" }],
+      [{ type: "text_delta", text: "已完成剩余文件" }],
+    ]);
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport,
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall: async () => ({
+            ok: true,
+            message:
+              "[tool result] create_file test_files/a.py\nCreated file: test_files/a.py\n[confirmed file mutation] create_file test_files/a.py",
+          }),
+        } as any,
+        runQuerySessionImpl: runQuerySession,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput(
+        "创建 test_files/a.py、test_files/b.py、test_files/c.py，并全部写入内容"
+      );
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    const stored = sessionStore.__getRecord("session-1");
+    expect(stored?.messages.findLast(message => message.role === "assistant")?.text).toBe(
+      "已完成剩余文件"
+    );
+    expect(getTexts(app.getLatest().items)).not.toContain("继续拆分剩余模块");
+    expect(getTexts(app.getLatest().items)).toContain("已完成剩余文件");
     app.cleanup();
   });
 
@@ -2780,10 +3351,18 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("approval success resumes suspended task automatically", async () => {
+  test("approval success keeps resumed callbacks active and does not force-stop the turn", async () => {
     let pending = [createPending("resume-approve")];
-    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    let capturedHandlers: { onState?: (state: any) => void; onTextDelta?: (text: string) => void } | null = null;
+    const resume = mock(async (_toolResultMessage: string) => {
+      capturedHandlers?.onState?.({ status: "streaming" });
+      capturedHandlers?.onTextDelta?.("after approval");
+      capturedHandlers?.onState?.({ status: "idle" });
+      return { status: "completed" as const };
+    });
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      capturedHandlers = { onState, onTextDelta };
       onState({ status: "awaiting_review" });
       onTextDelta("draft ");
       return { status: "suspended" as const, resume };
@@ -2792,7 +3371,7 @@ describe("useChatApp", () => {
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
         transport: createTestTransport(),
-        sessionStore: createTestSessionStore(),
+        sessionStore,
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
@@ -2820,23 +3399,144 @@ describe("useChatApp", () => {
 
     expect(resume).toHaveBeenCalledTimes(1);
     expect(resume).toHaveBeenCalledWith("[approved] resume-approve\nCreated file: ok");
+    expect(app.getLatest().status).toBe("idle");
     expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(app.getLatest().pendingReviews).toHaveLength(0);
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(getTexts(app.getLatest().items).some(text => text.trim() === "draft after approval")).toBe(true);
+    expect(sessionStore.__listRecords()[0]?.messages.map(message => message.text)).toEqual([
+      "create one file",
+      "draft after approval",
+    ]);
     app.cleanup();
   });
 
-  test("reject success resumes suspended task automatically", async () => {
-    let pending = [createPending("resume-reject")];
-    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+  test("/cancel reports when there is no running turn", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+      })
+    );
+
+    await runCommand(app, "/cancel");
+
+    expect(getTexts(app.getLatest().items)).toContain("No running turn to cancel.");
+    expect(app.getLatest().status).toBe("idle");
+    app.cleanup();
+  });
+
+  test("/cancel during streaming drops stale output and allows immediate resubmit", async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>(resolve => {
+      releaseSecond = resolve;
+    });
+
+    let callCount = 0;
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
-      onState({ status: "awaiting_review" });
-      onTextDelta("draft ");
-      return { status: "suspended" as const, resume };
+      callCount += 1;
+      if (callCount === 1) {
+        onState({ status: "streaming" });
+        onTextDelta("first draft");
+        await firstGate;
+        onTextDelta(" stale tail");
+        onState({ status: "idle" });
+        return { status: "completed" as const };
+      }
+
+      onState({ status: "streaming" });
+      onTextDelta("second draft");
+      await secondGate;
+      onTextDelta(" second final");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
     });
 
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
         transport: createTestTransport(),
         sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "first task");
+    expect(app.getLatest().status).toBe("streaming");
+    expect(app.getLatest().liveAssistantText).toBe("first draft");
+
+    await runCommand(app, "/cancel");
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("idle");
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Current turn cancelled. Add requirements and send a new prompt when ready.")
+      )
+    ).toBe(true);
+    expect(getTexts(app.getLatest().items)).not.toContain("first draft");
+
+    await runCommand(app, "second task");
+    expect(callCount).toBe(2);
+    expect(app.getLatest().status).toBe("streaming");
+    expect(app.getLatest().liveAssistantText).toBe("second draft");
+
+    await act(async () => {
+      releaseFirst();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("streaming");
+    expect(app.getLatest().liveAssistantText).toBe("second draft");
+    expect(getTexts(app.getLatest().items).join("\n")).not.toContain("stale tail");
+    expect(getTexts(app.getLatest().items).join("\n")).not.toContain("first draft");
+
+    await act(async () => {
+      releaseSecond();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("idle");
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(getTexts(app.getLatest().items)).toContain("second draft second final");
+    app.cleanup();
+  });
+
+  test("reject success cancels suspended task instead of resuming", async () => {
+    let pending = [createPending("resume-reject")];
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    let callCount = 0;
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      callCount += 1;
+      if (callCount === 1) {
+        onState({ status: "awaiting_review" });
+        onTextDelta("draft ");
+        return { status: "suspended" as const, resume };
+      }
+      onState({ status: "streaming" });
+      onTextDelta("updated answer");
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
         defaultSystemPrompt: "system",
         projectPrompt: "project",
         pinMaxCount: 3,
@@ -2862,9 +3562,126 @@ describe("useChatApp", () => {
     await flushMicrotasks();
     await flushMicrotasks();
 
-    expect(resume).toHaveBeenCalledTimes(1);
-    expect(resume).toHaveBeenCalledWith("[rejected] resume-reject");
+    expect(resume).not.toHaveBeenCalled();
+    expect(app.getLatest().status).toBe("idle");
     expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("current suspended task cancelled"))).toBe(true);
+    expect(getTexts(app.getLatest().items)).toContain("draft");
+
+    await runCommand(app, "add one more requirement");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(2);
+    const record = sessionStore.__listRecords()[0];
+    expect(record?.messages.map(message => message.text)).toEqual([
+      "reject path",
+      "draft",
+      "add one more requirement",
+      "updated answer",
+    ]);
+    app.cleanup();
+  });
+
+  test("/cancel clears a suspended approval turn without resuming it", async () => {
+    let pending = [createPending("cancel-suspended")];
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "awaiting_review" });
+      onTextDelta("draft ");
+      return { status: "suspended" as const, resume };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          reject: mock((id: string) => {
+            pending = pending.filter(item => item.id !== id);
+            return { ok: true, message: `[rejected] ${id}` };
+          }),
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "needs approval");
+    await openApprovalPanelForTest(app, pending);
+
+    await runCommand(app, "/cancel");
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(resume).not.toHaveBeenCalled();
+    expect(app.getLatest().status).toBe("idle");
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(app.getLatest().pendingReviews).toHaveLength(0);
+    expect(getTexts(app.getLatest().items).join("\n")).not.toContain("draft");
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Current turn cancelled. Add requirements and send a new prompt when ready.")
+      )
+    ).toBe(true);
+
+    const record = sessionStore.__listRecords()[0];
+    expect(record?.messages.map(message => message.text)).toEqual(["needs approval"]);
+    app.cleanup();
+  });
+
+  test("/reject all cancels the suspended task instead of resuming it", async () => {
+    let pending = [createPending("batch-ra"), createPending("batch-rb")];
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    const resume = mock(async (_toolResultMessage: string) => ({ status: "completed" as const }));
+    let callCount = 0;
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      callCount += 1;
+      if (callCount === 1) {
+        onState({ status: "awaiting_review" });
+        onTextDelta("draft batch ");
+        return { status: "suspended" as const, resume };
+      }
+      onTextDelta("after batch cancel");
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve: mock(async (id: string) => ({ ok: true, message: `[approved] ${id}\nok` })),
+          reject: mock((id: string) => {
+            pending = pending.filter(item => item.id !== id);
+            return { ok: true, message: `[rejected] ${id}` };
+          }),
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "reject every pending write");
+    await runCommand(app, "/reject all");
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(resume).not.toHaveBeenCalled();
+    expect(app.getLatest().status).toBe("idle");
+    expect(app.getLatest().approvalPanel.active).toBe(false);
+    expect(getTexts(app.getLatest().items).some(text => text.includes("suspended task: cancelled"))).toBe(true);
+
+    await runCommand(app, "fresh requirements now");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(2);
     app.cleanup();
   });
 

@@ -93,6 +93,12 @@ const normalizeTag = (tag: string) =>
 
 const cloneRecord = (record: SessionRecord): SessionRecord => ({
   ...record,
+  pendingChoice: record.pendingChoice
+    ? {
+        ...record.pendingChoice,
+        options: record.pendingChoice.options.map(option => ({ ...option })),
+      }
+    : null,
   lastStateUpdate: record.lastStateUpdate
     ? { ...record.lastStateUpdate }
     : null,
@@ -109,8 +115,15 @@ export const createSessionRecord = (
   title: overrides?.title ?? id,
   createdAt: overrides?.createdAt ?? now(),
   updatedAt: overrides?.updatedAt ?? now(),
+  projectRoot: overrides?.projectRoot ?? "D:/Projects/test-root",
   summary: overrides?.summary ?? "",
   pendingDigest: overrides?.pendingDigest ?? "",
+  pendingChoice: overrides?.pendingChoice
+    ? {
+        ...overrides.pendingChoice,
+        options: overrides.pendingChoice.options.map(option => ({ ...option })),
+      }
+    : null,
   lastStateUpdate: overrides?.lastStateUpdate
     ? { ...overrides.lastStateUpdate }
     : null,
@@ -306,6 +319,24 @@ export const createTestSessionStore = (seed: SessionRecord[] = []): TestSessionS
       const next: SessionRecord = {
         ...record,
         inFlightTurn,
+        updatedAt: now(),
+      };
+      records.set(id, next);
+      return cloneRecord(next);
+    },
+    updatePendingChoice: async (id, pendingChoice) => {
+      const record = records.get(id);
+      if (!record) {
+        throw new Error(`Missing session ${id}`);
+      }
+      const next: SessionRecord = {
+        ...record,
+        pendingChoice: pendingChoice
+          ? {
+              ...pendingChoice,
+              options: pendingChoice.options.map(option => ({ ...option })),
+            }
+          : null,
         updatedAt: now(),
       };
       records.set(id, next);

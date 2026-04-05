@@ -14,6 +14,17 @@ export type SessionInFlightTurn = {
   updatedAt: string;
 };
 
+export type SessionPendingChoiceOption = {
+  index: number;
+  label: string;
+};
+
+export type SessionPendingChoice = {
+  capturedAt: string;
+  sourcePreview: string;
+  options: SessionPendingChoiceOption[];
+};
+
 export type SessionStateUpdateDiagnosticCode =
   | "disabled"
   | "missing_tag"
@@ -37,8 +48,10 @@ export type SessionRecord = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  projectRoot: string | null;
   summary: string;
   pendingDigest: string;
+  pendingChoice: SessionPendingChoice | null;
   lastStateUpdate: SessionStateUpdateDiagnostic | null;
   inFlightTurn: SessionInFlightTurn | null;
   focus: string[];

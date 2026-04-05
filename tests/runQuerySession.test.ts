@@ -310,6 +310,42 @@ const createPromptCaptureRoundSequenceTransport = (
   };
 };
 
+type ScriptedTransportEvent =
+  | { type: "tool_call"; toolName: string; input: unknown }
+  | { type: "text_delta"; text: string };
+
+const createPromptCaptureScriptedTransport = (
+  rounds: ScriptedTransportEvent[][]
+): { transport: QueryTransport; prompts: string[] } => {
+  const prompts: string[] = [];
+  let streamCount = 0;
+
+  return {
+    prompts,
+    transport: {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async prompt => {
+        prompts.push(prompt);
+        return `stream://${++streamCount}`;
+      },
+      stream: async function* (streamUrl: string) {
+        const index = Number(streamUrl.replace("stream://", "")) - 1;
+        const round = rounds[index] ?? [];
+        for (const event of round) {
+          yield JSON.stringify(event);
+        }
+        yield JSON.stringify({ type: "done" });
+      },
+    },
+  };
+};
+
 const createLateToolCallAfterAnswerTransport = (): {
   transport: QueryTransport;
   prompts: string[];
@@ -397,6 +433,80 @@ describe("runQuerySession", () => {
     expect(textDeltas).toEqual(["done"]);
     expect(prompts[1]).toContain("[approved] review-1");
     expect(prompts[1]).toContain("Continue from the confirmed facts");
+  });
+
+  test("approval resume retries once when the immediate continuation completes silently", async () => {
+    const prompts: string[] = [];
+    let streamCount = 0;
+    const transport: QueryTransport = {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({
+        ok: true,
+        message: `provider ${provider}`,
+        currentProvider: provider,
+        providers: [provider],
+        models: ["gpt-test"],
+      }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async prompt => {
+        prompts.push(prompt);
+        return `stream://${++streamCount}`;
+      },
+      stream: async function* (streamUrl: string) {
+        if (streamUrl === "stream://1") {
+          yield JSON.stringify({
+            type: "tool_call",
+            toolName: "create_file",
+            input: { path: "test_files/main.py" },
+          });
+          yield JSON.stringify({ type: "done" });
+          return;
+        }
+
+        if (streamUrl === "stream://2") {
+          yield JSON.stringify({ type: "done" });
+          return;
+        }
+
+        yield JSON.stringify({ type: "text_delta", text: "continued after approval" });
+        yield JSON.stringify({ type: "done" });
+      },
+    };
+
+    const textDeltas: string[] = [];
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "create main.py then continue wiring",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => ({
+        message: "Approval required review-1",
+        reviewMode: "queue" as const,
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("suspended");
+    if (result.status !== "suspended") {
+      throw new Error("expected suspended result");
+    }
+
+    const resumed = await result.resume(
+      "[approved] review-1\nCreated file: main.py\n[confirmed file mutation] create_file main.py"
+    );
+
+    expect(resumed.status).toBe("completed");
+    expect(textDeltas).toEqual(["continued after approval"]);
+    expect(prompts).toHaveLength(3);
+    expect(prompts[2]).toContain("do not end silently");
+    expect(prompts[2]).toContain("[approved] review-1");
   });
 
   test("allows more than 6 tool steps before completion", async () => {
@@ -1268,5 +1378,226 @@ describe("runQuerySession", () => {
     ]);
     expect(textDeltas.join("")).toContain("done");
     expect(textDeltas.join("")).not.toContain("[tool loop detected]");
+  });
+
+  test("injects a simple multi-file execution memo into the first round only for matching tasks", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "创建 test_files/a.py、test_files/b.py，并分别写入内容",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: "[tool result] create_file test_files/a.py\nCreated file: test_files/a.py",
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[0]).toContain("Execution memo:");
+    expect(prompts[0]).toContain("simple multi-file task");
+    expect(prompts[0]).toContain("Original user task:");
+  });
+
+  test("single-file tasks do not get the simple multi-file execution memo", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: "[tool result] write_file src/app.ts\nWrote file: src/app.ts",
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[0]).not.toContain("Execution memo:");
+  });
+
+  test("explicit source reads are allowed once and do not count against broad discovery budget", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "main.py" },
+      },
+      null,
+    ]);
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "先看 main.py，再拆分模块结构",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: "[tool result] read_file main.py\nfrom fastapi import FastAPI\napp = FastAPI()",
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[1]).toContain("Execution state:");
+    expect(prompts[1]).toContain("broad discovery budget: 0/4");
+  });
+
+  test("repeated broad discovery collapses early and blocks when a split task still lacks concrete facts", async () => {
+    const { transport } = createPromptCaptureRoundSequenceTransport([
+      { toolName: "file", input: { action: "list_dir", path: "." } },
+      { toolName: "file", input: { action: "list_dir", path: "." } },
+      { toolName: "file", input: { action: "list_dir", path: "." } },
+      { toolName: "file", input: { action: "list_dir", path: "." } },
+      { toolName: "file", input: { action: "list_dir", path: "." } },
+    ]);
+    const textDeltas: string[] = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "请拆分成模块结构",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => {
+        toolCallCount += 1;
+        return {
+          message: "[tool result] list_dir .\n[confirmed directory state] (workspace root inspected)",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCallCount).toBe(2);
+    expect(textDeltas.join("")).toContain("still lacks a concrete source file or target file count");
+  });
+
+  test("execute phase skips renewed broad discovery and pushes a more specific continue-directly correction", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "search_text", path: "src", query: "needle" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "创建 test_files/a.py、test_files/b.py、test_files/c.py，并把三个文件都写好",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message:
+            "[tool result] create_file test_files/a.py\nCreated file: test_files/a.py\n[confirmed file mutation] create_file test_files/a.py",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["create_file"]);
+    expect(prompts[1]).toContain("phase: execute");
+    expect(prompts[1]).toContain(
+      "write remaining files directly; do not reread completed files or re-open broad discovery"
+    );
+    expect(prompts[2]).toContain("[tool skipped] search_text src");
+    expect(prompts[2]).toContain("remaining files are already known");
+  });
+
+  test("short non-progress chatter auto-continues once and drops the chatter from visible output", async () => {
+    const { transport, prompts } = createPromptCaptureScriptedTransport([
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "继续拆分剩余模块" }],
+      [{ type: "text_delta", text: "已完成剩余文件" }],
+    ]);
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "创建 test_files/a.py、test_files/b.py、test_files/c.py，并全部写入内容",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => ({
+        message:
+          "[tool result] create_file test_files/a.py\nCreated file: test_files/a.py\n[confirmed file mutation] create_file test_files/a.py",
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(textDeltas.join("")).toBe("已完成剩余文件");
+    expect(prompts).toHaveLength(3);
+    expect(prompts[2]).toContain(
+      "The previous reply narrated progress without completing the remaining files."
+    );
+  });
+
+  test("a second short non-progress chatter stops with an explicit remaining-files pause message", async () => {
+    const { transport } = createPromptCaptureScriptedTransport([
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "create_file", path: "test_files/a.py", content: "print('a')\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "继续拆分剩余模块" }],
+      [{ type: "text_delta", text: "继续补齐剩余文件" }],
+    ]);
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "创建 test_files/a.py、test_files/b.py、test_files/c.py，并全部写入内容",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => ({
+        message:
+          "[tool result] create_file test_files/a.py\nCreated file: test_files/a.py\n[confirmed file mutation] create_file test_files/a.py",
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(textDeltas.join("")).toContain("[execution paused]");
+    expect(textDeltas.join("")).toContain("Known remaining paths: test_files/b.py, test_files/c.py.");
+    expect(textDeltas.join("")).not.toContain("继续补齐剩余文件");
   });
 });

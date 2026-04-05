@@ -3,9 +3,11 @@ import { join, resolve } from "node:path";
 import {
   configureAppRootFromArgs,
   getCyreneConfigDir,
+  getLegacyProjectCyreneDir,
   parseRootArg,
   resetConfiguredAppRoot,
   resolveAppRoot,
+  resolveUserHomeDir,
 } from "../src/infra/config/appRoot";
 
 afterEach(() => {
@@ -46,10 +48,36 @@ describe("app root resolver", () => {
     ).toBe(resolve("workspace", "env-root"));
   });
 
-  test("builds .cyrene config path from resolved app root", () => {
+  test("builds global .cyrene path from user home and keeps legacy project path helper", () => {
+    const cwd = resolve("workspace", "repo");
+
     expect(parseRootArg(["--root", "./repo"])).toBe("./repo");
-    expect(getCyreneConfigDir(resolve("workspace", "repo"))).toBe(
-      join(resolve("workspace", "repo"), ".cyrene")
+    expect(
+      resolveUserHomeDir({
+        cwd,
+        env: {
+          USERPROFILE: "C:/Users/tester",
+        },
+      })
+    ).toBe(resolve("C:/Users/tester"));
+    expect(
+      getCyreneConfigDir({
+        cwd,
+        env: {
+          USERPROFILE: "C:/Users/tester",
+        },
+      })
+    ).toBe(join(resolve("C:/Users/tester"), ".cyrene"));
+    expect(
+      getCyreneConfigDir({
+        cwd,
+        env: {
+          CYRENE_HOME: "./global-cyrene",
+        },
+      })
+    ).toBe(resolve(cwd, "global-cyrene"));
+    expect(getLegacyProjectCyreneDir(cwd)).toBe(
+      join(cwd, ".cyrene")
     );
   });
 });

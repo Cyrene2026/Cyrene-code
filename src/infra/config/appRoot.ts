@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 type AppRootResolveOptions = {
@@ -5,6 +6,8 @@ type AppRootResolveOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
 };
+
+type CyreneDirResolveOptions = Pick<AppRootResolveOptions, "cwd" | "env">;
 
 let configuredAppRoot: string | null = null;
 
@@ -14,6 +17,26 @@ const trimNonEmpty = (value: string | undefined) => {
     return undefined;
   }
   return trimmed === "undefined" || trimmed === "null" ? undefined : trimmed;
+};
+
+const resolveHomeFromEnv = (env: NodeJS.ProcessEnv) => {
+  const userProfile = trimNonEmpty(env.USERPROFILE);
+  if (userProfile) {
+    return userProfile;
+  }
+
+  const home = trimNonEmpty(env.HOME);
+  if (home) {
+    return home;
+  }
+
+  const homeDrive = trimNonEmpty(env.HOMEDRIVE);
+  const homePath = trimNonEmpty(env.HOMEPATH);
+  if (homeDrive && homePath) {
+    return `${homeDrive}${homePath}`;
+  }
+
+  return undefined;
 };
 
 export const parseRootArg = (argv: string[]) => {
@@ -66,5 +89,27 @@ export const resetConfiguredAppRoot = () => {
   configuredAppRoot = null;
 };
 
-export const getCyreneConfigDir = (appRoot = resolveAppRoot()) =>
+export const resolveUserHomeDir = (options?: CyreneDirResolveOptions) => {
+  const cwd = options?.cwd ?? process.cwd();
+  const env = options?.env ?? process.env;
+  const envHome = resolveHomeFromEnv(env);
+  return envHome ? resolve(cwd, envHome) : homedir();
+};
+
+export const getLegacyProjectCyreneDir = (appRoot = resolveAppRoot()) =>
   join(appRoot, ".cyrene");
+
+export const getCyreneConfigDir = (
+  appRootOrOptions?: string | CyreneDirResolveOptions,
+  maybeOptions?: CyreneDirResolveOptions
+) => {
+  const options =
+    typeof appRootOrOptions === "string" ? maybeOptions : appRootOrOptions;
+  const cwd = options?.cwd ?? process.cwd();
+  const env = options?.env ?? process.env;
+  const explicitCyreneHome = trimNonEmpty(env.CYRENE_HOME);
+  if (explicitCyreneHome) {
+    return resolve(cwd, explicitCyreneHome);
+  }
+  return join(resolveUserHomeDir(options), ".cyrene");
+};

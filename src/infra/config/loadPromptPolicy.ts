@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { resolveAppRoot } from "./appRoot";
+import {
+  getCyreneConfigDir,
+  getLegacyProjectCyreneDir,
+  resolveAppRoot,
+} from "./appRoot";
 import type { CyreneConfig } from "./loadCyreneConfig";
 
 export type PromptPolicy = {
@@ -20,12 +24,18 @@ export const loadPromptPolicy = async (
     process.env.CYRENE_SYSTEM_PROMPT?.trim() ||
     DEFAULT_SYSTEM_PROMPT;
 
-  const projectFile = join(appRoot, ".cyrene", ".cyrene.md");
   let projectPrompt = "";
-  try {
-    projectPrompt = (await readFile(projectFile, "utf8")).trim();
-  } catch {
-    projectPrompt = "";
+  const projectFiles = [
+    join(getCyreneConfigDir(appRoot), ".cyrene.md"),
+    join(getLegacyProjectCyreneDir(appRoot), ".cyrene.md"),
+  ];
+  for (const projectFile of projectFiles) {
+    try {
+      projectPrompt = (await readFile(projectFile, "utf8")).trim();
+      break;
+    } catch {
+      // Try the next compatible location.
+    }
   }
 
   return {

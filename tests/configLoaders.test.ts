@@ -35,6 +35,7 @@ describe("config loaders", () => {
       "pin_max_count: 9",
       "query_max_tool_steps: 31",
       "auto_summary_refresh: false",
+      "request_temperature: 0.15",
       'system_prompt: "focus on tests"',
     ].join("\n"));
 
@@ -43,6 +44,7 @@ describe("config loaders", () => {
     expect(config.pinMaxCount).toBe(9);
     expect(config.queryMaxToolSteps).toBe(31);
     expect(config.autoSummaryRefresh).toBe(false);
+    expect(config.requestTemperature).toBe(0.15);
     expect(config.systemPrompt).toBe("focus on tests");
   });
 
@@ -54,6 +56,15 @@ describe("config loaders", () => {
 
     expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
     expect(config.autoSummaryRefresh).toBe(true);
+    expect(config.requestTemperature).toBe(0.2);
+  });
+
+  test("loadCyreneConfig clamps invalid request_temperature into 0..2", async () => {
+    const root = await createWorkspace("request_temperature: 9");
+
+    const config = await loadCyreneConfig(root);
+
+    expect(config.requestTemperature).toBe(2);
   });
 
   test("loadRuleConfig falls back to config.yaml for MCP review settings", async () => {

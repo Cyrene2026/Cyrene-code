@@ -275,9 +275,9 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Stop exploring once you have enough information to act.",
 ].join(" ");
 
-const normalizeBaseUrl = (url: string) => url.replace(/\/+$/, "");
+export const normalizeProviderBaseUrl = (url: string) => url.replace(/\/+$/, "");
 const resolveChatCompletionsUrl = (baseUrl: string) => {
-  const normalized = normalizeBaseUrl(baseUrl);
+  const normalized = normalizeProviderBaseUrl(baseUrl);
   if (normalized.endsWith("/chat/completions")) {
     return normalized;
   }
@@ -287,7 +287,7 @@ const resolveChatCompletionsUrl = (baseUrl: string) => {
   return `${normalized}/v1/chat/completions`;
 };
 const resolveModelsUrl = (baseUrl: string) => {
-  const normalized = normalizeBaseUrl(baseUrl);
+  const normalized = normalizeProviderBaseUrl(baseUrl);
   if (normalized.endsWith("/models")) {
     return normalized;
   }
@@ -298,7 +298,7 @@ const resolveModelsUrl = (baseUrl: string) => {
 };
 const DONE_EVENT = JSON.stringify({ type: "done" });
 const resolveProviderBaseUrl = (baseUrl: string | undefined) =>
-  baseUrl ? normalizeBaseUrl(baseUrl) : undefined;
+  baseUrl ? normalizeProviderBaseUrl(baseUrl) : undefined;
 const joinVisibleParts = (parts: string[]) => parts.filter(Boolean).join("");
 
 const extractTextValue = (value: unknown): string => {
@@ -458,7 +458,7 @@ async function* streamSseOpenAI(
   apiKey: string,
   model: string,
   query: string,
-  options?: { includeReasoning?: boolean }
+  options?: { includeReasoning?: boolean; temperature?: number }
 ): AsyncGenerator<string> {
   const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
     method: "POST",
@@ -469,6 +469,7 @@ async function* streamSseOpenAI(
     },
     body: JSON.stringify({
       model,
+      temperature: options?.temperature ?? 0.2,
       stream: true,
       stream_options: {
         include_usage: true,
@@ -656,10 +657,57 @@ const parseModelsPayload = (payload: unknown): string[] => {
   return Array.from(new Set(models));
 };
 
-type HttpQueryTransportOptions = {
+export type ProviderModelCatalogResult = {
+  providerBaseUrl: string;
+  models: string[];
+  selectedModel: string;
+};
+
+export const fetchProviderModelCatalog = async (options: {
+  baseUrl: string;
+  apiKey: string;
+  preferredModel?: string;
+  currentModel?: string;
+}): Promise<ProviderModelCatalogResult> => {
+  const providerBaseUrl = normalizeProviderBaseUrl(options.baseUrl);
+  const response = await fetch(resolveModelsUrl(providerBaseUrl), {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Model fetch failed: ${response.status} ${response.statusText}`);
+  }
+  const payload = (await response.json()) as unknown;
+  const models = parseModelsPayload(payload);
+  if (models.length === 0) {
+    throw new Error("Model fetch returned empty list.");
+  }
+
+  const firstModel = models[0] ?? options.currentModel ?? "gpt-4o-mini";
+  const selectedModel =
+    (options.preferredModel && models.includes(options.preferredModel)
+      ? options.preferredModel
+      : undefined) ??
+    (options.currentModel && models.includes(options.currentModel)
+      ? options.currentModel
+      : undefined) ??
+    firstModel;
+
+  return {
+    providerBaseUrl,
+    models,
+    selectedModel,
+  };
+};
+
+export type HttpQueryTransportOptions = {
   appRoot?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  requestTemperature?: number;
 };
 
 export const createHttpQueryTransport = (
@@ -668,6 +716,11 @@ export const createHttpQueryTransport = (
   const effectiveEnv = options?.env ?? process.env;
   const includeReasoningInTranscript =
     effectiveEnv.CYRENE_STREAM_REASONING === "1";
+  const requestTemperature =
+    typeof options?.requestTemperature === "number" &&
+    Number.isFinite(options.requestTemperature)
+      ? Math.min(2, Math.max(0, options.requestTemperature))
+      : 0.2;
   const appRoot =
     options?.appRoot ??
     resolveAmbientAppRoot({
@@ -708,7 +761,10 @@ export const createHttpQueryTransport = (
       lastUsedModel: selectedModel,
       providerBaseUrl: provider,
       providers: providerCatalog,
-    }, appRoot);
+    }, appRoot, {
+      cwd: options?.cwd,
+      env: effectiveEnv,
+    });
   };
 
   const refreshFromApi = async (
@@ -719,41 +775,31 @@ export const createHttpQueryTransport = (
     if (!targetProvider || !apiKey) {
       throw new Error("Missing CYRENE_BASE_URL or CYRENE_API_KEY.");
     }
-    const response = await fetch(resolveModelsUrl(targetProvider), {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
+    const catalog = await fetchProviderModelCatalog({
+      baseUrl: targetProvider,
+      apiKey,
+      preferredModel,
+      currentModel,
     });
-    if (!response.ok) {
-      throw new Error(`Model fetch failed: ${response.status} ${response.statusText}`);
-    }
-    const payload = (await response.json()) as unknown;
-    const models = parseModelsPayload(payload);
-    if (models.length === 0) {
-      throw new Error("Model fetch returned empty list.");
-    }
-
-    const firstModel = models[0] ?? currentModel;
-    const selectedModel =
-      (preferredModel && models.includes(preferredModel)
-        ? preferredModel
-        : undefined) ??
-      (models.includes(currentModel) ? currentModel : undefined) ??
-      firstModel;
-    await persistCatalog(models, selectedModel, targetProvider);
-    availableModels = models;
-    currentModel = selectedModel;
-    currentProvider = targetProvider;
+    await persistCatalog(
+      catalog.models,
+      catalog.selectedModel,
+      catalog.providerBaseUrl
+    );
+    availableModels = catalog.models;
+    currentModel = catalog.selectedModel;
+    currentProvider = catalog.providerBaseUrl;
     initializationError = null;
 
-    return models;
+    return catalog.models;
   };
 
   const initializeModels = async () => {
     try {
-      const local = await loadModelYaml(appRoot);
+      const local = await loadModelYaml(appRoot, {
+        cwd: options?.cwd,
+        env: effectiveEnv,
+      });
       providerCatalog = dedupeProviders([
         ...local.providers,
         local.providerBaseUrl,
@@ -949,6 +995,7 @@ export const createHttpQueryTransport = (
         query,
         {
           includeReasoning: includeReasoningInTranscript,
+          temperature: requestTemperature,
         }
       )) {
         yield event;

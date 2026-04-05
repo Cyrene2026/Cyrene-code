@@ -7,6 +7,10 @@ import type { TokenUsage } from "../../core/query/tokenUsage";
 import { buildPromptWithContext } from "../../core/session/buildPromptWithContext";
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
 import {
+  extractPendingChoiceFromAssistantText,
+  resolvePendingChoiceInput,
+} from "../../core/session/pendingChoice";
+import {
   applyParsedStateUpdate,
   applyLocalFallbackStateUpdate,
   buildFallbackPendingDigest,
@@ -18,8 +22,10 @@ import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type { QueryTransport } from "../../core/query/transport";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
+import type { AuthLoginInput, AuthStatus } from "../../infra/auth/types";
 import type {
   SessionListItem,
+  SessionPendingChoice,
   SessionRecord,
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
@@ -58,6 +64,20 @@ type UseChatAppParams = {
   autoSummaryRefresh?: boolean;
   queryMaxToolSteps?: number;
   mcpService: FileMcpService;
+  auth?: {
+    status: AuthStatus;
+    getStatus: () => Promise<AuthStatus>;
+    saveLogin: (input: AuthLoginInput) => Promise<{
+      ok: boolean;
+      message: string;
+      status: AuthStatus;
+    }>;
+    logout: () => Promise<{
+      ok: boolean;
+      message: string;
+      status: AuthStatus;
+    }>;
+  };
   runQuerySessionImpl?: typeof runQuerySession;
   inputAdapterHook?: typeof useInputAdapter;
 };
@@ -108,10 +128,35 @@ type ApprovalPanelState = {
   resumePending: boolean;
 };
 
+type AuthPanelMode = "auto_onboarding" | "manual_login";
+type AuthPanelStep = "provider" | "api_key" | "model" | "confirm";
+
+type AuthPanelState = {
+  active: boolean;
+  mode: AuthPanelMode;
+  step: AuthPanelStep;
+  providerBaseUrl: string;
+  apiKey: string;
+  model: string;
+  cursorOffset: number;
+  error: string | null;
+  info: string | null;
+  saving: boolean;
+  persistenceTarget: AuthStatus["persistenceTarget"];
+};
+
 type SuspendedTaskState = {
   sessionId: string;
   assistantBufferRef: { current: string };
   resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
+};
+
+type ActiveTurnState = {
+  runId: number;
+  sessionId: string | null;
+  assistantBufferRef: { current: string };
+  cancelRequested: boolean;
+  clearInFlightState?: () => Promise<void>;
 };
 
 type CommandSpec = {
@@ -139,7 +184,7 @@ type RuntimeUsageSummary = {
 };
 
 const defaultSystemText =
-  "Type /help to view commands. Use /resume to open session picker.";
+  "Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.";
 const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
@@ -147,8 +192,12 @@ const INPUT_HISTORY_LIMIT = 100;
 const STREAMING_RENDER_BATCH_MS = 40;
 const STREAMING_RENDER_BATCH_MS_MEDIUM = 80;
 const STREAMING_RENDER_BATCH_MS_LARGE = 140;
+const TURN_CANCELLED_ERROR = "__CYRENE_TURN_CANCELLED__";
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
+  { command: "/login", description: "open HTTP login wizard" },
+  { command: "/logout", description: "remove managed user auth and rebuild transport" },
+  { command: "/auth", description: "show auth mode, source, and persistence target" },
   { command: "/provider", description: "open provider picker" },
   { command: "/provider refresh", description: "refresh current provider models" },
   { command: "/provider <url>", description: "switch provider directly" },
@@ -163,6 +212,7 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/resume", description: "open session resume picker" },
   { command: "/resume <id>", description: "resume a session by id" },
   { command: "/new", description: "start a fresh session" },
+  { command: "/cancel", description: "cancel the current running turn" },
   { command: "/undo", description: "undo last approved filesystem mutation" },
   { command: "/search-session <query>", description: "search sessions by id/title/content" },
   { command: "/search-session #<tag> [query]", description: "search sessions by tag + query" },
@@ -388,6 +438,12 @@ const getPendingQueueSignature = (pending: PendingReviewItem[]) =>
 const HOTKEY_REPEAT_COOLDOWN_MS = 900;
 const ACTION_REPEAT_COOLDOWN_MS = 400;
 const APPROVAL_BLOCK_RETRY_MS = 1500;
+const AUTH_PANEL_STEPS: AuthPanelStep[] = [
+  "provider",
+  "api_key",
+  "model",
+  "confirm",
+];
 
 const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
   startedAt: new Date().toISOString(),
@@ -421,6 +477,41 @@ const getStreamingRenderBatchMs = (textLength: number) => {
   return STREAMING_RENDER_BATCH_MS;
 };
 
+const isUsableHttpProvider = (provider: string) =>
+  Boolean(provider && provider !== "none" && provider !== "local-core");
+
+const maskApiKey = (apiKey: string) => {
+  if (!apiKey) {
+    return "";
+  }
+  if (apiKey.length <= 4) {
+    return "•".repeat(apiKey.length);
+  }
+  return `${"•".repeat(Math.max(4, apiKey.length - 4))}${apiKey.slice(-4)}`;
+};
+
+const formatAuthStatusMessage = (status: AuthStatus) => {
+  const lines = [
+    "Auth status:",
+    `mode: ${status.mode}`,
+    `provider: ${status.provider}`,
+    `model: ${status.model}`,
+    `credential source: ${status.credentialSource}`,
+    `persistence target: ${status.persistenceTarget?.label ?? "unavailable"}`,
+    `persistence path: ${status.persistenceTarget?.path ?? "(none)"}`,
+  ];
+
+  if (status.credentialSource === "process_env") {
+    lines.push(
+      "note: credentials were supplied by the current launch environment and are not owned by Cyrene."
+    );
+  } else if (status.mode === "local") {
+    lines.push("note: local-core fallback is active. Use /login to connect HTTP.");
+  }
+
+  return lines.join("\n");
+};
+
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -430,6 +521,7 @@ export const useChatApp = ({
   autoSummaryRefresh = false,
   queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   mcpService,
+  auth,
   runQuerySessionImpl = runQuerySession,
   inputAdapterHook = useInputAdapter,
 }: UseChatAppParams) => {
@@ -497,6 +589,19 @@ export const useChatApp = ({
     actionState: null,
     resumePending: false,
   });
+  const [authPanel, setAuthPanel] = useState<AuthPanelState>({
+    active: false,
+    mode: "manual_login",
+    step: "provider",
+    providerBaseUrl: "",
+    apiKey: "",
+    model: "gpt-4o-mini",
+    cursorOffset: 0,
+    error: null,
+    info: null,
+    saving: false,
+    persistenceTarget: auth?.status.persistenceTarget ?? null,
+  });
 
   const queueRef = useRef(Promise.resolve());
   const approvalActionRef = useRef(createApprovalActionLock());
@@ -505,12 +610,17 @@ export const useChatApp = ({
   const modelPickerRef = useRef(modelPicker);
   const providerPickerRef = useRef(providerPicker);
   const approvalPanelRef = useRef(approvalPanel);
+  const authPanelRef = useRef(authPanel);
+  const authRef = useRef(auth);
   const pendingReviewsRef = useRef(pendingReviews);
   const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
+  const activeTurnRef = useRef<ActiveTurnState | null>(null);
+  const nextTurnRunIdRef = useRef(0);
+  const pendingChoiceRef = useRef<SessionPendingChoice | null>(null);
   const finalizedAssistantBuffersRef = useRef(new WeakSet<{ current: string }>());
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
@@ -525,12 +635,16 @@ export const useChatApp = ({
   const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveAssistantRenderedTextRef = useRef("");
   const liveAssistantLastFlushAtRef = useRef(0);
+  const authOnboardingHandledRef = useRef(false);
+  const authOnboardingSuppressedRef = useRef(false);
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
   modelPickerRef.current = modelPicker;
   providerPickerRef.current = providerPicker;
   approvalPanelRef.current = approvalPanel;
+  authPanelRef.current = authPanel;
+  authRef.current = auth;
   pendingReviewsRef.current = pendingReviews;
   inputHistoryRef.current = inputHistory;
   historyCursorRef.current = historyCursor;
@@ -565,6 +679,26 @@ export const useChatApp = ({
       cancelled = true;
     };
   }, [transport]);
+
+  useEffect(() => {
+    if (!auth || authPanelRef.current.active) {
+      return;
+    }
+    if (authOnboardingHandledRef.current || authOnboardingSuppressedRef.current) {
+      return;
+    }
+    const showStartupView =
+      !liveAssistantText &&
+      items.every(item => item.role === "system" && item.kind === "system_hint");
+    if (!showStartupView || status !== "idle") {
+      return;
+    }
+    if (auth.status.mode !== "local" || !auth.status.onboardingAvailable) {
+      return;
+    }
+    authOnboardingHandledRef.current = true;
+    openAuthPanel("auto_onboarding");
+  }, [auth, items, liveAssistantText, status]);
 
   const updateCurrentModelState = (model: string) => {
     setCurrentModel(model);
@@ -603,6 +737,11 @@ export const useChatApp = ({
       ...previous,
       stateUpdateCount: previous.stateUpdateCount + 1,
     }));
+  };
+
+  const clearPendingReviewState = () => {
+    pendingReviewsRef.current = [];
+    setPendingReviews([]);
   };
 
   const enqueueTask = (task: () => Promise<void> | void) => {
@@ -775,6 +914,88 @@ export const useChatApp = ({
     ]);
   };
 
+  const getPreferredLoginModel = () =>
+    currentModel && currentModel !== "local-core" ? currentModel : "gpt-4o-mini";
+
+  const getSuggestedLoginProvider = () => {
+    const authProvider = authRef.current?.status.provider;
+    if (authProvider && isUsableHttpProvider(authProvider)) {
+      return authProvider;
+    }
+    return isUsableHttpProvider(currentProvider) ? currentProvider : "";
+  };
+
+  const getAuthPanelFieldValue = (panel: AuthPanelState) => {
+    if (panel.step === "provider") {
+      return panel.providerBaseUrl;
+    }
+    if (panel.step === "api_key") {
+      return panel.apiKey;
+    }
+    return panel.model;
+  };
+
+  const updateAuthPanelFieldValue = (
+    panel: AuthPanelState,
+    nextValue: string,
+    nextCursorOffset: number
+  ): AuthPanelState => {
+    const sanitizedValue = nextValue.replace(/\r?\n/g, "");
+    const cursorOffset = clampCursorOffset(sanitizedValue, nextCursorOffset);
+    if (panel.step === "provider") {
+      return {
+        ...panel,
+        providerBaseUrl: sanitizedValue,
+        cursorOffset,
+        error: null,
+      };
+    }
+    if (panel.step === "api_key") {
+      return {
+        ...panel,
+        apiKey: sanitizedValue,
+        cursorOffset,
+        error: null,
+      };
+    }
+    return {
+      ...panel,
+      model: sanitizedValue,
+      cursorOffset,
+      error: null,
+    };
+  };
+
+  const setAuthPanelStep = (step: AuthPanelStep) => {
+    setAuthPanel(previous => ({
+      ...previous,
+      step,
+      cursorOffset:
+        step === "provider"
+          ? previous.providerBaseUrl.length
+          : step === "api_key"
+            ? previous.apiKey.length
+            : previous.model.length,
+      error: null,
+      info: null,
+    }));
+  };
+
+  const applyAuthEditorTransform = (
+    transform: (state: MultilineEditorState) => MultilineEditorState
+  ) => {
+    setAuthPanel(previous => {
+      if (!previous.active || previous.step === "confirm" || previous.saving) {
+        return previous;
+      }
+      const next = transform({
+        value: getAuthPanelFieldValue(previous),
+        cursorOffset: previous.cursorOffset,
+      });
+      return updateAuthPanelFieldValue(previous, next.value, next.cursorOffset);
+    });
+  };
+
   const formatReducerStateMessage = (session: SessionRecord | null) => {
     const lines = [
       "Reducer state:",
@@ -788,6 +1009,7 @@ export const useChatApp = ({
     if (!session) {
       lines.push("summary chars: 0");
       lines.push("pending digest chars: 0");
+      lines.push("pending choice: (none)");
       lines.push("last state update: (none)");
       lines.push("in-flight turn: no");
       lines.push("note: no active session loaded yet.");
@@ -796,6 +1018,11 @@ export const useChatApp = ({
 
     lines.push(`summary chars: ${session.summary.trim().length}`);
     lines.push(`pending digest chars: ${session.pendingDigest.trim().length}`);
+    lines.push(
+      session.pendingChoice
+        ? `pending choice: ${session.pendingChoice.options.length} options`
+        : "pending choice: (none)"
+    );
     if (session.lastStateUpdate) {
       lines.push(
         `last state update: ${session.lastStateUpdate.code}${
@@ -967,6 +1194,80 @@ export const useChatApp = ({
     }
   };
 
+  const syncPendingChoice = async (
+    sessionId: string,
+    pendingChoice: SessionPendingChoice | null
+  ) => {
+    pendingChoiceRef.current = pendingChoice;
+    try {
+      await sessionStore.updatePendingChoice(sessionId, pendingChoice);
+    } catch {
+      // Choice-latch persistence should not break the main chat flow.
+    }
+  };
+
+  const clearActiveTurnForAssistantBuffer = (
+    assistantBufferRef: { current: string } | null
+  ) => {
+    if (!assistantBufferRef) {
+      return;
+    }
+    if (activeTurnRef.current?.assistantBufferRef === assistantBufferRef) {
+      activeTurnRef.current = null;
+    }
+  };
+
+  const cancelCurrentTurn = async () => {
+    const suspended = suspendedTaskRef.current;
+    if (suspended) {
+      queuedSubmitRef.current = null;
+      queueRef.current = Promise.resolve();
+      await cancelSuspendedTask(
+        "Current turn cancelled. Add requirements and send a new prompt when ready.",
+        {
+          suppressApprovalQueue: true,
+          preserveVisibleAssistant: false,
+        }
+      );
+      return true;
+    }
+
+    const activeTurn = activeTurnRef.current;
+    if (!activeTurn || activeTurn.cancelRequested) {
+      return false;
+    }
+
+    activeTurn.cancelRequested = true;
+    if (activeTurnRef.current?.runId === activeTurn.runId) {
+      activeTurnRef.current = null;
+    }
+    queuedSubmitRef.current = null;
+    queueRef.current = Promise.resolve();
+    clearLiveAssistantSegment();
+    clearPendingReviewState();
+    setSessionState(null);
+    setStatus("idle");
+    closeApprovalPanel({ suppressCurrentQueue: true });
+    pushSystemMessage(
+      "Current turn cancelled. Add requirements and send a new prompt when ready.",
+      {
+        kind: "system_hint",
+        tone: "warning",
+        color: "yellow",
+      }
+    );
+    try {
+      if (activeTurn.clearInFlightState) {
+        await activeTurn.clearInFlightState();
+      } else if (activeTurn.sessionId) {
+        await syncInFlightTurn(activeTurn.sessionId, null);
+      }
+    } catch {
+      // Cancellation should still succeed even if recovery cleanup fails.
+    }
+    return true;
+  };
+
   const finalizeAssistantBuffer = async (
     sessionId: string,
     assistantBuffer: string
@@ -974,6 +1275,10 @@ export const useChatApp = ({
     const parsed = parseAssistantStateUpdate(assistantBuffer);
     const visibleAssistantText = parsed.visibleText.trim();
     const diagnosticTime = new Date().toISOString();
+    const nextPendingChoice = extractPendingChoiceFromAssistantText(
+      visibleAssistantText,
+      diagnosticTime
+    );
 
     if (visibleAssistantText) {
       await sessionStore.appendMessage(sessionId, {
@@ -1114,6 +1419,7 @@ export const useChatApp = ({
       });
     }
 
+    await syncPendingChoice(sessionId, nextPendingChoice);
     await syncInFlightTurn(sessionId, null);
   };
 
@@ -1142,6 +1448,9 @@ export const useChatApp = ({
           clearLiveAssistantSegment();
         }
         await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
+        clearActiveTurnForAssistantBuffer(assistantBufferRef);
+        setSessionState(null);
+        setStatus("idle");
       } catch (error) {
         finalizedAssistantBuffersRef.current.delete(assistantBufferRef);
         throw error;
@@ -1156,25 +1465,100 @@ export const useChatApp = ({
     };
   };
 
-  const resumeSuspendedTask = (toolResultMessage: string) => {
+  const resumeSuspendedTask = async (toolResultMessage: string) => {
     const suspended = suspendedTaskRef.current;
     if (!suspended) {
       return;
     }
 
-    enqueueTask(async () => {
-      const current = suspendedTaskRef.current;
-      if (!current || current.sessionId !== suspended.sessionId) {
-        return;
+    const current = suspendedTaskRef.current;
+    if (!current || current.sessionId !== suspended.sessionId) {
+      return;
+    }
+    suspendedTaskRef.current = null;
+    const result = await current.resume(toolResultMessage);
+    await consumeQueryRunResult(
+      current.sessionId,
+      current.assistantBufferRef,
+      result
+    );
+  };
+
+  const cancelSuspendedTask = async (
+    cancellationMessage?: string,
+    options?: {
+      suppressApprovalQueue?: boolean;
+      preserveVisibleAssistant?: boolean;
+    }
+  ) => {
+    const suspended = suspendedTaskRef.current;
+    if (!suspended) {
+      return false;
+    }
+
+    suspendedTaskRef.current = null;
+    clearActiveTurnForAssistantBuffer(suspended.assistantBufferRef);
+    finalizedAssistantBuffersRef.current.add(suspended.assistantBufferRef);
+    const visibleAssistantText = parseAssistantStateUpdate(
+      suspended.assistantBufferRef.current
+    ).visibleText.trim();
+    const pendingLiveAssistantText =
+      options?.preserveVisibleAssistant === false
+        ? ""
+        : liveAssistantTextRef.current.trim();
+    const persistedAssistantText =
+      options?.preserveVisibleAssistant === false ? "" : visibleAssistantText;
+
+    if (pendingLiveAssistantText || cancellationMessage?.trim()) {
+      setItems(previous => {
+        const next = [...previous];
+        if (pendingLiveAssistantText) {
+          next.push({
+            role: "assistant",
+            text: pendingLiveAssistantText,
+            kind: "transcript",
+            tone: "neutral",
+          });
+        }
+        if (cancellationMessage?.trim()) {
+          next.push({
+            role: "system",
+            text: cancellationMessage.trim(),
+            kind: "review_status",
+            tone: "warning",
+            color: "yellow",
+          });
+        }
+        return next;
+      });
+    }
+
+    clearLiveAssistantSegment();
+    clearPendingReviewState();
+    setSessionState(null);
+    setStatus("idle");
+
+    if (options?.suppressApprovalQueue) {
+      closeApprovalPanel({ suppressCurrentQueue: true });
+    }
+
+    try {
+      if (persistedAssistantText) {
+        try {
+          await sessionStore.appendMessage(suspended.sessionId, {
+            role: "assistant",
+            text: persistedAssistantText,
+            createdAt: new Date().toISOString(),
+          });
+        } catch {
+          // Cancelling a suspended turn should still clear runtime state even if persistence fails.
+        }
       }
-      suspendedTaskRef.current = null;
-      const result = await current.resume(toolResultMessage);
-      await consumeQueryRunResult(
-        current.sessionId,
-        current.assistantBufferRef,
-        result
-      );
-    });
+    } finally {
+      await syncInFlightTurn(suspended.sessionId, null);
+    }
+
+    return true;
   };
 
   const ensureActiveSession = async (titleHint?: string) => {
@@ -1186,6 +1570,7 @@ export const useChatApp = ({
     }
 
     const created = await sessionStore.createSession(titleHint);
+    pendingChoiceRef.current = null;
     updateActiveSessionIdState(created.id);
     return created;
   };
@@ -1218,6 +1603,7 @@ export const useChatApp = ({
   const applyLoadedSession = (loaded: SessionRecord) => {
     const shouldShowLegacyHint = hasLegacyCompressedMarkdown(loaded);
     clearLiveAssistantSegment();
+    pendingChoiceRef.current = loaded.pendingChoice;
     updateActiveSessionIdState(loaded.id);
     setItems([
       {
@@ -1311,7 +1697,26 @@ export const useChatApp = ({
     setSessionsPanel(nextState);
   };
 
+  const resetAuthPanel = () => {
+    const nextState: AuthPanelState = {
+      active: false,
+      mode: "manual_login",
+      step: "provider",
+      providerBaseUrl: "",
+      apiKey: "",
+      model: getPreferredLoginModel(),
+      cursorOffset: 0,
+      error: null,
+      info: null,
+      saving: false,
+      persistenceTarget: authRef.current?.status.persistenceTarget ?? null,
+    };
+    authPanelRef.current = nextState;
+    setAuthPanel(nextState);
+  };
+
   const closeAllOverlayPanels = (options?: {
+    keepAuthPanel?: boolean;
     keepApproval?: boolean;
     keepModelPicker?: boolean;
     keepProviderPicker?: boolean;
@@ -1330,6 +1735,9 @@ export const useChatApp = ({
     if (!options?.keepSessionsPanel) {
       closeSessionsPanel();
     }
+    if (!options?.keepAuthPanel) {
+      resetAuthPanel();
+    }
     if (!options?.keepApproval) {
       dismissedApprovalQueueSignatureRef.current = getPendingQueueSignature(
         pendingReviewsRef.current
@@ -1345,6 +1753,135 @@ export const useChatApp = ({
         previewOffset: 0,
       }));
     }
+  };
+
+  const openAuthPanel = (mode: AuthPanelMode) => {
+    closeAllOverlayPanels({ keepAuthPanel: true });
+    const providerBaseUrl = getSuggestedLoginProvider();
+    const model = getPreferredLoginModel();
+    const nextState: AuthPanelState = {
+      active: true,
+      mode,
+      step: "provider",
+      providerBaseUrl,
+      apiKey: "",
+      model,
+      cursorOffset: providerBaseUrl.length,
+      error: null,
+      info:
+        mode === "auto_onboarding"
+          ? "HTTP credentials not found. Press Esc to stay in local-core mode, or continue below."
+          : "Connect an OpenAI-compatible HTTP provider. API key input stays local to this panel.",
+      saving: false,
+      persistenceTarget: authRef.current?.status.persistenceTarget ?? null,
+    };
+    authPanelRef.current = nextState;
+    setAuthPanel(nextState);
+  };
+
+  const closeAuthPanel = (options?: { skipped?: boolean; silent?: boolean }) => {
+    const wasAutoOnboarding = authPanelRef.current.mode === "auto_onboarding";
+    resetAuthPanel();
+    if (options?.skipped && wasAutoOnboarding) {
+      authOnboardingSuppressedRef.current = true;
+      if (!options.silent) {
+        pushSystemMessage(
+          "Login skipped. Continuing in local-core mode. Use /login whenever you want to connect HTTP.",
+          {
+            kind: "system_hint",
+            tone: "info",
+            color: "cyan",
+          }
+        );
+      }
+    }
+  };
+
+  const advanceAuthPanel = () => {
+    const panel = authPanelRef.current;
+    if (!panel.active || panel.saving) {
+      return;
+    }
+
+    if (panel.step === "provider") {
+      const providerBaseUrl = panel.providerBaseUrl.trim();
+      try {
+        const parsed = new URL(providerBaseUrl);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          throw new Error("Provider base URL must use http or https.");
+        }
+      } catch (error) {
+        setAuthPanel(previous => ({
+          ...previous,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Provider base URL is invalid.",
+        }));
+        return;
+      }
+      setAuthPanelStep("api_key");
+      return;
+    }
+
+    if (panel.step === "api_key") {
+      if (!panel.apiKey.trim()) {
+        setAuthPanel(previous => ({
+          ...previous,
+          error: "API key is required.",
+        }));
+        return;
+      }
+      setAuthPanelStep("model");
+      return;
+    }
+
+    if (panel.step === "model") {
+      setAuthPanelStep("confirm");
+      return;
+    }
+
+    setAuthPanel(previous => ({
+      ...previous,
+      saving: true,
+      error: null,
+      info: "Validating provider and loading models...",
+    }));
+    enqueueTask(async () => {
+      const authRuntime = authRef.current;
+      if (!authRuntime) {
+        setAuthPanel(previous => ({
+          ...previous,
+          saving: false,
+          error: "Auth runtime is unavailable in this build.",
+        }));
+        return;
+      }
+
+      const loginInput: AuthLoginInput = {
+        providerBaseUrl: panel.providerBaseUrl.trim(),
+        apiKey: panel.apiKey,
+        model: panel.model.trim() || getPreferredLoginModel(),
+      };
+      const result = await authRuntime.saveLogin(loginInput);
+      if (!result.ok) {
+        setAuthPanel(previous => ({
+          ...previous,
+          saving: false,
+          error: result.message,
+          info: "Press 1/2/3 to edit a field, then Enter to retry.",
+        }));
+        return;
+      }
+
+      authOnboardingSuppressedRef.current = false;
+      resetAuthPanel();
+      pushSystemMessage(result.message, {
+        kind: "system_hint",
+        tone: "success",
+        color: "cyan",
+      });
+    });
   };
 
   const loadSessionIntoChat = async (sessionId: string) => {
@@ -1627,6 +2164,19 @@ export const useChatApp = ({
     }));
   };
 
+  const repairSettledReviewState = () => {
+    if (pendingReviewsRef.current.length > 0 || suspendedTaskRef.current) {
+      return;
+    }
+    if (approvalPanelRef.current.active) {
+      closeApprovalPanel();
+    }
+    setSessionState(previous =>
+      previous?.status === "awaiting_review" ? null : previous
+    );
+    setStatus(previous => (previous === "awaiting_review" ? "idle" : previous));
+  };
+
   const openApprovalPanel = (
     nextPending: PendingReviewItem[],
     options?: {
@@ -1828,7 +2378,8 @@ export const useChatApp = ({
             status: ["approved"],
           },
         });
-        resumeSuspendedTask(result.message);
+        await resumeSuspendedTask(result.message);
+        repairSettledReviewState();
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
         approvalActionRef.current.release();
@@ -1909,14 +2460,31 @@ export const useChatApp = ({
           clearBlocked: true,
         });
 
-        pushSystemMessage(buildApprovalMessage("Rejected", target), {
-          kind: "review_status",
-          tone: "warning",
-          color: "yellow",
-        });
+        const cancelledSuspendedTask = Boolean(suspendedTaskRef.current);
+        const rejectionMessage = buildApprovalMessage(
+          "Rejected",
+          target,
+          cancelledSuspendedTask
+            ? [
+                "current suspended task cancelled",
+                "add requirements and send a new prompt when ready",
+              ]
+            : []
+        );
+        if (cancelledSuspendedTask) {
+          await cancelSuspendedTask(rejectionMessage, {
+            suppressApprovalQueue: true,
+          });
+        } else {
+          pushSystemMessage(rejectionMessage, {
+            kind: "review_status",
+            tone: "warning",
+            color: "yellow",
+          });
+        }
         await recordSessionMemory(getMemorySessionId(), {
           kind: "approval",
-          text: buildApprovalMessage("Rejected", target),
+          text: rejectionMessage,
           priority: 78,
           entities: {
             path: [target.request.path],
@@ -1924,7 +2492,6 @@ export const useChatApp = ({
             status: ["rejected"],
           },
         });
-        resumeSuspendedTask(result.message);
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
         approvalActionRef.current.release();
@@ -1963,6 +2530,7 @@ export const useChatApp = ({
         let failed = 0;
         let resumeMessage: string | null = null;
         const failureDetails: string[] = [];
+        const hadSuspendedTask = Boolean(suspendedTaskRef.current);
 
         for (const target of targets) {
           const result =
@@ -1971,7 +2539,7 @@ export const useChatApp = ({
               : mcpService.reject(target.id);
           if (result.ok) {
             success += 1;
-            if (!resumeMessage) {
+            if (action === "approve" && !resumeMessage) {
               resumeMessage = result.message;
             }
             continue;
@@ -2007,6 +2575,9 @@ export const useChatApp = ({
           `success: ${success}`,
           `failed: ${failed}`,
           `remaining: ${nextPending.length}`,
+          action === "reject" && hadSuspendedTask && success > 0
+            ? "suspended task: cancelled"
+            : "",
           `processed_risk: high ${processedRisk.high} | medium ${processedRisk.medium} | low ${processedRisk.low}`,
           `remaining_risk: high ${remainingRisk.high} | medium ${remainingRisk.medium} | low ${remainingRisk.low}`,
           ...failureDetails.slice(0, 3).map(detail => `failure: ${detail}`),
@@ -2016,11 +2587,17 @@ export const useChatApp = ({
         ].filter(Boolean);
 
         const summaryMessage = buildApprovalMessage(title, undefined, lines);
-        pushSystemMessage(summaryMessage, {
-          kind: "review_status",
-          tone,
-          color,
-        });
+        if (action === "reject" && hadSuspendedTask && success > 0) {
+          await cancelSuspendedTask(summaryMessage, {
+            suppressApprovalQueue: true,
+          });
+        } else {
+          pushSystemMessage(summaryMessage, {
+            kind: "review_status",
+            tone,
+            color,
+          });
+        }
         await recordSessionMemory(getMemorySessionId(), {
           kind: failed > 0 ? "error" : "approval",
           text: summaryMessage,
@@ -2032,8 +2609,9 @@ export const useChatApp = ({
         });
 
         if (resumeMessage) {
-          resumeSuspendedTask(resumeMessage);
+          await resumeSuspendedTask(resumeMessage);
         }
+        repairSettledReviewState();
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
       }
@@ -2123,6 +2701,58 @@ export const useChatApp = ({
   };
 
   inputAdapterHook((inputValue, key) => {
+    if (authPanelRef.current.active) {
+      if (key.escape) {
+        closeAuthPanel({
+          skipped: authPanelRef.current.mode === "auto_onboarding",
+        });
+        return;
+      }
+
+      if (key.return || (key.ctrl && inputValue.toLowerCase() === "d")) {
+        advanceAuthPanel();
+        return;
+      }
+
+      if (authPanelRef.current.step === "confirm") {
+        if (!key.ctrl && !key.meta && /^[123]$/.test(inputValue)) {
+          const index = Number(inputValue) - 1;
+          const targetStep = AUTH_PANEL_STEPS[index];
+          if (targetStep && targetStep !== "confirm") {
+            setAuthPanelStep(targetStep);
+          }
+        }
+        return;
+      }
+
+      if (key.leftArrow) {
+        applyAuthEditorTransform(moveCursorLeft);
+        return;
+      }
+
+      if (key.rightArrow) {
+        applyAuthEditorTransform(moveCursorRight);
+        return;
+      }
+
+      if (key.backspace) {
+        applyAuthEditorTransform(deleteBackwardAtCursor);
+        return;
+      }
+
+      if (key.delete) {
+        applyAuthEditorTransform(deleteForwardAtCursor);
+        return;
+      }
+
+      if (inputValue && !key.ctrl && !key.meta) {
+        applyAuthEditorTransform(state =>
+          insertTextAtCursor(state, inputValue.replace(/\r?\n/g, ""))
+        );
+      }
+      return;
+    }
+
     if (modelPickerRef.current.active) {
       if (key.escape) {
         closeModelPicker();
@@ -2554,8 +3184,28 @@ export const useChatApp = ({
   });
 
   const submit = () => {
+    if (authPanelRef.current.active) {
+      advanceAuthPanel();
+      return;
+    }
+
     const rawInput = input;
     const query = rawInput.trim();
+
+    if (query === "/cancel") {
+      void cancelCurrentTurn().then(cancelled => {
+        if (!cancelled) {
+          pushSystemMessage("No running turn to cancel.", {
+            kind: "system_hint",
+            tone: "neutral",
+            color: "gray",
+          });
+        }
+      });
+      clearInput();
+      return;
+    }
+
     if (
       status === "preparing" ||
       status === "requesting" ||
@@ -2611,6 +3261,68 @@ export const useChatApp = ({
           color: "gray",
         },
       ]);
+      clearInput();
+      return;
+    }
+
+    if (query === "/login") {
+      if (!authRef.current) {
+        pushSystemMessage("Auth runtime unavailable. HTTP onboarding is not enabled in this build.", {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        });
+        clearInput();
+        return;
+      }
+      openAuthPanel("manual_login");
+      clearInput();
+      return;
+    }
+
+    if (query === "/logout") {
+      enqueueTask(async () => {
+        const authRuntime = authRef.current;
+        if (!authRuntime) {
+          pushSystemMessage("Auth runtime unavailable. Nothing to log out.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          return;
+        }
+        const result = await authRuntime.logout();
+        pushSystemMessage(result.message, {
+          kind: "system_hint",
+          tone:
+            result.status.credentialSource === "process_env" ? "warning" : "info",
+          color:
+            result.status.credentialSource === "process_env" ? "yellow" : "cyan",
+        });
+      });
+      clearInput();
+      return;
+    }
+
+    if (query === "/auth") {
+      enqueueTask(async () => {
+        const nextStatus = authRef.current
+          ? await authRef.current.getStatus()
+          : ({
+              mode: transport.getProvider() === "local-core" ? "local" : "http",
+              credentialSource: "none",
+              provider: transport.getProvider(),
+              model: transport.getModel(),
+              persistenceTarget: null,
+              onboardingAvailable: false,
+              httpReady: transport.getProvider() !== "local-core",
+            } as AuthStatus);
+        pushSystemMessage(formatAuthStatusMessage(nextStatus), {
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        });
+      });
       clearInput();
       return;
     }
@@ -2751,12 +3463,15 @@ export const useChatApp = ({
       return;
     }
 
-    queuedSubmitRef.current = { rawInput, query };
+    const queuedSubmit = { rawInput, query };
+    queuedSubmitRef.current = queuedSubmit;
 
     enqueueTask(async () => {
+      let activeSubmitRunId: number | null = null;
       try {
       if (query === "/new") {
         const created = await sessionStore.createSession();
+        pendingChoiceRef.current = null;
         updateActiveSessionIdState(created.id);
         clearLiveAssistantSegment();
         setItems([
@@ -3267,9 +3982,48 @@ export const useChatApp = ({
         return;
       }
 
+      const choiceResolution = resolvePendingChoiceInput(
+        query,
+        pendingChoiceRef.current
+      );
+      if (choiceResolution.kind === "missing_choice") {
+        pushSystemMessage(
+          `No active numbered options to resolve. Re-send the full request instead of just "${query}".`,
+          {
+            kind: "system_hint",
+            tone: "warning",
+            color: "yellow",
+          }
+        );
+        clearInput();
+        return;
+      }
+      if (choiceResolution.kind === "unknown_choice") {
+        pushSystemMessage(
+          `Choice ${choiceResolution.requestedIndex} is not available. Current choices: ${choiceResolution.availableIndexes.join(", ")}.`,
+          {
+            kind: "system_hint",
+            tone: "warning",
+            color: "yellow",
+          }
+        );
+        clearInput();
+        return;
+      }
+
+      const submittedTask =
+        choiceResolution.kind === "resolved"
+          ? choiceResolution.resolvedQuery
+          : rawInput;
+      const displayUserText =
+        choiceResolution.kind === "resolved"
+          ? choiceResolution.displayText
+          : rawInput;
+      const shouldClearPendingChoiceOnSubmit = Boolean(pendingChoiceRef.current);
+
       setItems(previous => [
         ...previous,
-        { role: "user", text: rawInput, kind: "transcript", tone: "neutral" },
+        { role: "user", text: displayUserText, kind: "transcript", tone: "neutral" },
       ]);
       clearLiveAssistantSegment();
       clearInput();
@@ -3279,22 +4033,38 @@ export const useChatApp = ({
       setStatus("preparing");
 
       const assistantBufferRef = { current: "" };
+      const runId = nextTurnRunIdRef.current + 1;
+      nextTurnRunIdRef.current = runId;
+      activeSubmitRunId = runId;
+      const activeTurn: ActiveTurnState = {
+        runId,
+        sessionId: null,
+        assistantBufferRef,
+        cancelRequested: false,
+      };
+      activeTurnRef.current = activeTurn;
       let recoverySessionId: string | null = null;
       let recoveryStartedAt = "";
-      let recoveryUserText = rawInput;
+      let recoveryUserText = displayUserText;
       let inFlightUpdateChain = Promise.resolve();
       let lastPersistedAssistantText = "";
       let lastPersistedAt = 0;
 
+      const isCurrentTurnActive = () =>
+        activeTurnRef.current?.runId === runId && !activeTurn.cancelRequested;
+
       const queueInFlightUpdate = (
         inFlightTurn: SessionRecord["inFlightTurn"]
       ) => {
-        if (!recoverySessionId) {
+        if (!recoverySessionId || activeTurn.cancelRequested) {
           return inFlightUpdateChain;
         }
-        inFlightUpdateChain = inFlightUpdateChain.then(() =>
-          syncInFlightTurn(recoverySessionId!, inFlightTurn)
-        );
+        inFlightUpdateChain = inFlightUpdateChain.then(async () => {
+          if (!isCurrentTurnActive()) {
+            return;
+          }
+          await syncInFlightTurn(recoverySessionId!, inFlightTurn);
+        });
         return inFlightUpdateChain;
       };
 
@@ -3302,7 +4072,7 @@ export const useChatApp = ({
         parseAssistantStateUpdate(assistantBufferRef.current).visibleText.trim();
 
       const persistInFlightAssistant = async (force = false) => {
-        if (!recoverySessionId || !recoveryStartedAt) {
+        if (!recoverySessionId || !recoveryStartedAt || !isCurrentTurnActive()) {
           return;
         }
 
@@ -3326,12 +4096,39 @@ export const useChatApp = ({
         });
       };
 
+      activeTurn.clearInFlightState = async () => {
+        try {
+          await inFlightUpdateChain;
+        } catch {
+          // Ignore stale recovery update failures while cancelling.
+        }
+        if (recoverySessionId) {
+          await syncInFlightTurn(recoverySessionId, null);
+          return;
+        }
+        if (activeTurn.sessionId) {
+          await syncInFlightTurn(activeTurn.sessionId, null);
+        }
+      };
+
       try {
-        const session = await ensureActiveSession(query);
+        const session = await ensureActiveSession(
+          choiceResolution.kind === "resolved" ? submittedTask : query
+        );
+        activeTurn.sessionId = session.id;
+        if (!isCurrentTurnActive()) {
+          return;
+        }
+        if (shouldClearPendingChoiceOnSubmit) {
+          await syncPendingChoice(session.id, null);
+        }
         const promptContextBase = await sessionStore.getPromptContext(
           session.id,
-          rawInput
+          submittedTask
         );
+        if (!isCurrentTurnActive()) {
+          return;
+        }
         const promptContext = autoSummaryRefresh
           ? promptContextBase
           : {
@@ -3341,9 +4138,12 @@ export const useChatApp = ({
         const now = new Date().toISOString();
         await sessionStore.appendMessage(session.id, {
           role: "user",
-          text: rawInput,
+          text: displayUserText,
           createdAt: now,
         });
+        if (!isCurrentTurnActive()) {
+          return;
+        }
         recoverySessionId = session.id;
         recoveryStartedAt = now;
         await queueInFlightUpdate({
@@ -3352,10 +4152,13 @@ export const useChatApp = ({
           startedAt: now,
           updatedAt: now,
         });
+        if (!isCurrentTurnActive()) {
+          return;
+        }
 
         setStatus("requesting");
         const prompt = buildPromptWithContext(
-          rawInput,
+          submittedTask,
           systemPrompt,
           projectPrompt,
           promptContext
@@ -3363,14 +4166,20 @@ export const useChatApp = ({
 
         const runResult = await runQuerySessionImpl({
           query: prompt,
-          originalTask: rawInput,
+          originalTask: submittedTask,
           queryMaxToolSteps,
           transport,
           onState: next => {
+            if (!isCurrentTurnActive()) {
+              return;
+            }
             setSessionState(next);
             setStatus(next.status as ChatStatus);
           },
           onTextDelta: text => {
+            if (!isCurrentTurnActive()) {
+              return;
+            }
             assistantBufferRef.current += text;
             appendToLiveAssistant(assistantBufferRef.current);
             void persistInFlightAssistant();
@@ -3379,6 +4188,9 @@ export const useChatApp = ({
             accumulateRuntimeUsage(usage);
           },
           onToolStatus: message => {
+            if (!isCurrentTurnActive()) {
+              return;
+            }
             pushStreamingSystemMessage(message, {
               kind: "tool_status",
               tone: "info",
@@ -3386,7 +4198,13 @@ export const useChatApp = ({
             });
           },
           onToolCall: async (toolName, toolInput) => {
+            if (!isCurrentTurnActive()) {
+              throw new Error(TURN_CANCELLED_ERROR);
+            }
             const result = await mcpService.handleToolCall(toolName, toolInput);
+            if (!isCurrentTurnActive()) {
+              throw new Error(TURN_CANCELLED_ERROR);
+            }
             if (result.pending) {
               const reviewMode = isHighRiskReviewAction(result.pending.request.action)
                 ? "block"
@@ -3429,6 +4247,12 @@ export const useChatApp = ({
             return { message: result.message };
           },
           onError: async message => {
+            if (!isCurrentTurnActive() && message === TURN_CANCELLED_ERROR) {
+              return;
+            }
+            if (!isCurrentTurnActive()) {
+              return;
+            }
             pushStreamingSystemMessage(
               `Stream error: ${message}`,
               {
@@ -3443,27 +4267,44 @@ export const useChatApp = ({
               priority: 92,
               entities: {
                 status: ["error"],
-                queryTerms: [rawInput],
+                queryTerms: [submittedTask],
                 },
               });
             await persistInFlightAssistant(true);
           },
         });
         await inFlightUpdateChain;
+        if (!isCurrentTurnActive()) {
+          return;
+        }
         await consumeQueryRunResult(session.id, assistantBufferRef, runResult);
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (
+          errorMessage === TURN_CANCELLED_ERROR ||
+          !isCurrentTurnActive()
+        ) {
+          return;
+        }
         await persistInFlightAssistant(true);
         setSessionState(null);
         setStatus("idle");
         throw error;
       }
       } finally {
-        const queued = queuedSubmitRef.current;
+        const activeTurnForSubmit = activeTurnRef.current;
+        const waitingForReviewResume =
+          activeTurnForSubmit !== null &&
+          suspendedTaskRef.current?.assistantBufferRef ===
+            activeTurnForSubmit.assistantBufferRef;
         if (
-          queued &&
-          queued.rawInput === rawInput &&
-          queued.query === query
+          activeSubmitRunId !== null &&
+          activeTurnForSubmit?.runId === activeSubmitRunId &&
+          !waitingForReviewResume
         ) {
+          activeTurnRef.current = null;
+        }
+        if (queuedSubmitRef.current === queuedSubmit) {
           queuedSubmitRef.current = null;
         }
       }
@@ -3499,6 +4340,7 @@ export const useChatApp = ({
     providerPicker,
     pendingReviews,
     approvalPanel,
+    authPanel,
     activeSessionId,
     currentModel,
     currentProvider,

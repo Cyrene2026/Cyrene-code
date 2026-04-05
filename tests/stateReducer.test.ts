@@ -182,9 +182,8 @@ describe("stateReducer", () => {
     expect(sanitized.summary).toContain(
       "OBJECTIVE:\n- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点"
     );
-    expect(sanitized.summary).toContain(
-      "CONFIRMED FACTS:\n- 项目名是 `@anthropic-ai/claude-code`。"
-    );
+    expect(sanitized.summary).toContain("CONFIRMED FACTS:");
+    expect(sanitized.summary).toContain("- 项目名是 `@anthropic-ai/claude-code`");
     expect(sanitized.summary).toContain(
       "CONSTRAINTS:\n- 避免 `yarnpkg` 被自动写进用户 `package.json`"
     );
@@ -203,5 +202,79 @@ describe("stateReducer", () => {
     expect(sanitized.pendingDigest).not.toContain("ensureMemoryDirExists");
     expect(sanitized.pendingDigest).not.toContain("这说明它的职责不是");
     expect(sanitized.pendingDigest).not.toContain("下面基于已经拿到的");
+  });
+
+  test("sanitizeStoredWorkingState drops filler, reclassifies constraints/completed lines, and safely salvages explicit endpoint labels", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: [
+        "OBJECTIVE:",
+        "- app/db.py 中数据库逻辑已完整实现",
+        "",
+        "CONFIRMED FACTS:",
+        "- FastAPI 应用实例",
+        "- 基础路由",
+        "- GET /items：列表查询",
+        "- 已创建 FastAPI 应用",
+        "",
+        "CONSTRAINTS:",
+        "- 支持 skip / limit 分页",
+        "- 需要 token=fastapi-demo",
+        "- 需要先激活 conda 环境 backend 再执行 pip",
+        "- 看下需要接上的调用点",
+        "",
+        "COMPLETED:",
+        "- 看看项目完成怎么样了",
+        "- 已完成的部分",
+        "",
+        "REMAINING:",
+        "- 写吧",
+        "- 好，继续",
+        "- 我就马上开写",
+        "- 可继续执行 GET /items 接口联调验证",
+        "",
+        "KNOWN PATHS:",
+        "- main.py",
+        "- app/db.py",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- 这个项目的 FastAPI 功能实现如下",
+        "",
+        "CONFIRMED FACTS:",
+        "- 启动入口：main.py",
+        "- 配置了 CORS，允许所有来源、方法、请求头。",
+        "",
+        "COMPLETED:",
+        "- 已创建 FastAPI 应用",
+        "",
+        "REMAINING:",
+        "- 创建了 FastAPI 应用",
+        "",
+        "NEXT BEST ACTIONS:",
+        "- 创建了 FastAPI 应用",
+      ].join("\n"),
+      allowedPaths: ["main.py", "app/db.py"],
+    });
+
+    expect(sanitized.summary).toContain("OBJECTIVE:\n- (none)");
+    expect(sanitized.summary).toContain("CONFIRMED FACTS:\n- `GET /items` 是列表查询");
+    expect(sanitized.summary).toContain("CONSTRAINTS:\n- 支持 skip / limit 分页");
+    expect(sanitized.summary).toContain("- 需要 token=fastapi-demo");
+    expect(sanitized.summary).toContain("- 需要先激活 conda 环境 backend 再执行 pip");
+    expect(sanitized.summary).toContain("COMPLETED:");
+    expect(sanitized.summary).toContain("- 已创建 FastAPI 应用");
+    expect(sanitized.summary).toContain("KNOWN PATHS:\n- main.py\n- app/db.py");
+    expect(sanitized.summary).not.toContain("FastAPI 应用实例");
+    expect(sanitized.summary).not.toContain("基础路由");
+    expect(sanitized.summary).not.toContain("看下需要接上的调用点");
+    expect(sanitized.summary).not.toContain("写吧");
+    expect(sanitized.summary).not.toContain("可继续执行 GET /items 接口联调验证");
+
+    expect(sanitized.pendingDigest).toContain("OBJECTIVE:\n- (none)");
+    expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:\n- 入口文件是 `main.py`");
+    expect(sanitized.pendingDigest).toContain("COMPLETED:\n- 已创建 FastAPI 应用");
+    expect(sanitized.pendingDigest).toContain("REMAINING:\n- (none)");
+    expect(sanitized.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
+    expect(sanitized.pendingDigest).not.toContain("创建了 FastAPI 应用");
   });
 });

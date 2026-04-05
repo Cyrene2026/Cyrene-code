@@ -78,6 +78,22 @@ const PENDING_DIGEST_TRIM_ORDER: WorkingStateSectionName[] = [
   "OBJECTIVE",
 ];
 
+const SECTION_PRIORITY: Record<WorkingStateSectionName, number> = {
+  OBJECTIVE: 0,
+  "NEXT BEST ACTIONS": 1,
+  REMAINING: 2,
+  "CONFIRMED FACTS": 3,
+  "KNOWN PATHS": 4,
+  COMPLETED: 5,
+  CONSTRAINTS: 6,
+  "RECENT FAILURES": 7,
+};
+
+type NormalizedCandidate = {
+  section: WorkingStateSectionName;
+  line: string;
+};
+
 const sectionNames = WORKING_STATE_SECTION_ORDER.map(section =>
   z.array(z.string()).optional()
 ) as [
@@ -192,13 +208,16 @@ const TASK_LEADIN_PREFIXES = [
 ] as const;
 
 const EXECUTABLE_TASK_SIGNAL =
-  /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate|clarify|confirm|locate|trace)\b|(?:看一下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查|澄清|确认|定位|走查|梳理)/iu;
+  /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate|clarify|confirm|locate|trace|add|patch|wire|connect|integrate)\b|(?:看一下|看下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查|澄清|确认|定位|走查|梳理|补齐|补上|补充|补一个|接上|接通|联调)/iu;
 
 const STABLE_FACT_SIGNAL =
   /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态)/iu;
 
+const STRICT_FACT_PREDICATE_SIGNAL =
+  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证)/iu;
+
 const COMPLETED_SECTION_SIGNAL =
-  /\b(?:done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved|answered|added|removed|renamed|stored|persisted|recorded|marked|recovered|handled|captured|merged|rebuilt|synced)\b|(?:完成|已写|已创建|已更新|已实现|已修复|已批准|已解决|已回答|已添加|已删除|已重命名|已存储|已记录|已标记|已恢复|已处理|已合并|已重建|已同步|标记为)/iu;
+  /\b(?:done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved|answered|added|removed|renamed|stored|persisted|recorded|marked|recovered|handled|captured|merged|rebuilt|synced)\b|(?:完成|已写|已创建|已更新|已实现|已修复|已批准|已解决|已回答|已添加|已删除|已重命名|已存储|已记录|已标记|已恢复|已处理|已合并|已重建|已同步|已确认|已[^，,。；;\s]{0,6}(?:实现|完成|创建|更新|确认|修复)|(?:创建|完成|实现|配置|确认|更新|修复|回答|编写)了|标记为)/iu;
 
 const CONSTRAINT_SECTION_SIGNAL =
   /\b(?:must|should|cannot|can't|do not|don't|avoid|pending approval|requires|limit|constraint|read-only|blocked|must not|no code changes)\b|(?:必须|不能|不要|避免|待审批|需要|限制|约束|只读|阻塞|不改|不准)/iu;
@@ -235,6 +254,32 @@ const INCOMPLETE_CLAUSE_END =
 const CONSTRAINT_MODAL_SIGNAL =
   /\b(?:must|should|cannot|can't|do not|don't|avoid|pending approval|requires|limit|constraint|read-only|blocked|must not|no code changes)\b|(?:必须|不能|不要|避免|待审批|需要|限制|约束|只读|阻塞|不改|不准)/iu;
 
+const HARD_CONSTRAINT_SIGNAL =
+  /\b(?:must|cannot|can't|do not|don't|avoid|requires?|must not|read-only|blocked|pending approval)\b|(?:必须|不能|不要|避免|待审批|只读|阻塞|不改|不准|需要先)/iu;
+
+const FILLER_ONLY_SIGNAL =
+  /^(?:写吧|好(?:了)?|好[,，]\s*继续|继续吧|继续一下|我就马上开写|我马上开写|马上开写)$/iu;
+
+const SUGGESTION_PREFIX =
+  /^(?:如果你愿意|你要我|下一步可以|可继续执行|可以继续执行|你回复一个数字|回复一个数字|我就继续写进去)/iu;
+
+const REVIEW_REQUEST_PREFIX =
+  /^(?:看下|看看|查看|检查|确认|分析|梳理|阅读|读一下|排查|走查|定位)/iu;
+
+const IMPERATIVE_CONSTRAINT_PREFIX =
+  /^(?:支持|需要先|需要|需|必须|不能|不要|避免|先激活|requires?|must|should|support)/iu;
+
+const TOKEN_OR_SETUP_CONSTRAINT_SIGNAL =
+  /(?:token\s*[:=]|需要先激活|先激活|conda|skip\s*\/\s*limit|skip\b.*limit\b|limit\b.*skip\b)/iu;
+
+const PATH_LABEL_ONLY_SIGNAL = /^(?:路径|path)\s+/iu;
+
+const ENDPOINT_LABEL_SIGNAL =
+  /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+([^\s：:]+)\s*[：:]\s*(.+)$/iu;
+
+const ENTRYPOINT_LABEL_SIGNAL =
+  /^(?:(?:启动)?入口(?:文件)?|主入口)\s*[：:]\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)$/u;
+
 const trimLeadingSeparators = (value: string) =>
   value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
 
@@ -258,6 +303,18 @@ const sanitizeCandidatePrefix = (value: string) =>
     stripLeadingPhrases(value, SELF_TALK_PREFIXES),
     POLITE_REQUEST_PREFIXES
   );
+
+const trimTrailingPunctuation = (value: string) =>
+  value.replace(/[\s,，;；。.!！?？]+$/u, "").trim();
+
+const canonicalizeCandidate = (line: string) => {
+  const rawCandidate = normalizeLooseLine(line);
+  if (!rawCandidate || rawCandidate === "(none)") {
+    return "";
+  }
+
+  return trimTrailingPunctuation(sanitizeCandidatePrefix(rawCandidate));
+};
 
 const splitIntoClauses = (value: string) =>
   value
@@ -342,95 +399,203 @@ const isRealFailureLine = (line: string) =>
   !QUESTION_OR_OPTION_SIGNAL.test(line);
 
 const isAnchoredTaskLine = (line: string) =>
-  collectPathCandidates(line).length > 0 || /`[^`]+`/.test(line) || line.length >= 8;
+  collectPathCandidates(line).length > 0 || /`[^`]+`/.test(line) || line.length >= 6;
+
+const isDiscardableChatter = (line: string) =>
+  !line ||
+  line === "(none)" ||
+  FILLER_ONLY_SIGNAL.test(line) ||
+  SUGGESTION_PREFIX.test(line) ||
+  META_NARRATION_PREFIX.test(line);
+
+const isCompletedCandidate = (line: string) =>
+  COMPLETED_SECTION_SIGNAL.test(line) &&
+  !REVIEW_REQUEST_PREFIX.test(line) &&
+  !QUESTION_OR_OPTION_SIGNAL.test(line) &&
+  !/^(?:已完成(?:的部分)?|完成情况|已完成事项?)$/iu.test(line) &&
+  !SUGGESTION_PREFIX.test(line);
+
+const isConstraintCandidate = (line: string) =>
+  !QUESTION_OR_OPTION_SIGNAL.test(line) &&
+  !SUGGESTION_PREFIX.test(line) &&
+  !isCompletedCandidate(line) &&
+  !REVIEW_REQUEST_PREFIX.test(line) &&
+  (HARD_CONSTRAINT_SIGNAL.test(line) ||
+    IMPERATIVE_CONSTRAINT_PREFIX.test(line) ||
+    TOKEN_OR_SETUP_CONSTRAINT_SIGNAL.test(line) ||
+    (CONSTRAINT_MODAL_SIGNAL.test(line) && !isExecutableTaskLine(line)));
+
+const isSafeFactFragment = (line: string) => {
+  const endpointMatch = line.match(ENDPOINT_LABEL_SIGNAL);
+  if (endpointMatch) {
+    const [, method, route, description] = endpointMatch;
+    const detail = trimTrailingPunctuation(description ?? "");
+    if (
+      method &&
+      route &&
+      detail &&
+      !QUESTION_OR_OPTION_SIGNAL.test(detail) &&
+      !isCompletedCandidate(detail) &&
+      !isConstraintCandidate(detail) &&
+      !isExecutableTaskLine(detail)
+    ) {
+      return `\`${method.toUpperCase()} ${route}\` 是${detail}`;
+    }
+  }
+
+  const entrypointMatch = line.match(ENTRYPOINT_LABEL_SIGNAL);
+  if (entrypointMatch) {
+    const [, path] = entrypointMatch;
+    if (path?.trim()) {
+      return `入口文件是 \`${path.trim()}\``;
+    }
+  }
+
+  return "";
+};
+
+const normalizeConstraintClause = (line: string) => {
+  const clause =
+    splitIntoClauses(line).find(part => {
+      const trimmed = part.trim();
+      return (
+        !REVIEW_REQUEST_PREFIX.test(trimmed) &&
+        (CONSTRAINT_MODAL_SIGNAL.test(trimmed) ||
+          IMPERATIVE_CONSTRAINT_PREFIX.test(trimmed) ||
+          TOKEN_OR_SETUP_CONSTRAINT_SIGNAL.test(trimmed))
+      );
+    }) ?? line;
+
+  return trimTrailingPunctuation(clause);
+};
+
+const normalizeCompletedClause = (line: string) =>
+  trimTrailingPunctuation(takePrimaryClause(line))
+    .replace(/^创建了/u, "已创建")
+    .replace(/^完成了/u, "已完成")
+    .replace(/^实现了/u, "已实现")
+    .replace(/^配置了/u, "已配置")
+    .replace(/^确认了/u, "已确认")
+    .replace(/^更新了/u, "已更新")
+    .replace(/^修复了/u, "已修复")
+    .replace(/^回答了/u, "已回答")
+    .replace(/^编写了/u, "已编写");
+
+const normalizeCandidateForSection = (
+  targetSection: WorkingStateSectionName,
+  line: string
+): NormalizedCandidate | null => {
+  const candidate = canonicalizeCandidate(line);
+  if (
+    isDiscardableChatter(candidate) ||
+    /[：:]$/.test(candidate) ||
+    isIncompleteConditionalLine(candidate) ||
+    INCOMPLETE_CLAUSE_END.test(candidate)
+  ) {
+    return null;
+  }
+
+  if (isPurePathLine(candidate)) {
+    const [firstPath] = collectPathCandidates(candidate);
+    return firstPath ? { section: "KNOWN PATHS", line: clipStateLine(firstPath) } : null;
+  }
+
+  if (isRealFailureLine(candidate)) {
+    return { section: "RECENT FAILURES", line: candidate };
+  }
+
+  if (isConstraintCandidate(candidate)) {
+    const normalized = normalizeConstraintClause(candidate);
+    return normalized
+      ? { section: "CONSTRAINTS", line: normalized }
+      : null;
+  }
+
+  if (isCompletedCandidate(candidate)) {
+    const normalized = normalizeCompletedClause(candidate);
+    return normalized
+      ? { section: "COMPLETED", line: normalized }
+      : null;
+  }
+
+  if (targetSection === "KNOWN PATHS") {
+    const [firstPath] = collectPathCandidates(candidate);
+    return firstPath ? { section: "KNOWN PATHS", line: clipStateLine(firstPath) } : null;
+  }
+
+  if (targetSection === "OBJECTIVE") {
+    const objective = pickExecutableClause(
+      stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
+    );
+    if (
+      !objective ||
+      QUESTION_OR_OPTION_SIGNAL.test(objective) ||
+      /(?:如下|如下所示|如下内容)$/u.test(objective) ||
+      ACTION_META_PREFIX.test(objective) ||
+      isExecutableTaskLine(objective) === false ||
+      isStableFactLine(objective) ||
+      LOW_SIGNAL_TASK_LINE.test(objective) ||
+      !isAnchoredTaskLine(objective)
+    ) {
+      return null;
+    }
+    return { section: "OBJECTIVE", line: objective };
+  }
+
+  if (targetSection === "CONFIRMED FACTS") {
+    const salvagedFact = isSafeFactFragment(candidate);
+    if (salvagedFact) {
+      return { section: "CONFIRMED FACTS", line: salvagedFact };
+    }
+    if (
+      candidate.length < 4 ||
+      FACT_META_PREFIX.test(candidate) ||
+      PATH_LABEL_ONLY_SIGNAL.test(candidate) ||
+      isBareSymbolLikeLine(candidate) ||
+      isPurePathLine(candidate) ||
+      !isStableFactLine(candidate) ||
+      !STRICT_FACT_PREDICATE_SIGNAL.test(candidate)
+    ) {
+      return null;
+    }
+    return { section: "CONFIRMED FACTS", line: candidate };
+  }
+
+  if (targetSection === "CONSTRAINTS") {
+    return null;
+  }
+
+  if (targetSection === "COMPLETED") {
+    return null;
+  }
+
+  if (targetSection === "RECENT FAILURES") {
+    return null;
+  }
+
+  const action = pickExecutableClause(
+    stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
+  );
+  if (
+    !action ||
+    QUESTION_OR_OPTION_SIGNAL.test(action) ||
+    ACTION_META_PREFIX.test(action) ||
+    !isExecutableTaskLine(action) ||
+    LOW_SIGNAL_TASK_LINE.test(action) ||
+    !isAnchoredTaskLine(action)
+  ) {
+    return null;
+  }
+
+  return { section: targetSection, line: action };
+};
 
 const normalizeSectionLine = (
   section: WorkingStateSectionName,
   line: string
 ) => {
-  const rawCandidate = normalizeLooseLine(line);
-  if (!rawCandidate || rawCandidate === "(none)") {
-    return null;
-  }
-
-  const candidate = sanitizeCandidatePrefix(rawCandidate);
-  if (
-    !candidate ||
-    candidate === "(none)" ||
-    META_NARRATION_PREFIX.test(candidate)
-  ) {
-    return null;
-  }
-
-  switch (section) {
-    case "OBJECTIVE": {
-      const objective = pickExecutableClause(
-        stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
-      );
-      if (!objective || QUESTION_OR_OPTION_SIGNAL.test(objective)) {
-        return null;
-      }
-      if (
-        !isExecutableTaskLine(objective) ||
-        isStableFactLine(objective) ||
-        ACTION_META_PREFIX.test(objective) ||
-        (LOW_SIGNAL_TASK_LINE.test(objective) && !isAnchoredTaskLine(objective))
-      ) {
-        return null;
-      }
-      return objective;
-    }
-    case "CONFIRMED FACTS":
-      if (
-        candidate.length < 4 ||
-        FACT_META_PREFIX.test(candidate) ||
-        isIncompleteConditionalLine(candidate) ||
-        INCOMPLETE_CLAUSE_END.test(candidate) ||
-        isBareSymbolLikeLine(candidate) ||
-        /[：:]$/.test(candidate) ||
-        isPurePathLine(candidate) ||
-        !isStableFactLine(candidate)
-      ) {
-        return null;
-      }
-      return candidate;
-    case "CONSTRAINTS": {
-      const clause =
-        splitIntoClauses(candidate).find(part => CONSTRAINT_MODAL_SIGNAL.test(part)) ??
-        candidate;
-      return CONSTRAINT_SECTION_SIGNAL.test(clause) &&
-        !ACTION_META_PREFIX.test(clause) &&
-        !/[：:]$/.test(clause)
-        ? clause
-        : null;
-    }
-    case "COMPLETED":
-      return COMPLETED_SECTION_SIGNAL.test(candidate) && !/[：:]$/.test(candidate)
-        ? takePrimaryClause(candidate)
-        : null;
-    case "REMAINING":
-    case "NEXT BEST ACTIONS": {
-      const action = pickExecutableClause(
-        stripLeadingPhrases(candidate, TASK_LEADIN_PREFIXES)
-      );
-      if (
-        !action ||
-        QUESTION_OR_OPTION_SIGNAL.test(action) ||
-        COMPLETED_SECTION_SIGNAL.test(action) ||
-        ACTION_META_PREFIX.test(action) ||
-        (LOW_SIGNAL_TASK_LINE.test(action) && !isAnchoredTaskLine(action))
-      ) {
-        return null;
-      }
-      return isExecutableTaskLine(action) ? action : null;
-    }
-    case "KNOWN PATHS": {
-      const [firstPath] = collectPathCandidates(candidate);
-      return firstPath ? clipStateLine(firstPath) : null;
-    }
-    case "RECENT FAILURES":
-      return isRealFailureLine(candidate) ? candidate : null;
-  }
+  const normalized = normalizeCandidateForSection(section, line);
+  return normalized?.section === section ? normalized.line : null;
 };
 
 const createEmptySectionMap = (): Record<WorkingStateSectionName, string[]> =>
@@ -450,12 +615,12 @@ const normalizeUniqueLines = (
   const seen = new Set<string>();
   const normalized: string[] = [];
   for (const line of lines) {
-    const candidate = normalizeSectionLine(section, line);
-    if (!candidate || candidate === "(none)" || seen.has(candidate)) {
+    const candidate = normalizeCandidateForSection(section, line);
+    if (!candidate || candidate.section !== section || seen.has(candidate.line)) {
       continue;
     }
-    seen.add(candidate);
-    normalized.push(candidate);
+    seen.add(candidate.line);
+    normalized.push(candidate.line);
     if (normalized.length >= limit) {
       break;
     }
@@ -469,12 +634,50 @@ const finalizeSectionMap = (
   allowedPaths?: ReadonlySet<string>
 ) => {
   const finalized = createEmptySectionMap();
+  const chosenByKey = new Map<
+    string,
+    NormalizedCandidate & {
+      order: number;
+    }
+  >();
+  let nextOrder = 0;
 
   for (const section of WORKING_STATE_SECTION_ORDER) {
+    for (const rawLine of sections[section] ?? []) {
+      const normalized = normalizeCandidateForSection(section, rawLine);
+      if (!normalized) {
+        continue;
+      }
+      const key = normalizeLooseLine(normalized.line);
+      if (!key) {
+        continue;
+      }
+      const previous = chosenByKey.get(key);
+      if (!previous) {
+        chosenByKey.set(key, {
+          ...normalized,
+          order: nextOrder,
+        });
+        nextOrder += 1;
+        continue;
+      }
+      if (SECTION_PRIORITY[normalized.section] > SECTION_PRIORITY[previous.section]) {
+        chosenByKey.set(key, {
+          ...normalized,
+          order: previous.order,
+        });
+      }
+    }
+  }
+
+  for (const candidate of [...chosenByKey.values()].sort((a, b) => a.order - b.order)) {
     const limit = pending
       ? PENDING_SECTION_ITEM_LIMIT
-      : SECTION_ITEM_LIMITS[section];
-    finalized[section] = normalizeUniqueLines(section, sections[section], limit);
+      : SECTION_ITEM_LIMITS[candidate.section];
+    if (finalized[candidate.section].length >= limit) {
+      continue;
+    }
+    finalized[candidate.section].push(candidate.line);
   }
 
   const completedSet = normalizeForComparison(finalized.COMPLETED);
@@ -491,6 +694,10 @@ const finalizeSectionMap = (
     finalized["KNOWN PATHS"] = finalized["KNOWN PATHS"].filter(path =>
       allowedPaths.has(path)
     );
+  }
+
+  if (finalized.OBJECTIVE.length > 1) {
+    finalized.OBJECTIVE = finalized.OBJECTIVE.slice(0, 1);
   }
 
   return finalized;
@@ -567,6 +774,10 @@ const parseStructuredStateText = (text: string) => {
   const trimmed = text.trim();
   if (!trimmed) {
     return createEmptySectionMap();
+  }
+  const directlyParsed = parseWorkingStateSummary(trimmed);
+  if (Object.keys(directlyParsed).length > 0) {
+    return finalizeSectionMap(directlyParsed);
   }
   const repaired = repairWorkingStateSummary(trimmed);
   const parsed = parseWorkingStateSummary(repaired);
@@ -675,20 +886,74 @@ const collectFallbackDigestLines = (text: string) => {
   return lines;
 };
 
+const buildFallbackSectionMap = (params: {
+  userText: string;
+  assistantLines: string[];
+}) => {
+  const sections = createEmptySectionMap();
+  const objective = normalizeCandidateForSection("OBJECTIVE", params.userText);
+  if (objective?.section === "OBJECTIVE") {
+    sections.OBJECTIVE.push(objective.line);
+  }
+
+  for (const rawLine of params.assistantLines) {
+    const candidate = canonicalizeCandidate(rawLine);
+    if (!candidate || isDiscardableChatter(candidate)) {
+      continue;
+    }
+
+    for (const path of collectPathCandidates(candidate)) {
+      sections["KNOWN PATHS"].push(path);
+    }
+
+    const failure = normalizeCandidateForSection("RECENT FAILURES", candidate);
+    if (failure?.section === "RECENT FAILURES") {
+      sections["RECENT FAILURES"].push(failure.line);
+      continue;
+    }
+
+    const constraint = normalizeCandidateForSection("CONSTRAINTS", candidate);
+    if (constraint?.section === "CONSTRAINTS") {
+      sections.CONSTRAINTS.push(constraint.line);
+      continue;
+    }
+
+    const completed = normalizeCandidateForSection("COMPLETED", candidate);
+    if (completed?.section === "COMPLETED") {
+      sections.COMPLETED.push(completed.line);
+      continue;
+    }
+
+    const fact = normalizeCandidateForSection("CONFIRMED FACTS", candidate);
+    if (fact?.section === "CONFIRMED FACTS") {
+      sections["CONFIRMED FACTS"].push(fact.line);
+      continue;
+    }
+
+    const nextAction = normalizeCandidateForSection("NEXT BEST ACTIONS", candidate);
+    if (nextAction?.section === "NEXT BEST ACTIONS") {
+      sections["NEXT BEST ACTIONS"].push(nextAction.line);
+    }
+  }
+
+  return sections;
+};
+
 export const buildFallbackPendingDigest = (params: {
   userText: string;
   assistantText: string;
 }) => {
   const userText = normalizeLooseLine(params.userText);
   const assistantLines = collectFallbackDigestLines(params.assistantText);
-  const sourceLines = [userText, ...assistantLines].filter(Boolean);
-
-  if (sourceLines.length === 0) {
+  if (!userText && assistantLines.length === 0) {
     return "";
   }
 
-  const repaired = repairWorkingStateSummary(sourceLines.join("\n"), userText);
-  return renderSectionMap(parseStructuredStateText(repaired), {
+  const fallbackSections = buildFallbackSectionMap({
+    userText,
+    assistantLines,
+  });
+  return renderSectionMap(fallbackSections, {
     pending: true,
   });
 };

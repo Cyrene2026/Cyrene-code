@@ -12,7 +12,10 @@ const createStore = async () => {
   tempRoots.push(root);
   return {
     root,
-    store: createFileSessionStore(root),
+    store: createFileSessionStore(root, {
+      cwd: root,
+      env: { CYRENE_ROOT: root } as NodeJS.ProcessEnv,
+    }),
   };
 };
 
@@ -202,9 +205,8 @@ describe("session memory index", () => {
     expect(loaded?.summary).toContain(
       "OBJECTIVE:\n- 沿着 `src/memdir/memdir.ts` 继续梳理 memory 的调用链与落盘点"
     );
-    expect(loaded?.summary).toContain(
-      "CONFIRMED FACTS:\n- 项目名是 `@anthropic-ai/claude-code`。"
-    );
+    expect(loaded?.summary).toContain("CONFIRMED FACTS:");
+    expect(loaded?.summary).toContain("- 项目名是 `@anthropic-ai/claude-code`");
     expect(loaded?.summary).toContain(
       "KNOWN PATHS:\n- package.json\n- src/bootstrap-entry.ts"
     );
@@ -632,39 +634,42 @@ describe("session memory index", () => {
   test("default session store path follows configured global root", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
     tempRoots.push(root);
-    await mkdir(join(root, ".cyrene"), { recursive: true });
+    const cyreneHome = join(root, ".cyrene");
+    await mkdir(cyreneHome, { recursive: true });
     const cwdElsewhere = await mkdtemp(join(tmpdir(), "cyrene-session-cwd-"));
     tempRoots.push(cwdElsewhere);
 
     const store = createFileSessionStore(undefined, {
       cwd: cwdElsewhere,
-      env: { CYRENE_ROOT: root },
+      env: { CYRENE_HOME: cyreneHome, CYRENE_ROOT: root },
     });
     const session = await store.createSession("root aware");
 
     const persisted = await readFile(
-      join(root, ".cyrene", "session", `${session.id}.json`),
+      join(cyreneHome, "session", `${session.id}.json`),
       "utf8"
     );
 
     expect(persisted).toContain("\"title\": \"root aware\"");
+    expect(persisted).toContain(`\"projectRoot\": \"${root.replace(/\\/g, "\\\\")}\"`);
   });
 
   test("session store context ignores unrelated configured app root", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-session-root-"));
     const unrelatedRoot = await mkdtemp(join(tmpdir(), "cyrene-session-other-root-"));
     tempRoots.push(root, unrelatedRoot);
-    await mkdir(join(root, ".cyrene"), { recursive: true });
+    const cyreneHome = join(root, ".cyrene");
+    await mkdir(cyreneHome, { recursive: true });
     await mkdir(join(unrelatedRoot, ".cyrene"), { recursive: true });
     setConfiguredAppRoot(unrelatedRoot);
 
     const store = createFileSessionStore(undefined, {
       cwd: root,
-      env: { CYRENE_ROOT: root },
+      env: { CYRENE_HOME: cyreneHome, CYRENE_ROOT: root },
     });
     const session = await store.createSession("scoped root");
 
-    const expectedPath = join(root, ".cyrene", "session", `${session.id}.json`);
+    const expectedPath = join(cyreneHome, "session", `${session.id}.json`);
     const unexpectedPath = join(unrelatedRoot, ".cyrene", "session", `${session.id}.json`);
 
     const persisted = await readFile(expectedPath, "utf8");

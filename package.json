@@ -1,5 +1,5 @@
 {
-  "name": "bun-react-template",
+  "name": "cyrenecode",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -26,5 +26,8 @@
   },
   "trustedDependencies": [
     "node-pty"
-  ]
+  ],
+  "bin": {
+    "cyrene": "src/entrypoint/cli.tsx"   
+  }
 }

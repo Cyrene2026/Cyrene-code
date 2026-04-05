@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 type AppRootResolveOptions = {
   argv?: string[];
@@ -19,7 +19,24 @@ const trimNonEmpty = (value: string | undefined) => {
   return trimmed === "undefined" || trimmed === "null" ? undefined : trimmed;
 };
 
-const resolveHomeFromEnv = (env: NodeJS.ProcessEnv) => {
+const WINDOWS_DRIVE_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/;
+const WINDOWS_UNC_ABSOLUTE_PATH = /^\\\\[^\\]/;
+
+const isWindowsStyleAbsolutePath = (value: string) =>
+  WINDOWS_DRIVE_ABSOLUTE_PATH.test(value) ||
+  WINDOWS_UNC_ABSOLUTE_PATH.test(value);
+
+const resolveHomeFromEnv = (
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform
+) => {
+  if (platform !== "win32") {
+    const home = trimNonEmpty(env.HOME);
+    if (home) {
+      return home;
+    }
+  }
+
   const userProfile = trimNonEmpty(env.USERPROFILE);
   if (userProfile) {
     return userProfile;
@@ -93,7 +110,19 @@ export const resolveUserHomeDir = (options?: CyreneDirResolveOptions) => {
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
   const envHome = resolveHomeFromEnv(env);
-  return envHome ? resolve(cwd, envHome) : homedir();
+  if (!envHome) {
+    return homedir();
+  }
+
+  if (isAbsolute(envHome)) {
+    return resolve(envHome);
+  }
+
+  if (isWindowsStyleAbsolutePath(envHome)) {
+    return envHome;
+  }
+
+  return resolve(cwd, envHome);
 };
 
 export const getLegacyProjectCyreneDir = (appRoot = resolveAppRoot()) =>

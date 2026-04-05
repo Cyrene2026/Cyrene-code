@@ -50,24 +50,25 @@ describe("app root resolver", () => {
 
   test("builds global .cyrene path from user home and keeps legacy project path helper", () => {
     const cwd = resolve("workspace", "repo");
+    const userHome = process.platform === "win32" ? "C:/Users/tester" : "/Users/tester";
+    const userHomeEnv =
+      process.platform === "win32"
+        ? { USERPROFILE: userHome }
+        : { HOME: userHome, USERPROFILE: "C:/should-not-win-on-posix" };
 
     expect(parseRootArg(["--root", "./repo"])).toBe("./repo");
     expect(
       resolveUserHomeDir({
         cwd,
-        env: {
-          USERPROFILE: "C:/Users/tester",
-        },
+        env: userHomeEnv,
       })
-    ).toBe(resolve("C:/Users/tester"));
+    ).toBe(resolve(userHome));
     expect(
       getCyreneConfigDir({
         cwd,
-        env: {
-          USERPROFILE: "C:/Users/tester",
-        },
+        env: userHomeEnv,
       })
-    ).toBe(join(resolve("C:/Users/tester"), ".cyrene"));
+    ).toBe(join(resolve(userHome), ".cyrene"));
     expect(
       getCyreneConfigDir({
         cwd,

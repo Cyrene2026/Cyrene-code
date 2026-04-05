@@ -52,7 +52,7 @@ export const loadCyreneConfig = async (
     return DEFAULT_CONFIG;
   }
 
-  const map = new Map<string, string | number>();
+  const map = new Map<string, string | number | boolean>();
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) {

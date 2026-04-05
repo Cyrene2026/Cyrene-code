@@ -484,7 +484,7 @@ export const buildStateReducerPrompt = ({
     "Use only these section names: OBJECTIVE, CONFIRMED FACTS, CONSTRAINTS, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, NEXT BEST ACTIONS.",
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
     "JSON shape:",
-    `{"version":1,"mode":"${mode === "disabled" ? "digest_only" : mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."]}}`,
+    `{"version":1,"mode":"${mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."]}}`,
   ]
     .filter(Boolean)
     .join("\n");

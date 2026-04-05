@@ -164,10 +164,25 @@ const buildProps = (
   inputCursorOffset: 0,
   inputCommandState: {
     active: false,
+    mode: "idle",
     currentCommand: null,
     suggestions: [],
+    selectedIndex: 0,
     historyPosition: null,
     historySize: 0,
+    shellShortcut: {
+      active: false,
+      action: null,
+      command: "",
+      actionLabel: "",
+      description: "",
+    },
+    fileMentions: {
+      references: [],
+      activeQuery: null,
+      suggestions: [],
+      loading: false,
+    },
   },
   resumePicker: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
   sessionsPanel: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
@@ -294,7 +309,7 @@ describe("ChatScreen", () => {
     ]);
   });
 
-  test("approval mode renders bordered approval view with diff stats and hidden composer", () => {
+  test("approval mode renders an inline approval view with diff stats and paused composer", () => {
     const tree = renderScreen({
       pendingReviews: [editPending],
       approvalPanel: {
@@ -304,24 +319,26 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("Code Approval");
+    expect(output).toContain("[review]");
+    expect(output).toContain("Review pending");
     expect(output).not.toContain("Conversation");
-    expect(output).toContain("Queue");
-    expect(output).toContain("Action summary");
+    expect(output).not.toContain("[queue]");
+    expect(output).toContain("[selection]");
     expect(output).toContain("Changes");
     expect(output).toContain("+1 lines");
     expect(output).toContain("-1 lines");
-    expect(output).toContain("root");
     expect(output).toContain("D:/Projects/demo-root");
     expect(output).toContain("added");
     expect(output).toContain("deleted");
     expect(output).toContain("Diff preview");
+    expect(output).toContain("[preview]");
     expect(output).toContain("[edit preview]");
     expect(output).toContain("@@ replacement");
     expect(output).toContain("newValue");
     expect(output).not.toContain("Review mode");
     expect(output).not.toContain("Approval panel active...");
-    expect(output).not.toContain("Message Cyrene...");
+    expect(output).toContain("approve or reject before typing...");
+    expect(output).toContain("review hotkeys");
   });
 
   test("approval mode hides raw preview header metadata lines", () => {
@@ -363,24 +380,21 @@ describe("ChatScreen", () => {
     const tree = renderScreen();
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("CYRENE");
-    expect(output).toContain("[");
-    expect(output).toContain("]");
     expect(output).toContain("READY");
     expect(output).toContain("model");
     expect(output).toContain("provider");
     expect(output).toContain("queue");
-    expect(output).toContain("root");
+    expect(output).toContain("cwd");
     expect(output).toContain("D:/Projects/demo-root");
-    expect(output).toContain("Tool: write_file src/a.ts | ok");
-    expect(output).toContain("Message Cyrene...");
-    expect(output).toContain("interactive lane");
-    expect(output).toContain("guide");
-    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands");
+    expect(output).toContain("[tool]");
+    expect(output).toContain("write_file src/a.ts | ok");
+    expect(output).toContain("Ask Cyrene, mention files with @, or use / commands...");
+    expect(output).toContain("ready  |  prompt ready");
+    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell");
     expect(output).not.toContain("Conversation");
   });
 
-  test("empty startup mode renders gemini-style welcome prompt and lightweight suggestions", () => {
+  test("empty startup mode renders a lightweight workspace-first welcome prompt", () => {
     const tree = renderScreen({
       items: [
         {
@@ -395,17 +409,18 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("█████");
-    expect(output).toContain("How can I help today?");
-    expect(output).toContain("Cyrene can inspect this workspace");
+    expect(output).toContain("Cyrene Code");
+    expect(output).toContain("Terminal-first coding assistant for the current workspace.");
+    expect(output).toContain("cwd D:/Projects/demo-root");
     expect(output).toContain("provider.test");
+    expect(output).toContain("Start here");
     expect(output).toContain("Explain this repository");
     expect(output).toContain("Fix something");
     expect(output).toContain("Connect HTTP");
     expect(output).toContain("Keep going");
     expect(output).toContain("/login");
-    expect(output).toContain("Ask Cyrene...");
-    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands");
+    expect(output).toContain("Ask about this workspace, mention files, or use / commands...");
+    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell");
     expect(output).not.toContain("Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.");
   });
 
@@ -475,9 +490,9 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("Prompt");
-    expect(output).toContain("Completion");
-    expect(output).toContain("Total");
+    expect(output).toContain("tokens");
+    expect(output).toContain("prompt");
+    expect(output).toContain("completion");
     expect(output).toContain("128");
     expect(output).toContain("64");
     expect(output).toContain("192");
@@ -487,12 +502,7 @@ describe("ChatScreen", () => {
     const tree = renderScreen({ usage: null });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("Prompt");
-    expect(output).toContain("Completion");
-    expect(output).toContain("Total");
-    expect(output).toContain("Prompt -");
-    expect(output).toContain("Completion -");
-    expect(output).toContain("Total -");
+    expect(output).toContain("tokens -");
   });
 
   test("preparing, requesting, and streaming states show phased waiting labels", () => {
@@ -523,7 +533,7 @@ describe("ChatScreen", () => {
     );
     expect(streamingOutput).toContain("WORKING");
     expect(streamingOutput).toContain("model streaming");
-    expect(streamingOutput).toContain("Message Cyrene...");
+    expect(streamingOutput).toContain("Ask Cyrene, mention files with @, or use / commands...");
   });
 
   test("review and error states remain visible in the flagship composer", () => {
@@ -541,7 +551,7 @@ describe("ChatScreen", () => {
     const reviewOutput = JSON.stringify(reviewTree);
 
     expect(reviewOutput).toContain("REVIEW");
-    expect(reviewOutput).toContain("approval gate");
+    expect(reviewOutput).toContain("review lane");
 
     const errorTree = renderScreen({
       items: [
@@ -654,7 +664,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("Last error:");
     expect(output).toContain("EEXIST");
     expect(output).toContain("blocked");
-    expect(output).toContain("r/d reject");
+    expect(output).toContain("reject with r/d");
     expect(output).toContain("State");
   });
 
@@ -827,8 +837,8 @@ describe("ChatScreen", () => {
     expect(output).toContain("Models  page 1/1  total 2");
     expect(output).toContain("> gpt-next");
     expect(output).toContain("[current]");
-    expect(output).toContain("interactive lane");
-    expect(output).toContain("Panel active...");
+    expect(output).toContain("panel active");
+    expect(output).toContain("Close the active panel to keep typing...");
     expect(output).toContain("panel active  |  close current panel to type");
   });
 
@@ -848,7 +858,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("Providers  page 1/1  total 2");
     expect(output).toContain("provider-b.test");
     expect(output).toContain("[current]");
-    expect(output).toContain("Panel active...");
+    expect(output).toContain("Close the active panel to keep typing...");
   });
 
   test("renders slash command hints in the input card helper line", () => {
@@ -857,21 +867,118 @@ describe("ChatScreen", () => {
       input: "/mo",
       inputCommandState: {
         active: true,
-        currentCommand: "/mo",
+        mode: "command",
+        currentCommand: "/model",
         suggestions: [
           { command: "/model", description: "open model picker" },
           { command: "/model refresh", description: "refresh available models" },
         ],
+        selectedIndex: 0,
         historyPosition: null,
         historySize: 0,
+        shellShortcut: {
+          active: false,
+          action: null,
+          command: "",
+          actionLabel: "",
+          description: "",
+        },
+        fileMentions: {
+          references: [],
+          activeQuery: null,
+          suggestions: [],
+          loading: false,
+        },
       },
     });
     const output = JSON.stringify(tree);
 
-    expect(output).toContain("commands");
+    expect(output).toContain("Command palette");
+    expect(output).toContain("command palette");
     expect(output).toContain("/model");
     expect(output).toContain("/model refresh");
     expect(output).not.toContain("history 2/5");
+  });
+
+  test("renders file mention palette rows in the composer", () => {
+    const tree = renderScreen({
+      items: [],
+      input: "@chat",
+      inputCommandState: {
+        active: false,
+        mode: "file",
+        currentCommand: null,
+        suggestions: [],
+        selectedIndex: 1,
+        historyPosition: null,
+        historySize: 0,
+        shellShortcut: {
+          active: false,
+          action: null,
+          command: "",
+          actionLabel: "",
+          description: "",
+        },
+        fileMentions: {
+          references: ["src/frontend/components/ChatScreen.tsx"],
+          activeQuery: "chat",
+          suggestions: [
+            {
+              path: "src/frontend/components/ChatScreen.tsx",
+              description: "src/frontend/components",
+            },
+            {
+              path: "tests/ChatScreen.test.tsx",
+              description: "tests",
+            },
+          ],
+          loading: false,
+        },
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("File mentions");
+    expect(output).toContain("search  @chat");
+    expect(output).toContain("@src/frontend/components/ChatScreen.tsx");
+    expect(output).toContain("@tests/ChatScreen.test.tsx");
+    expect(output).toContain("file mentions  |  Tab insert  |  ↑/↓ select");
+  });
+
+  test("renders shell shortcut status in the composer", () => {
+    const tree = renderScreen({
+      items: [],
+      input: "!shell bun test",
+      inputCommandState: {
+        active: false,
+        mode: "shell",
+        currentCommand: null,
+        suggestions: [],
+        selectedIndex: 0,
+        historyPosition: null,
+        historySize: 0,
+        shellShortcut: {
+          active: true,
+          action: "run_shell",
+          command: "bun test",
+          actionLabel: "run_shell",
+          description: "Run a one-shot shell command through the review lane.",
+        },
+        fileMentions: {
+          references: [],
+          activeQuery: null,
+          suggestions: [],
+          loading: false,
+        },
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Shell shortcut");
+    expect(output).toContain("run_shell");
+    expect(output).toContain("bun test");
+    expect(output).toContain("shell shortcut  |  Ctrl+D send  |  open/read/status/interrupt/close");
+    expect(output).toContain("!shell open [cwd]");
   });
 
   test("renders history indicator in the input card helper line", () => {
@@ -879,10 +986,25 @@ describe("ChatScreen", () => {
       items: [],
       inputCommandState: {
         active: false,
+        mode: "idle",
         currentCommand: null,
         suggestions: [],
+        selectedIndex: 0,
         historyPosition: 2,
         historySize: 5,
+        shellShortcut: {
+          active: false,
+          action: null,
+          command: "",
+          actionLabel: "",
+          description: "",
+        },
+        fileMentions: {
+          references: [],
+          activeQuery: null,
+          suggestions: [],
+          loading: false,
+        },
       },
     });
     const output = JSON.stringify(tree);

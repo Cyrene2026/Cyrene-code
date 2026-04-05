@@ -21,13 +21,38 @@ type ChatScreenProps = {
   inputCursorOffset: number;
   inputCommandState: {
     active: boolean;
+    mode: "idle" | "command" | "file" | "shell";
     currentCommand: string | null;
     suggestions: Array<{
       command: string;
       description: string;
     }>;
+    selectedIndex: number;
     historyPosition: number | null;
     historySize: number;
+    shellShortcut: {
+      active: boolean;
+      action:
+        | "run_shell"
+        | "open_shell"
+        | "read_shell"
+        | "shell_status"
+        | "interrupt_shell"
+        | "close_shell"
+        | null;
+      command: string;
+      actionLabel: string;
+      description: string;
+    };
+    fileMentions: {
+      references: string[];
+      activeQuery: string | null;
+      suggestions: Array<{
+        path: string;
+        description: string;
+      }>;
+      loading: boolean;
+    };
   };
   resumePicker: {
     active: boolean;
@@ -194,23 +219,15 @@ type GraphemeSegment = {
   endOffset: number;
 };
 
-const BRAND_NAME = "CYRENE";
-const BRAND_MARK = "C>";
+const APP_NAME = "Cyrene Code";
 const SECTION_GAP = 1;
-const STARTUP_WORDMARK = [
-  "██╗   ██████╗██╗   ██╗██████╗ ███████╗███╗   ██╗███████╗",
-  "╚██╗ ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝████╗  ██║██╔════╝",
-  " ╚██╗██║      ╚████╔╝ ██████╔╝█████╗  ██╔██╗ ██║█████╗  ",
-  " ██╔╝██║       ╚██╔╝  ██╔══██╗██╔══╝  ██║╚██╗██║██╔══╝  ",
-  "██╔╝ ╚██████╗   ██║   ██║  ██║███████╗██║ ╚████║███████╗",
-  "╚═╝   ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝",
-];
-const SPINNER_FRAMES = ["·", "•", "●", "•"];
-const STREAMING_IDLE_GLYPH = "●";
+const SPINNER_FRAMES = [".", "o", "O", "o"];
+const STREAMING_IDLE_GLYPH = "*";
 const ENABLE_STREAMING_ANIMATION = process.env.CYRENE_ANIMATE_STREAMING === "1";
-const DEFAULT_COMPOSER_HINT = "Ctrl+D send  |  Enter newline  |  / commands";
+const DEFAULT_COMPOSER_HINT =
+  "Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell";
 const MAX_COMPOSER_VISIBLE_LINES = 6;
-const COMPOSER_CURSOR_GLYPH = "█";
+const COMPOSER_CURSOR_GLYPH = "|";
 const DEFAULT_TERMINAL_COLUMNS = 80;
 const COMPOSER_CHROME_WIDTH = 24;
 const MIN_COMPOSER_WRAP_WIDTH = 16;
@@ -227,6 +244,7 @@ const MAX_RENDER_TEXT_CHARS = 24000;
 const MAX_STREAMING_RENDER_TEXT_LINES = 160;
 const MAX_STREAMING_RENDER_TEXT_CHARS = 12000;
 const MAX_RENDERED_TERMINAL_OUTPUT_LINES = 220;
+const MAX_COMPACT_TERMINAL_OUTPUT_LINES = 2;
 const CODE_KEYWORDS = new Set([
   "const",
   "let",
@@ -526,27 +544,6 @@ const getStatusBadge = (status: ChatStatus, spinner: string) => {
     inputColor: "green" as const,
   };
 };
-
-const renderBrandLockup = () => (
-  <Box>
-    <Text bold color="cyan">
-      [
-    </Text>
-    <Text bold color="cyan">
-      {BRAND_MARK.slice(0, 1)}
-    </Text>
-    <Text bold color="white">
-      {BRAND_MARK.slice(1)}
-    </Text>
-    <Text bold color="cyan">
-      ]
-    </Text>
-    <Text> </Text>
-    <Text bold color="black" backgroundColor="cyan">
-      {` ${BRAND_NAME} `}
-    </Text>
-  </Box>
-);
 
 const formatPaged = <T,>(items: T[], selectedIndex: number, pageSize: number): PagedResult<T> => {
   const total = items.length;
@@ -1156,73 +1153,169 @@ const parseTerminalTranscript = (item: ChatItem): TerminalTranscript | null => {
   };
 };
 
+const getTerminalMeaningfulOutputLines = (outputLines: string[]) =>
+  outputLines.filter(line => line.trim().toLowerCase() !== "(no new output)");
+
+const getTerminalOutputSummary = (outputLines: string[]) => {
+  const meaningfulLines = getTerminalMeaningfulOutputLines(outputLines);
+  if (meaningfulLines.length === 0) {
+    return "no output";
+  }
+  return meaningfulLines.length === 1 ? "1 line" : `${meaningfulLines.length} lines`;
+};
+
+const getTerminalTranscriptSummary = (transcript: TerminalTranscript) =>
+  [
+    transcript.commandLine ? shortenValue(transcript.commandLine, 64) : "",
+    ...transcript.metaParts,
+    `output ${getTerminalOutputSummary(transcript.outputLines)}`,
+  ]
+    .filter(Boolean)
+    .join("  |  ");
+
 const renderTerminalTranscript = (
   transcript: TerminalTranscript,
   itemIndex: number,
   clipNotice?: string
 ) => {
-  const shellPrompt = getTerminalPrompt(transcript.action, transcript.shell);
-  const meta = transcript.metaParts.join("  |  ");
-  const visibleOutputLines = transcript.outputLines.slice(
+  const activityLabel = transcript.action.includes("shell") ? "shell" : "tool";
+  const activityColor = activityLabel === "shell" ? "yellow" : "cyan";
+  const summary = getTerminalTranscriptSummary(transcript);
+  const meaningfulOutputLines = getTerminalMeaningfulOutputLines(transcript.outputLines);
+  const visibleOutputLines = meaningfulOutputLines.slice(
     0,
-    MAX_RENDERED_TERMINAL_OUTPUT_LINES
+    Math.min(MAX_RENDERED_TERMINAL_OUTPUT_LINES, MAX_COMPACT_TERMINAL_OUTPUT_LINES)
   );
   const hiddenOutputLines = Math.max(
     0,
-    transcript.outputLines.length - visibleOutputLines.length
+    meaningfulOutputLines.length - visibleOutputLines.length
   );
 
   return (
     <Box key={`terminal-${itemIndex}`} flexDirection="column" marginBottom={1}>
-      {meta ? <Text dimColor>{meta}</Text> : null}
-      {transcript.commandLine ? (
-        <Box>
-          <Text color="green">{shellPrompt}</Text>
-          <Text> </Text>
-          <Text color="white">{transcript.commandLine}</Text>
+      <Box flexWrap="wrap">
+        <Text color={activityColor}>{`[${activityLabel}]`}</Text>
+        {summary ? (
+          <>
+            <Text> </Text>
+            <Text color="white">{summary}</Text>
+          </>
+        ) : null}
+      </Box>
+      {visibleOutputLines.length > 0 ? (
+        <Box flexDirection="column">
+          {visibleOutputLines.map((line, lineIndex) =>
+            (() => {
+              const promptLine = normalizeTranscriptPromptLine(
+                line,
+                transcript.action,
+                transcript.shell
+              );
+              if (promptLine) {
+                return (
+                  <Box key={`terminal-output-${itemIndex}-${lineIndex}`}>
+                    <Text dimColor>{"  "}</Text>
+                    <Text color="green">{promptLine.prompt}</Text>
+                    <Text> </Text>
+                    <Text dimColor>{promptLine.text || " "}</Text>
+                  </Box>
+                );
+              }
+
+              const normalized = line.trim().toLowerCase();
+              const lineColor =
+                normalized.startsWith("[stderr]") ||
+                normalized.startsWith("stderr") ||
+                normalized.startsWith("error") ||
+                normalized.startsWith("exception")
+                  ? "red"
+                  : line.trim() === "(no new output)"
+                    ? "gray"
+                    : "white";
+
+              return (
+                <Text
+                  key={`terminal-output-${itemIndex}-${lineIndex}`}
+                  color={lineColor === "white" ? undefined : lineColor}
+                  dimColor={lineColor !== "red"}
+                >
+                  {`  ${line || " "}`}
+                </Text>
+              );
+            })()
+          )}
+          {hiddenOutputLines > 0 ? (
+            <Text dimColor>{`[+${hiddenOutputLines} more lines hidden]`}</Text>
+          ) : null}
         </Box>
       ) : null}
-      <Box flexDirection="column">
-        {visibleOutputLines.map((line, lineIndex) => (
-          (() => {
-            const promptLine = normalizeTranscriptPromptLine(
-              line,
-              transcript.action,
-              transcript.shell
-            );
-            if (promptLine) {
-              return (
-                <Box key={`terminal-output-${itemIndex}-${lineIndex}`}>
-                  <Text color="green">{promptLine.prompt}</Text>
-                  <Text> </Text>
-                  <Text color="white">{promptLine.text || " "}</Text>
-                </Box>
-              );
-            }
+      {clipNotice ? <Text dimColor>{clipNotice}</Text> : null}
+    </Box>
+  );
+};
 
-            const normalized = line.trim().toLowerCase();
-            const lineColor =
-              normalized.startsWith("[stderr]") ||
-              normalized.startsWith("stderr") ||
-              normalized.startsWith("error") ||
-              normalized.startsWith("exception")
-                ? "red"
-                : line.trim() === "(no new output)"
-                  ? "gray"
-                  : "white";
+const shouldRenderCompactEventRow = (
+  item: ChatItem,
+  terminalTranscript: TerminalTranscript | null
+) => {
+  if (terminalTranscript) {
+    return false;
+  }
 
-            return (
-              <Text key={`terminal-output-${itemIndex}-${lineIndex}`} color={lineColor}>
-                {line || " "}
-              </Text>
-            );
-          })()
-        ))}
-        {hiddenOutputLines > 0 ? (
-          <Text dimColor>{`[render clipped] omitted ${hiddenOutputLines} output lines`}</Text>
-        ) : null}
-        {clipNotice ? <Text dimColor>{clipNotice}</Text> : null}
+  if (item.role === "assistant" || item.role === "user") {
+    return false;
+  }
+
+  if (item.kind === "tool_status" || item.kind === "review_status") {
+    return true;
+  }
+
+  if ((item.kind === "system_hint" || item.kind === "error") && !item.text.includes("\n")) {
+    return true;
+  }
+
+  return false;
+};
+
+const summarizeCompactEventText = (text: string) => {
+  const lines = text
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return "";
+  }
+
+  const [firstLine = "", ...restLines] = lines;
+  const normalizedFirstLine = firstLine.replace(/^(tool|review|system):\s*/i, "");
+
+  return [normalizedFirstLine, ...restLines].join(" | ");
+};
+
+const renderCompactEventRow = (
+  item: ChatItem,
+  itemIndex: number,
+  text: string,
+  clipNotice: string,
+  color: ChatItem["color"]
+) => {
+  const messageLabel = getMessageLabel(item);
+  const eventLabel = item.kind === "system_hint" ? "note" : messageLabel.label;
+  const summaryText = summarizeCompactEventText(text);
+
+  return (
+    <Box key={`item-${itemIndex}`} flexDirection="column" marginBottom={1}>
+      <Box flexWrap="wrap">
+        <Text color={messageLabel.color}>{`[${eventLabel}]`}</Text>
+        <Text> </Text>
+        {renderInlineMarkdownLine(
+          summaryText,
+          `compact-event-${itemIndex}`,
+          color
+        )}
       </Box>
+      {clipNotice ? <Text dimColor>{clipNotice}</Text> : null}
     </Box>
   );
 };
@@ -1245,6 +1338,11 @@ const renderMessageItem = (
     ...item,
     text: clip.text,
   });
+
+  if (shouldRenderCompactEventRow(item, terminalTranscript)) {
+    return renderCompactEventRow(item, itemIndex, clip.text, clipNotice, color);
+  }
+
   const blocks = parseMarkdownBlocks(clip.text);
   const nodes: React.ReactNode[] = [];
   if (terminalTranscript) {
@@ -1353,7 +1451,7 @@ const renderMessageItem = (
   );
 };
 
-const renderShellHeader = (
+const renderStatusLine = (
   status: ChatStatus,
   activeSessionId: string | null,
   currentModel: string,
@@ -1366,17 +1464,15 @@ const renderShellHeader = (
 ) => {
   const statusBadge = getStatusBadge(status, spinner);
   const queueColor = pendingCount > 0 ? "yellow" : "green";
-  const tokenSummary = [
-    `Prompt ${usage ? String(usage.promptTokens) : "-"}`,
-    `Completion ${usage ? String(usage.completionTokens) : "-"}`,
-    `Total ${usage ? String(usage.totalTokens) : "-"}`,
-  ].join("  |  ");
+  const tokenSummary = usage
+    ? `tokens ${String(usage.totalTokens)}  |  prompt ${String(usage.promptTokens)}  |  completion ${String(
+        usage.completionTokens
+      )}`
+    : "tokens -";
 
   return (
-    <Box marginBottom={SECTION_GAP} flexDirection="column">
+    <Box marginTop={SECTION_GAP} flexDirection="column">
       <Box flexWrap="wrap">
-        {renderBrandLockup()}
-        <Text> </Text>
         <Text
           color={statusBadge.textColor}
           backgroundColor={statusBadge.backgroundColor}
@@ -1393,12 +1489,12 @@ const renderShellHeader = (
         {activePanel !== "idle" ? (
           <>
             <Text dimColor>{`  |  panel `}</Text>
-            <Text dimColor>{activePanel}</Text>
+            <Text>{activePanel}</Text>
           </>
         ) : null}
       </Box>
       <Text dimColor>
-        {`session ${shortenValue(activeSessionId ?? "none", 18)}  |  root ${shortenValue(appRoot || "none", 42)}  |  ${tokenSummary}`}
+        {`session ${shortenValue(activeSessionId ?? "none", 18)}  |  cwd ${shortenValue(appRoot || "none", 42)}  |  ${tokenSummary}`}
       </Text>
     </Box>
   );
@@ -1451,7 +1547,7 @@ const getComposerTone = (status: ChatStatus): ComposerTone => {
       chipBackground: "magenta",
       chipText: "black",
       chipLabel: "REVIEW",
-      metaLabel: "approval gate",
+      metaLabel: "review lane",
       promptColor: "magenta",
       helperColor: "magenta",
     };
@@ -1483,18 +1579,37 @@ const getComposerTone = (status: ChatStatus): ComposerTone => {
 };
 
 const getComposerHelperText = (
-  isPanelActive: boolean,
-  inputCommandState: ChatScreenProps["inputCommandState"],
-  suggestionSummary: string
+  activePanel: string,
+  inputCommandState: ChatScreenProps["inputCommandState"]
 ) => {
-  if (isPanelActive) {
+  if (activePanel === "approval") {
+    return "review hotkeys  |  a approve/retry  |  r reject  |  Tab preview  |  Esc close";
+  }
+
+  if (activePanel !== "idle") {
     return "panel active  |  close current panel to type";
   }
 
-  if (inputCommandState.active) {
-    return suggestionSummary
-      ? `commands  ${suggestionSummary}`
-      : `commands  ${inputCommandState.currentCommand ?? "/"}  |  /help show command list`;
+  if (inputCommandState.mode === "command") {
+    return inputCommandState.suggestions.length > 0
+      ? "command palette  |  Tab accept  |  ↑/↓ select  |  /help all commands"
+      : "command palette  |  no matching command  |  /help all commands";
+  }
+
+  if (inputCommandState.mode === "file") {
+    if (!inputCommandState.fileMentions.activeQuery) {
+      return "file mentions  |  type after @ to search the workspace";
+    }
+    if (inputCommandState.fileMentions.loading) {
+      return `file mentions  |  searching @${inputCommandState.fileMentions.activeQuery}...`;
+    }
+    return inputCommandState.fileMentions.suggestions.length > 0
+      ? "file mentions  |  Tab insert  |  ↑/↓ select"
+      : `file mentions  |  no matches for @${inputCommandState.fileMentions.activeQuery}`;
+  }
+
+  if (inputCommandState.mode === "shell") {
+    return "shell shortcut  |  Ctrl+D send  |  open/read/status/interrupt/close";
   }
 
   if (inputCommandState.historyPosition !== null) {
@@ -1655,6 +1770,152 @@ const renderComposerCursorLine = (
   );
 };
 
+const getPaletteWindow = <T,>(
+  items: T[],
+  selectedIndex: number,
+  maxItems = 4
+) => {
+  if (items.length <= maxItems) {
+    return items.map((item, index) => ({ item, index }));
+  }
+
+  const half = Math.floor(maxItems / 2);
+  const start = Math.min(
+    Math.max(0, selectedIndex - half),
+    Math.max(0, items.length - maxItems)
+  );
+
+  return items
+    .slice(start, start + maxItems)
+    .map((item, offset) => ({ item, index: start + offset }));
+};
+
+const renderComposerPalette = (
+  inputCommandState: ChatScreenProps["inputCommandState"],
+  tone: ComposerTone,
+  activePanel: string
+) => {
+  if (activePanel !== "idle") {
+    return null;
+  }
+
+  if (inputCommandState.mode === "command") {
+    const suggestionWindow = getPaletteWindow(
+      inputCommandState.suggestions,
+      inputCommandState.selectedIndex
+    );
+
+    return (
+      <Box marginTop={1} flexDirection="column">
+        <Text bold color="cyan">
+          Command palette
+        </Text>
+        {suggestionWindow.length > 0 ? (
+          suggestionWindow.map(({ item, index }) => {
+            const selected = index === inputCommandState.selectedIndex;
+            return (
+              <Box key={`composer-command-${item.command}`} flexWrap="wrap">
+                <Text color={selected ? tone.promptColor : "gray"}>
+                  {selected ? "→" : "·"}
+                </Text>
+                <Text> </Text>
+                <Text bold={selected} color={selected ? "white" : "gray"}>
+                  {item.command}
+                </Text>
+                <Text dimColor>{`  ${item.description}`}</Text>
+              </Box>
+            );
+          })
+        ) : (
+          <Text dimColor>
+            {`No command match for ${inputCommandState.currentCommand ?? "/"}.`}
+          </Text>
+        )}
+      </Box>
+    );
+  }
+
+  if (inputCommandState.mode === "file") {
+    const referenceSummary = inputCommandState.fileMentions.references
+      .slice(0, 3)
+      .join(", ");
+    const suggestionWindow = getPaletteWindow(
+      inputCommandState.fileMentions.suggestions,
+      inputCommandState.selectedIndex
+    );
+
+    return (
+      <Box marginTop={1} flexDirection="column">
+        <Text bold color="cyan">
+          File mentions
+        </Text>
+        {referenceSummary ? (
+          <Text dimColor>
+            {`attached  ${referenceSummary}${
+              inputCommandState.fileMentions.references.length > 3
+                ? `  +${inputCommandState.fileMentions.references.length - 3} more`
+                : ""
+            }`}
+          </Text>
+        ) : null}
+        <Text dimColor>
+          {inputCommandState.fileMentions.activeQuery
+            ? `search  @${inputCommandState.fileMentions.activeQuery}`
+            : "Type after @ to search workspace files."}
+        </Text>
+        {inputCommandState.fileMentions.loading ? (
+          <Text dimColor>searching workspace...</Text>
+        ) : suggestionWindow.length > 0 ? (
+          suggestionWindow.map(({ item, index }) => {
+            const selected = index === inputCommandState.selectedIndex;
+            return (
+              <Box key={`composer-file-${item.path}`} flexWrap="wrap">
+                <Text color={selected ? tone.promptColor : "gray"}>
+                  {selected ? "→" : "·"}
+                </Text>
+                <Text> </Text>
+                <Text bold={selected} color={selected ? "white" : "gray"}>
+                  {`@${item.path}`}
+                </Text>
+                <Text dimColor>{`  ${item.description}`}</Text>
+              </Box>
+            );
+          })
+        ) : inputCommandState.fileMentions.activeQuery ? (
+          <Text dimColor>
+            {`No workspace files match @${inputCommandState.fileMentions.activeQuery}.`}
+          </Text>
+        ) : null}
+      </Box>
+    );
+  }
+
+  if (inputCommandState.mode === "shell") {
+    return (
+      <Box marginTop={1} flexDirection="column">
+        <Text bold color="cyan">
+          Shell shortcut
+        </Text>
+        <Text color="white">
+          {inputCommandState.shellShortcut.actionLabel || "!shell"}
+        </Text>
+        <Text dimColor>
+          {inputCommandState.shellShortcut.command
+            ? inputCommandState.shellShortcut.command
+            : "!shell <command>"}
+        </Text>
+        <Text dimColor>{inputCommandState.shellShortcut.description}</Text>
+        <Text dimColor>
+          !shell open [cwd]  |  !shell read  |  !shell status  |  !shell
+          interrupt  |  !shell close
+        </Text>
+      </Box>
+    );
+  }
+
+  return null;
+};
+
 const renderStreamingAssistantItem = (
   text: string,
   itemIndex: number,
@@ -1687,7 +1948,7 @@ const renderStreamingAssistantItem = (
 
 const renderStartupSuggestion = (title: string, detail: string) => (
   <Box marginTop={1} flexWrap="wrap">
-    <Text color="cyan">› </Text>
+    <Text color="cyan">{"> "}</Text>
     <Text bold color="white">
       {title}
     </Text>
@@ -1696,26 +1957,19 @@ const renderStartupSuggestion = (title: string, detail: string) => (
 );
 
 const renderStartupView = (
+  appRoot: string,
   currentModel: string,
   currentProvider: string,
   activeSessionId: string | null,
   authStatus: AuthStatus
 ) => (
   <Box marginBottom={SECTION_GAP + 1} flexDirection="column">
-    <Box flexDirection="column" marginBottom={2}>
-      {STARTUP_WORDMARK.map((line, index) => (
-        <Text key={`startup-wordmark-${index}`} bold color={index === 2 ? "white" : "cyan"}>
-          {line}
-        </Text>
-      ))}
-    </Box>
-    <Text bold color="cyan">
-      How can I help today?
+    <Text bold color="white">
+      {APP_NAME}
     </Text>
+    <Text dimColor>Terminal-first coding assistant for the current workspace.</Text>
     <Box marginTop={1} flexDirection="column">
-      <Text dimColor>
-        Cyrene can inspect this workspace, explain code, edit files, and run reviewed commands.
-      </Text>
+      <Text dimColor>{`cwd ${shortenValue(appRoot || "none", 58)}`}</Text>
       <Text dimColor>
         {`mode ${authStatus.mode}  |  model ${shortenValue(currentModel || "none", 18)}  |  provider ${formatProviderLabel(currentProvider || "none", 18)}  |  session ${shortenValue(
           activeSessionId ?? "none",
@@ -1724,13 +1978,16 @@ const renderStartupView = (
       </Text>
     </Box>
     <Box marginTop={1} flexDirection="column">
+      <Text bold color="cyan">
+        Start here
+      </Text>
       {renderStartupSuggestion("Explain this repository", "Summarize the structure, stack, or a file.")}
       {renderStartupSuggestion("Fix something", "Point at an error, failing test, or suspicious behavior.")}
       {renderStartupSuggestion("Connect HTTP", "Use /login to save credentials, or skip and keep using local-core.")}
       {renderStartupSuggestion("Keep going", "Use /resume for a past session, /auth for status, or /model to switch models.")}
     </Box>
     <Text dimColor>
-      Type `/` for commands. `/login`, `/logout`, and `/auth` manage provider access without blocking local fallback.
+      Use `/` for commands. `/login`, `/logout`, and `/auth` manage provider access without blocking local fallback.
     </Text>
   </Box>
 );
@@ -1852,97 +2109,109 @@ const renderMainComposer = (
   inputCursorOffset: number,
   _onInputChange: (next: string) => void,
   _onSubmit: () => void,
-  isPanelActive: boolean,
+  activePanel: string,
   showStartupView: boolean,
-  inputCommandState: ChatScreenProps["inputCommandState"],
-  suggestionSummary: string
+  inputCommandState: ChatScreenProps["inputCommandState"]
 ) => {
-  const tone = getComposerTone(status);
+  const isPanelActive = activePanel !== "idle";
+  const tone = getComposerTone(activePanel === "approval" ? "awaiting_review" : status);
+  const metaLabel =
+    activePanel === "approval"
+      ? tone.metaLabel
+      : activePanel !== "idle"
+        ? "panel active"
+        : status !== "idle"
+          ? tone.metaLabel
+          : inputCommandState.mode === "command"
+            ? "command palette"
+            : inputCommandState.mode === "file"
+              ? "file mentions"
+              : inputCommandState.mode === "shell"
+                ? "shell shortcut"
+                : "prompt ready";
   const helperText = shortenValue(
-    getComposerHelperText(isPanelActive, inputCommandState, suggestionSummary),
+    getComposerHelperText(activePanel, inputCommandState),
     96
   );
-  const railSegments = ["██", "██", "██"];
-  const placeholder = isPanelActive
-    ? "Panel active..."
-    : showStartupView
-      ? "Ask Cyrene..."
-      : "Message Cyrene...";
+  const placeholder =
+    activePanel === "approval"
+      ? "Review pending — approve or reject before typing..."
+      : isPanelActive
+        ? "Close the active panel to keep typing..."
+        : inputCommandState.mode === "command"
+          ? "Choose a slash command..."
+          : inputCommandState.mode === "file"
+            ? "Mention workspace files with @..."
+            : inputCommandState.mode === "shell"
+              ? "Type a shell command or shell session action..."
+              : showStartupView
+                ? "Ask about this workspace, mention files, or use / commands..."
+                : "Ask Cyrene, mention files with @, or use / commands...";
   const composerWindow = getComposerWindow(input, inputCursorOffset);
+  const statusSummary = `${tone.chipLabel.toLowerCase()}  |  ${metaLabel}`;
+  const paletteNode = renderComposerPalette(
+    inputCommandState,
+    tone,
+    activePanel
+  );
 
   return (
     <Box
       flexShrink={0}
-      flexDirection="row"
+      flexDirection="column"
       borderStyle="round"
       borderColor={tone.borderColor}
-      paddingRight={1}
+      paddingX={1}
     >
-      <Box paddingLeft={1} paddingRight={1} flexDirection="column" justifyContent="center">
-        {railSegments.map((segment, index) => (
-          <Text key={`composer-rail-${tone.chipLabel}-${index}`} color={tone.promptColor}>
-            {segment}
-          </Text>
-        ))}
+      <Box flexWrap="wrap">
+        <Text bold color={tone.promptColor}>
+          {isPanelActive ? "x" : ">"}
+        </Text>
+        <Text> </Text>
+        <Text color={tone.helperColor} dimColor={tone.helperColor === "gray"}>
+          {statusSummary}
+        </Text>
       </Box>
-      <Box flexGrow={1} flexDirection="column" paddingY={0}>
-        <Box>
-          <Text color={tone.chipText} backgroundColor={tone.chipBackground}>
-            {` ${tone.chipLabel} `}
-          </Text>
-          <Text dimColor>{`  ${tone.metaLabel}`}</Text>
-        </Box>
-        <Box
-          marginTop={1}
-          borderStyle="single"
-          borderColor={tone.panelBorderColor}
-          paddingX={1}
-          flexDirection="column"
-        >
-          {input ? (
-            composerWindow.rows.map((row, visibleIndex) => {
-              return (
-                <Box key={`composer-line-${visibleIndex}`}>
-                  <Text bold color={tone.promptColor}>
-                    {row.prefix}
-                  </Text>
-                  <Text> </Text>
-                  <Box flexGrow={1}>
-                    {row.isCursorRow ? (
-                      renderComposerCursorLine(
-                        row.text,
-                        row.cursorColumn,
-                        tone.promptColor
-                      )
-                    ) : (
-                      <Text>{row.text || " "}</Text>
-                    )}
-                  </Box>
-                </Box>
-              );
-            })
-          ) : (
-            <Box>
-              <Text bold color={tone.promptColor}>
-                {">"}
-              </Text>
-              <Text> </Text>
-              <Box flexGrow={1}>
-                <Text color="white" backgroundColor={tone.promptColor}>
-                  {COMPOSER_CURSOR_GLYPH}
+      <Box marginTop={1} flexDirection="column">
+        {input ? (
+          composerWindow.rows.map((row, visibleIndex) => {
+            return (
+              <Box key={`composer-line-${visibleIndex}`}>
+                <Text bold color={tone.promptColor}>
+                  {row.prefix}
                 </Text>
-                <Text dimColor>{placeholder}</Text>
+                <Text> </Text>
+                <Box flexGrow={1}>
+                  {row.isCursorRow ? (
+                    renderComposerCursorLine(
+                      row.text,
+                      row.cursorColumn,
+                      tone.promptColor
+                    )
+                  ) : (
+                    <Text>{row.text || " "}</Text>
+                  )}
+                </Box>
               </Box>
+            );
+          })
+        ) : (
+          <Box>
+            <Text bold color={tone.promptColor}>
+              {">"}
+            </Text>
+            <Text> </Text>
+            <Box flexGrow={1}>
+              <Text color="white" backgroundColor={tone.promptColor}>
+                {COMPOSER_CURSOR_GLYPH}
+              </Text>
+              <Text dimColor>{` ${placeholder}`}</Text>
             </Box>
-          )}
-        </Box>
-        <Box marginTop={1}>
-          <Text color={tone.helperColor} dimColor={tone.helperColor === "gray"}>
-            guide
-          </Text>
-          <Text dimColor>{`  ${helperText}`}</Text>
-        </Box>
+          </Box>
+        )}
       </Box>
+      {paletteNode}
+      <Text dimColor>{helperText}</Text>
     </Box>
   );
 };
@@ -2463,8 +2732,8 @@ const renderApprovalPanel = (
     <Box
       marginBottom={SECTION_GAP}
       flexDirection="column"
-      borderStyle="round"
-      borderColor="yellow"
+      borderStyle="single"
+      borderColor={tone.border}
       paddingX={1}
       paddingY={1}
     >
@@ -2813,41 +3082,39 @@ const renderCompactApprovalPanel = (
     Math.min(pendingReviews.length, approvalPanel.selectedIndex + 3)
   );
   const tone = getActionTone(selectedPending.request.action);
+  const hasDiffStats = diffStats.additions > 0 || diffStats.deletions > 0;
+  const previewRangeLabel = `${previewWindow.safeOffset + 1}-${Math.min(
+    previewWindow.safeOffset + previewWindow.pageLines.length,
+    previewWindow.totalLines
+  )}/${previewWindow.totalLines}`;
 
   return (
-    <Box
-      marginBottom={SECTION_GAP}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor="yellow"
-      paddingX={1}
-      paddingY={1}
-    >
-      <Box justifyContent="space-between" flexWrap="wrap">
-        <Box>
-          <Text bold color="yellow">
-            Code Approval
-          </Text>
-          <Text> </Text>
-          <Text color={tone.badgeFg} backgroundColor={tone.badgeBg}>
-            {` ${selectedPending.request.action} `}
-          </Text>
-        </Box>
+    <Box marginBottom={SECTION_GAP} flexDirection="column">
+      <Box flexWrap="wrap">
+        <Text bold color={tone.border}>
+          [review]
+        </Text>
+        <Text> </Text>
+        <Text color={tone.badgeFg} backgroundColor={tone.badgeBg}>
+          {` ${selectedPending.request.action} `}
+        </Text>
+        <Text> </Text>
+        <Text color="white">{shortenValue(selectedPending.request.path, 56)}</Text>
         <Text dimColor>
-          {`${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${approvalState}`}
+          {`  |  ${approvalPanel.selectedIndex + 1}/${pendingReviews.length}  |  ${approvalPanel.previewMode}  |  ${approvalState}`}
         </Text>
       </Box>
       <Text dimColor>
-        {`session ${shortenValue(activeSessionId ?? "none", 14)}  |  model ${shortenValue(currentModel, 14)}  |  root ${shortenValue(appRoot || "none", 28)}  |  item ${selectedPending.id}`}
+        {`cwd ${shortenValue(appRoot || "none", 28)}  |  session ${shortenValue(activeSessionId ?? "none", 14)}  |  model ${shortenValue(currentModel, 14)}  |  item ${selectedPending.id}`}
       </Text>
-      <Text dimColor>{`${selectedPending.request.path}  |  ${selectedPending.createdAt}`}</Text>
+      <Text dimColor>{selectedPending.createdAt}</Text>
 
       {selectedInFlight ? (
         <Box marginTop={1} flexDirection="column">
           <Text color="cyan">
             {`${approvalPanel.actionState === "reject" ? "Rejecting" : "Approving"} current item...`}
           </Text>
-          <Text dimColor>hotkeys locked until the current approval action finishes</Text>
+          <Text dimColor>review hotkeys are locked until the current action finishes</Text>
         </Box>
       ) : null}
 
@@ -2856,16 +3123,17 @@ const renderCompactApprovalPanel = (
           <Text color="red">
             {`Last error: ${shortenValue(blockedReason || "approval failed", 120)}`}
           </Text>
-          <Text dimColor>
-            approve blocked for current item  |  ↑/↓ switch  |  r/d reject  |  a retry after cooldown
-          </Text>
+          <Text dimColor>retry with a  |  switch with ↑/↓  |  reject with r/d</Text>
         </Box>
       ) : null}
 
-      {renderCompactApprovalSection(
-        "Queue",
-        `${queueItems.length} visible  |  ${pendingReviews.length} total`,
-        <Box flexDirection="column">
+      {pendingReviews.length > 1 ? (
+        <Box marginTop={1} flexDirection="column">
+          <Box flexWrap="wrap">
+            <Text color="cyan">[queue]</Text>
+            <Text> </Text>
+            <Text dimColor>{`${queueItems.length} visible  |  ${pendingReviews.length} total`}</Text>
+          </Box>
           {queueItems.map((item, localIndex) => {
             const index = queueStart + localIndex;
             const selected = index === approvalPanel.selectedIndex;
@@ -2874,24 +3142,12 @@ const renderCompactApprovalPanel = (
             const inFlight = approvalPanel.inFlightId === item.id;
             return (
               <Box key={`compact-review-list-${item.id}`} flexWrap="wrap">
-                <Text
-                  color={selected ? "black" : "gray"}
-                  backgroundColor={selected ? "cyan" : undefined}
-                >
-                  {selected ? " > " : "   "}
-                </Text>
-                <Text> </Text>
-                <Text
-                  color={selected ? "black" : itemTone.badgeFg}
-                  backgroundColor={selected ? "white" : itemTone.badgeBg}
-                >
+                <Text color={selected ? "cyan" : "gray"}>{selected ? "> " : "  "}</Text>
+                <Text color={itemTone.badgeFg} backgroundColor={itemTone.badgeBg}>
                   {` ${item.request.action} `}
                 </Text>
                 <Text> </Text>
-                <Text
-                  color={selected ? "black" : "white"}
-                  backgroundColor={selected ? "cyan" : undefined}
-                >
+                <Text color={selected ? "white" : "gray"}>
                   {shortenValue(item.request.path, 68)}
                 </Text>
                 {blocked ? (
@@ -2913,14 +3169,16 @@ const renderCompactApprovalPanel = (
               </Box>
             );
           })}
-        </Box>,
-        "gray"
-      )}
+        </Box>
+      ) : null}
 
-      {renderCompactApprovalSection(
-        "Action summary",
-        describeApprovalAction(selectedPending.request.action),
-        <Box flexDirection="column">
+      <Box marginTop={1} flexDirection="column">
+        <Box flexWrap="wrap">
+          <Text color="cyan">[selection]</Text>
+          <Text> </Text>
+          <Text dimColor>{describeApprovalAction(selectedPending.request.action)}</Text>
+        </Box>
+        {hasDiffStats ? (
           <Box flexWrap="wrap">
             {renderCompactApprovalMetric("Changes", `${diffStats.additions + diffStats.deletions}`)}
             {renderCompactApprovalMetric(`+${diffStats.additions} lines`, "added", {
@@ -2934,85 +3192,86 @@ const renderCompactApprovalPanel = (
               valueBackground: APPROVAL_DIFF_REMOVE_BACKGROUND,
             })}
           </Box>
-          <Box flexDirection="column" marginTop={1}>
-            {renderCompactApprovalSummaryRow("Path", selectedPending.request.path, "white")}
-            {"destination" in selectedPending.request ? (
-              renderCompactApprovalSummaryRow(
-                "Destination",
-                selectedPending.request.destination,
-                "cyan"
-              )
-            ) : null}
-            {isCommandSummaryRequest(selectedPending.request) ? (
-              <>
-                {isShellSummaryRequest(selectedPending.request)
-                  ? renderCompactApprovalSummaryRow("Shell", "platform default", "red")
-                  : null}
-                {"command" in selectedPending.request
-                  ? renderCompactApprovalSummaryRow(
-                      "Command",
-                      selectedPending.request.command,
-                      "yellow"
-                    )
-                  : null}
-                {"input" in selectedPending.request
-                  ? renderCompactApprovalSummaryRow(
-                      "Input",
-                      selectedPending.request.input,
-                      "yellow"
-                    )
-                  : null}
-                {"args" in selectedPending.request &&
-                selectedPending.request.args.length > 0
-                  ? renderCompactApprovalSummaryRow(
-                      "Args",
-                      selectedPending.request.args.join(" "),
-                      "white"
-                    )
-                  : null}
-                {renderCompactApprovalSummaryRow(
-                  "Cwd",
-                  getApprovalRequestCwd(selectedPending.request),
-                  "magenta"
-                )}
-              </>
-            ) : null}
-            {renderCompactApprovalSummaryRow(
-              "Preview mode",
-              approvalPanel.previewMode,
+        ) : null}
+        <Box flexDirection="column" marginTop={hasDiffStats ? 1 : 0}>
+          {renderCompactApprovalSummaryRow("Path", selectedPending.request.path, "white")}
+          {"destination" in selectedPending.request ? (
+            renderCompactApprovalSummaryRow(
+              "Destination",
+              selectedPending.request.destination,
               "cyan"
-            )}
-            {renderCompactApprovalSummaryRow(
-              "State",
-              approvalState,
-              selectedBlocked ? "red" : selectedInFlight ? "yellow" : "green"
-            )}
-          </Box>
-        </Box>,
-        tone.border
-      )}
+            )
+          ) : null}
+          {isCommandSummaryRequest(selectedPending.request) ? (
+            <>
+              {isShellSummaryRequest(selectedPending.request)
+                ? renderCompactApprovalSummaryRow("Shell", "platform default", "red")
+                : null}
+              {"command" in selectedPending.request
+                ? renderCompactApprovalSummaryRow(
+                    "Command",
+                    selectedPending.request.command,
+                    "yellow"
+                  )
+                : null}
+              {"input" in selectedPending.request
+                ? renderCompactApprovalSummaryRow(
+                    "Input",
+                    selectedPending.request.input,
+                    "yellow"
+                  )
+                : null}
+              {"args" in selectedPending.request &&
+              selectedPending.request.args.length > 0
+                ? renderCompactApprovalSummaryRow(
+                    "Args",
+                    selectedPending.request.args.join(" "),
+                    "white"
+                  )
+                : null}
+              {renderCompactApprovalSummaryRow(
+                "Cwd",
+                getApprovalRequestCwd(selectedPending.request),
+                "magenta"
+              )}
+            </>
+          ) : null}
+          {renderCompactApprovalSummaryRow(
+            "Preview mode",
+            approvalPanel.previewMode,
+            "cyan"
+          )}
+          {renderCompactApprovalSummaryRow(
+            "State",
+            approvalState,
+            selectedBlocked ? "red" : selectedInFlight ? "yellow" : "green"
+          )}
+        </Box>
+      </Box>
 
-      {renderCompactApprovalSection(
-        getApprovalPreviewHeading(selectedPending.request.action),
-        `${previewWindow.safeOffset + 1}-${Math.min(
-          previewWindow.safeOffset + previewWindow.pageLines.length,
-          previewWindow.totalLines
-        )}/${previewWindow.totalLines}`,
-        <Box flexDirection="column">
-        {previewWindow.pageLines.map((line, index) =>
-          renderCompactApprovalLine(
-            line,
+      <Box marginTop={1} flexDirection="column">
+        <Box flexWrap="wrap">
+          <Text color="cyan">[preview]</Text>
+          <Text> </Text>
+          <Text bold color="white">
+            {getApprovalPreviewHeading(selectedPending.request.action)}
+          </Text>
+          <Text dimColor>{`  ${previewRangeLabel}`}</Text>
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          {previewWindow.pageLines.map((line, index) =>
+            renderCompactApprovalLine(
+              line,
               index,
               selectedPending.request.action,
               diffGutterWidth
             )
           )}
-        </Box>,
-        "gray"
-      )}
+        </Box>
+      </Box>
 
       <Text dimColor>
-        Up/Down: select  Tab: summary/full  j/k or PgUp/PgDn: scroll  a: approve/retry  r/d: reject  Esc: close
+        Tab: preview  |  a: approve/retry  |  r/d: reject  |  j/k or PgUp/PgDn: scroll  |  Esc: close
       </Text>
     </Box>
   );
@@ -3102,7 +3361,9 @@ export const ChatScreen = ({
           : "idle";
 
   const showStartupView =
-    !liveAssistantText && items.every(item => item.role === "system" && item.kind === "system_hint");
+    activePanel === "idle" &&
+    !liveAssistantText &&
+    items.every(item => item.role === "system" && item.kind === "system_hint");
   const transcriptWindow = React.useMemo(
     () => (showStartupView ? getTranscriptWindow([]) : getTranscriptWindow(items)),
     [items, showStartupView]
@@ -3138,16 +3399,12 @@ export const ChatScreen = ({
   const spinner = shouldAnimateStreaming
     ? SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length] || STREAMING_IDLE_GLYPH
     : STREAMING_IDLE_GLYPH;
-  const topSuggestions = inputCommandState.suggestions.slice(0, 3);
-  const suggestionSummary = topSuggestions
-    .map(suggestion => `${suggestion.command} ${suggestion.description}`)
-    .join("  ·  ");
   const pendingSummary = pendingReviews[approvalPanel.selectedIndex]
     ? `${pendingReviews[approvalPanel.selectedIndex]?.request.action}  |  ${pendingReviews[approvalPanel.selectedIndex]?.request.path}`
     : "no active review";
-  const shellHeaderNode = React.useMemo(
+  const statusLineNode = React.useMemo(
     () =>
-      renderShellHeader(
+      renderStatusLine(
         status,
         activeSessionId,
         currentModel,
@@ -3178,10 +3435,9 @@ export const ChatScreen = ({
         inputCursorOffset,
         onInputChange,
         onSubmit,
-        isPanelActive,
+        activePanel,
         showStartupView,
-        inputCommandState,
-        suggestionSummary
+        inputCommandState
       ),
     [
       input,
@@ -3192,30 +3448,14 @@ export const ChatScreen = ({
       onSubmit,
       showStartupView,
       status,
-      suggestionSummary,
     ]
   );
 
-  if (approvalModeActive) {
-    return (
-      <Box flexDirection="column">
-        {renderCompactApprovalPanel(
-          pendingReviews,
-          approvalPanel,
-          currentModel,
-          activeSessionId,
-          appRoot
-        )}
-      </Box>
-    );
-  }
-
   return (
     <Box flexDirection="column">
-      {shellHeaderNode}
       <Box marginBottom={SECTION_GAP} flexDirection="column">
         {showStartupView
-          ? renderStartupView(currentModel, currentProvider, activeSessionId, authStatus)
+          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
           : null}
         {showTranscriptWindowNotice ? (
           <Text dimColor>
@@ -3329,7 +3569,7 @@ export const ChatScreen = ({
           "Up/Down: select  Left/Right: page  Enter: switch  Esc: close"
         )}
 
-      {pendingReviews.length > 0 && (
+      {pendingReviews.length > 0 && !approvalPanel.active && (
         <Text color="yellow" dimColor>
           {`review ${pendingReviews.length} pending  |  ${pendingSummary}`}
         </Text>
@@ -3346,6 +3586,7 @@ export const ChatScreen = ({
         : null}
 
       {composerNode}
+      {statusLineNode}
     </Box>
   );
 };

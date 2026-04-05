@@ -30,7 +30,11 @@ import type {
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
 import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
-import type { MpcAction, PendingReviewItem } from "../../core/tools/mcp/types";
+import type {
+  MpcAction,
+  PendingReviewItem,
+  ToolRequest,
+} from "../../core/tools/mcp/types";
 import { createApprovalActionLock } from "./approvalActionLock";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import { useInputAdapter } from "./inputAdapter";
@@ -164,12 +168,46 @@ type CommandSpec = {
   description: string;
 };
 
+type InputMode = "idle" | "command" | "file" | "shell";
+
+type FileMentionSuggestion = {
+  path: string;
+  description: string;
+};
+
+type FileMentionState = {
+  references: string[];
+  activeQuery: string | null;
+  suggestions: FileMentionSuggestion[];
+  loading: boolean;
+};
+
+type ShellShortcutAction =
+  | "run_shell"
+  | "open_shell"
+  | "read_shell"
+  | "shell_status"
+  | "interrupt_shell"
+  | "close_shell";
+
+type ShellShortcutState = {
+  active: boolean;
+  action: ShellShortcutAction | null;
+  command: string;
+  actionLabel: string;
+  description: string;
+};
+
 type InputCommandState = {
   active: boolean;
+  mode: InputMode;
   currentCommand: string | null;
   suggestions: CommandSpec[];
+  selectedIndex: number;
   historyPosition: number | null;
   historySize: number;
+  shellShortcut: ShellShortcutState;
+  fileMentions: FileMentionState;
 };
 
 type RuntimeUsageSummary = {
@@ -281,6 +319,227 @@ const getSlashSuggestions = (rawInput: string) => {
     });
 
   return matches.slice(0, 6);
+};
+
+const getSlashInsertValue = (command: string) => {
+  switch (command) {
+    case "/provider <url>":
+      return "/provider ";
+    case "/model <name>":
+      return "/model ";
+    case "/system <text>":
+      return "/system ";
+    case "/resume <id>":
+      return "/resume ";
+    case "/search-session <query>":
+      return "/search-session ";
+    case "/search-session #<tag> [query]":
+      return "/search-session #";
+    case "/tag add <tag>":
+      return "/tag add ";
+    case "/tag remove <tag>":
+      return "/tag remove ";
+    case "/pin <note>":
+      return "/pin ";
+    case "/unpin <index>":
+      return "/unpin ";
+    case "/review <id>":
+      return "/review ";
+    case "/approve [id]":
+      return "/approve ";
+    case "/reject [id]":
+      return "/reject ";
+    default:
+      return command;
+  }
+};
+
+type ActiveFileMention = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+const FILE_MENTION_REGEX = /(^|\s)@([^\s@]*)/g;
+
+const getActiveFileMention = (
+  rawInput: string,
+  cursorOffset: number
+): ActiveFileMention | null => {
+  const clampedOffset = clampCursorOffset(rawInput, cursorOffset);
+  const beforeCursor = rawInput.slice(0, clampedOffset);
+  const match = beforeCursor.match(/(?:^|\s)@([^\s@]*)$/);
+  if (!match) {
+    return null;
+  }
+
+  const query = match[1] ?? "";
+  const start = beforeCursor.length - query.length - 1;
+  return {
+    start,
+    end: clampedOffset,
+    query,
+  };
+};
+
+const getFileMentionReferences = (rawInput: string) => {
+  const references: string[] = [];
+  let match: RegExpExecArray | null = null;
+  const pattern = new RegExp(FILE_MENTION_REGEX);
+  while ((match = pattern.exec(rawInput)) !== null) {
+    const reference = (match[2] ?? "").trim();
+    if (!reference) {
+      continue;
+    }
+    if (!references.includes(reference)) {
+      references.push(reference);
+    }
+  }
+  return references;
+};
+
+const buildFileSearchPattern = (query: string) =>
+  `*${query.replace(/\s+/g, "*")}*`;
+
+const buildFileSuggestionDescription = (path: string) => {
+  const normalized = path.replace(/\\/g, "/");
+  const slashIndex = normalized.lastIndexOf("/");
+  if (slashIndex <= 0) {
+    return "workspace root";
+  }
+  return normalized.slice(0, slashIndex);
+};
+
+const parseFindFilesSuggestions = (raw: string): FileMentionSuggestion[] => {
+  const body = raw.split("\n").slice(1);
+  const paths = body
+    .map(line => line.trim())
+    .filter(
+      line =>
+        Boolean(line) &&
+        !line.startsWith("Found ") &&
+        !line.startsWith("note:") &&
+        !line.startsWith("(no matches")
+    );
+
+  return paths.slice(0, 6).map(path => ({
+    path,
+    description: buildFileSuggestionDescription(path),
+  }));
+};
+
+type ParsedShellShortcut = {
+  active: boolean;
+  request: ToolRequest | null;
+  action: ShellShortcutAction | null;
+  command: string;
+  actionLabel: string;
+  description: string;
+};
+
+const parseShellShortcut = (rawInput: string): ParsedShellShortcut => {
+  const trimmed = rawInput.trim();
+  if (!trimmed.startsWith("!shell")) {
+    return {
+      active: false,
+      request: null,
+      action: null,
+      command: "",
+      actionLabel: "",
+      description: "",
+    };
+  }
+
+  const remainder = trimmed.slice("!shell".length).trim();
+  if (!remainder) {
+    return {
+      active: true,
+      request: null,
+      action: null,
+      command: "",
+      actionLabel: "!shell",
+      description:
+        "Run a safe shell command, or use open/read/status/interrupt/close.",
+    };
+  }
+
+  const [subcommandRaw = "", ...rest] = remainder.split(/\s+/);
+  const subcommand = subcommandRaw.toLowerCase();
+  const tail = rest.join(" ").trim();
+
+  if (subcommand === "open") {
+    return {
+      active: true,
+      request: {
+        action: "open_shell",
+        path: ".",
+        ...(tail ? { cwd: tail } : {}),
+      },
+      action: "open_shell",
+      command: tail || ".",
+      actionLabel: "open_shell",
+      description: tail
+        ? `Open a persistent shell session in ${tail}.`
+        : "Open a persistent shell session in the workspace root.",
+    };
+  }
+
+  if (subcommand === "read") {
+    return {
+      active: true,
+      request: { action: "read_shell", path: "." },
+      action: "read_shell",
+      command: "read",
+      actionLabel: "read_shell",
+      description: "Read buffered output from the persistent shell session.",
+    };
+  }
+
+  if (subcommand === "status") {
+    return {
+      active: true,
+      request: { action: "shell_status", path: "." },
+      action: "shell_status",
+      command: "status",
+      actionLabel: "shell_status",
+      description: "Inspect persistent shell status, cwd, and pending output.",
+    };
+  }
+
+  if (subcommand === "interrupt") {
+    return {
+      active: true,
+      request: { action: "interrupt_shell", path: "." },
+      action: "interrupt_shell",
+      command: "interrupt",
+      actionLabel: "interrupt_shell",
+      description: "Interrupt the currently running persistent shell command.",
+    };
+  }
+
+  if (subcommand === "close") {
+    return {
+      active: true,
+      request: { action: "close_shell", path: "." },
+      action: "close_shell",
+      command: "close",
+      actionLabel: "close_shell",
+      description: "Close the persistent shell session and discard its state.",
+    };
+  }
+
+  return {
+    active: true,
+    request: {
+      action: "run_shell",
+      path: ".",
+      command: remainder,
+    },
+    action: "run_shell",
+    command: remainder,
+    actionLabel: "run_shell",
+    description: "Run a one-shot shell command through the review lane.",
+  };
 };
 
 const isLikelyLegacyCompressedMarkdown = (text: string) => {
@@ -602,6 +861,17 @@ export const useChatApp = ({
     saving: false,
     persistenceTarget: auth?.status.persistenceTarget ?? null,
   });
+  const [commandSuggestionIndex, setCommandSuggestionIndex] = useState(0);
+  const [fileSuggestionIndex, setFileSuggestionIndex] = useState(0);
+  const [fileMentionLookup, setFileMentionLookup] = useState<{
+    activeQuery: string | null;
+    suggestions: FileMentionSuggestion[];
+    loading: boolean;
+  }>({
+    activeQuery: null,
+    suggestions: [],
+    loading: false,
+  });
 
   const queueRef = useRef(Promise.resolve());
   const approvalActionRef = useRef(createApprovalActionLock());
@@ -612,6 +882,7 @@ export const useChatApp = ({
   const approvalPanelRef = useRef(approvalPanel);
   const authPanelRef = useRef(authPanel);
   const authRef = useRef(auth);
+  const mcpServiceRef = useRef(mcpService);
   const pendingReviewsRef = useRef(pendingReviews);
   const dismissedApprovalQueueSignatureRef = useRef<string | null>(null);
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
@@ -645,6 +916,7 @@ export const useChatApp = ({
   approvalPanelRef.current = approvalPanel;
   authPanelRef.current = authPanel;
   authRef.current = auth;
+  mcpServiceRef.current = mcpService;
   pendingReviewsRef.current = pendingReviews;
   inputHistoryRef.current = inputHistory;
   historyCursorRef.current = historyCursor;
@@ -699,6 +971,114 @@ export const useChatApp = ({
     authOnboardingHandledRef.current = true;
     openAuthPanel("auto_onboarding");
   }, [auth, items, liveAssistantText, status]);
+
+  const commandQuery = input.trimStart();
+  const commandModeActive = commandQuery.startsWith("/");
+  const slashSuggestions = useMemo(() => getSlashSuggestions(input), [input]);
+  const activeFileMention = useMemo(
+    () => getActiveFileMention(input, inputCursorOffset),
+    [input, inputCursorOffset]
+  );
+  const fileMentionReferences = useMemo(() => getFileMentionReferences(input), [input]);
+  const shellShortcutPreview = useMemo(() => parseShellShortcut(input), [input]);
+  const commandSelectedIndex =
+    slashSuggestions.length > 0
+      ? Math.min(commandSuggestionIndex, slashSuggestions.length - 1)
+      : 0;
+  const fileSelectedIndex =
+    fileMentionLookup.suggestions.length > 0
+      ? Math.min(fileSuggestionIndex, fileMentionLookup.suggestions.length - 1)
+      : 0;
+
+  useEffect(() => {
+    setCommandSuggestionIndex(0);
+  }, [commandQuery]);
+
+  useEffect(() => {
+    setFileSuggestionIndex(0);
+  }, [activeFileMention?.query]);
+
+  useEffect(() => {
+    if (shellShortcutPreview.active) {
+      setFileMentionLookup(previous =>
+        previous.activeQuery === null &&
+        previous.suggestions.length === 0 &&
+        !previous.loading
+          ? previous
+          : {
+              activeQuery: null,
+              suggestions: [],
+              loading: false,
+            }
+      );
+      return;
+    }
+
+    if (!activeFileMention) {
+      setFileMentionLookup(previous =>
+        previous.activeQuery === null &&
+        previous.suggestions.length === 0 &&
+        !previous.loading
+          ? previous
+          : {
+              activeQuery: null,
+              suggestions: [],
+              loading: false,
+            }
+      );
+      return;
+    }
+
+    const query = activeFileMention.query.trim();
+    if (!query) {
+      setFileMentionLookup({
+        activeQuery: "",
+        suggestions: [],
+        loading: false,
+      });
+      return;
+    }
+
+    let cancelled = false;
+    setFileMentionLookup(previous => ({
+      activeQuery: query,
+      suggestions:
+        previous.activeQuery === query ? previous.suggestions : [],
+      loading: true,
+    }));
+
+    void mcpServiceRef.current
+      .handleToolCall("file", {
+        action: "find_files",
+        path: ".",
+        pattern: buildFileSearchPattern(query),
+        maxResults: 6,
+      })
+      .then(result => {
+        if (cancelled) {
+          return;
+        }
+        setFileMentionLookup({
+          activeQuery: query,
+          suggestions: result.ok ? parseFindFilesSuggestions(result.message) : [],
+          loading: false,
+        });
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setFileMentionLookup({
+          activeQuery: query,
+          suggestions: [],
+          loading: false,
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFileMention, shellShortcutPreview.active]);
 
   const updateCurrentModelState = (model: string) => {
     setCurrentModel(model);
@@ -896,6 +1276,83 @@ export const useChatApp = ({
     setInput(nextValue);
     setInputCursorOffset(nextValue.length);
     preferredInputColumnRef.current = null;
+  };
+
+  const replaceInputRange = (start: number, end: number, nextText: string) => {
+    const safeStart = Math.max(0, Math.min(start, input.length));
+    const safeEnd = Math.max(safeStart, Math.min(end, input.length));
+    const nextValue =
+      input.slice(0, safeStart) + nextText + input.slice(safeEnd);
+    commitEditorState({
+      value: nextValue,
+      cursorOffset: safeStart + nextText.length,
+    });
+  };
+
+  const applySlashSuggestion = (suggestion: CommandSpec | undefined) => {
+    if (!suggestion) {
+      return;
+    }
+    const nextValue = getSlashInsertValue(suggestion.command);
+    commitEditorState({
+      value: nextValue,
+      cursorOffset: nextValue.length,
+    });
+  };
+
+  const applyFileMentionSuggestion = (
+    suggestion: FileMentionSuggestion | undefined
+  ) => {
+    if (!suggestion || !activeFileMention) {
+      return;
+    }
+
+    const replacement = `@${suggestion.path}`;
+    const suffix = input.slice(activeFileMention.end);
+    const trailingSpace =
+      suffix.length === 0 || !/^\s/.test(suffix) ? " " : "";
+
+    replaceInputRange(
+      activeFileMention.start,
+      activeFileMention.end,
+      `${replacement}${trailingSpace}`
+    );
+  };
+
+  const executeDirectToolRequest = (request: ToolRequest) => {
+    enqueueTask(async () => {
+      const result = await mcpService.handleToolCall("file", request);
+      if (result.pending) {
+        const reviewMode = isHighRiskReviewAction(result.pending.request.action)
+          ? "block"
+          : "queue";
+        pushSystemMessage(
+          `Approval required | ${result.pending.request.action} ${result.pending.request.path} | ${result.pending.id} | panel opened`,
+          {
+            kind: "review_status",
+            tone: reviewMode === "block" ? "warning" : "info",
+            color: reviewMode === "block" ? "red" : "yellow",
+          }
+        );
+        openApprovalPanel(mcpService.listPending(), {
+          focusLatest: true,
+          previewMode: "summary",
+        });
+        return;
+      }
+
+      const summarized = summarizeToolMessage(result.message);
+      pushSystemMessage(summarized.text, {
+        kind: summarized.kind,
+        tone: summarized.tone,
+        color: summarized.color,
+      });
+      await recordSessionMemory(getMemorySessionId(), {
+        kind: result.ok ? "tool_result" : "error",
+        text: summarized.text,
+        priority: result.ok ? 72 : 88,
+      });
+    });
   };
 
   const pushSystemMessage = (
@@ -2978,7 +3435,45 @@ export const useChatApp = ({
     }
 
     if (!approvalPanelRef.current.active) {
+      if (key.tab) {
+        if (
+          !shellShortcutPreview.active &&
+          activeFileMention &&
+          fileMentionLookup.suggestions.length > 0
+        ) {
+          applyFileMentionSuggestion(
+            fileMentionLookup.suggestions[fileSelectedIndex]
+          );
+          return;
+        }
+
+        if (commandModeActive && slashSuggestions.length > 0) {
+          applySlashSuggestion(slashSuggestions[commandSelectedIndex]);
+          return;
+        }
+      }
+
       if (key.upArrow) {
+        if (
+          !shellShortcutPreview.active &&
+          activeFileMention &&
+          fileMentionLookup.suggestions.length > 0
+        ) {
+          setFileSuggestionIndex(previous =>
+            cycleSelection(
+              previous,
+              fileMentionLookup.suggestions.length,
+              "up"
+            )
+          );
+          return;
+        }
+        if (commandModeActive && slashSuggestions.length > 0) {
+          setCommandSuggestionIndex(previous =>
+            cycleSelection(previous, slashSuggestions.length, "up")
+          );
+          return;
+        }
         if (!input) {
           recallInputHistory("up");
           return;
@@ -2998,6 +3493,26 @@ export const useChatApp = ({
       }
 
       if (key.downArrow) {
+        if (
+          !shellShortcutPreview.active &&
+          activeFileMention &&
+          fileMentionLookup.suggestions.length > 0
+        ) {
+          setFileSuggestionIndex(previous =>
+            cycleSelection(
+              previous,
+              fileMentionLookup.suggestions.length,
+              "down"
+            )
+          );
+          return;
+        }
+        if (commandModeActive && slashSuggestions.length > 0) {
+          setCommandSuggestionIndex(previous =>
+            cycleSelection(previous, slashSuggestions.length, "down")
+          );
+          return;
+        }
         if (!input) {
           recallInputHistory("down");
           return;
@@ -3249,6 +3764,25 @@ export const useChatApp = ({
     }
 
     pushInputHistory(rawInput);
+
+    if (shellShortcutPreview.active) {
+      if (!shellShortcutPreview.request) {
+        pushSystemMessage(
+          "Usage: !shell <command> | !shell open [cwd] | !shell read | !shell status | !shell interrupt | !shell close",
+          {
+            kind: "system_hint",
+            tone: "warning",
+            color: "yellow",
+          }
+        );
+        clearInput();
+        return;
+      }
+
+      executeDirectToolRequest(shellShortcutPreview.request);
+      clearInput();
+      return;
+    }
 
     if (query === "/help") {
       setItems(previous => [
@@ -4312,18 +4846,56 @@ export const useChatApp = ({
   };
 
   const inputCommandState: InputCommandState = useMemo(() => {
-    const suggestions = getSlashSuggestions(input);
+    const mode: InputMode = shellShortcutPreview.active
+      ? "shell"
+      : activeFileMention
+        ? "file"
+        : commandModeActive
+          ? "command"
+          : "idle";
+
     return {
-      active: suggestions.length > 0,
-      currentCommand: suggestions[0]?.command ?? null,
-      suggestions,
+      active: mode === "command",
+      mode,
+      currentCommand:
+        mode === "command"
+          ? slashSuggestions[commandSelectedIndex]?.command ??
+            commandQuery.split(/\s+/, 2).join(" ")
+          : null,
+      suggestions: slashSuggestions,
+      selectedIndex:
+        mode === "file"
+          ? fileSelectedIndex
+          : mode === "command"
+            ? commandSelectedIndex
+            : 0,
       historyPosition:
         historyCursor >= 0 && inputHistory.length > 0
           ? historyCursor + 1
           : null,
       historySize: inputHistory.length,
+      shellShortcut: shellShortcutPreview,
+      fileMentions: {
+        references: fileMentionReferences,
+        activeQuery: activeFileMention?.query ?? null,
+        suggestions: fileMentionLookup.suggestions,
+        loading: fileMentionLookup.loading,
+      },
     };
-  }, [historyCursor, input, inputHistory.length]);
+  }, [
+    activeFileMention,
+    commandModeActive,
+    commandQuery,
+    commandSelectedIndex,
+    fileMentionLookup.loading,
+    fileMentionLookup.suggestions,
+    fileMentionReferences,
+    fileSelectedIndex,
+    historyCursor,
+    inputHistory.length,
+    shellShortcutPreview,
+    slashSuggestions,
+  ]);
 
   return {
     input,

@@ -814,6 +814,162 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
+  test("slash palette supports arrow navigation and tab autocomplete", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("/mo");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCommandState.mode).toBe("command");
+    expect(app.getLatest().inputCommandState.currentCommand).toBe("/model refresh");
+
+    await act(async () => {
+      inputHandler?.("", { downArrow: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCommandState.selectedIndex).toBe(1);
+    expect(app.getLatest().inputCommandState.currentCommand).toBe("/model <name>");
+
+    await act(async () => {
+      inputHandler?.("", { tab: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().input).toBe("/model ");
+    app.cleanup();
+  });
+
+  test("!shell submits direct shell requests without starting a query session", async () => {
+    const pending: PendingReviewItem = {
+      id: "shell-1",
+      request: {
+        action: "run_shell",
+        path: ".",
+        command: "bun test",
+      },
+      preview: "preview",
+      previewSummary: "summary",
+      previewFull: "full",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const handleToolCall = mock(async (_toolName: string, request: unknown) => ({
+      ok: true,
+      pending,
+      message: "[review required] shell-1",
+    }));
+    const runQuerySessionImpl = mock(async () => ({ status: "completed" as const }));
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [pending],
+          handleToolCall,
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "!shell bun test");
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "run_shell",
+      path: ".",
+      command: "bun test",
+    });
+    expect(runQuerySessionImpl).not.toHaveBeenCalled();
+    expect(app.getLatest().approvalPanel.active).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Approval required | run_shell . | shell-1 | panel opened")
+      )
+    ).toBe(true);
+    app.cleanup();
+  });
+
+  test("@file suggestions resolve via find_files and tab inserts the selected mention", async () => {
+    const handleToolCall = mock(async (_toolName: string, request: unknown) => ({
+      ok: true,
+      message: [
+        "[tool result] find_files .",
+        "Found 2 file(s):",
+        "src/frontend/components/ChatScreen.tsx",
+        "tests/ChatScreen.test.tsx",
+      ].join("\n"),
+    }));
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall,
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("@chat");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCommandState.mode).toBe("file");
+    expect(app.getLatest().inputCommandState.fileMentions.activeQuery).toBe("chat");
+    expect(app.getLatest().inputCommandState.fileMentions.suggestions[0]?.path).toBe(
+      "src/frontend/components/ChatScreen.tsx"
+    );
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "find_files",
+      path: ".",
+      pattern: "*chat*",
+      maxResults: 6,
+    });
+
+    await act(async () => {
+      inputHandler?.("", { downArrow: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().inputCommandState.selectedIndex).toBe(1);
+
+    await act(async () => {
+      inputHandler?.("", { tab: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().input).toBe("@tests/ChatScreen.test.tsx ");
+    app.cleanup();
+  });
+
   test("/model opens picker and /model <name> switches model", async () => {
     const transport = createTestTransport();
     const app = renderHookHarness(() =>

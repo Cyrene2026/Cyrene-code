@@ -29,6 +29,7 @@ render(
     defaultSystemPrompt={promptPolicy.systemPrompt}
     projectPrompt={promptPolicy.projectPrompt}
     pinMaxCount={cyreneConfig.pinMaxCount}
+    autoSummaryRefresh={cyreneConfig.autoSummaryRefresh}
     queryMaxToolSteps={cyreneConfig.queryMaxToolSteps}
     mcpService={mcpService}
     appRoot={appRoot}

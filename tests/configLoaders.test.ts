@@ -34,6 +34,7 @@ describe("config loaders", () => {
     const root = await createWorkspace([
       "pin_max_count: 9",
       "query_max_tool_steps: 31",
+      "auto_summary_refresh: false",
       'system_prompt: "focus on tests"',
     ].join("\n"));
 
@@ -41,6 +42,7 @@ describe("config loaders", () => {
 
     expect(config.pinMaxCount).toBe(9);
     expect(config.queryMaxToolSteps).toBe(31);
+    expect(config.autoSummaryRefresh).toBe(false);
     expect(config.systemPrompt).toBe("focus on tests");
   });
 
@@ -51,6 +53,7 @@ describe("config loaders", () => {
     const config = await loadCyreneConfig(root);
 
     expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
+    expect(config.autoSummaryRefresh).toBe(true);
   });
 
   test("loadRuleConfig falls back to config.yaml for MCP review settings", async () => {
@@ -136,6 +139,7 @@ describe("config loaders", () => {
 
     expect(cyreneConfig.pinMaxCount).toBe(11);
     expect(cyreneConfig.queryMaxToolSteps).toBe(42);
+    expect(cyreneConfig.autoSummaryRefresh).toBe(true);
     expect(ruleConfig.workspaceRoot).toBe(join(root, "workspace"));
     expect(ruleConfig.requireReview).toEqual(["run_shell"]);
   });

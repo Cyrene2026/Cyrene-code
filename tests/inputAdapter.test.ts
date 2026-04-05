@@ -155,4 +155,96 @@ describe("inputAdapter", () => {
       })
     ).toBe(true);
   });
+
+  test("raw stdin dispatch leaves ordinary navigation keys to ink to avoid duplicate edits", () => {
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "",
+        key: {
+          upArrow: true,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(false);
+
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: true,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(false);
+  });
+
+  test("raw stdin dispatch keeps backspace/delete available as a platform fallback", () => {
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: true,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(true);
+
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: false,
+          escape: false,
+          ctrl: false,
+          shift: false,
+          tab: false,
+          backspace: false,
+          delete: true,
+          meta: false,
+        },
+      })
+    ).toBe(true);
+  });
 });

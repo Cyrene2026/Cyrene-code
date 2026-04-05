@@ -218,6 +218,93 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("/state shows reducer diagnostics without creating a session", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/state");
+
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Reducer state:\nauto summary refresh: enabled")
+      )
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("note: no active session loaded yet.")
+      )
+    ).toBe(true);
+    expect(app.getLatest().activeSessionId).toBeNull();
+    app.cleanup();
+  });
+
+  test("/state reports summary and pendingDigest diagnostics for the active session", async () => {
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        summary: "OBJECTIVE:\n- ship reducer wiring",
+        pendingDigest: "COMPLETED:\n- added digest tracking",
+        lastStateUpdate: {
+          code: "applied",
+          message: "State update applied in merge_and_digest.",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          reducerMode: "merge_and_digest",
+          summaryLength: 33,
+          pendingDigestLength: 35,
+        },
+        messages: [
+          {
+            role: "user",
+            text: "resume this",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "/state");
+
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("session: session-a"))
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("last state update: applied / merge_and_digest")
+      )
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("pending digest chars:")
+      )
+    ).toBe(true);
+    app.cleanup();
+  });
+
   test("/undo calls mcp undo and appends returned message", async () => {
     const undoLastMutation = mock(async () => ({
       ok: true,
@@ -602,6 +689,75 @@ describe("useChatApp", () => {
     expect(app.getLatest().currentModel).toBe("gpt-placeholder");
     await flushMicrotasks();
     expect(app.getLatest().currentModel).toBe("gpt-from-yaml");
+    app.cleanup();
+  });
+
+  test("normal query submit ignores duplicate immediate submit", async () => {
+    const runQuerySessionImpl = mock(async ({ onState }: any) => {
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("same request");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      app.getLatest().submit();
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+    expect(
+      getTexts(app.getLatest().items).filter(text => text === "same request")
+    ).toHaveLength(1);
+    app.cleanup();
+  });
+
+  test("slash-prefixed unknown input is intercepted as a command error", async () => {
+    const runQuerySessionImpl = mock(async () => ({ status: "completed" as const }));
+    const sessionStore = createTestSessionStore();
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/你好");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).not.toHaveBeenCalled();
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Unknown command: /你好")
+      )
+    ).toBe(true);
+    expect(sessionStore.__listRecords()).toHaveLength(0);
     app.cleanup();
   });
 
@@ -1761,7 +1917,7 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
-  test("records missing_tag when a completed reply has no hidden reducer block", async () => {
+  test("records missing_tag and stores a local fallback pendingDigest when a completed reply has no hidden reducer block", async () => {
     const sessionStore = createTestSessionStore();
     const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
       onState({ status: "streaming" });
@@ -1788,11 +1944,78 @@ describe("useChatApp", () => {
 
     const stored = sessionStore.__getRecord("session-1");
     expect(stored?.summary).toBe("");
-    expect(stored?.pendingDigest).toBe("");
+    expect(stored?.pendingDigest).toContain("OBJECTIVE:");
+    expect(stored?.pendingDigest).toContain("- inspect the project");
+    expect(stored?.pendingDigest).toContain("CONFIRMED FACTS:");
+    expect(stored?.pendingDigest).toContain("- plain visible answer only");
     expect(stored?.lastStateUpdate?.code).toBe("missing_tag");
     expect(stored?.lastStateUpdate?.message).toContain(
       "without a <cyrene_state_update> block"
     );
+    expect(stored?.lastStateUpdate?.message).toContain(
+      "Applied local fallback pending digest"
+    );
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(0);
+    app.cleanup();
+  });
+
+  test("missing_tag with a prior pending digest locally advances summary and replaces pendingDigest", async () => {
+    const previousPendingDigest = [
+      "OBJECTIVE:",
+      "- continue oauth work",
+      "",
+      "CONFIRMED FACTS:",
+      "- api behavior confirmed",
+      "",
+      "REMAINING:",
+      "- verify approval flow",
+    ].join("\n");
+    const sessionStore = createTestSessionStore([
+      createSessionRecord("session-a", {
+        pendingDigest: previousPendingDigest,
+      }),
+    ]);
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("current turn answer only");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+    await runCommand(app, "finish the oauth task");
+    await flushMicrotasks();
+
+    const stored = sessionStore.__getRecord("session-a");
+    expect(stored?.summary).toContain("OBJECTIVE:");
+    expect(stored?.summary).toContain("- continue oauth work");
+    expect(stored?.summary).toContain("CONFIRMED FACTS:");
+    expect(stored?.summary).toContain("- api behavior confirmed");
+    expect(stored?.summary).toContain("REMAINING:");
+    expect(stored?.summary).toContain("- verify approval flow");
+    expect(stored?.pendingDigest).toContain("OBJECTIVE:");
+    expect(stored?.pendingDigest).toContain("- finish the oauth task");
+    expect(stored?.pendingDigest).toContain("CONFIRMED FACTS:");
+    expect(stored?.pendingDigest).toContain("- current turn answer only");
+    expect(stored?.pendingDigest).not.toBe(previousPendingDigest);
+    expect(stored?.lastStateUpdate?.code).toBe("missing_tag");
+    expect(stored?.lastStateUpdate?.message).toContain(
+      "Locally advanced durable summary"
+    );
+    expect(app.getLatest().exitSummary.stateUpdateCount).toBe(0);
     app.cleanup();
   });
 

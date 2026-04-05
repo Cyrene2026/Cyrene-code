@@ -13,6 +13,7 @@ type ChatCliAppProps = {
   defaultSystemPrompt: string;
   projectPrompt: string;
   pinMaxCount: number;
+  autoSummaryRefresh: boolean;
   queryMaxToolSteps?: number;
   mcpService: FileMcpService;
   appRoot: string;
@@ -24,6 +25,7 @@ export const ChatCliApp = ({
   defaultSystemPrompt,
   projectPrompt,
   pinMaxCount,
+  autoSummaryRefresh,
   queryMaxToolSteps,
   mcpService,
   appRoot,
@@ -67,7 +69,7 @@ export const ChatCliApp = ({
     pinMaxCount,
     queryMaxToolSteps,
     mcpService,
-    autoSummaryRefresh: true,
+    autoSummaryRefresh,
   });
 
   exitSnapshotRef.current = {

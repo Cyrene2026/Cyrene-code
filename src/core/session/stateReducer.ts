@@ -279,6 +279,155 @@ const trimTrailingPartialStateTag = (text: string) => {
   return text;
 };
 
+const collectFallbackDigestLines = (text: string) => {
+  const lines: string[] = [];
+  let inCodeFence = false;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (/^```/.test(trimmed)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) {
+      continue;
+    }
+
+    const normalized = trimmed
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/^>\s+/, "")
+      .replace(/^[-*+]\s+/, "")
+      .replace(/^\d+[.)]\s+/, "")
+      .trim();
+
+    if (
+      !normalized ||
+      normalized === "(none)" ||
+      /^[-_=]{3,}$/.test(normalized)
+    ) {
+      continue;
+    }
+
+    lines.push(normalized);
+    if (lines.length >= 12) {
+      break;
+    }
+  }
+
+  return lines;
+};
+
+export const buildFallbackPendingDigest = (params: {
+  userText: string;
+  assistantText: string;
+}) => {
+  const userText = normalizeLooseLine(params.userText);
+  const assistantLines = collectFallbackDigestLines(params.assistantText);
+  const sourceLines = [userText, ...assistantLines].filter(Boolean);
+
+  if (sourceLines.length === 0) {
+    return "";
+  }
+
+  const repaired = repairWorkingStateSummary(sourceLines.join("\n"), userText);
+  return renderSectionMap(parseStructuredStateText(repaired), {
+    pending: true,
+  });
+};
+
+const buildSummaryPatchFromStructuredText = (text: string) => {
+  const sectionMap = parseStructuredStateText(text);
+  const patch: Partial<
+    Record<WorkingStateSectionName, WorkingStatePatchOperation>
+  > = {};
+
+  for (const section of WORKING_STATE_SECTION_ORDER) {
+    const lines = sectionMap[section];
+    if (!lines.length) {
+      continue;
+    }
+
+    patch[section] =
+      section === "OBJECTIVE"
+        ? {
+            op: "replace",
+            set: lines,
+          }
+        : {
+            op: "merge",
+            add: lines,
+          };
+  }
+
+  return patch;
+};
+
+export const applyLocalFallbackStateUpdate = (params: {
+  durableSummary: string;
+  pendingDigest: string;
+  userText: string;
+  assistantText: string;
+}) => {
+  const normalizedSummary = params.durableSummary.trim()
+    ? renderSectionMap(parseStructuredStateText(params.durableSummary), {
+        preserveEmpty: true,
+      })
+    : "";
+  const normalizedPendingDigest = params.pendingDigest.trim()
+    ? renderSectionMap(parseStructuredStateText(params.pendingDigest), {
+        pending: true,
+      })
+    : "";
+  const fallbackPendingDigest = buildFallbackPendingDigest({
+    userText: params.userText,
+    assistantText: params.assistantText,
+  });
+
+  if (!normalizedPendingDigest) {
+    return {
+      summary: normalizedSummary,
+      pendingDigest: fallbackPendingDigest,
+      advancedSummary: false,
+      capturedPendingDigest: Boolean(fallbackPendingDigest.trim()),
+      updated: Boolean(fallbackPendingDigest.trim()),
+    };
+  }
+
+  if (!fallbackPendingDigest.trim()) {
+    return {
+      summary: normalizedSummary,
+      pendingDigest: normalizedPendingDigest,
+      advancedSummary: false,
+      capturedPendingDigest: false,
+      updated: false,
+    };
+  }
+
+  const applied = applyParsedStateUpdate({
+    durableSummary: normalizedSummary,
+    pendingDigest: "",
+    update: {
+      version: 1,
+      mode: normalizedSummary.trim()
+        ? "merge_and_digest"
+        : "full_rebuild_and_digest",
+      summaryPatch: buildSummaryPatchFromStructuredText(normalizedPendingDigest),
+      nextPendingDigest: parseStructuredStateText(fallbackPendingDigest),
+    },
+  });
+
+  return {
+    summary: applied.summary,
+    pendingDigest: applied.pendingDigest,
+    advancedSummary: Boolean(applied.summary.trim()),
+    capturedPendingDigest: Boolean(applied.pendingDigest.trim()),
+    updated: applied.updated,
+  };
+};
+
 export const deriveReducerMode = (params: {
   enabled: boolean;
   durableSummary: string;

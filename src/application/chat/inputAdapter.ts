@@ -29,6 +29,10 @@ type NormalizedInputEvent = {
   key: InputKeyState;
 };
 
+type DispatchableInputEvent = NormalizedInputEvent & {
+  source: "ink" | "raw";
+};
+
 const emptyKeyState = (): InputKeyState => ({
   upArrow: false,
   downArrow: false,
@@ -141,7 +145,11 @@ export const normalizeRawInputChunk = (
 };
 
 export const shouldDispatchRawInputEvent = (event: NormalizedInputEvent) => {
-  if (hasSpecialKey(event.key)) {
+  if (event.key.ctrl || event.key.meta) {
+    return true;
+  }
+
+  if (event.key.backspace || event.key.delete) {
     return true;
   }
 
@@ -149,7 +157,7 @@ export const shouldDispatchRawInputEvent = (event: NormalizedInputEvent) => {
     return false;
   }
 
-  return /[\r\n]/.test(event.input);
+  return /[\r\n]/.test(event.input) && event.input.length > 1;
 };
 
 export const useInputAdapter = (
@@ -162,13 +170,26 @@ export const useInputAdapter = (
   const lastEventRef = useRef<{ signature: string; timestamp: number } | null>(
     null
   );
+  const suppressInkPrintableUntilRef = useRef(0);
 
   handlerRef.current = handler;
 
   const dispatch = useMemo(
-    () => (event: NormalizedInputEvent) => {
-      const signature = buildSignature(event);
+    () => (event: DispatchableInputEvent) => {
       const now = Date.now();
+
+      if (
+        event.source === "ink" &&
+        now < suppressInkPrintableUntilRef.current &&
+        event.input &&
+        !hasSpecialKey(event.key) &&
+        !event.key.ctrl &&
+        !event.key.meta
+      ) {
+        return;
+      }
+
+      const signature = buildSignature(event);
       const last = lastEventRef.current;
 
       if (last && last.signature === signature && now - last.timestamp < 32) {
@@ -179,6 +200,11 @@ export const useInputAdapter = (
         signature,
         timestamp: now,
       };
+
+      if (event.source === "raw" && /[\r\n]/.test(event.input)) {
+        suppressInkPrintableUntilRef.current = now + 120;
+      }
+
       handlerRef.current(event.input, event.key);
     },
     []
@@ -187,6 +213,7 @@ export const useInputAdapter = (
   useInput(
     (input, key) => {
       dispatch({
+        source: "ink",
         input,
         key: {
           upArrow: key.upArrow,
@@ -221,7 +248,10 @@ export const useInputAdapter = (
     const onData = (data: Buffer | string) => {
       const normalized = normalizeRawInputChunk(data);
       if (normalized && shouldDispatchRawInputEvent(normalized)) {
-        dispatch(normalized);
+        dispatch({
+          ...normalized,
+          source: "raw",
+        });
       }
     };
 

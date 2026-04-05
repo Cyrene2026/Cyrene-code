@@ -8,6 +8,8 @@ import { buildPromptWithContext } from "../../core/session/buildPromptWithContex
 import type { SessionMemoryInput } from "../../core/session/memoryIndex";
 import {
   applyParsedStateUpdate,
+  applyLocalFallbackStateUpdate,
+  buildFallbackPendingDigest,
   parseAssistantStateUpdate,
   type ReducerMode,
 } from "../../core/session/stateReducer";
@@ -143,6 +145,8 @@ const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
 const STREAMING_RENDER_BATCH_MS = 40;
+const STREAMING_RENDER_BATCH_MS_MEDIUM = 80;
+const STREAMING_RENDER_BATCH_MS_LARGE = 140;
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
   { command: "/provider", description: "open provider picker" },
@@ -154,6 +158,7 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/system", description: "show current system prompt" },
   { command: "/system <text>", description: "set system prompt for this runtime" },
   { command: "/system reset", description: "restore default system prompt" },
+  { command: "/state", description: "show reducer/session state diagnostics" },
   { command: "/sessions", description: "open sessions panel" },
   { command: "/resume", description: "open session resume picker" },
   { command: "/resume <id>", description: "resume a session by id" },
@@ -406,6 +411,16 @@ const addUsageToRuntimeSummary = (
   totalTokens: summary.totalTokens + usage.totalTokens,
 });
 
+const getStreamingRenderBatchMs = (textLength: number) => {
+  if (textLength >= 8_000) {
+    return STREAMING_RENDER_BATCH_MS_LARGE;
+  }
+  if (textLength >= 2_000) {
+    return STREAMING_RENDER_BATCH_MS_MEDIUM;
+  }
+  return STREAMING_RENDER_BATCH_MS;
+};
+
 export const useChatApp = ({
   transport,
   sessionStore,
@@ -496,10 +511,15 @@ export const useChatApp = ({
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
+  const finalizedAssistantBuffersRef = useRef(new WeakSet<{ current: string }>());
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
   const inputDraftRef = useRef("");
   const preferredInputColumnRef = useRef<number | null>(null);
+  const queuedSubmitRef = useRef<{
+    rawInput: string;
+    query: string;
+  } | null>(null);
   const liveAssistantRawTextRef = useRef("");
   const liveAssistantTextRef = useRef("");
   const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -755,6 +775,44 @@ export const useChatApp = ({
     ]);
   };
 
+  const formatReducerStateMessage = (session: SessionRecord | null) => {
+    const lines = [
+      "Reducer state:",
+      `auto summary refresh: ${autoSummaryRefresh ? "enabled" : "disabled"}`,
+      `runtime state updates: ${runtimeUsageSummary.stateUpdateCount}`,
+      `status: ${status}`,
+      `model: ${currentModel}`,
+      `session: ${session?.id ?? activeSessionId ?? "-"}`,
+    ];
+
+    if (!session) {
+      lines.push("summary chars: 0");
+      lines.push("pending digest chars: 0");
+      lines.push("last state update: (none)");
+      lines.push("in-flight turn: no");
+      lines.push("note: no active session loaded yet.");
+      return lines.join("\n");
+    }
+
+    lines.push(`summary chars: ${session.summary.trim().length}`);
+    lines.push(`pending digest chars: ${session.pendingDigest.trim().length}`);
+    if (session.lastStateUpdate) {
+      lines.push(
+        `last state update: ${session.lastStateUpdate.code}${
+          session.lastStateUpdate.reducerMode
+            ? ` / ${session.lastStateUpdate.reducerMode}`
+            : ""
+        }`
+      );
+      lines.push(`last update at: ${session.lastStateUpdate.updatedAt}`);
+      lines.push(`detail: ${session.lastStateUpdate.message}`);
+    } else {
+      lines.push("last state update: (none)");
+    }
+    lines.push(`in-flight turn: ${session.inFlightTurn ? "yes" : "no"}`);
+    return lines.join("\n");
+  };
+
   const cancelLiveAssistantRender = () => {
     if (!liveAssistantRenderTimerRef.current) {
       return;
@@ -777,7 +835,8 @@ export const useChatApp = ({
       return;
     }
     const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
-    const waitMs = Math.max(0, STREAMING_RENDER_BATCH_MS - elapsed);
+    const batchMs = getStreamingRenderBatchMs(liveAssistantTextRef.current.length);
+    const waitMs = Math.max(0, batchMs - elapsed);
     if (waitMs === 0) {
       flushLiveAssistantSegment();
       return;
@@ -929,6 +988,11 @@ export const useChatApp = ({
       let nextSummary = latest.summary;
       let nextPendingDigest = latest.pendingDigest;
       let diagnostic: SessionStateUpdateDiagnostic;
+      const latestUserText =
+        [...latest.messages]
+          .reverse()
+          .find(message => message.role === "user")
+          ?.text ?? "";
 
       const createDiagnostic = (
         code: SessionStateUpdateDiagnostic["code"],
@@ -943,6 +1007,51 @@ export const useChatApp = ({
         pendingDigestLength: nextPendingDigest.trim().length,
       });
 
+      const withLocalFallbackState = (message: string) => {
+        if (!visibleAssistantText) {
+          return message;
+        }
+
+        const fallbackState = applyLocalFallbackStateUpdate({
+          durableSummary: latest.summary,
+          pendingDigest: latest.pendingDigest,
+          userText: latestUserText,
+          assistantText: visibleAssistantText,
+        });
+
+        if (!fallbackState.updated) {
+          return message;
+        }
+
+        nextSummary = fallbackState.summary;
+        nextPendingDigest = fallbackState.pendingDigest;
+
+        if (fallbackState.advancedSummary) {
+          return `${message} Locally advanced durable summary from the previous pending digest and captured a fallback pending digest for this turn.`;
+        }
+
+        if (fallbackState.capturedPendingDigest) {
+          return `${message} Applied local fallback pending digest for this turn.`;
+        }
+
+        return message;
+      };
+
+      const withLocalFallbackDigest = (message: string) => {
+        if (nextPendingDigest.trim() || !visibleAssistantText) {
+          return message;
+        }
+        const fallbackPendingDigest = buildFallbackPendingDigest({
+          userText: latestUserText,
+          assistantText: visibleAssistantText,
+        });
+        if (!fallbackPendingDigest) {
+          return message;
+        }
+        nextPendingDigest = fallbackPendingDigest;
+        return `${message} Applied local fallback pending digest for this turn.`;
+      };
+
       if (!autoSummaryRefresh) {
         diagnostic = createDiagnostic(
           "disabled",
@@ -951,22 +1060,30 @@ export const useChatApp = ({
       } else if (parsed.parseStatus === "missing_tag") {
         diagnostic = createDiagnostic(
           "missing_tag",
-          "Assistant reply finished without a <cyrene_state_update> block."
+          withLocalFallbackState(
+            "Assistant reply finished without a <cyrene_state_update> block."
+          )
         );
       } else if (parsed.parseStatus === "incomplete_tag") {
         diagnostic = createDiagnostic(
           "incomplete_tag",
-          "Assistant reply started a <cyrene_state_update> block, but it did not complete before the turn ended."
+          withLocalFallbackDigest(
+            "Assistant reply started a <cyrene_state_update> block, but it did not complete before the turn ended."
+          )
         );
       } else if (parsed.parseStatus === "empty_payload") {
         diagnostic = createDiagnostic(
           "empty_payload",
-          "Assistant reply included an empty <cyrene_state_update> payload."
+          withLocalFallbackDigest(
+            "Assistant reply included an empty <cyrene_state_update> payload."
+          )
         );
       } else if (parsed.parseStatus === "invalid_payload") {
         diagnostic = createDiagnostic(
           "invalid_payload",
-          "Assistant reply included a <cyrene_state_update> block, but the JSON payload was invalid."
+          withLocalFallbackDigest(
+            "Assistant reply included a <cyrene_state_update> block, but the JSON payload was invalid."
+          )
         );
       } else {
         const applied = applyParsedStateUpdate({
@@ -1006,20 +1123,29 @@ export const useChatApp = ({
     result: RunQuerySessionResult | void
   ) => {
     if (!result || result.status === "completed") {
-      suspendedTaskRef.current = null;
-      if (liveAssistantTextRef.current) {
-        setItems(previous => [
-          ...previous,
-          {
-            role: "assistant",
-            text: liveAssistantTextRef.current,
-            kind: "transcript",
-            tone: "neutral",
-          },
-        ]);
-        clearLiveAssistantSegment();
+      if (finalizedAssistantBuffersRef.current.has(assistantBufferRef)) {
+        return;
       }
-      await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
+      finalizedAssistantBuffersRef.current.add(assistantBufferRef);
+      suspendedTaskRef.current = null;
+      try {
+        if (liveAssistantTextRef.current) {
+          setItems(previous => [
+            ...previous,
+            {
+              role: "assistant",
+              text: liveAssistantTextRef.current,
+              kind: "transcript",
+              tone: "neutral",
+            },
+          ]);
+          clearLiveAssistantSegment();
+        }
+        await finalizeAssistantBuffer(sessionId, assistantBufferRef.current);
+      } catch (error) {
+        finalizedAssistantBuffersRef.current.delete(assistantBufferRef);
+        throw error;
+      }
       return;
     }
 
@@ -1081,7 +1207,7 @@ export const useChatApp = ({
     }
 
     const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
-    if (elapsed >= STREAMING_RENDER_BATCH_MS) {
+    if (elapsed >= getStreamingRenderBatchMs(nextVisible.length)) {
       flushLiveAssistantSegment(nextVisible);
       return;
     }
@@ -2621,7 +2747,14 @@ export const useChatApp = ({
       return;
     }
 
+    if (queuedSubmitRef.current) {
+      return;
+    }
+
+    queuedSubmitRef.current = { rawInput, query };
+
     enqueueTask(async () => {
+      try {
       if (query === "/new") {
         const created = await sessionStore.createSession();
         updateActiveSessionIdState(created.id);
@@ -2760,6 +2893,19 @@ export const useChatApp = ({
 
       if (query === "/system") {
         pushSystemMessage(`Current system prompt:\n${systemPrompt}`);
+        clearInput();
+        return;
+      }
+
+      if (query === "/state") {
+        const activeSession = activeSessionId
+          ? await sessionStore.loadSession(activeSessionId)
+          : null;
+        pushSystemMessage(formatReducerStateMessage(activeSession), {
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        });
         clearInput();
         return;
       }
@@ -3108,6 +3254,19 @@ export const useChatApp = ({
         return;
       }
 
+      if (query.startsWith("/")) {
+        pushSystemMessage(
+          `Unknown command: ${query}\nUse /help to view available commands.`,
+          {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          }
+        );
+        clearInput();
+        return;
+      }
+
       setItems(previous => [
         ...previous,
         { role: "user", text: rawInput, kind: "transcript", tone: "neutral" },
@@ -3297,6 +3456,16 @@ export const useChatApp = ({
         setSessionState(null);
         setStatus("idle");
         throw error;
+      }
+      } finally {
+        const queued = queuedSubmitRef.current;
+        if (
+          queued &&
+          queued.rawInput === rawInput &&
+          queued.query === query
+        ) {
+          queuedSubmitRef.current = null;
+        }
       }
     });
   };

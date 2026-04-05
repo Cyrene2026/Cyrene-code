@@ -400,31 +400,34 @@ const extractTextContent = (content: unknown): string => {
     return "";
   }
 
-  return joinVisibleParts(
-    content.map(item => {
-      if (typeof item === "string") {
-        return item;
-      }
-      if (!item || typeof item !== "object") {
-        return "";
-      }
-      const typedItem = item as {
-        type?: unknown;
-        text?: unknown;
-      };
-      if (
-        typedItem.type === "text" ||
-        typedItem.type === "output_text" ||
-        typedItem.type === "input_text"
-      ) {
-        return extractTextValue(typedItem.text);
-      }
-      return "";
-    })
+  const stringParts = content.filter(
+    (item): item is string => typeof item === "string"
   );
+  const typedItems = content
+    .filter(
+      (item): item is { type?: unknown; text?: unknown } =>
+        Boolean(item) && typeof item === "object"
+    )
+    .filter(
+      item =>
+        item.type === "text" ||
+        item.type === "output_text" ||
+        item.type === "input_text"
+    );
+  const preferredTypedItems = typedItems.some(item => item.type === "output_text")
+    ? typedItems.filter(item => item.type === "output_text")
+    : typedItems.filter(item => item.type === "text");
+
+  return joinVisibleParts([
+    ...stringParts,
+    ...preferredTypedItems.map(item => extractTextValue(item.text)),
+  ]);
 };
 
-const extractVisibleDeltaText = (delta: unknown) => {
+const extractVisibleDeltaText = (
+  delta: unknown,
+  options?: { includeReasoning?: boolean }
+) => {
   if (!delta || typeof delta !== "object") {
     return "";
   }
@@ -436,19 +439,26 @@ const extractVisibleDeltaText = (delta: unknown) => {
     thinking?: unknown;
   };
 
-  return joinVisibleParts([
-    extractTextContent(typedDelta.content),
-    extractReasoningText(typedDelta.reasoning_content),
-    extractReasoningText(typedDelta.reasoning),
-    extractReasoningText(typedDelta.thinking),
-  ]);
+  return joinVisibleParts(
+    [
+      extractTextContent(typedDelta.content),
+      options?.includeReasoning
+        ? extractReasoningText(typedDelta.reasoning_content)
+        : "",
+      options?.includeReasoning
+        ? extractReasoningText(typedDelta.reasoning)
+        : "",
+      options?.includeReasoning ? extractReasoningText(typedDelta.thinking) : "",
+    ].filter(Boolean)
+  );
 };
 
 async function* streamSseOpenAI(
   baseUrl: string,
   apiKey: string,
   model: string,
-  query: string
+  query: string,
+  options?: { includeReasoning?: boolean }
 ): AsyncGenerator<string> {
   const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
     method: "POST",
@@ -521,7 +531,9 @@ async function* streamSseOpenAI(
           }
           const choice = parsed.choices?.[0];
           const delta = choice?.delta;
-          const deltaText = extractVisibleDeltaText(delta);
+          const deltaText = extractVisibleDeltaText(delta, {
+            includeReasoning: options?.includeReasoning,
+          });
 
           if (deltaText) {
             yield JSON.stringify({ type: "text_delta", text: deltaText });
@@ -654,6 +666,8 @@ export const createHttpQueryTransport = (
   options?: HttpQueryTransportOptions
 ): QueryTransport => {
   const effectiveEnv = options?.env ?? process.env;
+  const includeReasoningInTranscript =
+    effectiveEnv.CYRENE_STREAM_REASONING === "1";
   const appRoot =
     options?.appRoot ??
     resolveAmbientAppRoot({
@@ -932,7 +946,10 @@ export const createHttpQueryTransport = (
         targetProvider,
         apiKey,
         currentModel,
-        query
+        query,
+        {
+          includeReasoning: includeReasoningInTranscript,
+        }
       )) {
         yield event;
       }

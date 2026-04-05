@@ -258,7 +258,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     ]);
   });
 
-  test("emits text deltas from structured content array chunks", async () => {
+  test("prefers output_text over plain text parts in structured content array chunks", async () => {
     const { root, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
@@ -315,12 +315,12 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     expect(events).toEqual([
-      JSON.stringify({ type: "text_delta", text: "thinking visible" }),
+      JSON.stringify({ type: "text_delta", text: "visible" }),
       JSON.stringify({ type: "done" }),
     ]);
   });
 
-  test("emits text deltas from reasoning_content and thinking fields", async () => {
+  test("ignores reasoning_content and thinking fields by default", async () => {
     const { root, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
@@ -371,6 +371,70 @@ describe("createHttpQueryTransport streaming usage", () => {
       env: {
         CYRENE_BASE_URL: "https://example.test/v1",
         CYRENE_API_KEY: "test-key",
+      },
+    });
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([JSON.stringify({ type: "done" })]);
+  });
+
+  test("can include reasoning_content and thinking fields when explicitly enabled", async () => {
+    const { root, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"reasoning_content":"plan: inspect "}}]}',
+              "",
+              'data: {"choices":[{"delta":{"thinking":{"text":"then patch"}}}]}',
+              "",
+              'data: {"choices":[{"delta":{"reasoning":[{"type":"reasoning_text","text":" now"}]}}]}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(
+      async () =>
+        new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        })
+    ) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_STREAM_REASONING: "1",
       },
     });
     const streamUrl = await transport.requestStreamUrl("hello");

@@ -34,6 +34,8 @@ export type RunQuerySessionResult =
       resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
     };
 
+const COMPLETED_RESULT: RunQuerySessionResult = { status: "completed" };
+
 type ConfirmedFileMutation = {
   action: "create_file" | "write_file" | "edit_file" | "apply_patch";
   path: string;
@@ -45,6 +47,8 @@ type MultiFileProgressLedger = {
   completedPaths: string[];
   lastCompletedPath?: string;
 };
+
+const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
 
 const getToolAction = (toolName: string, input: unknown) => {
   if (
@@ -942,7 +946,28 @@ export const runQuerySession = async ({
     let completed = false;
     let sawToolCall = false;
     let streamOpened = false;
+    let visibleAnswerChars = 0;
     const toolResults: string[] = [];
+
+    const completeRound = () => {
+      dispatch({ type: "complete" });
+      return COMPLETED_RESULT;
+    };
+
+    const createOneShotResume = (
+      resumeImpl: (toolResultMessage: string) => Promise<RunQuerySessionResult>
+    ): RunQuerySessionResult => {
+      let resumePromise: Promise<RunQuerySessionResult> | null = null;
+      return {
+        status: "suspended",
+        resume: toolResultMessage => {
+          if (!resumePromise) {
+            resumePromise = resumeImpl(toolResultMessage);
+          }
+          return resumePromise;
+        },
+      };
+    };
 
     for await (const chunk of transport.stream(streamUrl)) {
       const events = parseStreamChunk(chunk);
@@ -953,18 +978,24 @@ export const runQuerySession = async ({
         }
 
         if (event.type === "text_delta") {
+          if (sawToolCall) {
+            continue;
+          }
+          visibleAnswerChars += event.text.trim() ? event.text.length : 0;
           dispatch({ type: "text_delta", text: event.text });
           onTextDelta(event.text);
           continue;
         }
 
         if (event.type === "tool_call") {
+          if (visibleAnswerChars >= LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD) {
+            continue;
+          }
           if (toolStepsUsed >= maxToolSteps) {
             onTextDelta(
               `\n[tool budget exhausted] Used ${toolStepsUsed}/${maxToolSteps} tool steps. Stopping to avoid runaway execution. Split the task or raise query_max_tool_steps to continue.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           toolStepsUsed += 1;
           sawToolCall = true;
@@ -1010,23 +1041,20 @@ export const runQuerySession = async ({
             onTextDelta(
               `\n[tool loop detected] list_dir ${repeatedPath} was called repeatedly after directory state was already confirmed. Stopping to prevent infinite loop.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           if (seen >= 3 && isCommandLikeAction(event.toolName, event.input)) {
             const action = getToolAction(event.toolName, event.input);
             onTextDelta(
               `\n[tool loop detected] ${action} was called repeatedly with the same command signature. Stopping to prevent infinite loop.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           if (seen >= 4) {
             onTextDelta(
               `\n[tool loop detected] ${displayName} was called repeatedly with same input. Stopping to prevent infinite loop.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           if (
             isImmediateRedundantPostWriteRead(
@@ -1057,8 +1085,7 @@ export const runQuerySession = async ({
               onTextDelta(
                 `\n[tool loop detected] read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write. Stopping to prevent needless rereads.\n`
               );
-              dispatch({ type: "complete" });
-              return { status: "completed" };
+              return completeRound();
             }
             continue;
           }
@@ -1082,8 +1109,7 @@ export const runQuerySession = async ({
             onTextDelta(
               `\n[tool loop detected] read_file ${repeatedPath} was repeated even though the file was already confirmed empty. Stopping to prevent infinite loop.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           if (
             seen >= 2 &&
@@ -1094,8 +1120,7 @@ export const runQuerySession = async ({
             onTextDelta(
               `\n[tool loop detected] ${action} was retried after the same command already failed. Stop rerunning it unchanged and choose a new concrete step.\n`
             );
-            dispatch({ type: "complete" });
-            return { status: "completed" };
+            return completeRound();
           }
           if (didApplyFileMutation(event.toolName, event.input, toolResult.message)) {
             filesystemMutationRevision += 1;
@@ -1120,9 +1145,7 @@ export const runQuerySession = async ({
           }
           if (toolResult.reviewMode) {
             dispatch({ type: "suspended" });
-            return {
-              status: "suspended",
-              resume: async (toolResultMessage: string) => {
+            return createOneShotResume(async (toolResultMessage: string) => {
                 if (didApplyFileMutation(event.toolName, event.input, toolResultMessage)) {
                   filesystemMutationRevision += 1;
                   loopCorrection = "";
@@ -1163,8 +1186,7 @@ export const runQuerySession = async ({
                   nextToolResults,
                   toolStepsUsed
                 );
-              },
-            };
+              });
           }
           toolResults.push(
             `[tool_result] ${event.toolName}\n${toolResult.message}`.trim()
@@ -1199,8 +1221,7 @@ export const runQuerySession = async ({
     }
 
     if (!sawToolCall) {
-      dispatch({ type: "complete" });
-      return { status: "completed" };
+      return completeRound();
     }
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];

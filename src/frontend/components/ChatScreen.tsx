@@ -166,6 +166,12 @@ type ComposerTone = {
   helperColor: "gray" | "cyan" | "yellow" | "magenta" | "red";
 };
 
+type GraphemeSegment = {
+  text: string;
+  startOffset: number;
+  endOffset: number;
+};
+
 const BRAND_NAME = "CYRENE";
 const BRAND_MARK = "C>";
 const SECTION_GAP = 1;
@@ -336,6 +342,39 @@ const formatProviderLabel = (provider: string, max = 22) => {
   } catch {
     return shortenValue(provider, max);
   }
+};
+
+const splitIntoGraphemes = (value: string) => {
+  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+    const segmenter = new Intl.Segmenter(undefined, {
+      granularity: "grapheme",
+    });
+    return Array.from(segmenter.segment(value), segment => segment.segment);
+  }
+
+  return Array.from(value);
+};
+
+const segmentLineByGrapheme = (line: string): GraphemeSegment[] => {
+  if (!line) {
+    return [];
+  }
+
+  const graphemes = splitIntoGraphemes(line);
+  const segments: GraphemeSegment[] = [];
+  let currentOffset = 0;
+
+  for (const grapheme of graphemes) {
+    const nextOffset = currentOffset + grapheme.length;
+    segments.push({
+      text: grapheme,
+      startOffset: currentOffset,
+      endOffset: nextOffset,
+    });
+    currentOffset = nextOffset;
+  }
+
+  return segments;
 };
 
 const getStatusBadge = (status: ChatStatus, spinner: string) => {
@@ -1380,17 +1419,6 @@ const getComposerWindow = (input: string, inputCursorOffset: number) => {
   const visualRows: ComposerVisualRow[] = [];
   let cursorVisualRow = 0;
 
-  const splitIntoGraphemes = (value: string) => {
-    if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
-      const segmenter = new Intl.Segmenter(undefined, {
-        granularity: "grapheme",
-      });
-      return Array.from(segmenter.segment(value), segment => segment.segment);
-    }
-
-    return Array.from(value);
-  };
-
   const splitLine = (line: string): WrappedComposerSegment[] => {
     if (!line) {
       return [{ text: "", startOffset: 0, endOffset: 0 }];
@@ -1497,17 +1525,63 @@ const renderComposerCursorLine = (
   color: ComposerTone["promptColor"]
 ) => {
   const safeColumn = Math.max(0, Math.min(cursorColumn, line.length));
-  const cursorChar = line[safeColumn] ?? " ";
-  const before = line.slice(0, safeColumn);
-  const after = line.slice(cursorChar === " " ? safeColumn : safeColumn + 1);
+  const segments = segmentLineByGrapheme(line);
+  const cursorSegment = segments.find(
+    segment =>
+      safeColumn >= segment.startOffset &&
+      safeColumn < segment.endOffset
+  );
+  const before = cursorSegment
+    ? segments
+        .filter(segment => segment.endOffset <= cursorSegment.startOffset)
+        .map(segment => segment.text)
+        .join("")
+    : line;
+  const cursorChar = cursorSegment?.text ?? " ";
+  const after = cursorSegment
+    ? segments
+        .filter(segment => segment.startOffset >= cursorSegment.endOffset)
+        .map(segment => segment.text)
+        .join("")
+    : "";
 
   return (
     <Box>
       {before ? <Text>{before}</Text> : null}
-      <Text color={color} backgroundColor="white">
+      <Text color="white" backgroundColor={color}>
         {cursorChar === " " ? COMPOSER_CURSOR_GLYPH : cursorChar}
       </Text>
       {after ? <Text>{after}</Text> : null}
+    </Box>
+  );
+};
+
+const renderStreamingAssistantItem = (
+  text: string,
+  itemIndex: number,
+  clipOptions: RenderClipOptions = {}
+) => {
+  if (!text) {
+    return null;
+  }
+
+  const clip = clipTextForRender(text, clipOptions);
+  const lines = clip.text.split("\n");
+  const visibleLines = lines.length > 0 ? lines : [" "];
+
+  return (
+    <Box key={`streaming-item-${itemIndex}`} flexDirection="column" marginBottom={1}>
+      <Text bold color="cyan">
+        cyrene
+      </Text>
+      {visibleLines.map((line, lineIndex) => (
+        <Text
+          key={`streaming-line-${itemIndex}-${lineIndex}`}
+          color={line.trim() ? "white" : "gray"}
+        >
+          {`  ${line || " "}`}
+        </Text>
+      ))}
     </Box>
   );
 };
@@ -1642,7 +1716,7 @@ const renderMainComposer = (
               </Text>
               <Text> </Text>
               <Box flexGrow={1}>
-                <Text color={tone.promptColor} backgroundColor="white">
+                <Text color="white" backgroundColor={tone.promptColor}>
                   {COMPOSER_CURSOR_GLYPH}
                 </Text>
                 <Text dimColor>{placeholder}</Text>
@@ -2830,13 +2904,8 @@ export const ChatScreen = ({
   const liveAssistantNode = React.useMemo(
     () =>
       liveAssistantText
-        ? renderMessageItem(
-            {
-              role: "assistant",
-              text: liveAssistantText,
-              kind: "transcript",
-              tone: "neutral",
-            },
+        ? renderStreamingAssistantItem(
+            liveAssistantText,
             items.length,
             {
               preferTail: true,

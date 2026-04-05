@@ -310,6 +310,49 @@ const createPromptCaptureRoundSequenceTransport = (
   };
 };
 
+const createLateToolCallAfterAnswerTransport = (): {
+  transport: QueryTransport;
+  prompts: string[];
+} => {
+  const prompts: string[] = [];
+  let streamCount = 0;
+
+  return {
+    prompts,
+    transport: {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({
+        ok: true,
+        message: `provider ${provider}`,
+        currentProvider: provider,
+        providers: [provider],
+        models: ["gpt-test"],
+      }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async prompt => {
+        prompts.push(prompt);
+        return `stream://${++streamCount}`;
+      },
+      stream: async function* () {
+        yield JSON.stringify({
+          type: "text_delta",
+          text: "This is the final answer. ".repeat(12),
+        });
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+      },
+    },
+  };
+};
+
 describe("runQuerySession", () => {
   test("suspends on pending review and resumes same task with approval result", async () => {
     const { transport, prompts } = createTransport();
@@ -523,6 +566,62 @@ describe("runQuerySession", () => {
 
     expect(result.status).toBe("completed");
     expect(states).toEqual(["requesting", "idle"]);
+  });
+
+  test("ignores late tool calls after a substantial final answer and does not re-enter another round", async () => {
+    const { transport, prompts } = createLateToolCallAfterAnswerTransport();
+    const textDeltas: string[] = [];
+    const onToolCall = mock(async () => ({ message: "should not run" }));
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "summarize only",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall,
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(onToolCall).not.toHaveBeenCalled();
+    expect(prompts).toHaveLength(1);
+    expect(textDeltas.join("")).toContain("This is the final answer.");
+  });
+
+  test("suspended resume is one-shot and does not re-enter rounds twice", async () => {
+    const { transport, prompts } = createTransport();
+    const onToolCall = mock(async () => ({
+      message: "Approval required review-1",
+      reviewMode: "queue" as const,
+    }));
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "create u1 and u2",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall,
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("suspended");
+    if (result.status !== "suspended") {
+      throw new Error("expected suspended result");
+    }
+
+    const [first, second] = await Promise.all([
+      result.resume("[approved] review-1\nCreated file: test_files/u1.py"),
+      result.resume("[approved] review-1\nCreated file: test_files/u1.py"),
+    ]);
+
+    expect(first.status).toBe("completed");
+    expect(second.status).toBe("completed");
+    expect(prompts).toHaveLength(2);
+    expect(onToolCall).toHaveBeenCalledTimes(1);
   });
 
   test("emits a visible tool status before awaiting tool execution", async () => {

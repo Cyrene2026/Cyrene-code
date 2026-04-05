@@ -9,6 +9,7 @@ import { resolveAmbientAppRoot } from "./appRoot";
 export type CyreneConfig = {
   pinMaxCount: number;
   queryMaxToolSteps: number;
+  autoSummaryRefresh: boolean;
   systemPrompt?: string;
 };
 
@@ -20,12 +21,16 @@ type CyreneConfigLoadContext = {
 const DEFAULT_CONFIG: CyreneConfig = {
   pinMaxCount: DEFAULT_PIN_MAX_COUNT,
   queryMaxToolSteps: DEFAULT_QUERY_MAX_TOOL_STEPS,
+  autoSummaryRefresh: true,
 };
 
-const parseValue = (raw: string): string | number => {
+const parseValue = (raw: string): string | number | boolean => {
   const trimmed = raw.trim();
   if (/^-?\d+$/.test(trimmed)) {
     return Number(trimmed);
+  }
+  if (/^(true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === "true";
   }
   const quoted = trimmed.match(/^"(.*)"$/) ?? trimmed.match(/^'(.*)'$/);
   if (quoted) {
@@ -74,6 +79,12 @@ export const loadCyreneConfig = async (
       ? Math.floor(queryMaxToolStepsRaw)
       : DEFAULT_CONFIG.queryMaxToolSteps;
 
+  const autoSummaryRefreshRaw = map.get("auto_summary_refresh");
+  const autoSummaryRefresh =
+    typeof autoSummaryRefreshRaw === "boolean"
+      ? autoSummaryRefreshRaw
+      : DEFAULT_CONFIG.autoSummaryRefresh;
+
   const systemRaw = map.get("system_prompt");
   const systemPrompt =
     typeof systemRaw === "string" && systemRaw.trim()
@@ -83,6 +94,7 @@ export const loadCyreneConfig = async (
   return {
     pinMaxCount,
     queryMaxToolSteps,
+    autoSummaryRefresh,
     systemPrompt,
   };
 };

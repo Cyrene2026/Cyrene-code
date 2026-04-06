@@ -3380,6 +3380,42 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
+  test("terminated queued actions are treated as benign interruptions instead of red errors", async () => {
+    const sessionStore = createTestSessionStore();
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("partial reply before termination");
+      throw new Error("terminated");
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        autoSummaryRefresh: true,
+        mcpService: { listPending: () => [] } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "task that gets interrupted");
+    await flushMicrotasks();
+
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Queued action failed: terminated")
+      )
+    ).toBe(false);
+    expect(sessionStore.__getRecord("session-1")?.inFlightTurn?.assistantText).toBe(
+      "partial reply before termination"
+    );
+
+    app.cleanup();
+  });
+
   test("exitSummary accumulates query usage and reducer state updates across resume and new session flows", async () => {
     const sessionStore = createTestSessionStore([
       createSessionRecord("session-a", {

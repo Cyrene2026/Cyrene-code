@@ -1316,6 +1316,23 @@ const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
   totalTokens: 0,
 });
 
+const getQueuedTaskErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
+const isBenignQueuedTaskTermination = (error: unknown) => {
+  const message = getQueuedTaskErrorMessage(error).trim().toLowerCase();
+  return (
+    message === TURN_CANCELLED_ERROR.toLowerCase() ||
+    message === "terminated" ||
+    message === "aborterror" ||
+    message === "aborted" ||
+    message === "cancelled" ||
+    message === "canceled" ||
+    message === "the operation was aborted" ||
+    message === "the operation was canceled"
+  );
+};
+
 const addUsageToRuntimeSummary = (
   summary: RuntimeUsageSummary,
   usage: TokenUsage
@@ -2073,10 +2090,11 @@ export const useChatApp = ({
   const enqueueTask = (task: () => Promise<void> | void) => {
     queueRef.current = queueRef.current
       .catch(error => {
+        if (isBenignQueuedTaskTermination(error)) {
+          return;
+        }
         pushSystemMessage(
-          `Queued action failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `Queued action failed: ${getQueuedTaskErrorMessage(error)}`,
           {
             kind: "error",
             tone: "danger",
@@ -2086,10 +2104,11 @@ export const useChatApp = ({
       })
       .then(task)
       .catch(error => {
+        if (isBenignQueuedTaskTermination(error)) {
+          return;
+        }
         pushSystemMessage(
-          `Queued action failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `Queued action failed: ${getQueuedTaskErrorMessage(error)}`,
           {
             kind: "error",
             tone: "danger",

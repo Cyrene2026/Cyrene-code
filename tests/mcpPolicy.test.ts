@@ -3,7 +3,7 @@ import {
   buildMcpPolicyDecision,
   getMcpToolCapabilities,
   getMcpToolRisk,
-} from "../src/core/mcp/McpPolicy";
+} from "../src/core/mcp";
 
 describe("McpPolicy", () => {
   test("classifies read/search/git capabilities", () => {

@@ -1,7 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
-import { McpManager } from "../src/core/mcp/McpManager";
-import type { McpServerAdapter } from "../src/core/mcp/types";
-import type { PendingReviewItem } from "../src/core/tools/mcp/types";
+import {
+  McpManager,
+  type McpServerAdapter,
+  type PendingReviewItem,
+} from "../src/core/mcp";
 
 const createPending = (id: string): PendingReviewItem => ({
   id,
@@ -96,7 +98,12 @@ describe("McpManager", () => {
 
   test("falls back to the primary adapter for file aliases", async () => {
     const adapter = createAdapter();
-    const manager = new McpManager([adapter]);
+    const manager = new McpManager([adapter], {
+      primaryServerId: "filesystem",
+      legacyToolServerIds: {
+        file: "filesystem",
+      },
+    });
 
     await manager.handleToolCall("file", {
       action: "read_file",
@@ -104,6 +111,67 @@ describe("McpManager", () => {
     });
 
     expect(adapter.handleToolCall).toHaveBeenCalledWith("file", {
+      action: "read_file",
+      path: "src/example.ts",
+    });
+  });
+
+  test("routes namespaced tool ids to the owning adapter", async () => {
+    const adapter = createAdapter({
+      descriptor: {
+        id: "filesystem",
+        label: "Filesystem",
+        enabled: true,
+        source: "built_in",
+        health: "online",
+        tools: [
+          {
+            id: "filesystem.read_file",
+            serverId: "filesystem",
+            name: "read_file",
+            label: "read file",
+            capabilities: ["read"],
+            risk: "low",
+            requiresReview: false,
+            enabled: true,
+          },
+        ],
+      },
+    });
+    const manager = new McpManager([adapter], {
+      primaryServerId: "filesystem",
+    });
+
+    await manager.handleToolCall("filesystem.read_file", {
+      path: "src/example.ts",
+    });
+
+    expect(adapter.handleToolCall).toHaveBeenCalledWith("read_file", {
+      path: "src/example.ts",
+    });
+  });
+
+  test("fromFileService adapts namespaced actions back to the file tool backend", async () => {
+    const service = {
+      handleToolCall: mock(async () => ({ ok: true, message: "ok" })),
+      listPending: mock(() => []),
+      approve: mock(async () => ({ ok: true, message: "approved" })),
+      reject: mock(() => ({ ok: true, message: "rejected" })),
+      undoLastMutation: mock(async () => ({ ok: true, message: "undo" })),
+      dispose: mock(() => {}),
+    };
+
+    const manager = McpManager.fromFileService(service, {
+      workspaceRoot: "D:/Projects/js_projects/Cyrene-code",
+      maxReadBytes: 100_000,
+      requireReview: [],
+    });
+
+    await manager.handleToolCall("filesystem.read_file", {
+      path: "src/example.ts",
+    });
+
+    expect(service.handleToolCall).toHaveBeenCalledWith("file", {
       action: "read_file",
       path: "src/example.ts",
     });

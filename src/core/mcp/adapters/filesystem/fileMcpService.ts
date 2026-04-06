@@ -44,8 +44,8 @@ import type {
   CloseShellToolRequest,
   StatPathsToolRequest,
   ToolRequest,
-} from "./types";
-import { parseYamlDocument } from "./simpleYaml";
+} from "../../toolTypes";
+import { parseYamlDocument } from "../../simpleYaml";
 
 type HandleResult = {
   ok: boolean;

@@ -5,9 +5,7 @@ import { loadCyreneConfig } from "../infra/config/loadCyreneConfig";
 import { loadPromptPolicy } from "../infra/config/loadPromptPolicy";
 import { configureAppRootFromArgs, getCyreneConfigDir } from "../infra/config/appRoot";
 import { createFileSessionStore } from "../infra/session/createFileSessionStore";
-import { FileMcpService } from "../core/tools/mcp/fileMcpService";
-import { loadRuleConfig } from "../core/tools/mcp/loadRuleConfig";
-import { McpManager } from "../core/mcp/McpManager";
+import { createMcpRuntime } from "../core/mcp";
 import { createAuthRuntime } from "../infra/auth/authRuntime";
 import { join } from "node:path";
 
@@ -21,9 +19,7 @@ const initialAuthStatus = await authRuntime.getStatus();
 const transport = await authRuntime.buildTransport();
 const sessionStore = createFileSessionStore(join(getCyreneConfigDir(appRoot), "session"));
 const promptPolicy = await loadPromptPolicy(cyreneConfig, appRoot);
-const ruleConfig = await loadRuleConfig(appRoot);
-const fileMcpService = new FileMcpService(ruleConfig);
-const mcpService = McpManager.fromFileService(fileMcpService, ruleConfig);
+const mcpService = await createMcpRuntime(appRoot);
 
 render(
   <ChatCliApp

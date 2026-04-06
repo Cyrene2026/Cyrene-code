@@ -501,3 +501,89 @@ export const parseYamlDocument = (input: string): unknown => {
 
   return parsed.value;
 };
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+const isScalar = (value: unknown) =>
+  value === null ||
+  typeof value === "string" ||
+  typeof value === "number" ||
+  typeof value === "boolean";
+
+const shouldQuoteYamlString = (value: string) => {
+  if (!value) {
+    return true;
+  }
+
+  if (
+    value === "null" ||
+    value === "~" ||
+    value === "true" ||
+    value === "false"
+  ) {
+    return true;
+  }
+
+  return !/^[A-Za-z0-9_./:@+-]+$/.test(value);
+};
+
+const stringifyYamlScalar = (value: unknown): string => {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "boolean" || typeof value === "number") {
+    return String(value);
+  }
+  if (typeof value !== "string") {
+    return JSON.stringify(value);
+  }
+  if (!shouldQuoteYamlString(value)) {
+    return value;
+  }
+
+  return JSON.stringify(value);
+};
+
+const stringifyYamlValue = (value: unknown, indent: number): string => {
+  const pad = " ".repeat(indent);
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return `${pad}[]`;
+    }
+
+    return value
+      .map(item => {
+        if (isScalar(item)) {
+          return `${pad}- ${stringifyYamlScalar(item)}`;
+        }
+
+        const nested = stringifyYamlValue(item, indent + 2);
+        return `${pad}-\n${nested}`;
+      })
+      .join("\n");
+  }
+
+  if (isPlainRecord(value)) {
+    const entries = Object.entries(value).filter(([, item]) => item !== undefined);
+    if (entries.length === 0) {
+      return `${pad}{}`;
+    }
+
+    return entries
+      .map(([key, item]) => {
+        if (isScalar(item)) {
+          return `${pad}${key}: ${stringifyYamlScalar(item)}`;
+        }
+
+        return `${pad}${key}:\n${stringifyYamlValue(item, indent + 2)}`;
+      })
+      .join("\n");
+  }
+
+  return `${pad}${stringifyYamlScalar(value)}`;
+};
+
+export const stringifyYamlDocument = (value: unknown) =>
+  `${stringifyYamlValue(value, 0)}\n`;

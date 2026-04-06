@@ -6,9 +6,9 @@ import {
   getCursorPosition,
   getInputLines,
 } from "../../application/chat/multilineInput";
+import type { PendingReviewItem } from "../../core/mcp";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { SessionListItem } from "../../core/session/types";
-import type { PendingReviewItem } from "../../core/tools/mcp/types";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import type { AuthStatus } from "../../infra/auth/types";
 

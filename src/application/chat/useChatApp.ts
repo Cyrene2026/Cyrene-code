@@ -29,12 +29,16 @@ import type {
   SessionRecord,
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
-import type { McpRuntime } from "../../core/mcp/types";
 import type {
+  McpRuntime,
+  McpRuntimeSummary,
+  McpServerDescriptor,
+  McpRuntimeServerInput,
+  McpToolDescriptor,
   MpcAction,
   PendingReviewItem,
   ToolRequest,
-} from "../../core/tools/mcp/types";
+} from "../../core/mcp";
 import { createApprovalActionLock } from "./approvalActionLock";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import { useInputAdapter } from "./inputAdapter";
@@ -307,6 +311,19 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/pin <note>", description: "pin important context" },
   { command: "/pins", description: "list pinned context" },
   { command: "/unpin <index>", description: "remove a pin" },
+  { command: "/mcp", description: "show MCP runtime summary" },
+  { command: "/mcp servers", description: "list registered MCP servers" },
+  { command: "/mcp server <id>", description: "inspect one MCP server" },
+  { command: "/mcp tools", description: "list tools across registered MCP servers" },
+  { command: "/mcp tools <server>", description: "list tools for one MCP server" },
+  { command: "/mcp pending", description: "show pending MCP operations" },
+  { command: "/mcp add stdio <id> <command...>", description: "add a stdio MCP server to project config" },
+  { command: "/mcp add http <id> <url>", description: "add an HTTP MCP server to project config" },
+  { command: "/mcp add filesystem <id> [workspace]", description: "add a filesystem MCP server to project config" },
+  { command: "/mcp remove <id>", description: "remove one MCP server from active project config" },
+  { command: "/mcp enable <id>", description: "enable one MCP server in project config" },
+  { command: "/mcp disable <id>", description: "disable one MCP server in project config" },
+  { command: "/mcp reload", description: "reload MCP config from disk" },
   { command: "/review", description: "open approval queue" },
   { command: "/review <id>", description: "inspect one pending operation" },
   { command: "/approve [id]", description: "approve pending operation(s)" },
@@ -399,6 +416,11 @@ const getCommandGroup = (command: string) => {
     command.startsWith("/unpin")
   ) {
     return "Context";
+  }
+  if (
+    command.startsWith("/mcp")
+  ) {
+    return "MCP";
   }
   if (
     command === "/undo" ||
@@ -501,6 +523,22 @@ const getSlashInsertValue = (command: string) => {
       return "/pin ";
     case "/unpin <index>":
       return "/unpin ";
+    case "/mcp server <id>":
+      return "/mcp server ";
+    case "/mcp tools <server>":
+      return "/mcp tools ";
+    case "/mcp add stdio <id> <command...>":
+      return "/mcp add stdio ";
+    case "/mcp add http <id> <url>":
+      return "/mcp add http ";
+    case "/mcp add filesystem <id> [workspace]":
+      return "/mcp add filesystem ";
+    case "/mcp remove <id>":
+      return "/mcp remove ";
+    case "/mcp enable <id>":
+      return "/mcp enable ";
+    case "/mcp disable <id>":
+      return "/mcp disable ";
     case "/review <id>":
       return "/review ";
     case "/approve [id]":
@@ -1237,6 +1275,168 @@ const summarizePendingRisk = (pending: PendingReviewItem[]) =>
     },
     { high: 0, medium: 0, low: 0 } as Record<ApprovalRisk, number>
   );
+
+const formatMcpAliases = (aliases?: string[]) =>
+  aliases && aliases.length > 0 ? aliases.join(", ") : "(none)";
+
+const formatMcpCapabilities = (tool: McpToolDescriptor) =>
+  tool.capabilities.length > 0 ? tool.capabilities.join(", ") : "-";
+
+const resolveMcpServerDescriptor = (
+  servers: McpServerDescriptor[],
+  idOrAlias: string
+) => {
+  const normalized = idOrAlias.trim().toLowerCase();
+  return servers.find(
+    server =>
+      server.id.toLowerCase() === normalized ||
+      (server.aliases ?? []).some(alias => alias.toLowerCase() === normalized)
+  );
+};
+
+const formatMcpServerLine = (server: McpServerDescriptor) =>
+  [
+    `- ${server.id}`,
+    server.label !== server.id ? `label ${server.label}` : "",
+    `transport ${server.transport ?? "unknown"}`,
+    `source ${server.source}`,
+    `health ${server.health}`,
+    server.enabled ? "enabled" : "disabled",
+    `tools ${server.tools.length}`,
+    `aliases ${formatMcpAliases(server.aliases)}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+const formatMcpToolLine = (tool: McpToolDescriptor) =>
+  [
+    `- ${tool.name}`,
+    `caps ${formatMcpCapabilities(tool)}`,
+    `risk ${tool.risk}`,
+    tool.requiresReview ? "review yes" : "review no",
+    tool.enabled ? "enabled" : "disabled",
+    tool.description ? `desc ${tool.description}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+const formatMcpPendingLine = (item: PendingReviewItem) =>
+  [
+    `- ${item.id}`,
+    `server ${item.serverId ?? "unknown"}`,
+    `action ${item.request.action}`,
+    `path ${item.request.path}`,
+    `risk ${getApprovalRisk(item.request.action)}`,
+  ].join(" | ");
+
+const formatMcpRuntimeSummary = (
+  summary: McpRuntimeSummary | undefined,
+  servers: McpServerDescriptor[],
+  pending: PendingReviewItem[]
+) => {
+  const enabledCount = servers.filter(server => server.enabled).length;
+  const healthCounts = servers.reduce(
+    (acc, server) => {
+      acc[server.health] = (acc[server.health] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<McpServerDescriptor["health"], number>
+  );
+
+  return [
+    "MCP runtime",
+    `primary: ${summary?.primaryServerId ?? servers[0]?.id ?? "(none)"}`,
+    `servers: ${summary?.serverCount ?? servers.length} total | ${summary?.enabledServerCount ?? enabledCount} enabled`,
+    `health: online ${healthCounts.online ?? 0} | unknown ${healthCounts.unknown ?? 0} | offline ${healthCounts.offline ?? 0} | error ${healthCounts.error ?? 0}`,
+    `pending: ${pending.length}`,
+    ...(summary?.configPaths.length
+      ? [
+          "config:",
+          ...summary.configPaths.map(path => `- ${path}`),
+        ]
+      : ["config: built-in default filesystem profile"]),
+    ...(summary?.editableConfigPath
+      ? [`editable: ${summary.editableConfigPath}`]
+      : []),
+    "commands: /mcp servers | /mcp server <id> | /mcp tools [server] | /mcp pending | /mcp add/remove/enable/disable/reload",
+  ].join("\n");
+};
+
+const tokenizeInlineCommand = (raw: string) =>
+  [...raw.matchAll(/"([^"]*)"|'([^']*)'|[^\s]+/g)].map(
+    match => match[1] ?? match[2] ?? match[0] ?? ""
+  );
+
+const parseMcpAddCommand = (
+  query: string
+): { ok: true; input: McpRuntimeServerInput } | { ok: false; message: string } => {
+  const raw = query.slice("/mcp add ".length).trim();
+  const tokens = tokenizeInlineCommand(raw);
+  const transport = (tokens[0] ?? "").toLowerCase();
+
+  if (transport === "stdio") {
+    const id = tokens[1]?.trim();
+    const command = tokens[2]?.trim();
+    if (!id || !command) {
+      return {
+        ok: false,
+        message: "Usage: /mcp add stdio <id> <command...>",
+      };
+    }
+    return {
+      ok: true,
+      input: {
+        id,
+        transport: "stdio",
+        command,
+        args: tokens.slice(3),
+      },
+    };
+  }
+
+  if (transport === "http") {
+    const id = tokens[1]?.trim();
+    const url = tokens[2]?.trim();
+    if (!id || !url) {
+      return {
+        ok: false,
+        message: "Usage: /mcp add http <id> <url>",
+      };
+    }
+    return {
+      ok: true,
+      input: {
+        id,
+        transport: "http",
+        url,
+      },
+    };
+  }
+
+  if (transport === "filesystem") {
+    const id = tokens[1]?.trim();
+    if (!id) {
+      return {
+        ok: false,
+        message: "Usage: /mcp add filesystem <id> [workspace]",
+      };
+    }
+    return {
+      ok: true,
+      input: {
+        id,
+        transport: "filesystem",
+        workspaceRoot: tokens[2]?.trim() || ".",
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    message:
+      "Usage: /mcp add stdio <id> <command...> | /mcp add http <id> <url> | /mcp add filesystem <id> [workspace]",
+  };
+};
 
 const extractMessageBody = (raw: string) => {
   const [, ...rest] = raw.split("\n");
@@ -5165,6 +5365,284 @@ export const useChatApp = ({
             { kind: "system_hint", tone: "info", color: "cyan" }
           );
         }
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp") {
+        const servers = mcpService.listServers();
+        const pending = mcpService.listPending();
+        pushSystemMessage(
+          formatMcpRuntimeSummary(mcpService.describeRuntime?.(), servers, pending),
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp servers") {
+        const servers = mcpService.listServers();
+        pushSystemMessage(
+          servers.length > 0
+            ? ["MCP servers", ...servers.map(formatMcpServerLine)].join("\n")
+            : "No MCP servers registered.",
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp tools") {
+        const servers = mcpService.listServers();
+        const lines = servers.flatMap(server => {
+          const tools = mcpService.listTools(server.id);
+          return [
+            `[${server.id}] ${server.label} | tools ${tools.length}`,
+            ...(tools.length > 0
+              ? tools.map(formatMcpToolLine)
+              : ["- (no tools registered)"]),
+          ];
+        });
+
+        pushSystemMessage(
+          lines.length > 0
+            ? ["MCP tools", ...lines].join("\n")
+            : "No MCP tools registered.",
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp pending") {
+        const pending = mcpService.listPending();
+        pushSystemMessage(
+          pending.length > 0
+            ? ["MCP pending operations", ...pending.map(formatMcpPendingLine)].join("\n")
+            : "No pending MCP operations.",
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp reload") {
+        if (!mcpService.reloadConfig) {
+          pushSystemMessage("MCP runtime reload is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await mcpService.reloadConfig();
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp add ")) {
+        if (!mcpService.addServer) {
+          pushSystemMessage("MCP server management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const parsed = parseMcpAddCommand(query);
+        if (!parsed.ok) {
+          pushSystemMessage(parsed.message, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await mcpService.addServer(parsed.input);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp remove ")) {
+        if (!mcpService.removeServer) {
+          pushSystemMessage("MCP server management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const serverId = query.slice("/mcp remove ".length).trim();
+        if (!serverId) {
+          pushSystemMessage("Usage: /mcp remove <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await mcpService.removeServer(serverId);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp enable ")) {
+        if (!mcpService.setServerEnabled) {
+          pushSystemMessage("MCP server management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const serverId = query.slice("/mcp enable ".length).trim();
+        if (!serverId) {
+          pushSystemMessage("Usage: /mcp enable <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await mcpService.setServerEnabled(serverId, true);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp disable ")) {
+        if (!mcpService.setServerEnabled) {
+          pushSystemMessage("MCP server management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const serverId = query.slice("/mcp disable ".length).trim();
+        if (!serverId) {
+          pushSystemMessage("Usage: /mcp disable <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await mcpService.setServerEnabled(serverId, false);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp server ")) {
+        const serverId = query.slice("/mcp server ".length).trim();
+        if (!serverId) {
+          pushSystemMessage("Usage: /mcp server <id>");
+          clearInput();
+          return;
+        }
+
+        const servers = mcpService.listServers();
+        const server = resolveMcpServerDescriptor(servers, serverId);
+        if (!server) {
+          pushSystemMessage(`MCP server not found: ${serverId}`, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const tools = mcpService.listTools(server.id);
+        pushSystemMessage(
+          [
+            `MCP server ${server.id}`,
+            `label: ${server.label}`,
+            `transport: ${server.transport ?? "unknown"}`,
+            `source: ${server.source}`,
+            `health: ${server.health}`,
+            `enabled: ${server.enabled ? "true" : "false"}`,
+            `aliases: ${formatMcpAliases(server.aliases)}`,
+            `tools: ${tools.length}`,
+          ].join("\n"),
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp tools ")) {
+        const serverId = query.slice("/mcp tools ".length).trim();
+        if (!serverId) {
+          pushSystemMessage("Usage: /mcp tools <server>");
+          clearInput();
+          return;
+        }
+
+        const servers = mcpService.listServers();
+        const server = resolveMcpServerDescriptor(servers, serverId);
+        if (!server) {
+          pushSystemMessage(`MCP server not found: ${serverId}`, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const tools = mcpService.listTools(server.id);
+        pushSystemMessage(
+          [
+            `MCP tools for ${server.id}`,
+            ...(tools.length > 0
+              ? tools.map(formatMcpToolLine)
+              : ["- (no tools registered)"]),
+          ].join("\n"),
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
         clearInput();
         return;
       }

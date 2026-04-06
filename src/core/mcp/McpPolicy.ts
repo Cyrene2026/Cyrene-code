@@ -1,5 +1,9 @@
-import type { ToolRequest } from "../tools/mcp/types";
-import type { McpPolicyDecision, McpToolCapability, McpToolRisk } from "./types";
+import type { ToolRequest } from "./toolTypes";
+import type {
+  McpPolicyDecision,
+  McpToolCapability,
+  McpToolRisk,
+} from "./runtimeTypes";
 
 const READ_ACTIONS = new Set<ToolRequest["action"]>([
   "read_file",

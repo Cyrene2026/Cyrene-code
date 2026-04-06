@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadRuleConfig } from "../src/core/tools/mcp/loadRuleConfig";
+import {
+  loadFilesystemRuleConfig,
+  loadMcpConfig,
+  saveProjectMcpConfig,
+} from "../src/core/mcp";
 import {
   configureAppRootFromArgs,
   resetConfiguredAppRoot,
@@ -67,7 +71,7 @@ describe("config loaders", () => {
     expect(config.requestTemperature).toBe(2);
   });
 
-  test("loadRuleConfig falls back to config.yaml for MCP review settings", async () => {
+  test("loadFilesystemRuleConfig falls back to config.yaml for MCP review settings", async () => {
     const root = await createWorkspace([
       "workspace_root: .",
       "max_read_bytes: 4096",
@@ -77,7 +81,7 @@ describe("config loaders", () => {
       "  - run_command",
     ].join("\n"));
 
-    const config = await loadRuleConfig(root);
+    const config = await loadFilesystemRuleConfig(root);
 
     expect(config.workspaceRoot).toBe(root);
     expect(config.maxReadBytes).toBe(4096);
@@ -88,10 +92,10 @@ describe("config loaders", () => {
     ]);
   });
 
-  test("loadRuleConfig default review list keeps write_shell but not open_shell", async () => {
+  test("loadFilesystemRuleConfig default review list keeps write_shell but not open_shell", async () => {
     const root = await createWorkspace("");
 
-    const config = await loadRuleConfig(root);
+    const config = await loadFilesystemRuleConfig(root);
 
     expect(config.workspaceRoot).toBe(root);
     expect(config.requireReview).toContain("write_shell");
@@ -118,7 +122,7 @@ describe("config loaders", () => {
       cwd: root,
       env: {},
     });
-    const ruleConfig = await loadRuleConfig(undefined, {
+    const ruleConfig = await loadFilesystemRuleConfig(undefined, {
       cwd: root,
       env: {},
     });
@@ -143,7 +147,7 @@ describe("config loaders", () => {
       cwd: join(root, "workspace"),
       env: { CYRENE_ROOT: root },
     });
-    const ruleConfig = await loadRuleConfig(undefined, {
+    const ruleConfig = await loadFilesystemRuleConfig(undefined, {
       cwd: join(root, "workspace"),
       env: { CYRENE_ROOT: root },
     });
@@ -153,5 +157,116 @@ describe("config loaders", () => {
     expect(cyreneConfig.autoSummaryRefresh).toBe(true);
     expect(ruleConfig.workspaceRoot).toBe(join(root, "workspace"));
     expect(ruleConfig.requireReview).toEqual(["run_shell"]);
+  });
+
+  test("loadMcpConfig merges global and project mcp.yaml files and preserves filesystem fallback", async () => {
+    const root = await createWorkspace("");
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await mkdir(join(root, "packages", "app"), { recursive: true });
+    await writeFile(
+      join(globalHome, "mcp.yaml"),
+      [
+        "primary_server: docs",
+        "servers:",
+        "  - id: docs",
+        "    transport: stdio",
+        '    label: "Docs Search"',
+        "    aliases:",
+        "      - knowledge",
+        "    tools:",
+        "      - name: search_docs",
+        "        capabilities: [read, search]",
+        "        risk: low",
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "primary_server: filesystem",
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        '    label: "Repo Files"',
+        "    aliases:",
+        "      - repofs",
+        "    workspace_root: ./packages/app",
+        "    max_read_bytes: 8192",
+        "    require_review: [write_file, run_command]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = await loadMcpConfig(undefined, {
+      cwd: root,
+      env: {
+        CYRENE_HOME: globalHome,
+      },
+    });
+
+    expect(config.primaryServerId).toBe("filesystem");
+    expect(config.configPaths).toEqual([
+      join(globalHome, "mcp.yaml"),
+      join(root, ".cyrene", "mcp.yaml"),
+    ]);
+    expect(config.servers.map(server => server.id)).toEqual(
+      expect.arrayContaining(["filesystem", "docs", "repo"])
+    );
+    expect(config.servers.find(server => server.id === "docs")).toEqual(
+      expect.objectContaining({
+        transport: "stdio",
+        aliases: ["knowledge"],
+      })
+    );
+    expect(config.servers.find(server => server.id === "repo")).toEqual(
+      expect.objectContaining({
+        transport: "filesystem",
+        aliases: ["repofs"],
+        workspaceRoot: join(root, "packages", "app"),
+        maxReadBytes: 8192,
+        requireReview: ["write_file", "run_command"],
+      })
+    );
+    expect(
+      config.servers
+        .find(server => server.id === "filesystem")
+        ?.aliases.includes("file")
+    ).toBe(true);
+  });
+
+  test("loadMcpConfig honors project remove_servers overrides and saveProjectMcpConfig persists them", async () => {
+    const root = await createWorkspace("");
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await writeFile(
+      join(globalHome, "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: docs",
+        "    transport: http",
+        '    url: "http://127.0.0.1:9000/mcp"',
+      ].join("\n"),
+      "utf8"
+    );
+    await saveProjectMcpConfig(
+      root,
+      {
+        removeServerIds: ["docs"],
+        servers: [],
+      },
+      {
+        cwd: root,
+        env: { CYRENE_HOME: globalHome },
+      }
+    );
+
+    const config = await loadMcpConfig(undefined, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    expect(config.servers.some(server => server.id === "docs")).toBe(false);
+    expect(config.editableConfigPath).toBe(join(root, ".cyrene", "mcp.yaml"));
   });
 });

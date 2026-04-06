@@ -1,7 +1,7 @@
 import React from "react";
 import { describe, expect, mock, test } from "bun:test";
 import { create } from "react-test-renderer";
-import type { PendingReviewItem } from "../src/core/tools/mcp/types";
+import type { PendingReviewItem } from "../src/core/mcp";
 
 mock.module("ink", () => ({
   Box: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,

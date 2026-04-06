@@ -1,92 +1,63 @@
-import type { PendingReviewItem, RuleConfig, ToolRequest } from "../tools/mcp/types";
-import { buildMcpPolicyDecision, getMcpToolCapabilities } from "./McpPolicy";
+import type { PendingReviewItem, RuleConfig, ToolRequest } from "./toolTypes";
+import { buildBuiltinToolDescriptors } from "./builtinTools";
+import { McpServerRegistry } from "./McpServerRegistry";
+import { McpToolRouter } from "./McpToolRouter";
 import type {
   McpHandleResult,
   McpRuntime,
+  McpRuntimeSummary,
   McpServerAdapter,
   McpServerDescriptor,
-  McpToolDescriptor,
-} from "./types";
+} from "./runtimeTypes";
 
 const FILE_TOOL_NAMES = new Set(["file", "fs", "mcp.file"]);
 
-const getNamespacedToolId = (serverId: string, action: ToolRequest["action"]) =>
-  `${serverId}.${action}`;
+const buildFileServerAliases = (serverId: string) => ({
+  file: serverId,
+  fs: serverId,
+  "mcp.file": serverId,
+});
 
-const getToolLabel = (action: ToolRequest["action"]) => action.replace(/_/g, " ");
-
-const buildBuiltinToolDescriptors = (
-  serverId: string,
-  ruleConfig: Pick<RuleConfig, "requireReview">
-): McpToolDescriptor[] => {
-  const actions: ToolRequest["action"][] = [
-    "read_file",
-    "read_files",
-    "read_range",
-    "read_json",
-    "read_yaml",
-    "list_dir",
-    "create_dir",
-    "create_file",
-    "write_file",
-    "edit_file",
-    "apply_patch",
-    "delete_file",
-    "stat_path",
-    "stat_paths",
-    "outline_file",
-    "find_files",
-    "find_symbol",
-    "find_references",
-    "search_text",
-    "search_text_context",
-    "copy_path",
-    "move_path",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "run_command",
-    "run_shell",
-    "open_shell",
-    "write_shell",
-    "read_shell",
-    "shell_status",
-    "interrupt_shell",
-    "close_shell",
-  ];
-
-  return actions.map(action => {
-    const requiresReview =
-      action === "run_command" ||
-      action === "run_shell" ||
-      ruleConfig.requireReview.includes(action);
-    const policy = buildMcpPolicyDecision(
-      { action, path: "." } as ToolRequest,
-      requiresReview
-    );
-
-    return {
-      id: getNamespacedToolId(serverId, action),
-      serverId,
-      name: action,
-      label: getToolLabel(action),
-      capabilities: getMcpToolCapabilities(action),
-      risk: policy.risk,
-      requiresReview: policy.requiresReview,
-      enabled: true,
-    };
-  });
+const toRecord = (input: unknown): Record<string, unknown> | null => {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  return input as Record<string, unknown>;
 };
 
-export class McpManager implements McpRuntime {
-  private readonly servers = new Map<string, McpServerAdapter>();
+const withToolAction = (input: unknown, action: ToolRequest["action"]) => ({
+  ...(toRecord(input) ?? {}),
+  action,
+});
 
-  constructor(servers: McpServerAdapter[]) {
-    for (const server of servers) {
-      this.servers.set(server.descriptor.id, server);
+export class McpManager implements McpRuntime {
+  private readonly registry: McpServerRegistry;
+  private readonly router: McpToolRouter;
+  private readonly summary: McpRuntimeSummary;
+
+  constructor(
+    servers: McpServerAdapter[],
+    options?: {
+      primaryServerId?: string;
+      serverAliases?: Record<string, string>;
+      legacyToolServerIds?: Record<string, string>;
+      configPaths?: string[];
     }
+  ) {
+    this.registry = new McpServerRegistry(servers, {
+      primaryServerId: options?.primaryServerId,
+      serverAliases: options?.serverAliases,
+    });
+    this.router = new McpToolRouter(this.registry, {
+      legacyToolServerIds: options?.legacyToolServerIds,
+    });
+    const descriptors = this.registry.listServers();
+    this.summary = {
+      primaryServerId: this.registry.getPrimaryServer().descriptor.id,
+      serverCount: descriptors.length,
+      enabledServerCount: descriptors.filter(server => server.enabled).length,
+      configPaths: [...(options?.configPaths ?? [])],
+    };
   }
 
   static fromFileService(
@@ -108,12 +79,29 @@ export class McpManager implements McpRuntime {
       enabled: options?.enabled ?? true,
       source: "built_in",
       health: "online",
+      transport: "filesystem",
+      aliases: Object.keys(buildFileServerAliases(serverId)),
       tools: buildBuiltinToolDescriptors(serverId, ruleConfig),
     };
+    const toolNames = new Set(descriptor.tools.map(tool => tool.name));
 
     const adapter: McpServerAdapter = {
       descriptor,
-      handleToolCall: service.handleToolCall.bind(service),
+      handleToolCall: (toolName, input) => {
+        const normalizedToolName = toolName.trim().toLowerCase();
+        if (FILE_TOOL_NAMES.has(normalizedToolName)) {
+          return service.handleToolCall("file", input);
+        }
+
+        if (toolNames.has(normalizedToolName as ToolRequest["action"])) {
+          return service.handleToolCall(
+            "file",
+            withToolAction(input, normalizedToolName as ToolRequest["action"])
+          );
+        }
+
+        return service.handleToolCall(toolName, input);
+      },
       listPending: service.listPending.bind(service),
       approve: service.approve.bind(service),
       reject: service.reject.bind(service),
@@ -121,52 +109,59 @@ export class McpManager implements McpRuntime {
       dispose: service.dispose?.bind(service),
     };
 
-    return new McpManager([adapter]);
+    const serverAliases = buildFileServerAliases(serverId);
+
+    return new McpManager([adapter], {
+      primaryServerId: serverId,
+      serverAliases,
+      legacyToolServerIds: serverAliases,
+    });
   }
 
   listServers() {
-    return [...this.servers.values()].map(server => server.descriptor);
+    return this.registry.listServers();
   }
 
   listTools(serverId?: string) {
-    if (serverId) {
-      return this.servers.get(serverId)?.descriptor.tools ?? [];
-    }
-    return this.listServers().flatMap(server => server.tools);
+    return this.registry.listTools(serverId);
   }
 
-  private getPrimaryServer() {
-    const [server] = this.servers.values();
-    if (!server) {
-      throw new Error("No MCP servers are registered.");
-    }
-    return server;
+  describeRuntime() {
+    return {
+      ...this.summary,
+    };
   }
 
   async handleToolCall(toolName: string, input: unknown): Promise<McpHandleResult> {
-    if (FILE_TOOL_NAMES.has(toolName.trim().toLowerCase())) {
-      return this.getPrimaryServer().handleToolCall(toolName, input);
-    }
-
-    const [serverId] = toolName.split(".", 1);
-    if (serverId && this.servers.has(serverId)) {
-      return this.servers.get(serverId)!.handleToolCall(toolName, input);
-    }
-
-    return this.getPrimaryServer().handleToolCall(toolName, input);
+    const route = this.router.route(toolName);
+    const result = await route.server.handleToolCall(route.forwardedToolName, input);
+    return result.pending
+      ? {
+          ...result,
+          pending: {
+            ...result.pending,
+            serverId: result.pending.serverId ?? route.server.descriptor.id,
+          },
+        }
+      : result;
   }
 
   listPending(): PendingReviewItem[] {
-    return [...this.servers.values()]
-      .flatMap(server => server.listPending())
+    return this.registry
+      .listServers()
+      .flatMap(server =>
+        (this.registry.getServer(server.id)?.listPending() ?? []).map(item => ({
+          ...item,
+          serverId: item.serverId ?? server.id,
+        }))
+      )
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
   async approve(id: string): Promise<McpHandleResult> {
-    for (const server of this.servers.values()) {
-      if (server.listPending().some(item => item.id === id)) {
-        return server.approve(id);
-      }
+    const owner = this.registry.findPendingOwner(id);
+    if (owner) {
+      return owner.approve(id);
     }
     return {
       ok: false,
@@ -175,10 +170,9 @@ export class McpManager implements McpRuntime {
   }
 
   reject(id: string): McpHandleResult {
-    for (const server of this.servers.values()) {
-      if (server.listPending().some(item => item.id === id)) {
-        return server.reject(id);
-      }
+    const owner = this.registry.findPendingOwner(id);
+    if (owner) {
+      return owner.reject(id);
     }
     return {
       ok: false,
@@ -187,12 +181,19 @@ export class McpManager implements McpRuntime {
   }
 
   async undoLastMutation(): Promise<McpHandleResult> {
-    return this.getPrimaryServer().undoLastMutation();
+    const filesystemServer = this.registry
+      .listServers()
+      .find(server => server.transport === "filesystem" && server.enabled);
+
+    return (filesystemServer
+      ? this.registry.getServer(filesystemServer.id)
+      : this.registry.getPrimaryServer()
+    )!.undoLastMutation();
   }
 
   dispose() {
-    for (const server of this.servers.values()) {
-      server.dispose?.();
+    for (const server of this.registry.listServers()) {
+      this.registry.getServer(server.id)?.dispose?.();
     }
   }
 }

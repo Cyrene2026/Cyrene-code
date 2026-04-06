@@ -4,8 +4,8 @@ import {
   getCyreneConfigDir,
   getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
-} from "../../../infra/config/appRoot";
-import type { MpcAction, RuleConfig } from "./types";
+} from "../../../../infra/config/appRoot";
+import type { MpcAction, RuleConfig } from "../../toolTypes";
 
 type RuleConfigLoadContext = {
   cwd?: string;
@@ -79,7 +79,7 @@ const readConfigFile = async (path: string) => {
   }
 };
 
-export const loadRuleConfig = async (
+export const loadFilesystemRuleConfig = async (
   appRoot?: string,
   context?: RuleConfigLoadContext
 ): Promise<RuleConfig> => {

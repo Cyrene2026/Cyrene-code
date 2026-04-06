@@ -5,7 +5,7 @@ import { join, posix } from "node:path";
 import {
   FileMcpService,
   isPathInsideWorkspaceRoot,
-} from "../src/core/tools/mcp/fileMcpService";
+} from "../src/core/mcp";
 
 const tempRoots: string[] = [];
 const services: FileMcpService[] = [];

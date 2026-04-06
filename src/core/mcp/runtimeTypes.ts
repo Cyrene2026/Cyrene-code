@@ -1,4 +1,4 @@
-import type { PendingReviewItem, ToolRequest } from "../tools/mcp/types";
+import type { MpcAction, PendingReviewItem, ToolRequest } from "./toolTypes";
 
 export type McpToolCapability =
   | "read"
@@ -10,6 +10,7 @@ export type McpToolCapability =
   | "review";
 
 export type McpToolRisk = "low" | "medium" | "high";
+export type McpServerTransport = "filesystem" | "stdio" | "http";
 
 export type McpPolicyDecision = {
   allowed: boolean;
@@ -21,7 +22,7 @@ export type McpPolicyDecision = {
 export type McpToolDescriptor = {
   id: string;
   serverId: string;
-  name: ToolRequest["action"];
+  name: string;
   label: string;
   description?: string;
   capabilities: McpToolCapability[];
@@ -36,6 +37,8 @@ export type McpServerDescriptor = {
   enabled: boolean;
   source: "built_in" | "local" | "remote";
   health: "unknown" | "online" | "offline" | "error";
+  transport?: McpServerTransport;
+  aliases?: string[];
   tools: McpToolDescriptor[];
 };
 
@@ -43,6 +46,46 @@ export type McpHandleResult = {
   ok: boolean;
   message: string;
   pending?: PendingReviewItem;
+};
+
+export type McpRuntimeSummary = {
+  primaryServerId: string;
+  serverCount: number;
+  enabledServerCount: number;
+  configPaths: string[];
+  editableConfigPath?: string;
+};
+
+export type McpRuntimeToolInput = {
+  name: string;
+  label?: string;
+  description?: string;
+  capabilities?: McpToolCapability[];
+  risk?: McpToolRisk;
+  requiresReview?: boolean;
+  enabled?: boolean;
+};
+
+export type McpRuntimeServerInput = {
+  id: string;
+  transport: McpServerTransport;
+  label?: string;
+  enabled?: boolean;
+  aliases?: string[];
+  workspaceRoot?: string;
+  maxReadBytes?: number;
+  requireReview?: MpcAction[];
+  command?: string;
+  args?: string[];
+  url?: string;
+  tools?: McpRuntimeToolInput[];
+};
+
+export type McpRuntimeMutationResult = {
+  ok: boolean;
+  message: string;
+  serverId?: string;
+  configPath?: string;
 };
 
 export interface McpServerAdapter {
@@ -63,5 +106,13 @@ export interface McpRuntime {
   undoLastMutation(): Promise<McpHandleResult>;
   listServers(): McpServerDescriptor[];
   listTools(serverId?: string): McpToolDescriptor[];
+  describeRuntime?(): McpRuntimeSummary;
+  reloadConfig?(): Promise<McpRuntimeMutationResult>;
+  addServer?(input: McpRuntimeServerInput): Promise<McpRuntimeMutationResult>;
+  removeServer?(serverId: string): Promise<McpRuntimeMutationResult>;
+  setServerEnabled?(
+    serverId: string,
+    enabled: boolean
+  ): Promise<McpRuntimeMutationResult>;
   dispose(): void;
 }

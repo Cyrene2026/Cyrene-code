@@ -298,6 +298,7 @@ export type ToolRequest =
 
 export type PendingReviewItem = {
   id: string;
+  serverId?: string;
   request: ToolRequest;
   preview: string;
   previewSummary: string;

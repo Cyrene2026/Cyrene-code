@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { act } from "react-test-renderer";
-import type { FileAction, PendingReviewItem, ToolRequest } from "../src/core/tools/mcp/types";
+import type {
+  FileAction,
+  PendingReviewItem,
+  ToolRequest,
+} from "../src/core/mcp";
 import type { QueryTransport } from "../src/core/query/transport";
 import {
   CYRENE_STATE_UPDATE_END_TAG,
@@ -638,6 +642,179 @@ const createScriptedTransport = (
         text.includes("[undo] reverted write_file: restored notes.txt")
       )
     ).toBe(true);
+    app.cleanup();
+  });
+
+  test("/mcp commands expose runtime summary, servers, tools and pending queue", async () => {
+    const pending = [
+      {
+        ...createPending("m1", "create_file", "safe.txt"),
+        serverId: "filesystem",
+      },
+    ];
+    const mcpService = {
+      listPending: () => pending,
+      listServers: () => [
+        {
+          id: "filesystem",
+          label: "Filesystem",
+          enabled: true,
+          source: "built_in" as const,
+          health: "online" as const,
+          transport: "filesystem" as const,
+          aliases: ["file", "fs", "mcp.file"],
+          tools: [
+            {
+              id: "filesystem.read_file",
+              serverId: "filesystem",
+              name: "read_file",
+              label: "read file",
+              capabilities: ["read"] as const,
+              risk: "low" as const,
+              requiresReview: false,
+              enabled: true,
+            },
+          ],
+        },
+        {
+          id: "docs",
+          label: "Docs",
+          enabled: true,
+          source: "local" as const,
+          health: "error" as const,
+          transport: "stdio" as const,
+          aliases: ["docs"],
+          tools: [
+            {
+              id: "docs.search_docs",
+              serverId: "docs",
+              name: "search_docs",
+              label: "search docs",
+              capabilities: ["read", "search"] as const,
+              risk: "low" as const,
+              requiresReview: false,
+              enabled: true,
+            },
+          ],
+        },
+      ],
+      listTools: (serverId?: string) =>
+        serverId === "docs"
+          ? [
+              {
+                id: "docs.search_docs",
+                serverId: "docs",
+                name: "search_docs",
+                label: "search docs",
+                capabilities: ["read", "search"] as const,
+                risk: "low" as const,
+                requiresReview: false,
+                enabled: true,
+              },
+            ]
+          : serverId === "filesystem"
+            ? [
+                {
+                  id: "filesystem.read_file",
+                  serverId: "filesystem",
+                  name: "read_file",
+                  label: "read file",
+                  capabilities: ["read"] as const,
+                  risk: "low" as const,
+                  requiresReview: false,
+                  enabled: true,
+                },
+              ]
+            : [],
+      describeRuntime: () => ({
+        primaryServerId: "filesystem",
+        serverCount: 2,
+        enabledServerCount: 2,
+        configPaths: ["D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml"],
+      }),
+    };
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: mcpService as any,
+      })
+    );
+
+    await runCommand(app, "/mcp");
+    await runCommand(app, "/mcp servers");
+    await runCommand(app, "/mcp tools docs");
+    await runCommand(app, "/mcp pending");
+
+    const texts = getTexts(app.getLatest().items);
+    expect(texts.some(text => text.includes("MCP runtime"))).toBe(true);
+    expect(texts.some(text => text.includes("config:"))).toBe(true);
+    expect(texts.some(text => text.includes("- filesystem |"))).toBe(true);
+    expect(texts.some(text => text.includes("MCP tools for docs"))).toBe(true);
+    expect(texts.some(text => text.includes("search_docs"))).toBe(true);
+    expect(texts.some(text => text.includes("server filesystem"))).toBe(true);
+
+    app.cleanup();
+  });
+
+  test("/mcp management commands call runtime mutation hooks", async () => {
+    const addServer = mock(async () => ({
+      ok: true,
+      message: "MCP server added: docs\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+    }));
+    const removeServer = mock(async (id: string) => ({
+      ok: true,
+      message: `MCP server removed: ${id}\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml`,
+    }));
+    const setServerEnabled = mock(async (id: string, enabled: boolean) => ({
+      ok: true,
+      message: `${enabled ? "MCP server enabled" : "MCP server disabled"}: ${id}\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml`,
+    }));
+    const reloadConfig = mock(async () => ({
+      ok: true,
+      message: "MCP config reloaded\nservers: 3\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+    }));
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          addServer,
+          removeServer,
+          setServerEnabled,
+          reloadConfig,
+        } as any,
+      })
+    );
+
+    await runCommand(app, '/mcp add stdio docs "node" "scripts/mcp-server.mjs" "--watch"');
+    await runCommand(app, "/mcp disable docs");
+    await runCommand(app, "/mcp enable docs");
+    await runCommand(app, "/mcp remove docs");
+    await runCommand(app, "/mcp reload");
+
+    expect(addServer).toHaveBeenCalledWith({
+      id: "docs",
+      transport: "stdio",
+      command: "node",
+      args: ["scripts/mcp-server.mjs", "--watch"],
+    });
+    expect(setServerEnabled).toHaveBeenCalledWith("docs", false);
+    expect(setServerEnabled).toHaveBeenCalledWith("docs", true);
+    expect(removeServer).toHaveBeenCalledWith("docs");
+    expect(reloadConfig).toHaveBeenCalledTimes(1);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("MCP config reloaded"))
+    ).toBe(true);
+
     app.cleanup();
   });
 

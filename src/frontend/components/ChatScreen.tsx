@@ -294,11 +294,13 @@ const APPROVAL_DIFF_REMOVE_FOREGROUND = "#fee2e2";
 const APPROVAL_DIFF_REMOVE_BACKGROUND = "#7f1d1d";
 const APPROVAL_DIFF_ADD_ACCENT = "#166534";
 const APPROVAL_DIFF_REMOVE_ACCENT = "#991b1b";
-const MAX_RENDERED_TRANSCRIPT_ITEMS = 80;
-const MAX_RENDER_TEXT_LINES = 420;
-const MAX_RENDER_TEXT_CHARS = 24000;
-const MAX_STREAMING_RENDER_TEXT_LINES = 160;
-const MAX_STREAMING_RENDER_TEXT_CHARS = 12000;
+const MAX_RENDERED_TRANSCRIPT_ITEMS = 48;
+const MAX_TRANSCRIPT_WINDOW_LINES = 240;
+const MAX_TRANSCRIPT_WINDOW_CHARS = 18000;
+const MAX_RENDER_TEXT_LINES = 280;
+const MAX_RENDER_TEXT_CHARS = 14000;
+const MAX_STREAMING_RENDER_TEXT_LINES = 48;
+const MAX_STREAMING_RENDER_TEXT_CHARS = 4000;
 const MAX_RENDERED_TERMINAL_OUTPUT_LINES = 220;
 const MAX_COMPACT_TERMINAL_OUTPUT_LINES = 2;
 const CODE_KEYWORDS = new Set([
@@ -887,16 +889,54 @@ const getMessageClipOptions = (item: ChatItem): RenderClipOptions =>
       }
     : {};
 
-const getTranscriptWindow = (items: ChatItem[]) => {
-  if (items.length <= MAX_RENDERED_TRANSCRIPT_ITEMS) {
-    return {
-      items,
-      hiddenCount: 0,
-    };
-  }
+const getApproximateMessageRenderCost = (item: ChatItem) => {
+  const text = item.text ?? "";
+  const lineCount = text ? text.split("\n").length : 0;
+
   return {
-    items: items.slice(-MAX_RENDERED_TRANSCRIPT_ITEMS),
-    hiddenCount: items.length - MAX_RENDERED_TRANSCRIPT_ITEMS,
+    lineCount: Math.min(lineCount, MAX_RENDER_TEXT_LINES),
+    charCount: Math.min(text.length, MAX_RENDER_TEXT_CHARS),
+  };
+};
+
+const getTranscriptWindow = (items: ChatItem[]) => {
+  if (items.length === 0) {
+    return { items, hiddenCount: 0 };
+  }
+
+  let visibleItems = 0;
+  let visibleLines = 0;
+  let visibleChars = 0;
+  let startIndex = items.length - 1;
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item) {
+      continue;
+    }
+    const cost = getApproximateMessageRenderCost(item);
+    const nextItemCount = visibleItems + 1;
+    const nextLineCount = visibleLines + cost.lineCount;
+    const nextCharCount = visibleChars + cost.charCount;
+    const exceedsWindow =
+      visibleItems > 0 &&
+      (nextItemCount > MAX_RENDERED_TRANSCRIPT_ITEMS ||
+        nextLineCount > MAX_TRANSCRIPT_WINDOW_LINES ||
+        nextCharCount > MAX_TRANSCRIPT_WINDOW_CHARS);
+
+    if (exceedsWindow) {
+      break;
+    }
+
+    startIndex = index;
+    visibleItems = nextItemCount;
+    visibleLines = nextLineCount;
+    visibleChars = nextCharCount;
+  }
+
+  return {
+    items: items.slice(startIndex),
+    hiddenCount: startIndex,
   };
 };
 
@@ -2522,22 +2562,14 @@ const renderStreamingAssistantItem = (
   }
 
   const clip = clipTextForRender(text, clipOptions);
-  const lines = clip.text.split("\n");
-  const visibleLines = lines.length > 0 ? lines : [" "];
+  const body = clip.text ? `  ${clip.text.replace(/\n/g, "\n  ")}` : "  ";
 
   return (
     <Box key={`streaming-item-${itemIndex}`} flexDirection="column" marginBottom={1}>
       <Text bold color="cyan">
         cyrene
       </Text>
-      {visibleLines.map((line, lineIndex) => (
-        <Text
-          key={`streaming-line-${itemIndex}-${lineIndex}`}
-          color={line.trim() ? "white" : "gray"}
-        >
-          {`  ${line || " "}`}
-        </Text>
-      ))}
+      <Text color={clip.text.trim() ? "white" : "gray"}>{body}</Text>
     </Box>
   );
 };
@@ -4088,18 +4120,8 @@ export const ChatScreen = ({
 
   return (
     <Box flexDirection="column">
-      <Box marginBottom={SECTION_GAP} flexDirection="column">
-        {showStartupView
-          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
-          : null}
-        {showTranscriptWindowNotice ? (
-          <Text dimColor>
-            {`[render window] showing latest ${transcriptWindow.items.length} of ${items.length} messages`}
-          </Text>
-        ) : null}
-        {transcriptNodes}
-        {liveAssistantNode}
-      </Box>
+      {composerNode}
+      {statusLineNode}
 
       {authPanel.active ? renderAuthWizardPanel(authPanel, authStatus) : null}
 
@@ -4229,8 +4251,18 @@ export const ChatScreen = ({
           )
         : null}
 
-      {composerNode}
-      {statusLineNode}
+      <Box marginTop={SECTION_GAP} flexDirection="column">
+        {showStartupView
+          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
+          : null}
+        {showTranscriptWindowNotice ? (
+          <Text dimColor>
+            {`[render window] showing latest ${transcriptWindow.items.length} of ${items.length} messages`}
+          </Text>
+        ) : null}
+        {transcriptNodes}
+        {liveAssistantNode}
+      </Box>
     </Box>
   );
 };

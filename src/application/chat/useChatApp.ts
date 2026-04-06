@@ -292,9 +292,9 @@ const RESUME_PAGE_SIZE = 8;
 const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
-const STREAMING_RENDER_BATCH_MS = 40;
-const STREAMING_RENDER_BATCH_MS_MEDIUM = 80;
-const STREAMING_RENDER_BATCH_MS_LARGE = 140;
+const STREAMING_RENDER_BATCH_MS = 90;
+const STREAMING_RENDER_BATCH_MS_MEDIUM = 150;
+const STREAMING_RENDER_BATCH_MS_LARGE = 240;
 const TURN_CANCELLED_ERROR = "__CYRENE_TURN_CANCELLED__";
 const COMMAND_SPECS: CommandSpec[] = [
   { command: "/help", description: "show command list" },
@@ -1666,10 +1666,10 @@ const addUsageToRuntimeSummary = (
 });
 
 const getStreamingRenderBatchMs = (textLength: number) => {
-  if (textLength >= 8_000) {
+  if (textLength >= 4_000) {
     return STREAMING_RENDER_BATCH_MS_LARGE;
   }
-  if (textLength >= 2_000) {
+  if (textLength >= 1_500) {
     return STREAMING_RENDER_BATCH_MS_MEDIUM;
   }
   return STREAMING_RENDER_BATCH_MS;

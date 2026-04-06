@@ -856,6 +856,60 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
+  test("slash suggestions expose palette groups and highlight ranges", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("/mod ref");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    const refreshSuggestion = app
+      .getLatest()
+      .inputCommandState.suggestions.find(
+        suggestion => suggestion.command === "/model refresh"
+      );
+
+    expect(refreshSuggestion?.group).toBe("Model & provider");
+    expect(refreshSuggestion?.matchRanges).toEqual([
+      { start: 0, end: 4 },
+      { start: 7, end: 10 },
+    ]);
+    expect(refreshSuggestion?.baseCommand).toBe("/model");
+    expect(refreshSuggestion?.template).toBe("refresh");
+    expect(refreshSuggestion?.argumentHints).toEqual([]);
+
+    const modelSuggestion = app
+      .getLatest()
+      .inputCommandState.suggestions.find(
+        suggestion => suggestion.command === "/model <name>"
+      );
+
+    expect(modelSuggestion?.baseCommand).toBe("/model");
+    expect(modelSuggestion?.template).toBe("<name>");
+    expect(modelSuggestion?.argumentHints).toEqual([
+      {
+        label: "name",
+        optional: false,
+      },
+    ]);
+    expect(modelSuggestion?.insertValue).toBe("/model ");
+
+    app.cleanup();
+  });
+
   test("!shell submits direct shell requests without starting a query session", async () => {
     const pending: PendingReviewItem = {
       id: "shell-1",
@@ -907,6 +961,120 @@ const createScriptedTransport = (
       )
     ).toBe(true);
     app.cleanup();
+  });
+
+  test("!shell session actions keep shell session state in sync", async () => {
+    const realDateNow = Date.now;
+    let now = 1_710_000_000_000;
+    Date.now = () => now;
+
+    const handleToolCall = mock(async (_toolName: string, request: any) => {
+      if (request.action === "open_shell") {
+        return {
+          ok: true,
+          message: [
+            "[tool result] open_shell .",
+            "status: opened",
+            "program: pwsh",
+            "status: idle",
+            "shell: pwsh",
+            "cwd: workspace/subdir",
+            "busy: false",
+            "alive: true",
+            "pending_output: false",
+            "last_exit: unknown",
+            "output_truncated: false",
+            "output:",
+            "(no new output)",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "shell_status") {
+        return {
+          ok: true,
+          message: [
+            "[tool result] shell_status .",
+            "status: running",
+            "shell: pwsh",
+            "cwd: workspace/subdir",
+            "busy: true",
+            "alive: true",
+            "pending_output: true",
+            "last_exit: 0",
+            "output_truncated: false",
+            "output:",
+            "Compiling chat renderer",
+            "Done in 0.48s",
+          ].join("\n"),
+        };
+      }
+
+      throw new Error(`Unexpected action: ${String(request.action)}`);
+    });
+    const runQuerySessionImpl = mock(async () => ({ status: "completed" as const }));
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall,
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    try {
+      await runCommand(app, "!shell open workspace/subdir");
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      expect(runQuerySessionImpl).not.toHaveBeenCalled();
+      expect(app.getLatest().shellSession).toEqual(
+        expect.objectContaining({
+          visible: true,
+          status: "idle",
+          shell: "pwsh",
+          cwd: "workspace/subdir",
+          alive: true,
+          pendingOutput: false,
+          lastEvent: "opened",
+          openedAt: now,
+          runningSince: null,
+          lastOutputSummary: null,
+          lastOutputAt: null,
+        })
+      );
+
+      now += 9_000;
+      await runCommand(app, "!shell status");
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      expect(app.getLatest().shellSession).toEqual(
+        expect.objectContaining({
+          visible: true,
+          status: "running",
+          shell: "pwsh",
+          cwd: "workspace/subdir",
+          busy: true,
+          alive: true,
+          pendingOutput: true,
+          lastExit: "0",
+          openedAt: 1_710_000_000_000,
+          runningSince: now,
+          lastOutputSummary: "Compiling chat renderer  ·  Done in 0.48s",
+          lastOutputAt: now,
+        })
+      );
+    } finally {
+      Date.now = realDateNow;
+      app.cleanup();
+    }
   });
 
   test("@file suggestions resolve via find_files and tab inserts the selected mention", async () => {
@@ -967,6 +1135,270 @@ const createScriptedTransport = (
     await flushMicrotasks();
 
     expect(app.getLatest().input).toBe("@tests/ChatScreen.test.tsx ");
+    app.cleanup();
+  });
+
+  test("@file preview prefers contextual snippets when the query matches file contents", async () => {
+    const handleToolCall = mock(async (_toolName: string, request: any) => {
+      if (request.action === "find_files") {
+        return {
+          ok: true,
+          message: [
+            "[tool result] find_files .",
+            "Found 1 file(s):",
+            "src/frontend/components/ChatScreen.tsx",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "search_text_context") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] search_text_context ${request.path}`,
+            "Found 1 contextual match(es):",
+            `[match] ${request.path}:44`,
+            "42 | const before = true;",
+            "43 | const around = true;",
+            "> 44 | const modelName = currentModel;",
+            "45 | const after = false;",
+          ].join("\n"),
+        };
+      }
+
+      throw new Error(`Unexpected action: ${String(request.action)}`);
+    });
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall,
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("@model");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "search_text_context",
+      path: "src/frontend/components/ChatScreen.tsx",
+      query: "model",
+      before: 2,
+      after: 3,
+      maxResults: 1,
+    });
+    expect(app.getLatest().inputCommandState.fileMentions.preview).toEqual(
+      expect.objectContaining({
+        path: "src/frontend/components/ChatScreen.tsx",
+        meta: "context hit  |  lines 42-45",
+        loading: false,
+      })
+    );
+    expect(app.getLatest().inputCommandState.fileMentions.preview.text).toContain(
+      "› const modelName = currentModel;"
+    );
+
+    app.cleanup();
+  });
+
+  test("@file preview falls back to syntax-aware symbol snippets for code files", async () => {
+    const handleToolCall = mock(async (_toolName: string, request: any) => {
+      if (request.action === "find_files") {
+        return {
+          ok: true,
+          message: [
+            "[tool result] find_files .",
+            "Found 1 file(s):",
+            "src/frontend/components/ChatScreen.tsx",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "search_text_context") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] search_text_context ${request.path}`,
+            "Found 0 contextual match(es):",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "outline_file") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] outline_file ${request.path}`,
+            `Outline for ${request.path}`,
+            "10 | function renderComposerPalette(",
+            "40 | function renderCommandPaletteRow(",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "search_text_context") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] search_text_context ${request.path}`,
+            "Found 0 contextual match(es):",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "outline_file") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] outline_file ${request.path}`,
+            `Outline for ${request.path}`,
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "read_range") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] read_range ${request.path}`,
+            `path: ${request.path}`,
+            "lines: 39-44",
+            " 39 |",
+            " 40 | function renderCommandPaletteRow() {",
+            " 41 |   return null;",
+            " 42 | }",
+          ].join("\n"),
+        };
+      }
+
+      throw new Error(`Unexpected action: ${String(request.action)}`);
+    });
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall,
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("@command");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "outline_file",
+      path: "src/frontend/components/ChatScreen.tsx",
+    });
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "read_range",
+      path: "src/frontend/components/ChatScreen.tsx",
+      startLine: 39,
+      endLine: 44,
+    });
+    expect(app.getLatest().inputCommandState.fileMentions.preview).toEqual(
+      expect.objectContaining({
+        path: "src/frontend/components/ChatScreen.tsx",
+        meta: "symbol function renderCommandPaletteRow(  |  lines 39-44",
+        loading: false,
+      })
+    );
+    expect(app.getLatest().inputCommandState.fileMentions.preview.text).toContain(
+      "function renderCommandPaletteRow() {"
+    );
+
+    app.cleanup();
+  });
+
+  test("@file preview loads a compact selected-file excerpt", async () => {
+    const handleToolCall = mock(async (_toolName: string, request: any) => {
+      if (request.action === "find_files") {
+        return {
+          ok: true,
+          message: [
+            "[tool result] find_files .",
+            "Found 2 file(s):",
+            "src/frontend/components/ChatScreen.tsx",
+            "tests/ChatScreen.test.tsx",
+          ].join("\n"),
+        };
+      }
+
+      if (request.action === "read_range") {
+        return {
+          ok: true,
+          message: [
+            `[tool result] read_range ${request.path}`,
+            `path: ${request.path}`,
+            "lines: 1-8",
+            '  1 | import React from "react";',
+            '  2 | import { Box, Text } from "ink";',
+            "  3 | const preview = true;",
+          ].join("\n"),
+        };
+      }
+
+      throw new Error(`Unexpected action: ${String(request.action)}`);
+    });
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall,
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("@chat");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(handleToolCall).toHaveBeenCalledWith("file", {
+      action: "read_range",
+      path: "src/frontend/components/ChatScreen.tsx",
+      startLine: 1,
+      endLine: 8,
+    });
+    expect(app.getLatest().inputCommandState.fileMentions.preview).toEqual(
+      expect.objectContaining({
+        path: "src/frontend/components/ChatScreen.tsx",
+        meta: "lines 1-8",
+        loading: false,
+      })
+    );
+    expect(app.getLatest().inputCommandState.fileMentions.preview.text).toContain(
+      'import React from "react";'
+    );
+
     app.cleanup();
   });
 

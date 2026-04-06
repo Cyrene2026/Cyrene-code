@@ -90,6 +90,7 @@ export const ChatCliApp = ({
     input,
     inputCursorOffset,
     inputCommandState,
+    shellSession,
     status,
     resumePicker,
     sessionsPanel,
@@ -168,6 +169,7 @@ export const ChatCliApp = ({
       input={input}
       inputCursorOffset={inputCursorOffset}
       inputCommandState={inputCommandState}
+      shellSession={shellSession}
       status={status}
       resumePicker={resumePicker}
       sessionsPanel={sessionsPanel}

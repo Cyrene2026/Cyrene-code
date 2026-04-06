@@ -26,6 +26,15 @@ type ChatScreenProps = {
     suggestions: Array<{
       command: string;
       description: string;
+      group?: string;
+      matchRanges?: MatchRange[];
+      baseCommand?: string;
+      template?: string | null;
+      argumentHints?: Array<{
+        label: string;
+        optional: boolean;
+      }>;
+      insertValue?: string;
     }>;
     selectedIndex: number;
     historyPosition: number | null;
@@ -52,7 +61,28 @@ type ChatScreenProps = {
         description: string;
       }>;
       loading: boolean;
+      preview?: {
+        path: string | null;
+        text: string;
+        meta: string | null;
+        loading: boolean;
+      };
     };
+  };
+  shellSession: {
+    visible: boolean;
+    status: "none" | "idle" | "running" | "exited" | "closed";
+    shell: string | null;
+    cwd: string | null;
+    busy: boolean;
+    alive: boolean;
+    pendingOutput: boolean;
+    lastExit: string | null;
+    lastEvent: "opened" | "interrupted" | null;
+    openedAt?: number | null;
+    runningSince?: number | null;
+    lastOutputSummary?: string | null;
+    lastOutputAt?: number | null;
   };
   resumePicker: {
     active: boolean;
@@ -121,6 +151,23 @@ type PagedResult<T> = {
   currentPage: number;
   totalPages: number;
   total: number;
+};
+
+type MatchRange = {
+  start: number;
+  end: number;
+};
+
+type CommandArgumentHint = {
+  label: string;
+  optional: boolean;
+};
+
+type CommandTemplateMeta = {
+  baseCommand: string;
+  template: string | null;
+  argumentHints: CommandArgumentHint[];
+  insertValue: string;
 };
 
 type InkTone = ChatItem["color"] | string;
@@ -313,6 +360,397 @@ const getMessageLabel = (
 
 const shortenValue = (value: string, max = 20) =>
   value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
+
+const clipPreviewLine = (value: string, max = 88) =>
+  value.length <= max ? value : `${value.slice(0, Math.max(1, max - 3))}...`;
+
+const getSlashInsertValue = (command: string) => {
+  switch (command) {
+    case "/provider <url>":
+      return "/provider ";
+    case "/model <name>":
+      return "/model ";
+    case "/system <text>":
+      return "/system ";
+    case "/resume <id>":
+      return "/resume ";
+    case "/search-session <query>":
+      return "/search-session ";
+    case "/search-session #<tag> [query]":
+      return "/search-session #";
+    case "/tag add <tag>":
+      return "/tag add ";
+    case "/tag remove <tag>":
+      return "/tag remove ";
+    case "/pin <note>":
+      return "/pin ";
+    case "/unpin <index>":
+      return "/unpin ";
+    case "/review <id>":
+      return "/review ";
+    case "/approve [id]":
+      return "/approve ";
+    case "/reject [id]":
+      return "/reject ";
+    default:
+      return command;
+  }
+};
+
+const getCommandTemplateMeta = (
+  suggestion: ChatScreenProps["inputCommandState"]["suggestions"][number]
+): CommandTemplateMeta => {
+  if (
+    suggestion.baseCommand &&
+    Array.isArray(suggestion.argumentHints) &&
+    "insertValue" in suggestion
+  ) {
+    return {
+      baseCommand: suggestion.baseCommand,
+      template:
+        typeof suggestion.template === "string" ? suggestion.template : null,
+      argumentHints: suggestion.argumentHints,
+      insertValue:
+        typeof suggestion.insertValue === "string"
+          ? suggestion.insertValue
+          : getSlashInsertValue(suggestion.command),
+    };
+  }
+
+  const [baseCommand = suggestion.command, ...rest] = suggestion.command
+    .trim()
+    .split(/\s+/);
+  const template = rest.length > 0 ? rest.join(" ") : null;
+  const argumentHints: CommandArgumentHint[] = [];
+  const argumentPattern = /#?<([^>]+)>|\[([^\]]+)\]/g;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = argumentPattern.exec(template ?? "")) !== null) {
+    const label = (match[1] ?? match[2] ?? "").trim().replace(/^#/, "");
+    if (!label) {
+      continue;
+    }
+    argumentHints.push({
+      label,
+      optional: Boolean(match[2]),
+    });
+  }
+
+  return {
+    baseCommand,
+    template,
+    argumentHints,
+    insertValue: getSlashInsertValue(suggestion.command),
+  };
+};
+
+const sliceMatchRanges = (
+  ranges: MatchRange[] = [],
+  start: number,
+  end: number
+) =>
+  ranges
+    .map(range => ({
+      start: Math.max(start, range.start),
+      end: Math.min(end, range.end),
+    }))
+    .filter(range => range.end > range.start)
+    .map(range => ({
+      start: range.start - start,
+      end: range.end - start,
+    }));
+
+const buildHighlightSegments = (text: string, ranges: MatchRange[] = []) => {
+  if (ranges.length === 0) {
+    return [{ text, highlight: false }];
+  }
+
+  const ordered = [...ranges].sort((left, right) =>
+    left.start === right.start ? left.end - right.end : left.start - right.start
+  );
+  const segments: Array<{ text: string; highlight: boolean }> = [];
+  let cursor = 0;
+
+  for (const range of ordered) {
+    const start = Math.max(0, Math.min(text.length, range.start));
+    const end = Math.max(start, Math.min(text.length, range.end));
+
+    if (start > cursor) {
+      segments.push({
+        text: text.slice(cursor, start),
+        highlight: false,
+      });
+    }
+
+    if (end > start) {
+      segments.push({
+        text: text.slice(start, end),
+        highlight: true,
+      });
+    }
+    cursor = end;
+  }
+
+  if (cursor < text.length) {
+    segments.push({
+      text: text.slice(cursor),
+      highlight: false,
+    });
+  }
+
+  return segments.filter(segment => segment.text.length > 0);
+};
+
+const renderHighlightedText = (
+  text: string,
+  ranges: MatchRange[] | undefined,
+  options: {
+    selected?: boolean;
+    tone: ComposerTone;
+    baseColor?: InkTone;
+    highlightColor?: InkTone;
+    dimColor?: boolean;
+  }
+) => (
+  <Text
+    bold={options.selected}
+    color={options.baseColor ?? (options.selected ? "white" : "gray")}
+    dimColor={options.dimColor}
+  >
+    {buildHighlightSegments(text, ranges).map((segment, index) => (
+      <Text
+        key={`${text}-${index}`}
+        color={
+          segment.highlight ? options.highlightColor ?? options.tone.promptColor : undefined
+        }
+        bold={options.selected || segment.highlight}
+      >
+        {segment.text}
+      </Text>
+    ))}
+  </Text>
+);
+
+const groupPaletteWindow = <T extends { group?: string }>(
+  items: Array<{ item: T; index: number }>
+) => {
+  const groups = new Map<string, Array<{ item: T; index: number }>>();
+  for (const entry of items) {
+    const group = entry.item.group ?? "Commands";
+    const bucket = groups.get(group);
+    if (bucket) {
+      bucket.push(entry);
+    } else {
+      groups.set(group, [entry]);
+    }
+  }
+  return [...groups.entries()];
+};
+
+const formatDuration = (startAt: number | null | undefined, now: number) => {
+  if (!startAt) {
+    return null;
+  }
+
+  const elapsedSeconds = Math.max(0, Math.floor((now - startAt) / 1000));
+  const hours = Math.floor(elapsedSeconds / 3600);
+  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+  const seconds = elapsedSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+};
+
+const renderCommandPaletteRow = (
+  suggestion: ChatScreenProps["inputCommandState"]["suggestions"][number],
+  selected: boolean,
+  tone: ComposerTone
+) => {
+  const templateMeta = getCommandTemplateMeta(suggestion);
+  const baseText = templateMeta.baseCommand;
+  const templateText = templateMeta.template ?? "";
+  const baseRanges = sliceMatchRanges(
+    suggestion.matchRanges,
+    0,
+    baseText.length
+  );
+  const templateOffset =
+    suggestion.command.length > baseText.length ? baseText.length + 1 : baseText.length;
+  const templateRanges = templateText
+    ? sliceMatchRanges(
+        suggestion.matchRanges,
+        templateOffset,
+        templateOffset + templateText.length
+      )
+    : [];
+  const argumentSummary = templateMeta.argumentHints
+    .map(argument => `${argument.label}${argument.optional ? "?" : ""}`)
+    .join(", ");
+  const insertsTemplate = templateMeta.insertValue !== suggestion.command;
+
+  return (
+    <Box key={`composer-command-${suggestion.command}`} flexDirection="column">
+      <Box flexWrap="wrap">
+        <Text color={selected ? tone.promptColor : "gray"}>
+          {selected ? "→" : "·"}
+        </Text>
+        <Text> </Text>
+        {renderHighlightedText(baseText, baseRanges, {
+          selected,
+          tone,
+        })}
+        {templateText ? (
+          <>
+            <Text> </Text>
+            {renderHighlightedText(templateText, templateRanges, {
+              selected,
+              tone,
+              baseColor: selected ? "gray" : "gray",
+              dimColor: !selected,
+            })}
+          </>
+        ) : null}
+        <Text dimColor>{`  ${suggestion.description}`}</Text>
+      </Box>
+      {selected && (templateText || argumentSummary || insertsTemplate) ? (
+        <Box marginLeft={2} flexWrap="wrap">
+          {templateText ? (
+            <>
+              <Text dimColor>template </Text>
+              <Text>{templateMeta.baseCommand}</Text>
+              <Text dimColor>{` ${templateText}`}</Text>
+            </>
+          ) : null}
+          {argumentSummary ? (
+            <>
+              <Text dimColor>{templateText ? `  |  args ` : `args `}</Text>
+              <Text>{argumentSummary}</Text>
+            </>
+          ) : null}
+          {insertsTemplate ? (
+            <>
+              <Text dimColor>
+                {templateText || argumentSummary ? `  |  Tab ` : "Tab "}
+              </Text>
+              <Text>{clipPreviewLine(templateMeta.insertValue, 28)}</Text>
+            </>
+          ) : null}
+        </Box>
+      ) : null}
+    </Box>
+  );
+};
+
+const getShellSessionBadge = (
+  shellSession: ChatScreenProps["shellSession"]
+): {
+  label: string;
+  backgroundColor: "cyan" | "yellow" | "red" | "magenta";
+  textColor: "black";
+} => {
+  if (shellSession.status === "running") {
+    return {
+      label: " SHELL RUNNING ",
+      backgroundColor: "yellow",
+      textColor: "black",
+    };
+  }
+  if (shellSession.status === "exited" || !shellSession.alive) {
+    return {
+      label: " SHELL EXITED ",
+      backgroundColor: "red",
+      textColor: "black",
+    };
+  }
+  if (shellSession.lastEvent === "interrupted") {
+    return {
+      label: " SHELL INTERRUPTED ",
+      backgroundColor: "magenta",
+      textColor: "black",
+    };
+  }
+  return {
+    label: " SHELL IDLE ",
+    backgroundColor: "cyan",
+    textColor: "black",
+  };
+};
+
+const renderShellSessionBar = (
+  shellSession: ChatScreenProps["shellSession"],
+  now: number
+) => {
+  if (!shellSession.visible) {
+    return null;
+  }
+
+  const badge = getShellSessionBadge(shellSession);
+  const liveDuration = formatDuration(shellSession.openedAt, now);
+  const runningDuration = formatDuration(shellSession.runningSince, now);
+  const outputAge = formatDuration(shellSession.lastOutputAt, now);
+
+  return (
+    <Box marginTop={1} flexDirection="column">
+      <Box flexWrap="wrap">
+        <Text
+          color={badge.textColor}
+          backgroundColor={badge.backgroundColor}
+        >
+          {badge.label}
+        </Text>
+        <Text> </Text>
+        <Text>{shellSession.shell ?? "shell"}</Text>
+        <Text dimColor>{`  |  cwd `}</Text>
+        <Text>{shortenValue(shellSession.cwd ?? "workspace", 36)}</Text>
+        {liveDuration ? (
+          <>
+            <Text dimColor>{`  |  live `}</Text>
+            <Text>{liveDuration}</Text>
+          </>
+        ) : null}
+        {runningDuration ? (
+          <>
+            <Text dimColor>{`  |  run `}</Text>
+            <Text color="yellow">{runningDuration}</Text>
+          </>
+        ) : null}
+        {shellSession.pendingOutput ? (
+          <>
+            <Text dimColor>{`  |  buffer `}</Text>
+            <Text color="yellow">ready</Text>
+          </>
+        ) : null}
+        {shellSession.lastEvent ? (
+          <>
+            <Text dimColor>{`  |  event `}</Text>
+            <Text>{shellSession.lastEvent}</Text>
+          </>
+        ) : null}
+        {shellSession.lastExit ? (
+          <>
+            <Text dimColor>{`  |  exit `}</Text>
+            <Text>{shellSession.lastExit}</Text>
+          </>
+        ) : null}
+      </Box>
+      {shellSession.lastOutputSummary ? (
+        <Box flexWrap="wrap">
+          <Text dimColor>recent </Text>
+          <Text>{clipPreviewLine(shellSession.lastOutputSummary, 104)}</Text>
+          {outputAge ? (
+            <>
+              <Text dimColor>{`  |  age `}</Text>
+              <Text>{outputAge}</Text>
+            </>
+          ) : null}
+        </Box>
+      ) : null}
+    </Box>
+  );
+};
 
 const fitLinesToCharBudget = (
   lines: string[],
@@ -1580,7 +2018,8 @@ const getComposerTone = (status: ChatStatus): ComposerTone => {
 
 const getComposerHelperText = (
   activePanel: string,
-  inputCommandState: ChatScreenProps["inputCommandState"]
+  inputCommandState: ChatScreenProps["inputCommandState"],
+  shellSession: ChatScreenProps["shellSession"]
 ) => {
   if (activePanel === "approval") {
     return "review hotkeys  |  a approve/retry  |  r reject  |  Tab preview  |  Esc close";
@@ -1591,9 +2030,22 @@ const getComposerHelperText = (
   }
 
   if (inputCommandState.mode === "command") {
-    return inputCommandState.suggestions.length > 0
-      ? "command palette  |  Tab accept  |  ↑/↓ select  |  /help all commands"
-      : "command palette  |  no matching command  |  /help all commands";
+    const selectedSuggestion =
+      inputCommandState.suggestions[inputCommandState.selectedIndex] ?? null;
+    if (!selectedSuggestion) {
+      return "command palette  |  no matching command  |  /help all commands";
+    }
+
+    const templateMeta = getCommandTemplateMeta(selectedSuggestion);
+    const argumentSummary = templateMeta.argumentHints
+      .map(argument => `${argument.label}${argument.optional ? "?" : ""}`)
+      .join(", ");
+
+    return argumentSummary
+      ? `command palette  |  Tab insert template  |  args ${argumentSummary}`
+      : templateMeta.insertValue !== selectedSuggestion.command
+        ? `command palette  |  Tab accept  |  inserts ${templateMeta.insertValue.trim()}`
+        : "command palette  |  Tab accept  |  ↑/↓ select  |  /help all commands";
   }
 
   if (inputCommandState.mode === "file") {
@@ -1610,6 +2062,12 @@ const getComposerHelperText = (
 
   if (inputCommandState.mode === "shell") {
     return "shell shortcut  |  Ctrl+D send  |  open/read/status/interrupt/close";
+  }
+
+  if (shellSession.visible) {
+    return shellSession.pendingOutput
+      ? "shell session live  |  !shell read  |  !shell interrupt  |  !shell close"
+      : "shell session live  |  !shell status  |  !shell interrupt  |  !shell close";
   }
 
   if (inputCommandState.historyPosition !== null) {
@@ -1804,6 +2262,7 @@ const renderComposerPalette = (
       inputCommandState.suggestions,
       inputCommandState.selectedIndex
     );
+    const groupedSuggestions = groupPaletteWindow(suggestionWindow);
 
     return (
       <Box marginTop={1} flexDirection="column">
@@ -1811,21 +2270,18 @@ const renderComposerPalette = (
           Command palette
         </Text>
         {suggestionWindow.length > 0 ? (
-          suggestionWindow.map(({ item, index }) => {
-            const selected = index === inputCommandState.selectedIndex;
-            return (
-              <Box key={`composer-command-${item.command}`} flexWrap="wrap">
-                <Text color={selected ? tone.promptColor : "gray"}>
-                  {selected ? "→" : "·"}
-                </Text>
-                <Text> </Text>
-                <Text bold={selected} color={selected ? "white" : "gray"}>
-                  {item.command}
-                </Text>
-                <Text dimColor>{`  ${item.description}`}</Text>
-              </Box>
-            );
-          })
+          groupedSuggestions.map(([group, entries]) => (
+            <Box
+              key={`composer-command-group-${group}`}
+              flexDirection="column"
+            >
+              <Text dimColor>{group}</Text>
+              {entries.map(({ item, index }) => {
+                const selected = index === inputCommandState.selectedIndex;
+                return renderCommandPaletteRow(item, selected, tone);
+              })}
+            </Box>
+          ))
         ) : (
           <Text dimColor>
             {`No command match for ${inputCommandState.currentCommand ?? "/"}.`}
@@ -1843,6 +2299,13 @@ const renderComposerPalette = (
       inputCommandState.fileMentions.suggestions,
       inputCommandState.selectedIndex
     );
+    const selectedFile =
+      inputCommandState.fileMentions.suggestions[inputCommandState.selectedIndex] ??
+      null;
+    const preview = inputCommandState.fileMentions.preview;
+    const previewLines = preview?.text
+      ? preview.text.split("\n").slice(0, 5)
+      : [];
 
     return (
       <Box marginTop={1} flexDirection="column">
@@ -1885,6 +2348,26 @@ const renderComposerPalette = (
           <Text dimColor>
             {`No workspace files match @${inputCommandState.fileMentions.activeQuery}.`}
           </Text>
+        ) : null}
+        {selectedFile ? (
+          <Box marginTop={1} marginLeft={2} flexDirection="column">
+            <Text dimColor>
+              {`preview  @${selectedFile.path}${
+                preview?.meta ? `  |  ${preview.meta}` : ""
+              }`}
+            </Text>
+            {preview?.loading ? (
+              <Text dimColor>loading preview...</Text>
+            ) : previewLines.length > 0 ? (
+              previewLines.map((line, index) => (
+                <Text key={`composer-file-preview-${selectedFile.path}-${index}`}>
+                  {clipPreviewLine(line)}
+                </Text>
+              ))
+            ) : (
+              <Text dimColor>preview unavailable for the selected file.</Text>
+            )}
+          </Box>
         ) : null}
       </Box>
     );
@@ -2111,7 +2594,9 @@ const renderMainComposer = (
   _onSubmit: () => void,
   activePanel: string,
   showStartupView: boolean,
-  inputCommandState: ChatScreenProps["inputCommandState"]
+  inputCommandState: ChatScreenProps["inputCommandState"],
+  shellSession: ChatScreenProps["shellSession"],
+  shellClock: number
 ) => {
   const isPanelActive = activePanel !== "idle";
   const tone = getComposerTone(activePanel === "approval" ? "awaiting_review" : status);
@@ -2122,6 +2607,8 @@ const renderMainComposer = (
         ? "panel active"
         : status !== "idle"
           ? tone.metaLabel
+          : shellSession.visible && inputCommandState.mode === "idle"
+            ? "shell session"
           : inputCommandState.mode === "command"
             ? "command palette"
             : inputCommandState.mode === "file"
@@ -2130,7 +2617,7 @@ const renderMainComposer = (
                 ? "shell shortcut"
                 : "prompt ready";
   const helperText = shortenValue(
-    getComposerHelperText(activePanel, inputCommandState),
+    getComposerHelperText(activePanel, inputCommandState, shellSession),
     96
   );
   const placeholder =
@@ -2154,6 +2641,7 @@ const renderMainComposer = (
     tone,
     activePanel
   );
+  const shellSessionNode = renderShellSessionBar(shellSession, shellClock);
 
   return (
     <Box
@@ -2172,6 +2660,7 @@ const renderMainComposer = (
           {statusSummary}
         </Text>
       </Box>
+      {shellSessionNode}
       <Box marginTop={1} flexDirection="column">
         {input ? (
           composerWindow.rows.map((row, visibleIndex) => {
@@ -3285,6 +3774,7 @@ export const ChatScreen = ({
   input,
   inputCursorOffset,
   inputCommandState,
+  shellSession,
   resumePicker,
   sessionsPanel,
   modelPicker,
@@ -3301,6 +3791,7 @@ export const ChatScreen = ({
   onSubmit,
 }: ChatScreenProps) => {
   const [spinnerIndex, setSpinnerIndex] = React.useState(0);
+  const [shellClock, setShellClock] = React.useState(() => Date.now());
   const approvalModeActive = approvalPanel.active;
   const shouldAnimateStreaming = ENABLE_STREAMING_ANIMATION && !approvalModeActive;
   const isAnimatedWaitingStatus =
@@ -3316,6 +3807,27 @@ export const ChatScreen = ({
     }, 220);
     return () => clearInterval(timer);
   }, [isAnimatedWaitingStatus, shouldAnimateStreaming, status]);
+
+  React.useEffect(() => {
+    if (
+      !shellSession.visible ||
+      (!shellSession.openedAt && !shellSession.runningSince && !shellSession.lastOutputAt)
+    ) {
+      return;
+    }
+
+    setShellClock(Date.now());
+    const timer = setInterval(() => {
+      setShellClock(Date.now());
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [
+    shellSession.lastOutputAt,
+    shellSession.openedAt,
+    shellSession.runningSince,
+    shellSession.visible,
+  ]);
 
   const resumePage = React.useMemo(
     () => formatPaged(resumePicker.sessions, resumePicker.selectedIndex, resumePicker.pageSize),
@@ -3437,7 +3949,9 @@ export const ChatScreen = ({
         onSubmit,
         activePanel,
         showStartupView,
-        inputCommandState
+        inputCommandState,
+        shellSession,
+        shellClock
       ),
     [
       input,
@@ -3446,6 +3960,8 @@ export const ChatScreen = ({
       isPanelActive,
       onInputChange,
       onSubmit,
+      shellSession,
+      shellClock,
       showStartupView,
       status,
     ]

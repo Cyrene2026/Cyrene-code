@@ -184,6 +184,17 @@ const buildProps = (
       loading: false,
     },
   },
+  shellSession: {
+    visible: false,
+    status: "none",
+    shell: null,
+    cwd: null,
+    busy: false,
+    alive: false,
+    pendingOutput: false,
+    lastExit: null,
+    lastEvent: null,
+  },
   resumePicker: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
   sessionsPanel: { active: false, sessions: [], selectedIndex: 0, pageSize: 8 },
   modelPicker: { active: false, models: [], selectedIndex: 0, pageSize: 8 },
@@ -868,10 +879,34 @@ describe("ChatScreen", () => {
       inputCommandState: {
         active: true,
         mode: "command",
-        currentCommand: "/model",
+        currentCommand: "/model <name>",
         suggestions: [
-          { command: "/model", description: "open model picker" },
-          { command: "/model refresh", description: "refresh available models" },
+          {
+            command: "/model <name>",
+            description: "switch model directly",
+            group: "Model & provider",
+            matchRanges: [{ start: 0, end: 3 }],
+            baseCommand: "/model",
+            template: "<name>",
+            argumentHints: [{ label: "name", optional: false }],
+            insertValue: "/model ",
+          },
+          {
+            command: "/model refresh",
+            description: "refresh available models",
+            group: "Model & provider",
+            matchRanges: [{ start: 0, end: 3 }],
+            baseCommand: "/model",
+            template: "refresh",
+            argumentHints: [],
+            insertValue: "/model refresh",
+          },
+          {
+            command: "/resume",
+            description: "open session resume picker",
+            group: "Session",
+            matchRanges: [],
+          },
         ],
         selectedIndex: 0,
         historyPosition: null,
@@ -895,8 +930,15 @@ describe("ChatScreen", () => {
 
     expect(output).toContain("Command palette");
     expect(output).toContain("command palette");
+    expect(output).toContain("Model & provider");
+    expect(output).toContain("Session");
     expect(output).toContain("/model");
-    expect(output).toContain("/model refresh");
+    expect(output).toContain("<name>");
+    expect(output).toContain("template");
+    expect(output).toContain("args");
+    expect(output).toContain("name");
+    expect(output).toContain("refresh available models");
+    expect(output).toContain("command palette  |  Tab insert template  |  args name");
     expect(output).not.toContain("history 2/5");
   });
 
@@ -933,6 +975,12 @@ describe("ChatScreen", () => {
             },
           ],
           loading: false,
+          preview: {
+            path: "tests/ChatScreen.test.tsx",
+            text: 'import React from "react";\n› const preview = true;',
+            meta: "context hit  |  lines 1-3",
+            loading: false,
+          },
         },
       },
     });
@@ -942,43 +990,82 @@ describe("ChatScreen", () => {
     expect(output).toContain("search  @chat");
     expect(output).toContain("@src/frontend/components/ChatScreen.tsx");
     expect(output).toContain("@tests/ChatScreen.test.tsx");
+    expect(output).toContain("preview  @tests/ChatScreen.test.tsx  |  context hit  |  lines 1-3");
+    expect(output).toContain('import React from \\"react\\";');
+    expect(output).toContain("› const preview = true;");
     expect(output).toContain("file mentions  |  Tab insert  |  ↑/↓ select");
   });
 
   test("renders shell shortcut status in the composer", () => {
-    const tree = renderScreen({
-      items: [],
-      input: "!shell bun test",
-      inputCommandState: {
-        active: false,
-        mode: "shell",
-        currentCommand: null,
-        suggestions: [],
-        selectedIndex: 0,
-        historyPosition: null,
-        historySize: 0,
-        shellShortcut: {
-          active: true,
-          action: "run_shell",
-          command: "bun test",
-          actionLabel: "run_shell",
-          description: "Run a one-shot shell command through the review lane.",
-        },
-        fileMentions: {
-          references: [],
-          activeQuery: null,
-          suggestions: [],
-          loading: false,
-        },
-      },
-    });
-    const output = JSON.stringify(tree);
+    const realDateNow = Date.now;
+    Date.now = () => 1_710_000_060_000;
 
-    expect(output).toContain("Shell shortcut");
-    expect(output).toContain("run_shell");
-    expect(output).toContain("bun test");
-    expect(output).toContain("shell shortcut  |  Ctrl+D send  |  open/read/status/interrupt/close");
-    expect(output).toContain("!shell open [cwd]");
+    try {
+      const tree = renderScreen({
+        items: [],
+        input: "!shell bun test",
+        shellSession: {
+          visible: true,
+          status: "idle",
+          shell: "pwsh",
+          cwd: "workspace/subdir",
+          busy: false,
+          alive: true,
+          pendingOutput: true,
+          lastExit: "0",
+          lastEvent: "opened",
+          openedAt: 1_710_000_015_000,
+          runningSince: 1_710_000_048_000,
+          lastOutputSummary: "Compiling chat renderer  ·  Done in 0.48s",
+          lastOutputAt: 1_710_000_057_000,
+        },
+        inputCommandState: {
+          active: false,
+          mode: "shell",
+          currentCommand: null,
+          suggestions: [],
+          selectedIndex: 0,
+          historyPosition: null,
+          historySize: 0,
+          shellShortcut: {
+            active: true,
+            action: "run_shell",
+            command: "bun test",
+            actionLabel: "run_shell",
+            description: "Run a one-shot shell command through the review lane.",
+          },
+          fileMentions: {
+            references: [],
+            activeQuery: null,
+            suggestions: [],
+            loading: false,
+          },
+        },
+      });
+      const output = JSON.stringify(tree);
+
+      expect(output).toContain("Shell shortcut");
+      expect(output).toContain("SHELL IDLE");
+      expect(output).toContain("run_shell");
+      expect(output).toContain("bun test");
+      expect(output).toContain("workspace/subdir");
+      expect(output).toContain("live");
+      expect(output).toContain("00:45");
+      expect(output).toContain("run");
+      expect(output).toContain("00:12");
+      expect(output).toContain("recent");
+      expect(output).toContain("Compiling chat renderer");
+      expect(output).toContain("age");
+      expect(output).toContain("00:03");
+      expect(output).toContain("buffer");
+      expect(output).toContain("opened");
+      expect(output).toContain(
+        "shell shortcut  |  Ctrl+D send  |  open/read/status/interrupt/close"
+      );
+      expect(output).toContain("!shell open [cwd]");
+    } finally {
+      Date.now = realDateNow;
+    }
   });
 
   test("renders history indicator in the input card helper line", () => {

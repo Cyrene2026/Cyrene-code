@@ -103,6 +103,7 @@ describe("createAuthRuntime", () => {
         lastUsedModel: "gpt-stored",
         providerBaseUrl: "https://stored-provider.test/v1",
         providers: ["https://stored-provider.test/v1"],
+        providerProfiles: {},
       })),
     });
 
@@ -132,6 +133,7 @@ describe("createAuthRuntime", () => {
         lastUsedModel: "gpt-stored",
         providerBaseUrl: "https://stored-provider.test/v1",
         providers: ["https://stored-provider.test/v1"],
+        providerProfiles: {},
       })),
     });
 
@@ -167,6 +169,32 @@ describe("createAuthRuntime", () => {
     expect(result.message).toContain("URL");
   });
 
+  test("validateLoginInput accepts provider presets and normalizes before validation", async () => {
+    const appRoot = await createTempRoot();
+    const fetchProviderModelCatalogImpl = mock(async (options: { baseUrl: string }) => {
+      expect(options.baseUrl).toBe("https://api.anthropic.com");
+      return {
+        providerBaseUrl: "https://api.anthropic.com",
+        models: ["claude-3-7-sonnet-latest"],
+        selectedModel: "claude-3-7-sonnet-latest",
+      };
+    });
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: createMemoryApiKeyStore(),
+      fetchProviderModelCatalogImpl: fetchProviderModelCatalogImpl as any,
+    });
+
+    const result = await runtime.validateLoginInput({
+      providerBaseUrl: "anthropic",
+      apiKey: "sk-test",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.normalizedProviderBaseUrl).toBe("https://api.anthropic.com");
+  });
+
   test("saveLogin persists provider metadata, saves the key, and switches to HTTP immediately", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();
@@ -177,6 +205,7 @@ describe("createAuthRuntime", () => {
           lastUsedModel?: string;
           providerBaseUrl?: string;
           providers: string[];
+          providerProfiles: Record<string, "openai" | "gemini" | "anthropic">;
         }
       | undefined;
     const saveModelYamlImpl = mock(
@@ -187,6 +216,10 @@ describe("createAuthRuntime", () => {
           lastUsedModel?: string;
           providerBaseUrl?: string;
           providers?: string[];
+          providerProfiles?: Record<
+            string,
+            "openai" | "gemini" | "anthropic"
+          >;
         }
       ) => {
         savedModelState = {
@@ -195,6 +228,7 @@ describe("createAuthRuntime", () => {
           lastUsedModel: options?.lastUsedModel,
           providerBaseUrl: options?.providerBaseUrl,
           providers: options?.providers ?? [],
+          providerProfiles: options?.providerProfiles ?? {},
         };
       }
     );
@@ -264,6 +298,7 @@ describe("createAuthRuntime", () => {
         lastUsedModel: "gpt-run",
         providerBaseUrl: "https://provider.test/v1",
         providers: ["https://provider.test/v1"],
+        providerProfiles: {},
       })),
     });
 

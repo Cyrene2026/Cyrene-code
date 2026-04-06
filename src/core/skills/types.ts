@@ -8,6 +8,7 @@ export type SkillDefinition = {
   triggers: string[];
   enabled: boolean;
   source: SkillSource;
+  configPath?: string;
 };
 
 export type SkillsRuntimeSummary = {
@@ -33,4 +34,5 @@ export interface SkillsRuntime {
     skillId: string,
     enabled: boolean
   ): Promise<SkillsRuntimeMutationResult>;
+  removeSkill?(skillId: string): Promise<SkillsRuntimeMutationResult>;
 }

@@ -24,6 +24,10 @@ import type {
 import type {
   ModelRefreshResult,
   ModelSetResult,
+  ProviderProfile,
+  ProviderProfileOverrideMap,
+  ProviderProfileSetResult,
+  ProviderRuntimeInfo,
   ProviderSetResult,
   QueryTransport,
 } from "../../src/core/query/transport";
@@ -504,7 +508,13 @@ export const createTestTransport = (
     providers?: string[];
     setModelImpl?: (model: string) => Promise<ModelSetResult>;
     setProviderImpl?: (provider: string) => Promise<ProviderSetResult>;
+    setProviderProfileImpl?: (
+      provider: string,
+      profile: ProviderProfile
+    ) => Promise<ProviderProfileSetResult>;
+    providerProfileOverrides?: ProviderProfileOverrideMap;
     refreshImpl?: () => Promise<ModelRefreshResult>;
+    describeProviderImpl?: (provider: string | undefined) => ProviderRuntimeInfo;
   }
 ): QueryTransport => {
   let currentModel = options?.initialModel ?? "gpt-test";
@@ -512,10 +522,67 @@ export const createTestTransport = (
     options?.initialProvider ?? "https://provider.test/v1";
   const models = options?.models ?? ["gpt-test", "gpt-next"];
   const providers = options?.providers ?? [currentProvider];
+  let providerProfiles: ProviderProfileOverrideMap = {
+    ...(options?.providerProfileOverrides ?? {}),
+  };
 
   return {
     getModel: () => currentModel,
     getProvider: () => currentProvider,
+    describeProvider: provider =>
+      options?.describeProviderImpl?.(provider) ?? {
+        provider: provider?.trim() || currentProvider,
+        vendor: "openai",
+        keySource: "CYRENE_API_KEY",
+      },
+    getProviderProfile: provider => {
+      const target = provider?.trim() || currentProvider;
+      return providerProfiles[target] ?? "custom";
+    },
+    listProviderProfiles: () => ({ ...providerProfiles }),
+    setProviderProfile: async (provider, profile) => {
+      if (options?.setProviderProfileImpl) {
+        const result = await options.setProviderProfileImpl(provider, profile);
+        if (result.ok && result.provider) {
+          if (result.profile === "custom") {
+            const next = { ...providerProfiles };
+            delete next[result.provider];
+            providerProfiles = next;
+          } else if (
+            result.profile === "openai" ||
+            result.profile === "gemini" ||
+            result.profile === "anthropic"
+          ) {
+            providerProfiles = {
+              ...providerProfiles,
+              [result.provider]: result.profile,
+            };
+          }
+        }
+        return result;
+      }
+      if (profile === "custom") {
+        const next = { ...providerProfiles };
+        delete next[provider];
+        providerProfiles = next;
+        return {
+          ok: true,
+          message: `Provider profile override cleared: ${provider}`,
+          provider,
+          profile: "custom",
+        };
+      }
+      providerProfiles = {
+        ...providerProfiles,
+        [provider]: profile,
+      };
+      return {
+        ok: true,
+        message: `Provider profile override set: ${provider} => ${profile}`,
+        provider,
+        profile,
+      };
+    },
     setModel: async model => {
       if (options?.setModelImpl) {
         const result = await options.setModelImpl(model);

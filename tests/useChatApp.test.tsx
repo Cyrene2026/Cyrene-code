@@ -351,6 +351,66 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("/login provider step supports 1/2/3 preset shortcuts", async () => {
+    const authStatus = {
+      mode: "local" as const,
+      credentialSource: "none" as const,
+      provider: "none",
+      model: "gpt-4o-mini",
+      persistenceTarget: null,
+      onboardingAvailable: false,
+      httpReady: false,
+    };
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "local-core",
+          initialProvider: "local-core",
+          models: ["local-core"],
+          providers: ["local-core"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: authStatus,
+          getStatus: async () => authStatus,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: authStatus,
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: authStatus,
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/login");
+    expect(app.getLatest().authPanel.step).toBe("provider");
+
+    await act(async () => {
+      inputHandler?.("2", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.step).toBe("api_key");
+    expect(app.getLatest().authPanel.providerBaseUrl).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai"
+    );
+    expect(app.getLatest().authPanel.info).toContain("Preset selected: Gemini");
+
+    app.cleanup();
+  });
+
   test("successful login stays out of transcript/session storage and masks the API key", async () => {
     const sessionStore = createTestSessionStore();
     const saveLogin = mock(async (input: {
@@ -818,10 +878,14 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
-  test("/skills commands expose runtime summary, list and enable/disable flow", async () => {
+  test("/skills commands expose runtime summary, list and enable/disable/remove/use flow", async () => {
     const setSkillEnabled = mock(async (skillId: string, enabled: boolean) => ({
       ok: true,
       message: `${enabled ? "Skill enabled" : "Skill disabled"}: ${skillId}\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml`,
+    }));
+    const removeSkill = mock(async (skillId: string) => ({
+      ok: true,
+      message: `Skill removed: ${skillId}\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml`,
     }));
     const reloadConfig = mock(async () => ({
       ok: true,
@@ -837,6 +901,7 @@ const createScriptedTransport = (
           triggers: ["review", "审查"],
           enabled: true,
           source: "built_in" as const,
+          configPath: "D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml",
         },
       ],
       describeRuntime: () => ({
@@ -846,6 +911,7 @@ const createScriptedTransport = (
         editableConfigPath: "D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml",
       }),
       setSkillEnabled,
+      removeSkill,
       reloadConfig,
       resolveForQuery: () => [],
     };
@@ -866,12 +932,16 @@ const createScriptedTransport = (
 
     await runCommand(app, "/skills");
     await runCommand(app, "/skills list");
+    await runCommand(app, "/skills show code-review");
     await runCommand(app, "/skills disable code-review");
     await runCommand(app, "/skills enable code-review");
+    await runCommand(app, "/skills use code-review");
+    await runCommand(app, "/skills remove code-review");
     await runCommand(app, "/skills reload");
 
     expect(setSkillEnabled).toHaveBeenCalledWith("code-review", false);
     expect(setSkillEnabled).toHaveBeenCalledWith("code-review", true);
+    expect(removeSkill).toHaveBeenCalledWith("code-review");
     expect(reloadConfig).toHaveBeenCalledTimes(1);
     expect(
       getTexts(app.getLatest().items).some(text => text.includes("Skills runtime"))
@@ -879,11 +949,19 @@ const createScriptedTransport = (
     expect(
       getTexts(app.getLatest().items).some(text => text.includes("Skill enabled: code-review"))
     ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("Skill code-review"))
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text =>
+        text.includes("Session skill activated: code-review")
+      )
+    ).toBe(true);
 
     app.cleanup();
   });
 
-  test("active skills are injected into composed prompt before query run", async () => {
+  test("active skills include session-level /skills use overrides before query run", async () => {
     const runQuerySessionImpl = mock(async (params: any) => {
       expect(String(params.query)).toContain("ACTIVE SKILLS");
       expect(String(params.query)).toContain("[code-review] Code Review");
@@ -903,8 +981,7 @@ const createScriptedTransport = (
           handleToolCall: async () => ({ ok: true, message: "[tool result] noop" }),
         } as any,
         skillsService: {
-          listSkills: () => [],
-          resolveForQuery: () => [
+          listSkills: () => [
             {
               id: "code-review",
               label: "Code Review",
@@ -915,11 +992,13 @@ const createScriptedTransport = (
               source: "built_in" as const,
             },
           ],
+          resolveForQuery: () => [],
         } as any,
         runQuerySessionImpl,
       })
     );
 
+    await runCommand(app, "/skills use code-review");
     await runCommand(app, "please review this patch");
     expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
 
@@ -1765,6 +1844,14 @@ const createScriptedTransport = (
     const transport = createTestTransport({
       initialProvider: "https://provider-a.test/v1",
       providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
+      describeProviderImpl: provider => ({
+        provider: provider?.trim() || "https://provider-a.test/v1",
+        vendor: "openai",
+        keySource:
+          provider?.includes("provider-a") ?? false
+            ? "CYRENE_OPENAI_API_KEY"
+            : "CYRENE_API_KEY",
+      }),
     });
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
@@ -1786,6 +1873,17 @@ const createScriptedTransport = (
       "https://provider-a.test/v1",
       "https://provider-b.test/v1",
     ]);
+    expect(app.getLatest().providerPicker.currentKeySource).toBe(
+      "CYRENE_OPENAI_API_KEY"
+    );
+    expect(app.getLatest().providerPicker.providerProfiles).toEqual({
+      "https://provider-a.test/v1": "openai",
+      "https://provider-b.test/v1": "openai",
+    });
+    expect(app.getLatest().providerPicker.providerProfileSources).toEqual({
+      "https://provider-a.test/v1": "inferred",
+      "https://provider-b.test/v1": "inferred",
+    });
 
     await act(async () => {
       app.getLatest().setInput("");
@@ -1797,6 +1895,70 @@ const createScriptedTransport = (
     await runCommand(app, "/provider https://provider-b.test/v1");
 
     expect(app.getLatest().currentProvider).toBe("https://provider-b.test/v1");
+    app.cleanup();
+  });
+
+  test("/provider profile commands list and set manual overrides", async () => {
+    const setProviderProfileImpl = mock(
+      async (provider: string, profile: "openai" | "gemini" | "anthropic" | "custom") => ({
+        ok: true,
+        message:
+          profile === "custom"
+            ? `Provider profile override cleared: ${provider}`
+            : `Provider profile override set: ${provider} => ${profile}`,
+        provider,
+        profile,
+      })
+    );
+    const transport = createTestTransport({
+      initialProvider: "https://relay.test/openai",
+      providers: ["https://relay.test/openai"],
+      providerProfileOverrides: {
+        "https://relay.test/openai": "anthropic",
+      },
+      describeProviderImpl: provider => ({
+        provider: provider?.trim() || "https://relay.test/openai",
+        vendor: "anthropic",
+        keySource: "CYRENE_ANTHROPIC_API_KEY",
+      }),
+      setProviderProfileImpl,
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/provider profile list");
+    expect(getTexts(app.getLatest().items)).toContain(
+      "Manual provider profile overrides:\n- https://relay.test/openai => anthropic"
+    );
+
+    await runCommand(app, "/provider profile openai");
+    expect(setProviderProfileImpl).toHaveBeenCalledWith(
+      "https://relay.test/openai",
+      "openai"
+    );
+    expect(getTexts(app.getLatest().items)).toContain(
+      "Provider profile override set: https://relay.test/openai => openai"
+    );
+
+    await runCommand(app, "/provider profile clear");
+    expect(setProviderProfileImpl).toHaveBeenLastCalledWith(
+      "https://relay.test/openai",
+      "custom"
+    );
+    expect(getTexts(app.getLatest().items)).toContain(
+      "Provider profile override cleared: https://relay.test/openai"
+    );
     app.cleanup();
   });
 

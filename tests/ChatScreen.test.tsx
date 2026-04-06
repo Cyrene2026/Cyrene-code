@@ -203,6 +203,13 @@ const buildProps = (
     providers: ["https://provider.test/v1"],
     selectedIndex: 0,
     pageSize: 8,
+    currentKeySource: "CYRENE_API_KEY",
+    providerProfiles: {
+      "https://provider.test/v1": "openai",
+    },
+    providerProfileSources: {
+      "https://provider.test/v1": "inferred",
+    },
   },
   pendingReviews: [],
   approvalPanel: {
@@ -433,6 +440,21 @@ describe("ChatScreen", () => {
     expect(output).toContain("Ask about this workspace, mention files, or use / commands...");
     expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell");
     expect(output).not.toContain("Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.");
+  });
+
+  test("auth wizard provider step shows preset shortcut hints", () => {
+    const tree = renderScreen({
+      authPanel: {
+        ...buildProps().authPanel,
+        active: true,
+        step: "provider",
+        providerBaseUrl: "",
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Quick preset: 1 OpenAI | 2 Gemini | 3 Anthropic");
+    expect(output).toContain("1/2/3: preset + next");
   });
 
   test("renders multiline composer content and grows beyond one logical line", () => {
@@ -861,12 +883,26 @@ describe("ChatScreen", () => {
         providers: ["https://provider-a.test/v1", "https://provider-b.test/v1"],
         selectedIndex: 1,
         pageSize: 8,
+        currentKeySource: "CYRENE_OPENAI_API_KEY",
+        providerProfiles: {
+          "https://provider-a.test/v1": "openai",
+          "https://provider-b.test/v1": "openai",
+        },
+        providerProfileSources: {
+          "https://provider-a.test/v1": "manual",
+          "https://provider-b.test/v1": "inferred",
+        },
       },
       currentProvider: "https://provider-a.test/v1",
     });
     const output = JSON.stringify(tree);
 
     expect(output).toContain("Providers  page 1/1  total 2");
+    expect(output).toContain("profile OpenAI-compatible");
+    expect(output).toContain("source manual");
+    expect(output).toContain("source inferred");
+    expect(output).toContain("endpoint relay/custom");
+    expect(output).toContain("key source openai env");
     expect(output).toContain("provider-b.test");
     expect(output).toContain("[current]");
     expect(output).toContain("Close the active panel to keep typing...");

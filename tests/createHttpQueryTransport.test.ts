@@ -6,6 +6,7 @@ import {
   FILE_TOOL,
   TOOL_USAGE_SYSTEM_PROMPT,
   createHttpQueryTransport,
+  normalizeProviderBaseUrl,
 } from "../src/infra/http/createHttpQueryTransport";
 import { resetConfiguredAppRoot, setConfiguredAppRoot } from "../src/infra/config/appRoot";
 
@@ -735,6 +736,364 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(persisted).toContain("providers:");
     expect(persisted).toContain("  - https://provider-a.test/v1");
     expect(persisted).toContain("  - https://provider-b.test/v1");
+  });
+
+  test("normalizes provider presets for openai/gemini/anthropic", () => {
+    expect(normalizeProviderBaseUrl("openai")).toBe("https://api.openai.com/v1");
+    expect(normalizeProviderBaseUrl("gemini")).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai"
+    );
+    expect(normalizeProviderBaseUrl("anthropic")).toBe(
+      "https://api.anthropic.com"
+    );
+  });
+
+  test("describeProvider reports vendor and key source", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://api.openai.com/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_OPENAI_API_KEY: "openai-key",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.describeProvider?.()).toEqual({
+      provider: "https://api.openai.com/v1",
+      vendor: "openai",
+      keySource: "CYRENE_OPENAI_API_KEY",
+    });
+    expect(transport.describeProvider?.("gemini")).toEqual({
+      provider: "https://generativelanguage.googleapis.com/v1beta/openai",
+      vendor: "gemini",
+      keySource: "CYRENE_GEMINI_API_KEY",
+    });
+  });
+
+  test("setProvider accepts gemini preset and uses provider-specific API key", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://api.openai.com/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(
+        JSON.stringify({
+          data: [{ id: "gemini-2.5-pro" }, { id: "gemini-2.5-flash" }],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+      },
+    });
+
+    const result = await transport.setProvider("gemini");
+    expect(result.ok).toBe(true);
+    expect(transport.getProvider()).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai"
+    );
+    expect(fetchCalls[0]?.url).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai/models"
+    );
+    expect(
+      (fetchCalls[0]?.init?.headers as Record<string, string>)?.["x-goog-api-key"]
+    ).toBe("gemini-key");
+  });
+
+  test("provider profile override APIs manage manual map and clear on custom", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.getProviderProfile?.("https://relay.test/openai")).toBe(
+      "custom"
+    );
+
+    const setResult = await transport.setProviderProfile?.(
+      "https://relay.test/openai",
+      "gemini"
+    );
+    expect(setResult?.ok).toBe(true);
+    expect(transport.listProviderProfiles?.()).toEqual({
+      "https://relay.test/openai": "gemini",
+    });
+    expect(transport.getProviderProfile?.("https://relay.test/openai")).toBe(
+      "gemini"
+    );
+
+    const clearResult = await transport.setProviderProfile?.(
+      "https://relay.test/openai",
+      "custom"
+    );
+    expect(clearResult?.ok).toBe(true);
+    expect(transport.listProviderProfiles?.()).toEqual({});
+    expect(transport.getProviderProfile?.("https://relay.test/openai")).toBe(
+      "custom"
+    );
+  });
+
+  test("manual profile override forces anthropic family for relay provider and persists", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://relay.test/v1",
+        "providers:",
+        "  - https://relay.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url.endsWith("/models")) {
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "claude-relay" }],
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+      if (url.endsWith("/v1/messages")) {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/v1",
+        CYRENE_API_KEY: "shared-key",
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    await transport.listModels();
+    const overrideResult = await transport.setProviderProfile?.(
+      "https://relay.test/v1",
+      "anthropic"
+    );
+    expect(overrideResult?.ok).toBe(true);
+    expect(transport.describeProvider?.()?.vendor).toBe("anthropic");
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/v1/models");
+    expect(
+      (fetchCalls[0]?.init?.headers as Record<string, string>)?.["x-api-key"]
+    ).toBe("anthropic-key");
+    expect(fetchCalls[1]?.url).toBe("https://relay.test/v1/messages");
+    expect(
+      (fetchCalls[1]?.init?.headers as Record<string, string>)?.["x-api-key"]
+    ).toBe("anthropic-key");
+    expect(events).toContain(JSON.stringify({ type: "text_delta", text: "ok" }));
+    expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_profiles:");
+    expect(persisted).toContain("  - provider: https://relay.test/v1");
+    expect(persisted).toContain("    profile: anthropic");
+
+    const reloaded = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+    await reloaded.listModels();
+    expect(reloaded.describeProvider?.()?.vendor).toBe("anthropic");
+    expect(reloaded.listProviderProfiles?.()).toEqual({
+      "https://relay.test/v1": "anthropic",
+    });
+  });
+
+  test("anthropic provider streams text/tool events via native messages API", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: message_start',
+              'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}',
+              "",
+              'event: content_block_start',
+              'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"file"}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"action\\":\\"read_file\\",\\"path\\":\\"README.md\\"}"}}',
+              "",
+              'event: content_block_stop',
+              'data: {"type":"content_block_stop","index":1}',
+              "",
+              'event: message_delta',
+              'data: {"type":"message_delta","usage":{"output_tokens":5}}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls[0]?.url).toBe("https://api.anthropic.com/v1/messages");
+    expect(
+      (fetchCalls[0]?.init?.headers as Record<string, string>)?.["x-api-key"]
+    ).toBe("anthropic-key");
+    expect(events).toContain(JSON.stringify({ type: "text_delta", text: "hello" }));
+    expect(events).toContain(
+      JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "read_file", path: "README.md" },
+      })
+    );
+    expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
   });
 
 });

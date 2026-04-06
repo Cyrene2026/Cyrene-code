@@ -107,6 +107,15 @@ type ChatScreenProps = {
     providers: string[];
     selectedIndex: number;
     pageSize: number;
+    currentKeySource?: string | null;
+    providerProfiles?: Record<
+      string,
+      "openai" | "gemini" | "anthropic" | "custom" | "local" | "none"
+    >;
+    providerProfileSources?: Record<
+      string,
+      "manual" | "inferred" | "local" | "none"
+    >;
   };
   pendingReviews: PendingReviewItem[];
   approvalPanel: {
@@ -368,6 +377,10 @@ const getSlashInsertValue = (command: string) => {
   switch (command) {
     case "/provider <url>":
       return "/provider ";
+    case "/provider profile <openai|gemini|anthropic|custom> [url]":
+      return "/provider profile ";
+    case "/provider profile clear [url]":
+      return "/provider profile clear ";
     case "/model <name>":
       return "/model ";
     case "/system <text>":
@@ -386,6 +399,16 @@ const getSlashInsertValue = (command: string) => {
       return "/pin ";
     case "/unpin <index>":
       return "/unpin ";
+    case "/skills enable <id>":
+      return "/skills enable ";
+    case "/skills disable <id>":
+      return "/skills disable ";
+    case "/skills remove <id>":
+      return "/skills remove ";
+    case "/skills use <id>":
+      return "/skills use ";
+    case "/skills show <id>":
+      return "/skills show ";
     case "/review <id>":
       return "/review ";
     case "/approve [id]":
@@ -888,6 +911,96 @@ const formatProviderLabel = (provider: string, max = 22) => {
   } catch {
     return shortenValue(provider, max);
   }
+};
+
+type ProviderProfile =
+  | "openai"
+  | "gemini"
+  | "anthropic"
+  | "custom"
+  | "local"
+  | "none";
+
+const formatProviderProfileLabel = (profile?: ProviderProfile | null) => {
+  switch (profile) {
+    case "openai":
+      return "OpenAI-compatible";
+    case "gemini":
+      return "Gemini-compatible";
+    case "anthropic":
+      return "Anthropic-compatible";
+    case "local":
+      return "Local";
+    case "none":
+      return "none";
+    default:
+      return "Custom";
+  }
+};
+
+type ProviderProfileSource = "manual" | "inferred" | "local" | "none";
+
+const formatProviderProfileSourceLabel = (
+  source?: ProviderProfileSource | null
+) => {
+  switch (source) {
+    case "manual":
+      return "manual";
+    case "local":
+      return "local";
+    case "none":
+      return "none";
+    default:
+      return "inferred";
+  }
+};
+
+const getProviderEndpointKind = (
+  provider: string,
+  profile?: ProviderProfile | null
+) => {
+  if (!provider || provider === "none") {
+    return "none";
+  }
+  if (profile === "local") {
+    return "local";
+  }
+  try {
+    const host = new URL(provider).hostname.toLowerCase();
+    const isOfficial =
+      (profile === "openai" && host.endsWith("openai.com")) ||
+      (profile === "gemini" && host === "generativelanguage.googleapis.com") ||
+      (profile === "anthropic" && host.endsWith("anthropic.com"));
+    return isOfficial ? "official" : "relay/custom";
+  } catch {
+    return "custom";
+  }
+};
+
+const formatKeySourceLabel = (keySource?: string | null) => {
+  const normalized = keySource?.trim() ?? "";
+  if (!normalized || normalized === "unknown") {
+    return "unknown";
+  }
+  if (normalized === "CYRENE_OPENAI_API_KEY") {
+    return "openai env";
+  }
+  if (normalized === "CYRENE_GEMINI_API_KEY") {
+    return "gemini env";
+  }
+  if (normalized === "CYRENE_ANTHROPIC_API_KEY") {
+    return "anthropic env";
+  }
+  if (normalized === "CYRENE_API_KEY") {
+    return "shared env";
+  }
+  if (normalized === "process_env") {
+    return "process env";
+  }
+  if (normalized === "user_env") {
+    return "user env";
+  }
+  return normalized;
 };
 
 const splitIntoGraphemes = (value: string) => {
@@ -2509,12 +2622,13 @@ const renderAuthWizardPanel = (
           : "4/4 confirm";
   const fieldPrompt =
     authPanel.step === "provider"
-      ? "Enter your OpenAI-compatible base URL."
+      ? "Enter provider URL or preset name (openai / gemini / anthropic)."
       : authPanel.step === "api_key"
         ? "Paste the API key. It is masked and never written to the transcript."
         : authPanel.step === "model"
           ? "Optional initial model. Leave blank to use the current model or gpt-4o-mini."
           : "Review the target and press Enter to connect.";
+  const providerPresetHint = "Quick preset: 1 OpenAI | 2 Gemini | 3 Anthropic";
   const effectiveModel = authPanel.model.trim() || authStatus.model || "gpt-4o-mini";
 
   return (
@@ -2534,6 +2648,7 @@ const renderAuthWizardPanel = (
       </Box>
       {authPanel.info ? <Text dimColor>{authPanel.info}</Text> : null}
       <Text color="white">{fieldPrompt}</Text>
+      {authPanel.step === "provider" ? <Text dimColor>{providerPresetHint}</Text> : null}
 
       {authPanel.step !== "confirm" ? (
         <Box
@@ -2579,7 +2694,11 @@ const renderAuthWizardPanel = (
 
       {authPanel.step !== "confirm" ? (
         <Text dimColor>
-          Enter: next  |  Esc: {authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}
+          Enter: next
+          {authPanel.step === "provider"
+            ? "  |  1/2/3: preset + next"
+            : ""}
+          {`  |  Esc: ${authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}`}
         </Text>
       ) : null}
     </Box>
@@ -4066,23 +4185,32 @@ export const ChatScreen = ({
           providerPage,
           activeSessionId,
           currentModel,
-          formatProviderLabel(currentProvider, 28),
+          `${formatProviderLabel(currentProvider, 28)} | profile ${formatProviderProfileLabel(
+            providerPicker.providerProfiles?.[currentProvider] ?? "custom"
+          )} | source ${formatProviderProfileSourceLabel(
+            providerPicker.providerProfileSources?.[currentProvider] ??
+              "inferred"
+          )} | key ${formatKeySourceLabel(providerPicker.currentKeySource)}`,
           providerPage.pageItems.map((provider, localIndex) => {
             const index = providerPage.pageStart + localIndex;
             const selected = index === providerPicker.selectedIndex;
             const isCurrent = provider === currentProvider;
+            const profile = providerPicker.providerProfiles?.[provider] ?? "custom";
+            const profileSource =
+              providerPicker.providerProfileSources?.[provider] ?? "inferred";
+            const endpointKind = getProviderEndpointKind(provider, profile);
             return (
               <React.Fragment key={`provider-picker-${provider}-${index}`}>
                 {renderCompactPickerItem(
                   formatProviderLabel(provider, 36),
-                  provider,
+                  `profile ${formatProviderProfileLabel(profile)}  |  source ${formatProviderProfileSourceLabel(profileSource)}  |  endpoint ${endpointKind}  |  ${provider}`,
                   selected,
                   isCurrent ? "current" : undefined
                 )}
               </React.Fragment>
             );
           }),
-          "Up/Down: select  Left/Right: page  Enter: switch  Esc: close"
+          `Up/Down: select  Left/Right: page  Enter: switch  Esc: close  |  key source ${formatKeySourceLabel(providerPicker.currentKeySource)}`
         )}
 
       {pendingReviews.length > 0 && !approvalPanel.active && (

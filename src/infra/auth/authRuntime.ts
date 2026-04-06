@@ -2,13 +2,17 @@ import { createHttpQueryTransport, fetchProviderModelCatalog, normalizeProviderB
 import { createLocalCoreTransport } from "../local/createLocalCoreTransport";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import { createUserScopedApiKeyStore, type UserScopedApiKeyStore } from "./userScopedApiKeyStore";
-import type { QueryTransport } from "../../core/query/transport";
+import type {
+  ProviderProfileOverrideMap,
+  QueryTransport,
+} from "../../core/query/transport";
 import type { AuthLoginInput, AuthStatus, AuthValidationResult } from "./types";
 
 type LoadedProviderMetadata = {
   providerBaseUrl?: string;
   currentModel?: string;
   providers: string[];
+  providerProfiles: ProviderProfileOverrideMap;
 };
 
 type ResolvedAuthState = {
@@ -108,10 +112,28 @@ export const createAuthRuntime = (
         cwd: options.cwd,
         env: effectiveEnv,
       });
+      const normalizedProvider = trimNonEmpty(loaded.providerBaseUrl);
+      const normalizedProviderProfiles = Object.fromEntries(
+        Object.entries(loaded.providerProfiles ?? {})
+          .map(([provider, profile]) => {
+            try {
+              const normalized = normalizeProviderBaseUrl(provider);
+              return [normalized, profile] as const;
+            } catch {
+              return null;
+            }
+          })
+          .filter(
+            (
+              entry
+            ): entry is [string, ProviderProfileOverrideMap[string]] =>
+              Boolean(entry)
+          )
+      ) as ProviderProfileOverrideMap;
       return {
-        providerBaseUrl: normalizeProviderBaseUrl(
-          trimNonEmpty(loaded.providerBaseUrl) ?? ""
-        ),
+        providerBaseUrl: normalizedProvider
+          ? normalizeProviderBaseUrl(normalizedProvider)
+          : undefined,
         currentModel:
           trimNonEmpty(
             loaded.lastUsedModel ?? loaded.defaultModel ?? loaded.models[0]
@@ -124,12 +146,14 @@ export const createAuthRuntime = (
             ].filter(Boolean)
           )
         ) as string[],
+        providerProfiles: normalizedProviderProfiles,
       };
     } catch {
       return {
         providerBaseUrl: undefined,
         currentModel: trimNonEmpty(effectiveEnv.CYRENE_MODEL) ?? "gpt-4o-mini",
         providers: [],
+        providerProfiles: {},
       };
     }
   };
@@ -223,11 +247,11 @@ export const createAuthRuntime = (
 
     let normalizedProviderBaseUrl = rawProviderBaseUrl;
     try {
-      const parsed = new URL(rawProviderBaseUrl);
+      normalizedProviderBaseUrl = normalizeProviderBaseUrl(rawProviderBaseUrl);
+      const parsed = new URL(normalizedProviderBaseUrl);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         throw new Error("Provider base URL must use http or https.");
       }
-      normalizedProviderBaseUrl = normalizeProviderBaseUrl(parsed.toString());
     } catch (error) {
       return {
         ok: false,
@@ -323,6 +347,7 @@ export const createAuthRuntime = (
         lastUsedModel: validation.selectedModel,
         providerBaseUrl: validation.normalizedProviderBaseUrl,
         providers: nextProviders,
+        providerProfiles: existingMetadata.providerProfiles,
       },
       options.appRoot,
       {

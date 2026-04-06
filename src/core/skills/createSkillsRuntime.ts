@@ -205,6 +205,41 @@ class ManagedSkillsRuntime implements SkillsRuntime {
       configPath: saved.path,
     };
   }
+
+  async removeSkill(skillId: string): Promise<SkillsRuntimeMutationResult> {
+    const normalizedId = skillId.trim();
+    if (!normalizedId) {
+      return {
+        ok: false,
+        message: "Skill id is required.",
+      };
+    }
+
+    const current = this.getConfig();
+    const target = current.skills.find(skill => skill.id === normalizedId);
+    if (!target) {
+      return {
+        ok: false,
+        message: `Skill not found: ${normalizedId}`,
+      };
+    }
+
+    const patch = clonePatch(current.projectPatch);
+    patch.removeSkillIds = Array.from(
+      new Set([...patch.removeSkillIds, normalizedId])
+    );
+    patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
+
+    const saved = await saveProjectSkillsConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: formatMutationMessage("Skill removed", normalizedId, saved.path),
+      skillId: normalizedId,
+      configPath: saved.path,
+    };
+  }
 }
 
 export const createSkillsRuntimeFromConfig = async (

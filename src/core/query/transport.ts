@@ -17,9 +17,36 @@ export type ProviderSetResult = {
   models?: string[];
 };
 
+export type ProviderRuntimeInfo = {
+  provider: string;
+  vendor: "openai" | "gemini" | "anthropic" | "custom" | "local" | "none";
+  keySource: string;
+};
+
+export type ProviderProfile = "openai" | "gemini" | "anthropic" | "custom";
+
+export type ProviderProfileOverrideMap = Record<
+  string,
+  Exclude<ProviderProfile, "custom">
+>;
+
+export type ProviderProfileSetResult = {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  profile?: ProviderProfile;
+};
+
 export type QueryTransport = {
   getModel: () => string;
   getProvider: () => string;
+  describeProvider?: (provider?: string) => ProviderRuntimeInfo;
+  setProviderProfile?: (
+    provider: string,
+    profile: ProviderProfile
+  ) => Promise<ProviderProfileSetResult>;
+  getProviderProfile?: (provider?: string) => ProviderProfile | null;
+  listProviderProfiles?: () => ProviderProfileOverrideMap;
   setModel: (model: string) => Promise<ModelSetResult>;
   listModels: () => Promise<string[]>;
   listProviders: () => Promise<string[]>;

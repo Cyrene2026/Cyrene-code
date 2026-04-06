@@ -92,4 +92,19 @@ describe("skills runtime", () => {
     expect(skillsText).toContain("id: code-review");
     expect(skillsText).toContain("enabled: false");
   });
+
+  test("removeSkill persists remove_skills override to project config", async () => {
+    const root = await createWorkspace();
+    const runtime = await createSkillsRuntime(root, {
+      cwd: root,
+      env: {},
+    });
+
+    const removeResult = await runtime.removeSkill?.("code-review");
+    expect(removeResult?.ok).toBe(true);
+
+    const skillsText = await readFile(join(root, ".cyrene", "skills.yaml"), "utf8");
+    expect(skillsText).toContain("remove_skills:");
+    expect(skillsText).toContain("- code-review");
+  });
 });

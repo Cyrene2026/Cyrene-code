@@ -1,14 +1,40 @@
 import { z } from "zod";
-import type { QueryTransport } from "../../core/query/transport";
+import type {
+  ProviderProfile,
+  ProviderProfileOverrideMap,
+  QueryTransport,
+} from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import { resolveAmbientAppRoot } from "../config/appRoot";
 
 const envSchema = z.object({
-  CYRENE_BASE_URL: z.string().url().optional(),
+  CYRENE_BASE_URL: z.string().min(1).optional(),
   CYRENE_API_KEY: z.string().min(1).optional(),
+  CYRENE_OPENAI_API_KEY: z.string().min(1).optional(),
+  CYRENE_GEMINI_API_KEY: z.string().min(1).optional(),
+  CYRENE_ANTHROPIC_API_KEY: z.string().min(1).optional(),
   CYRENE_MODEL: z.string().min(1).optional(),
 });
+
+const PROVIDER_ALIASES = {
+  openai: "https://api.openai.com/v1",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
+  anthropic: "https://api.anthropic.com",
+  claude: "https://api.anthropic.com",
+} as const;
+
+type ProviderAlias = keyof typeof PROVIDER_ALIASES;
+type ProviderFamily = "openai" | "gemini" | "anthropic";
+const PROVIDER_PROFILE_VALUES = ["openai", "gemini", "anthropic"] as const;
+
+type ParsedProvider = {
+  providerBaseUrl: string;
+  family: ProviderFamily;
+};
+
+const isProviderFamily = (value: string): value is ProviderFamily =>
+  (PROVIDER_PROFILE_VALUES as readonly string[]).includes(value);
 
 const parseSseEventData = (rawEvent: string): string[] => {
   const lines = rawEvent.split("\n");
@@ -275,11 +301,65 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Stop exploring once you have enough information to act.",
 ].join(" ");
 
-export const normalizeProviderBaseUrl = (url: string) => url.replace(/\/+$/, "");
+const trimProviderInput = (value: string) => value.trim();
+
+const resolveProviderAlias = (value: string) => {
+  const normalizedKey = trimProviderInput(value).toLowerCase() as ProviderAlias;
+  return PROVIDER_ALIASES[normalizedKey];
+};
+
+const parseProviderBaseUrl = (provider: string): ParsedProvider => {
+  const trimmed = trimProviderInput(provider);
+  if (!trimmed) {
+    throw new Error("Provider cannot be empty.");
+  }
+
+  const aliased = resolveProviderAlias(trimmed);
+  const candidate = aliased ?? trimmed;
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    if (aliased) {
+      parsed = new URL(aliased);
+    } else {
+      throw new Error(
+        "Provider must be a valid URL or one of: openai, gemini, anthropic."
+      );
+    }
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Provider base URL must use http or https.");
+  }
+
+  const normalized = parsed.toString().replace(/\/+$/, "");
+  const host = parsed.hostname.toLowerCase();
+  const family: ProviderFamily = host.includes("anthropic.com")
+    ? "anthropic"
+    : host.includes("generativelanguage.googleapis.com")
+      ? "gemini"
+      : "openai";
+
+  return {
+    providerBaseUrl: normalized,
+    family,
+  };
+};
+
+export const normalizeProviderBaseUrl = (url: string) =>
+  parseProviderBaseUrl(url).providerBaseUrl;
+
+const resolveProviderFamily = (providerBaseUrl: string): ProviderFamily =>
+  parseProviderBaseUrl(providerBaseUrl).family;
+
 const resolveChatCompletionsUrl = (baseUrl: string) => {
   const normalized = normalizeProviderBaseUrl(baseUrl);
   if (normalized.endsWith("/chat/completions")) {
     return normalized;
+  }
+  if (normalized.endsWith("/openai")) {
+    return `${normalized}/chat/completions`;
   }
   if (normalized.endsWith("/v1")) {
     return `${normalized}/chat/completions`;
@@ -291,14 +371,36 @@ const resolveModelsUrl = (baseUrl: string) => {
   if (normalized.endsWith("/models")) {
     return normalized;
   }
+  if (normalized.endsWith("/openai")) {
+    return `${normalized}/models`;
+  }
   if (normalized.endsWith("/v1")) {
     return `${normalized}/models`;
   }
   return `${normalized}/v1/models`;
 };
+
+const resolveAnthropicMessagesUrl = (baseUrl: string) => {
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  if (normalized.endsWith("/messages")) {
+    return normalized;
+  }
+  if (normalized.endsWith("/v1")) {
+    return `${normalized}/messages`;
+  }
+  return `${normalized}/v1/messages`;
+};
 const DONE_EVENT = JSON.stringify({ type: "done" });
-const resolveProviderBaseUrl = (baseUrl: string | undefined) =>
-  baseUrl ? normalizeProviderBaseUrl(baseUrl) : undefined;
+const resolveProviderBaseUrl = (baseUrl: string | undefined) => {
+  if (!baseUrl) {
+    return undefined;
+  }
+  try {
+    return normalizeProviderBaseUrl(baseUrl);
+  } catch {
+    return undefined;
+  }
+};
 const joinVisibleParts = (parts: string[]) => parts.filter(Boolean).join("");
 
 const extractTextValue = (value: unknown): string => {
@@ -458,15 +560,24 @@ async function* streamSseOpenAI(
   apiKey: string,
   model: string,
   query: string,
-  options?: { includeReasoning?: boolean; temperature?: number }
+  options?: {
+    includeReasoning?: boolean;
+    temperature?: number;
+    family?: ProviderFamily;
+  }
 ): AsyncGenerator<string> {
+  const headers: Record<string, string> = {
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+  if (options?.family === "gemini") {
+    headers["x-goog-api-key"] = apiKey;
+  }
+
   const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
     method: "POST",
-    headers: {
-      Accept: "text/event-stream",
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
       model,
       temperature: options?.temperature ?? 0.2,
@@ -633,7 +744,276 @@ async function* streamSseOpenAI(
   yield DONE_EVENT;
 }
 
+const ANTHROPIC_TOOL = {
+  name: FILE_TOOL.function.name,
+  description: FILE_TOOL.function.description,
+  input_schema: FILE_TOOL.function.parameters,
+} as const;
+
+type AnthropicUsageState = {
+  inputTokens?: number;
+  outputTokens?: number;
+  lastEmitted?: string;
+};
+
+const extractAnthropicUsageEvent = (
+  payload: unknown,
+  state: AnthropicUsageState
+) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    usage?: unknown;
+    message?: { usage?: unknown };
+  };
+  const usageCandidate = record.usage ?? record.message?.usage;
+  if (!usageCandidate || typeof usageCandidate !== "object") {
+    return null;
+  }
+
+  const usageRecord = usageCandidate as {
+    input_tokens?: unknown;
+    output_tokens?: unknown;
+  };
+  if (typeof usageRecord.input_tokens === "number") {
+    state.inputTokens = Math.max(0, Math.floor(usageRecord.input_tokens));
+  }
+  if (typeof usageRecord.output_tokens === "number") {
+    state.outputTokens = Math.max(0, Math.floor(usageRecord.output_tokens));
+  }
+
+  if (
+    typeof state.inputTokens !== "number" &&
+    typeof state.outputTokens !== "number"
+  ) {
+    return null;
+  }
+
+  const promptTokens = state.inputTokens ?? 0;
+  const completionTokens = state.outputTokens ?? 0;
+  const signature = `${promptTokens}:${completionTokens}`;
+  if (state.lastEmitted === signature) {
+    return null;
+  }
+  state.lastEmitted = signature;
+  return JSON.stringify({
+    type: "usage",
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+  });
+};
+
+async function* streamSseAnthropic(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  query: string,
+  options?: { temperature?: number }
+): AsyncGenerator<string> {
+  const response = await fetch(resolveAnthropicMessagesUrl(baseUrl), {
+    method: "POST",
+    headers: {
+      Accept: "text/event-stream",
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      stream: true,
+      max_tokens: 4096,
+      temperature: options?.temperature ?? 0.2,
+      system: TOOL_USAGE_SYSTEM_PROMPT,
+      tools: [ANTHROPIC_TOOL],
+      tool_choice: { type: "auto" },
+      messages: [{ role: "user", content: query }],
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Stream error: ${response.status} ${response.statusText}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const usageState: AnthropicUsageState = {};
+  const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+    let splitIndex = buffer.indexOf("\n\n");
+    while (splitIndex !== -1) {
+      const rawEvent = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+
+      const dataLines = parseSseEventData(rawEvent);
+      for (const line of dataLines) {
+        if (line === "[DONE]") {
+          yield DONE_EVENT;
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(line) as {
+            type?: unknown;
+            index?: unknown;
+            content_block?: {
+              type?: unknown;
+              text?: unknown;
+              name?: unknown;
+              input?: unknown;
+            };
+            delta?: {
+              type?: unknown;
+              text?: unknown;
+              partial_json?: unknown;
+            };
+          };
+          const usageEvent = extractAnthropicUsageEvent(parsed, usageState);
+          if (usageEvent) {
+            yield usageEvent;
+          }
+
+          const eventType =
+            typeof parsed.type === "string" ? parsed.type : "";
+          const index = typeof parsed.index === "number" ? parsed.index : 0;
+
+          if (eventType === "content_block_start") {
+            const contentBlock = parsed.content_block;
+            const blockType =
+              contentBlock && typeof contentBlock.type === "string"
+                ? contentBlock.type
+                : "";
+            if (blockType === "text" && typeof contentBlock?.text === "string") {
+              if (contentBlock.text) {
+                yield JSON.stringify({
+                  type: "text_delta",
+                  text: contentBlock.text,
+                });
+              }
+            }
+            if (blockType === "tool_use") {
+              const current = toolState.get(index) ?? {
+                args: "",
+                emitted: false,
+              };
+              if (typeof contentBlock?.name === "string") {
+                current.name = contentBlock.name;
+              }
+              if (typeof contentBlock?.input === "string") {
+                current.args += contentBlock.input;
+              } else if (
+                contentBlock?.input &&
+                typeof contentBlock.input === "object"
+              ) {
+                current.args = JSON.stringify(contentBlock.input);
+              }
+              toolState.set(index, current);
+            }
+          }
+
+          if (eventType === "content_block_delta") {
+            const deltaType =
+              parsed.delta && typeof parsed.delta.type === "string"
+                ? parsed.delta.type
+                : "";
+            if (
+              deltaType === "text_delta" &&
+              typeof parsed.delta?.text === "string" &&
+              parsed.delta.text
+            ) {
+              yield JSON.stringify({
+                type: "text_delta",
+                text: parsed.delta.text,
+              });
+            }
+            if (
+              deltaType === "input_json_delta" &&
+              typeof parsed.delta?.partial_json === "string"
+            ) {
+              const current = toolState.get(index) ?? {
+                args: "",
+                emitted: false,
+              };
+              current.args += parsed.delta.partial_json;
+              toolState.set(index, current);
+            }
+          }
+
+          if (eventType === "content_block_stop") {
+            const current = toolState.get(index);
+            if (current?.name && !current.emitted) {
+              let parsedArgs: unknown = {};
+              try {
+                parsedArgs = current.args ? JSON.parse(current.args) : {};
+              } catch {
+                parsedArgs = { raw: current.args };
+              }
+              if (
+                parsedArgs &&
+                typeof parsedArgs === "object" &&
+                Object.keys(parsedArgs as Record<string, unknown>).length > 0
+              ) {
+                yield JSON.stringify({
+                  type: "tool_call",
+                  toolName: current.name,
+                  input: parsedArgs,
+                });
+                current.emitted = true;
+                toolState.set(index, current);
+              }
+            }
+          }
+
+          if (eventType === "message_stop") {
+            yield DONE_EVENT;
+            return;
+          }
+        } catch {
+          // ignore malformed SSE data line
+        }
+      }
+
+      splitIndex = buffer.indexOf("\n\n");
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    const dataLines = parseSseEventData(buffer);
+    for (const line of dataLines) {
+      if (line === "[DONE]") {
+        yield DONE_EVENT;
+        return;
+      }
+    }
+  }
+
+  yield DONE_EVENT;
+}
+
 const parseModelsPayload = (payload: unknown): string[] => {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "models" in payload &&
+    Array.isArray((payload as { models: unknown[] }).models)
+  ) {
+    const models = (payload as { models: Array<{ name?: unknown }> }).models
+      .map(item => (typeof item?.name === "string" ? item.name : ""))
+      .map(name => name.replace(/^models\//, "").trim())
+      .filter(Boolean);
+    return Array.from(new Set(models));
+  }
+
   if (
     !payload ||
     typeof payload !== "object" ||
@@ -668,15 +1048,31 @@ export const fetchProviderModelCatalog = async (options: {
   apiKey: string;
   preferredModel?: string;
   currentModel?: string;
+  familyOverride?: ProviderFamily;
 }): Promise<ProviderModelCatalogResult> => {
-  const providerBaseUrl = normalizeProviderBaseUrl(options.baseUrl);
-  const response = await fetch(resolveModelsUrl(providerBaseUrl), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${options.apiKey}`,
-    },
-  });
+  const parsedProvider = parseProviderBaseUrl(options.baseUrl);
+  const providerBaseUrl = parsedProvider.providerBaseUrl;
+  const providerFamily = options.familyOverride ?? parsedProvider.family;
+  const response =
+    providerFamily === "anthropic"
+      ? await fetch(resolveModelsUrl(providerBaseUrl), {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "x-api-key": options.apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+        })
+      : await fetch(resolveModelsUrl(providerBaseUrl), {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${options.apiKey}`,
+            ...(providerFamily === "gemini"
+              ? { "x-goog-api-key": options.apiKey }
+              : {}),
+          },
+        });
   if (!response.ok) {
     throw new Error(`Model fetch failed: ${response.status} ${response.statusText}`);
   }
@@ -686,7 +1082,11 @@ export const fetchProviderModelCatalog = async (options: {
     throw new Error("Model fetch returned empty list.");
   }
 
-  const firstModel = models[0] ?? options.currentModel ?? "gpt-4o-mini";
+  const fallbackModel =
+    providerFamily === "anthropic"
+      ? "claude-3-7-sonnet-latest"
+      : "gpt-4o-mini";
+  const firstModel = models[0] ?? options.currentModel ?? fallbackModel;
   const selectedModel =
     (options.preferredModel && models.includes(options.preferredModel)
       ? options.preferredModel
@@ -710,6 +1110,68 @@ export type HttpQueryTransportOptions = {
   requestTemperature?: number;
 };
 
+type ParsedHttpEnv = z.infer<typeof envSchema>;
+
+const resolveDefaultModelForFamily = (family: ProviderFamily) =>
+  family === "anthropic" ? "claude-3-7-sonnet-latest" : "gpt-4o-mini";
+
+const resolveApiKeySourceForFamily = (
+  family: ProviderFamily,
+  env: ParsedHttpEnv
+) => {
+  if (family === "anthropic" && env.CYRENE_ANTHROPIC_API_KEY) {
+    return "CYRENE_ANTHROPIC_API_KEY";
+  }
+  if (family === "gemini" && env.CYRENE_GEMINI_API_KEY) {
+    return "CYRENE_GEMINI_API_KEY";
+  }
+  if (family === "openai" && env.CYRENE_OPENAI_API_KEY) {
+    return "CYRENE_OPENAI_API_KEY";
+  }
+  return env.CYRENE_API_KEY ? "CYRENE_API_KEY" : "none";
+};
+
+const resolveApiKeyForFamily = (
+  family: ProviderFamily,
+  env: ParsedHttpEnv
+) => {
+  if (family === "anthropic") {
+    return env.CYRENE_ANTHROPIC_API_KEY ?? env.CYRENE_API_KEY;
+  }
+  if (family === "gemini") {
+    return env.CYRENE_GEMINI_API_KEY ?? env.CYRENE_API_KEY;
+  }
+  return env.CYRENE_OPENAI_API_KEY ?? env.CYRENE_API_KEY;
+};
+
+const resolveApiKeySourceForProvider = (
+  provider: string | undefined,
+  env: ParsedHttpEnv,
+  resolveFamily?: (provider: string) => ProviderFamily
+) => {
+  if (!provider) {
+    return env.CYRENE_API_KEY ? "CYRENE_API_KEY" : "none";
+  }
+  const family = resolveFamily
+    ? resolveFamily(provider)
+    : resolveProviderFamily(provider);
+  return resolveApiKeySourceForFamily(family, env);
+};
+
+const resolveApiKeyForProvider = (
+  provider: string | undefined,
+  env: ParsedHttpEnv,
+  resolveFamily?: (provider: string) => ProviderFamily
+) => {
+  if (!provider) {
+    return env.CYRENE_API_KEY;
+  }
+  const family = resolveFamily
+    ? resolveFamily(provider)
+    : resolveProviderFamily(provider);
+  return resolveApiKeyForFamily(family, env);
+};
+
 export const createHttpQueryTransport = (
   options?: HttpQueryTransportOptions
 ): QueryTransport => {
@@ -730,21 +1192,105 @@ export const createHttpQueryTransport = (
   const env = envSchema.safeParse({
     CYRENE_BASE_URL: effectiveEnv.CYRENE_BASE_URL,
     CYRENE_API_KEY: effectiveEnv.CYRENE_API_KEY,
+    CYRENE_OPENAI_API_KEY: effectiveEnv.CYRENE_OPENAI_API_KEY,
+    CYRENE_GEMINI_API_KEY: effectiveEnv.CYRENE_GEMINI_API_KEY,
+    CYRENE_ANTHROPIC_API_KEY: effectiveEnv.CYRENE_ANTHROPIC_API_KEY,
     CYRENE_MODEL: effectiveEnv.CYRENE_MODEL,
   });
 
-  const baseUrl = env.success ? env.data.CYRENE_BASE_URL : undefined;
-  const apiKey = env.success ? env.data.CYRENE_API_KEY : undefined;
+  const parsedEnv: ParsedHttpEnv = env.success
+    ? env.data
+    : {
+        CYRENE_BASE_URL: undefined,
+        CYRENE_API_KEY: undefined,
+        CYRENE_OPENAI_API_KEY: undefined,
+        CYRENE_GEMINI_API_KEY: undefined,
+        CYRENE_ANTHROPIC_API_KEY: undefined,
+        CYRENE_MODEL: undefined,
+      };
+  const baseUrl = parsedEnv.CYRENE_BASE_URL;
   let currentModel = env.success
-    ? env.data.CYRENE_MODEL ?? "gpt-4o-mini"
+    ? env.data.CYRENE_MODEL ??
+      resolveDefaultModelForFamily(
+        baseUrl ? resolveProviderFamily(baseUrl) : "openai"
+      )
     : "gpt-4o-mini";
   let currentProvider = resolveProviderBaseUrl(baseUrl);
   let availableModels: string[] = [];
   let providerCatalog = currentProvider ? [currentProvider] : ([] as string[]);
+  let providerProfileOverrides: ProviderProfileOverrideMap = {};
   let initializationError: string | null = null;
-  const sessionQueries = new Map<string, string>();
+  const sessionQueries = new Map<
+    string,
+    {
+      query: string;
+      provider: string;
+      model: string;
+      apiKey: string;
+      family: ProviderFamily;
+    }
+  >();
   const dedupeProviders = (providers: Array<string | undefined>) =>
     Array.from(new Set(providers.map(provider => resolveProviderBaseUrl(provider)).filter(Boolean))) as string[];
+  const resolveFamilyForProvider = (provider: string | undefined): ProviderFamily => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return "openai";
+    }
+    const overrideFamily = providerProfileOverrides[normalizedProvider];
+    if (overrideFamily) {
+      return overrideFamily;
+    }
+    return resolveProviderFamily(normalizedProvider);
+  };
+  const getProviderProfileOverride = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return providerProfileOverrides[normalizedProvider] ?? null;
+  };
+  const setProviderProfileOverride = (
+    provider: string | undefined,
+    profile: ProviderFamily | null
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    if (!profile) {
+      if (normalizedProvider in providerProfileOverrides) {
+        const next = { ...providerProfileOverrides };
+        delete next[normalizedProvider];
+        providerProfileOverrides = next;
+      }
+      return normalizedProvider;
+    }
+    if (providerProfileOverrides[normalizedProvider] === profile) {
+      return normalizedProvider;
+    }
+    providerProfileOverrides = {
+      ...providerProfileOverrides,
+      [normalizedProvider]: profile,
+    };
+    return normalizedProvider;
+  };
+  const normalizeLoadedProviderProfiles = (
+    profiles: Record<string, string | undefined> | undefined
+  ): ProviderProfileOverrideMap => {
+    const normalizedEntries: Array<[string, ProviderFamily]> = [];
+    for (const [provider, profile] of Object.entries(profiles ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        continue;
+      }
+      if (!profile || !isProviderFamily(profile)) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, profile]);
+    }
+    return Object.fromEntries(normalizedEntries);
+  };
   const resolvePersistedModels = () =>
     availableModels.length > 0
       ? [...availableModels]
@@ -761,6 +1307,7 @@ export const createHttpQueryTransport = (
       lastUsedModel: selectedModel,
       providerBaseUrl: provider,
       providers: providerCatalog,
+      providerProfiles: providerProfileOverrides,
     }, appRoot, {
       cwd: options?.cwd,
       env: effectiveEnv,
@@ -772,14 +1319,20 @@ export const createHttpQueryTransport = (
     providerOverride?: string
   ) => {
     const targetProvider = resolveProviderBaseUrl(providerOverride ?? currentProvider ?? baseUrl);
-    if (!targetProvider || !apiKey) {
-      throw new Error("Missing CYRENE_BASE_URL or CYRENE_API_KEY.");
+    const targetApiKey = resolveApiKeyForProvider(
+      targetProvider,
+      parsedEnv,
+      resolveFamilyForProvider
+    );
+    if (!targetProvider || !targetApiKey) {
+      throw new Error("Missing provider or API key. Use /provider and /login.");
     }
     const catalog = await fetchProviderModelCatalog({
       baseUrl: targetProvider,
-      apiKey,
+      apiKey: targetApiKey,
       preferredModel,
       currentModel,
+      familyOverride: resolveFamilyForProvider(targetProvider),
     });
     await persistCatalog(
       catalog.models,
@@ -800,15 +1353,20 @@ export const createHttpQueryTransport = (
         cwd: options?.cwd,
         env: effectiveEnv,
       });
+      providerProfileOverrides = normalizeLoadedProviderProfiles(
+        local.providerProfiles
+      );
+      const localProvider = resolveProviderBaseUrl(local.providerBaseUrl);
       providerCatalog = dedupeProviders([
         ...local.providers,
-        local.providerBaseUrl,
+        ...Object.keys(providerProfileOverrides),
+        localProvider,
         currentProvider,
       ]);
       const providerChanged =
         Boolean(currentProvider) &&
-        Boolean(local.providerBaseUrl) &&
-        local.providerBaseUrl !== currentProvider;
+        Boolean(localProvider) &&
+        localProvider !== currentProvider;
       if (providerChanged) {
         await refreshFromApi(
           local.lastUsedModel ?? local.defaultModel ?? currentModel,
@@ -816,7 +1374,7 @@ export const createHttpQueryTransport = (
         );
         return;
       }
-      currentProvider = currentProvider ?? local.providerBaseUrl;
+      currentProvider = currentProvider ?? localProvider;
       availableModels = local.models;
       currentModel =
         (local.lastUsedModel && local.models.includes(local.lastUsedModel)
@@ -850,6 +1408,104 @@ export const createHttpQueryTransport = (
   return {
     getModel: () => currentModel,
     getProvider: () => currentProvider ?? "none",
+    describeProvider: (provider?: string) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider) {
+        return {
+          provider: "none",
+          vendor: "none",
+          keySource: "none",
+        };
+      }
+      const family = resolveFamilyForProvider(normalizedProvider);
+      const keySource = resolveApiKeySourceForProvider(
+        normalizedProvider,
+        parsedEnv,
+        resolveFamilyForProvider
+      );
+      return {
+        provider: normalizedProvider,
+        vendor: family,
+        keySource,
+      };
+    },
+    setProviderProfile: async (provider: string, profile: ProviderProfile) => {
+      await modelInit;
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+
+      const normalizedProfile = profile.trim().toLowerCase();
+      if (
+        normalizedProfile !== "custom" &&
+        !isProviderFamily(normalizedProfile)
+      ) {
+        return {
+          ok: false,
+          message:
+            "Profile must be one of: openai, gemini, anthropic, custom.",
+        };
+      }
+
+      const previousOverrides = providerProfileOverrides;
+      const previousProvider = currentProvider;
+      const previousModel = currentModel;
+      const previousModels = [...availableModels];
+      const previousProviderCatalog = [...providerCatalog];
+
+      setProviderProfileOverride(
+        normalizedProvider,
+        normalizedProfile === "custom" ? null : normalizedProfile
+      );
+      providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
+
+      try {
+        if (currentProvider === normalizedProvider) {
+          await refreshFromApi(undefined, normalizedProvider);
+        } else {
+          await persistCatalog(resolvePersistedModels(), currentModel, currentProvider);
+        }
+      } catch (error) {
+        providerProfileOverrides = previousOverrides;
+        currentProvider = previousProvider;
+        currentModel = previousModel;
+        availableModels = previousModels;
+        providerCatalog = previousProviderCatalog;
+        return {
+          ok: false,
+          message:
+            error instanceof Error
+              ? `Failed to apply provider profile: ${error.message}`
+              : `Failed to apply provider profile: ${String(error)}`,
+        };
+      }
+
+      const appliedOverride = getProviderProfileOverride(normalizedProvider);
+      return {
+        ok: true,
+        message: appliedOverride
+          ? `Provider profile override set: ${normalizedProvider} => ${appliedOverride}`
+          : `Provider profile override cleared: ${normalizedProvider}`,
+        provider: normalizedProvider,
+        profile: appliedOverride ?? "custom",
+      };
+    },
+    getProviderProfile: (provider?: string) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider) {
+        return null;
+      }
+      return getProviderProfileOverride(normalizedProvider) ?? "custom";
+    },
+    listProviderProfiles: () => ({ ...providerProfileOverrides }),
     setModel: async (model: string) => {
       await modelInit;
       const next = model.trim();
@@ -896,22 +1552,34 @@ export const createHttpQueryTransport = (
     },
     listProviders: async () => {
       await modelInit;
-      providerCatalog = dedupeProviders([...providerCatalog, currentProvider]);
+      providerCatalog = dedupeProviders([
+        ...providerCatalog,
+        ...Object.keys(providerProfileOverrides),
+        currentProvider,
+      ]);
       return [...providerCatalog];
     },
     setProvider: async (provider: string) => {
       await modelInit;
-      const nextProvider = resolveProviderBaseUrl(provider.trim());
-      if (!nextProvider) {
+      let nextProvider: string;
+      try {
+        nextProvider = normalizeProviderBaseUrl(provider.trim());
+      } catch (error) {
         return {
           ok: false,
-          message: "Provider cannot be empty.",
+          message: error instanceof Error ? error.message : String(error),
         };
       }
-      if (!apiKey) {
+      const providerApiKey = resolveApiKeyForProvider(
+        nextProvider,
+        parsedEnv,
+        resolveFamilyForProvider
+      );
+      if (!providerApiKey) {
         return {
           ok: false,
-          message: "Missing CYRENE_API_KEY for HTTP transport.",
+          message:
+            "Missing API key for selected provider. Set CYRENE_API_KEY (or provider-specific key).",
         };
       }
       if (currentProvider === nextProvider) {
@@ -960,9 +1628,19 @@ export const createHttpQueryTransport = (
     requestStreamUrl: async (query: string) => {
       await modelInit;
       const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
-      if (!targetProvider || !apiKey) {
+      if (!targetProvider) {
         throw new Error(
-          "Missing CYRENE_BASE_URL or CYRENE_API_KEY for HTTP transport."
+          "Missing CYRENE_BASE_URL (or /provider) for HTTP transport."
+        );
+      }
+      const targetApiKey = resolveApiKeyForProvider(
+        targetProvider,
+        parsedEnv,
+        resolveFamilyForProvider
+      );
+      if (!targetApiKey) {
+        throw new Error(
+          "Missing API key for current provider. Use /login or set provider-specific key env."
         );
       }
       if (initializationError && availableModels.length === 0) {
@@ -970,32 +1648,52 @@ export const createHttpQueryTransport = (
           `Model initialization failed: ${initializationError}. Run /model refresh after fixing API/base URL.`
         );
       }
+      const providerFamily = resolveFamilyForProvider(targetProvider);
+      const modelForRequest =
+        currentModel || resolveDefaultModelForFamily(providerFamily);
       const sessionId = crypto.randomUUID();
-      sessionQueries.set(sessionId, query);
+      sessionQueries.set(sessionId, {
+        query,
+        provider: targetProvider,
+        model: modelForRequest,
+        apiKey: targetApiKey,
+        family: providerFamily,
+      });
       return `openai://${sessionId}`;
     },
     stream: async function* (streamUrl: string) {
       const sessionId = streamUrl.replace("openai://", "");
-      const query = sessionQueries.get(sessionId);
+      const session = sessionQueries.get(sessionId);
       sessionQueries.delete(sessionId);
 
-      if (!query || !apiKey) {
+      if (!session) {
         throw new Error("Invalid HTTP stream session.");
       }
-      const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
 
-      if (!targetProvider) {
-        throw new Error("Invalid HTTP stream session.");
+      if (session.family === "anthropic") {
+        for await (const event of streamSseAnthropic(
+          session.provider,
+          session.apiKey,
+          session.model,
+          session.query,
+          {
+            temperature: requestTemperature,
+          }
+        )) {
+          yield event;
+        }
+        return;
       }
 
       for await (const event of streamSseOpenAI(
-        targetProvider,
-        apiKey,
-        currentModel,
-        query,
+        session.provider,
+        session.apiKey,
+        session.model,
+        session.query,
         {
           includeReasoning: includeReasoningInTranscript,
           temperature: requestTemperature,
+          family: session.family,
         }
       )) {
         yield event;

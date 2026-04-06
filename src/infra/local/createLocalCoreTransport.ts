@@ -33,6 +33,11 @@ export const createLocalCoreTransport = (): QueryTransport => {
   return {
     getModel: () => currentModel,
     getProvider: () => currentProvider,
+    describeProvider: (provider?: string) => ({
+      provider: provider?.trim() || currentProvider,
+      vendor: "local",
+      keySource: "local-core",
+    }),
     setModel: async (model: string) => {
       const next = model.trim();
       if (!next) {

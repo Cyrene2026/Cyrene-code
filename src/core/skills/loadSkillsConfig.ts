@@ -284,6 +284,7 @@ export const loadSkillsConfig = async (
             : [...(base?.triggers ?? [])],
         enabled: skill.enabled ?? base?.enabled ?? true,
         source: "global",
+        configPath: file.path,
       });
       origins.set(skill.id, {
         source: "global",
@@ -306,6 +307,7 @@ export const loadSkillsConfig = async (
             : [...(base?.triggers ?? [])],
         enabled: skill.enabled ?? base?.enabled ?? true,
         source: "project",
+        configPath: file.path,
       });
       origins.set(skill.id, {
         source: "project",

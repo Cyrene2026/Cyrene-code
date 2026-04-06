@@ -19,10 +19,16 @@ import {
 } from "../../core/session/stateReducer";
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
-import type { QueryTransport } from "../../core/query/transport";
+import type {
+  ProviderProfile,
+  ProviderProfileOverrideMap,
+  ProviderRuntimeInfo,
+  QueryTransport,
+} from "../../core/query/transport";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
 import type { AuthLoginInput, AuthStatus } from "../../infra/auth/types";
+import { normalizeProviderBaseUrl } from "../../infra/http/createHttpQueryTransport";
 import type {
   SessionListItem,
   SessionPendingChoice,
@@ -118,6 +124,12 @@ type ProviderPickerState = {
   providers: string[];
   selectedIndex: number;
   pageSize: number;
+  currentKeySource: string | null;
+  providerProfiles: Record<string, ProviderRuntimeInfo["vendor"]>;
+  providerProfileSources: Record<
+    string,
+    "manual" | "inferred" | "local" | "none"
+  >;
 };
 
 type ApprovalPreviewMode = "summary" | "full";
@@ -291,7 +303,19 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/auth", description: "show auth mode, source, and persistence target" },
   { command: "/provider", description: "open provider picker" },
   { command: "/provider refresh", description: "refresh current provider models" },
-  { command: "/provider <url>", description: "switch provider directly" },
+  {
+    command: "/provider profile list",
+    description: "list manual provider profile overrides",
+  },
+  {
+    command: "/provider profile <openai|gemini|anthropic|custom> [url]",
+    description: "override provider profile (custom clears override)",
+  },
+  {
+    command: "/provider profile clear [url]",
+    description: "clear manual provider profile override",
+  },
+  { command: "/provider <url>", description: "switch provider directly (also accepts openai/gemini/anthropic)" },
   { command: "/model", description: "open model picker" },
   { command: "/model refresh", description: "refresh available models" },
   { command: "/model <name>", description: "switch model directly" },
@@ -315,8 +339,11 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/unpin <index>", description: "remove a pin" },
   { command: "/skills", description: "show skills runtime summary" },
   { command: "/skills list", description: "list available skills" },
+  { command: "/skills show <id>", description: "show one skill details" },
   { command: "/skills enable <id>", description: "enable one skill in project config" },
   { command: "/skills disable <id>", description: "disable one skill in project config" },
+  { command: "/skills remove <id>", description: "remove one skill via project remove_skills override" },
+  { command: "/skills use <id>", description: "use one skill for the current session only" },
   { command: "/skills reload", description: "reload skills config from disk" },
   { command: "/mcp", description: "show MCP runtime summary" },
   { command: "/mcp servers", description: "list registered MCP servers" },
@@ -343,6 +370,21 @@ const HELP_TEXT = [
   "Commands:",
   ...COMMAND_SPECS.map(spec => `${spec.command} - ${spec.description}`),
 ].join("\n");
+
+const AUTH_PROVIDER_PRESETS = {
+  "1": {
+    alias: "openai",
+    label: "OpenAI",
+  },
+  "2": {
+    alias: "gemini",
+    label: "Gemini",
+  },
+  "3": {
+    alias: "anthropic",
+    label: "Anthropic",
+  },
+} as const;
 
 const mergeMatchRanges = (ranges: MatchRange[]) => {
   if (ranges.length === 0) {
@@ -517,6 +559,10 @@ const getSlashInsertValue = (command: string) => {
   switch (command) {
     case "/provider <url>":
       return "/provider ";
+    case "/provider profile <openai|gemini|anthropic|custom> [url]":
+      return "/provider profile ";
+    case "/provider profile clear [url]":
+      return "/provider profile clear ";
     case "/model <name>":
       return "/model ";
     case "/system <text>":
@@ -539,6 +585,12 @@ const getSlashInsertValue = (command: string) => {
       return "/skills enable ";
     case "/skills disable <id>":
       return "/skills disable ";
+    case "/skills remove <id>":
+      return "/skills remove ";
+    case "/skills use <id>":
+      return "/skills use ";
+    case "/skills show <id>":
+      return "/skills show ";
     case "/mcp server <id>":
       return "/mcp server ";
     case "/mcp tools <server>":
@@ -1384,11 +1436,27 @@ const formatSkillLine = (skill: SkillDefinition) =>
     `label ${skill.label}`,
     skill.enabled ? "enabled" : "disabled",
     `source ${skill.source}`,
+    skill.configPath ? `config ${skill.configPath}` : "",
     skill.triggers.length > 0 ? `triggers ${skill.triggers.join(", ")}` : "",
     skill.description ? `desc ${skill.description}` : "",
   ]
     .filter(Boolean)
     .join(" | ");
+
+const formatSkillDetail = (skill: SkillDefinition) =>
+  [
+    `Skill ${skill.id}`,
+    `label: ${skill.label}`,
+    `enabled: ${skill.enabled ? "yes" : "no"}`,
+    `source: ${skill.source}`,
+    skill.configPath ? `config: ${skill.configPath}` : "",
+    skill.triggers.length > 0 ? `triggers: ${skill.triggers.join(", ")}` : "triggers: (none)",
+    skill.description ? `description: ${skill.description}` : "",
+    "prompt:",
+    skill.prompt.trim() || "(empty)",
+  ]
+    .filter(Boolean)
+    .join("\n");
 
 const formatSkillsRuntimeSummary = (
   summary: ReturnType<NonNullable<SkillsRuntime["describeRuntime"]>>
@@ -1400,7 +1468,7 @@ const formatSkillsRuntimeSummary = (
       ? ["config:", ...summary.configPaths.map(path => `- ${path}`)]
       : ["config: built-in default"]),
     `editable: ${summary.editableConfigPath}`,
-    "commands: /skills list | /skills enable <id> | /skills disable <id> | /skills reload",
+    "commands: /skills list | /skills show <id> | /skills enable <id> | /skills disable <id> | /skills remove <id> | /skills use <id> | /skills reload",
   ].join("\n");
 
 const formatActiveSkillsPrompt = (skills: SkillDefinition[]) =>
@@ -1674,6 +1742,9 @@ export const useChatApp = ({
   );
   const [currentModel, setCurrentModel] = useState(() => transport.getModel());
   const [currentProvider, setCurrentProvider] = useState(() => transport.getProvider());
+  const [currentProviderKeySource, setCurrentProviderKeySource] = useState<string>(
+    () => transport.describeProvider?.(transport.getProvider()).keySource ?? "unknown"
+  );
   const [runtimeUsageSummary, setRuntimeUsageSummary] = useState<RuntimeUsageSummary>(
     () => createRuntimeUsageSummary(transport.getModel())
   );
@@ -1704,6 +1775,9 @@ export const useChatApp = ({
     providers: [],
     selectedIndex: 0,
     pageSize: PROVIDER_PAGE_SIZE,
+    currentKeySource: null,
+    providerProfiles: {},
+    providerProfileSources: {},
   });
   const [pendingReviews, setPendingReviews] = useState<PendingReviewItem[]>([]);
   const [approvalPanel, setApprovalPanel] = useState<ApprovalPanelState>({
@@ -1796,6 +1870,8 @@ export const useChatApp = ({
     new Map()
   );
   const shellStatusPollInFlightRef = useRef(false);
+  const sessionSkillUsesBySessionIdRef = useRef<Record<string, string[]>>({});
+  const draftSessionSkillUsesRef = useRef<string[]>([]);
 
   resumePickerRef.current = resumePicker;
   sessionsPanelRef.current = sessionsPanel;
@@ -2309,8 +2385,90 @@ export const useChatApp = ({
     );
   };
 
+  const resolveProviderKeySource = (provider: string) => {
+    const describedSource = transport.describeProvider?.(provider)?.keySource;
+    if (describedSource && describedSource.trim()) {
+      return describedSource.trim();
+    }
+    const credentialSource = authRef.current?.status.credentialSource;
+    if (credentialSource && credentialSource !== "none") {
+      return credentialSource;
+    }
+    return credentialSource ?? "unknown";
+  };
+
+  const resolveProviderProfile = (
+    provider: string
+  ): ProviderRuntimeInfo["vendor"] => {
+    const describedVendor = transport.describeProvider?.(provider)?.vendor;
+    if (describedVendor) {
+      return describedVendor;
+    }
+    if (!provider || provider === "none") {
+      return "none";
+    }
+    if (provider === "local-core") {
+      return "local";
+    }
+    return "custom";
+  };
+
+  const normalizeProviderForProfileLookup = (provider: string) => {
+    if (!provider || provider === "none" || provider === "local-core") {
+      return provider;
+    }
+    try {
+      return normalizeProviderBaseUrl(provider);
+    } catch {
+      return provider.trim();
+    }
+  };
+
+  const listManualProviderProfileOverrides = (): ProviderProfileOverrideMap =>
+    transport.listProviderProfiles?.() ?? {};
+
+  const resolveProviderProfileSource = (
+    provider: string,
+    manualOverrides?: ProviderProfileOverrideMap
+  ): ProviderPickerState["providerProfileSources"][string] => {
+    const profile = resolveProviderProfile(provider);
+    if (profile === "none") {
+      return "none";
+    }
+    if (profile === "local") {
+      return "local";
+    }
+    const normalizedProvider = normalizeProviderForProfileLookup(provider);
+    const overrides = manualOverrides ?? listManualProviderProfileOverrides();
+    return normalizedProvider && overrides[normalizedProvider]
+      ? "manual"
+      : "inferred";
+  };
+
   const updateCurrentProviderState = (provider: string) => {
     setCurrentProvider(provider);
+    const keySource = resolveProviderKeySource(provider);
+    const profile = resolveProviderProfile(provider);
+    const profileSource = resolveProviderProfileSource(provider);
+    setCurrentProviderKeySource(keySource);
+    setProviderPicker(previous =>
+      previous.currentKeySource === keySource &&
+      previous.providerProfiles[provider] === profile &&
+      previous.providerProfileSources[provider] === profileSource
+        ? previous
+        : {
+            ...previous,
+            currentKeySource: keySource,
+            providerProfiles: {
+              ...previous.providerProfiles,
+              [provider]: profile,
+            },
+            providerProfileSources: {
+              ...previous.providerProfileSources,
+              [provider]: profileSource,
+            },
+          }
+    );
   };
 
   const updateActiveSessionIdState = (sessionId: string | null) => {
@@ -2323,6 +2481,79 @@ export const useChatApp = ({
             activeSessionId: sessionId,
           }
     );
+  };
+
+  const dedupeSkillIds = (ids: string[]) => {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const rawId of ids) {
+      const normalized = rawId.trim();
+      if (!normalized || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      result.push(normalized);
+    }
+    return result;
+  };
+
+  const getSkillDefinitionById = (skillId: string) => {
+    const normalized = skillId.trim().toLowerCase();
+    if (!normalized || !skillsService) {
+      return null;
+    }
+    return (
+      skillsService
+        .listSkills()
+        .find(skill => skill.id.trim().toLowerCase() === normalized) ?? null
+    );
+  };
+
+  const getSessionSkillUseIds = (sessionId: string | null) =>
+    sessionId
+      ? [...(sessionSkillUsesBySessionIdRef.current[sessionId] ?? [])]
+      : [...draftSessionSkillUsesRef.current];
+
+  const setSessionSkillUseIds = (sessionId: string | null, ids: string[]) => {
+    const deduped = dedupeSkillIds(ids);
+    if (sessionId) {
+      if (deduped.length === 0) {
+        delete sessionSkillUsesBySessionIdRef.current[sessionId];
+        return;
+      }
+      sessionSkillUsesBySessionIdRef.current = {
+        ...sessionSkillUsesBySessionIdRef.current,
+        [sessionId]: deduped,
+      };
+      return;
+    }
+    draftSessionSkillUsesRef.current = deduped;
+  };
+
+  const resolveSessionSkillUseDefinitions = (sessionId: string | null) => {
+    if (!skillsService) {
+      return [] as SkillDefinition[];
+    }
+    const skillIds = getSessionSkillUseIds(sessionId);
+    if (skillIds.length === 0) {
+      return [] as SkillDefinition[];
+    }
+    const byId = new Map(
+      skillsService
+        .listSkills()
+        .map(skill => [skill.id.trim().toLowerCase(), skill] as const)
+    );
+    const selected: SkillDefinition[] = [];
+    const seen = new Set<string>();
+    for (const skillId of skillIds) {
+      const skill = byId.get(skillId.trim().toLowerCase());
+      if (!skill || seen.has(skill.id)) {
+        continue;
+      }
+      seen.add(skill.id);
+      selected.push(skill);
+    }
+    return selected;
   };
 
   const accumulateRuntimeUsage = (usage: TokenUsage) => {
@@ -2656,6 +2887,32 @@ export const useChatApp = ({
       error: null,
       info: null,
     }));
+  };
+
+  const applyAuthProviderPreset = (presetKey: keyof typeof AUTH_PROVIDER_PRESETS) => {
+    const preset = AUTH_PROVIDER_PRESETS[presetKey];
+    if (!preset) {
+      return;
+    }
+    let providerBaseUrl: string = preset.alias;
+    try {
+      providerBaseUrl = normalizeProviderBaseUrl(preset.alias);
+    } catch {
+      // keep alias text as a safe fallback
+    }
+    setAuthPanel(previous => {
+      if (!previous.active || previous.step !== "provider" || previous.saving) {
+        return previous;
+      }
+      return {
+        ...previous,
+        providerBaseUrl,
+        step: "api_key",
+        cursorOffset: previous.apiKey.length,
+        error: null,
+        info: `Preset selected: ${preset.label} (${providerBaseUrl})`,
+      };
+    });
   };
 
   const applyAuthEditorTransform = (
@@ -3248,6 +3505,10 @@ export const useChatApp = ({
 
     const created = await sessionStore.createSession(titleHint);
     pendingChoiceRef.current = null;
+    if (draftSessionSkillUsesRef.current.length > 0) {
+      setSessionSkillUseIds(created.id, draftSessionSkillUsesRef.current);
+      draftSessionSkillUsesRef.current = [];
+    }
     updateActiveSessionIdState(created.id);
     return created;
   };
@@ -3347,6 +3608,9 @@ export const useChatApp = ({
       providers: [],
       selectedIndex: 0,
       pageSize: PROVIDER_PAGE_SIZE,
+      currentKeySource: null,
+      providerProfiles: {},
+      providerProfileSources: {},
     };
     providerPickerRef.current = nextState;
     setProviderPicker(nextState);
@@ -3448,7 +3712,7 @@ export const useChatApp = ({
       info:
         mode === "auto_onboarding"
           ? "HTTP credentials not found. Press Esc to stay in local-core mode, or continue below."
-          : "Connect an OpenAI-compatible HTTP provider. API key input stays local to this panel.",
+          : "Connect an HTTP provider (URL or preset: openai / gemini / anthropic). API key input stays local to this panel.",
       saving: false,
       persistenceTarget: authRef.current?.status.persistenceTarget ?? null,
     };
@@ -3483,9 +3747,18 @@ export const useChatApp = ({
     if (panel.step === "provider") {
       const providerBaseUrl = panel.providerBaseUrl.trim();
       try {
-        const parsed = new URL(providerBaseUrl);
+        const normalized = normalizeProviderBaseUrl(providerBaseUrl);
+        const parsed = new URL(normalized);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
           throw new Error("Provider base URL must use http or https.");
+        }
+        if (normalized !== providerBaseUrl) {
+          setAuthPanel(previous => ({
+            ...previous,
+            providerBaseUrl: normalized,
+            cursorOffset: normalized.length,
+            error: null,
+          }));
         }
       } catch (error) {
         setAuthPanel(previous => ({
@@ -4392,6 +4665,24 @@ export const useChatApp = ({
         return;
       }
 
+      if (
+        authPanelRef.current.step === "provider" &&
+        (() => {
+          const currentValue = authPanelRef.current.providerBaseUrl.trim();
+          const suggestedValue = getSuggestedLoginProvider().trim();
+          return (
+            currentValue.length === 0 ||
+            (Boolean(suggestedValue) && currentValue === suggestedValue)
+          );
+        })() &&
+        !key.ctrl &&
+        !key.meta &&
+        Object.prototype.hasOwnProperty.call(AUTH_PROVIDER_PRESETS, inputValue)
+      ) {
+        applyAuthProviderPreset(inputValue as keyof typeof AUTH_PROVIDER_PRESETS);
+        return;
+      }
+
       if (authPanelRef.current.step === "confirm") {
         if (!key.ctrl && !key.meta && /^[123]$/.test(inputValue)) {
           const index = Number(inputValue) - 1;
@@ -5087,23 +5378,162 @@ export const useChatApp = ({
         const providers = await transport.listProviders();
         updateCurrentProviderState(transport.getProvider());
         if (providers.length === 0) {
-          pushSystemMessage("No providers available. Set CYRENE_BASE_URL or switch with /provider <url>.");
+          pushSystemMessage("No providers available. Set CYRENE_BASE_URL or switch with /provider <url|openai|gemini|anthropic>.");
           return;
         }
         const current = transport.getProvider();
         const selectedIndex = Math.max(0, providers.indexOf(current));
+        const currentKeySource = currentProviderKeySource || resolveProviderKeySource(current);
+        const manualOverrides = listManualProviderProfileOverrides();
+        const providerProfiles = Object.fromEntries(
+          providers.map(provider => [provider, resolveProviderProfile(provider)])
+        ) as ProviderPickerState["providerProfiles"];
+        const providerProfileSources = Object.fromEntries(
+          providers.map(provider => [
+            provider,
+            resolveProviderProfileSource(provider, manualOverrides),
+          ])
+        ) as ProviderPickerState["providerProfileSources"];
         closeAllOverlayPanels({ keepProviderPicker: true });
         const nextState = {
           active: true,
           providers,
           selectedIndex,
           pageSize: PROVIDER_PAGE_SIZE,
+          currentKeySource,
+          providerProfiles,
+          providerProfileSources,
         };
         providerPickerRef.current = nextState;
         setProviderPicker(nextState);
         pushSystemMessage(
           "Provider picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
         );
+      });
+      clearInput();
+      return;
+    }
+
+    if (query.startsWith("/provider profile")) {
+      enqueueTask(async () => {
+        if (!transport.setProviderProfile) {
+          pushSystemMessage(
+            "Provider profile override is unavailable in this transport.",
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
+          return;
+        }
+
+        if (query === "/provider profile list") {
+          const overrides = transport.listProviderProfiles?.() ?? {};
+          const lines = Object.entries(overrides)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([provider, profile]) => `- ${provider} => ${profile}`);
+          pushSystemMessage(
+            lines.length > 0
+              ? ["Manual provider profile overrides:", ...lines].join("\n")
+              : "No manual provider profile overrides."
+          );
+          return;
+        }
+
+        if (query === "/provider profile") {
+          pushSystemMessage(
+            "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list",
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
+          return;
+        }
+
+        const rawArgs = query
+          .slice("/provider profile".length)
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        if (rawArgs.length === 0) {
+          pushSystemMessage(
+            "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list",
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
+          return;
+        }
+
+        const profileToken = rawArgs[0]?.toLowerCase();
+        let normalizedProfile: ProviderProfile | null = null;
+        if (profileToken === "clear") {
+          normalizedProfile = "custom";
+        } else if (
+          profileToken === "openai" ||
+          profileToken === "gemini" ||
+          profileToken === "anthropic" ||
+          profileToken === "custom"
+        ) {
+          normalizedProfile = profileToken;
+        }
+        if (!normalizedProfile) {
+          pushSystemMessage(
+            "Profile must be one of: openai, gemini, anthropic, custom (or clear).",
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
+          return;
+        }
+
+        const targetProvider = rawArgs.slice(1).join(" ").trim() || transport.getProvider();
+        if (!targetProvider || targetProvider === "none") {
+          pushSystemMessage(
+            "No active provider. Use /provider <url> first, or pass [url] explicitly.",
+            {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            }
+          );
+          return;
+        }
+
+        if (
+          isRepeatedActionInteraction(
+            `command:provider-profile:${targetProvider}:${normalizedProfile}`
+          )
+        ) {
+          return;
+        }
+
+        const result = await transport.setProviderProfile(
+          targetProvider,
+          normalizedProfile
+        );
+        updateCurrentProviderState(transport.getProvider());
+        updateCurrentModelState(transport.getModel());
+        if (result.ok) {
+          pushSystemMessage(result.message, {
+            kind: "system_hint",
+            tone: "info",
+            color: "cyan",
+          });
+        } else {
+          pushSystemMessage(`[provider profile failed] ${result.message}`, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+        }
       });
       clearInput();
       return;
@@ -5130,7 +5560,9 @@ export const useChatApp = ({
       const nextProvider = query.slice("/provider ".length).trim();
       enqueueTask(async () => {
         if (!nextProvider) {
-          pushSystemMessage("Usage: /provider <base_url> | /provider refresh");
+          pushSystemMessage(
+            "Usage: /provider <base_url|openai|gemini|anthropic> | /provider refresh | /provider profile ..."
+          );
           return;
         }
         if (isRepeatedActionInteraction(`command:provider:${nextProvider}`)) {
@@ -5224,30 +5656,34 @@ export const useChatApp = ({
     enqueueTask(async () => {
       let activeSubmitRunId: number | null = null;
       try {
-      if (query === "/new") {
-        const created = await sessionStore.createSession();
-        pendingChoiceRef.current = null;
-        updateActiveSessionIdState(created.id);
-        clearLiveAssistantSegment();
-        setItems([
-          {
-            role: "system",
-            text: defaultSystemText,
-            kind: "system_hint",
-            tone: "neutral",
-            color: "gray",
-          },
-          {
-            role: "system",
-            text: `Started new session: ${created.id}`,
-            kind: "system_hint",
-            tone: "info",
-            color: "cyan",
-          },
-        ]);
-        clearInput();
-        return;
-      }
+        if (query === "/new") {
+          const created = await sessionStore.createSession();
+          pendingChoiceRef.current = null;
+          if (draftSessionSkillUsesRef.current.length > 0) {
+            setSessionSkillUseIds(created.id, draftSessionSkillUsesRef.current);
+            draftSessionSkillUsesRef.current = [];
+          }
+          updateActiveSessionIdState(created.id);
+          clearLiveAssistantSegment();
+          setItems([
+            {
+              role: "system",
+              text: defaultSystemText,
+              kind: "system_hint",
+              tone: "neutral",
+              color: "gray",
+            },
+            {
+              role: "system",
+              text: `Started new session: ${created.id}`,
+              kind: "system_hint",
+              tone: "info",
+              color: "cyan",
+            },
+          ]);
+          clearInput();
+          return;
+        }
 
       if (query === "/undo") {
         const result = await mcpService.undoLastMutation();
@@ -5464,6 +5900,41 @@ export const useChatApp = ({
         return;
       }
 
+      if (query.startsWith("/skills show ")) {
+        if (!skillsService) {
+          pushSystemMessage("Skills runtime is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const skillId = query.slice("/skills show ".length).trim();
+        if (!skillId) {
+          pushSystemMessage("Usage: /skills show <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const skill = skillsService.listSkills().find(item => item.id === skillId);
+        pushSystemMessage(
+          skill ? formatSkillDetail(skill) : `Skill not found: ${skillId}`,
+          {
+            kind: skill ? "system_hint" : "error",
+            tone: skill ? "info" : "danger",
+            color: skill ? "cyan" : "red",
+          }
+        );
+        clearInput();
+        return;
+      }
+
       if (query === "/skills reload") {
         if (!skillsService?.reloadConfig) {
           pushSystemMessage("Skills runtime reload is unavailable in this build.", {
@@ -5543,6 +6014,92 @@ export const useChatApp = ({
           tone: result.ok ? "info" : "danger",
           color: result.ok ? "cyan" : "red",
         });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/skills remove ")) {
+        if (!skillsService?.removeSkill) {
+          pushSystemMessage("Skills runtime remove is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+        const skillId = query.slice("/skills remove ".length).trim();
+        if (!skillId) {
+          pushSystemMessage("Usage: /skills remove <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await skillsService.removeSkill(skillId);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/skills use ")) {
+        if (!skillsService) {
+          pushSystemMessage("Skills runtime is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+        const skillId = query.slice("/skills use ".length).trim();
+        if (!skillId) {
+          pushSystemMessage("Usage: /skills use <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const skill = getSkillDefinitionById(skillId);
+        if (!skill) {
+          pushSystemMessage(`Skill not found: ${skillId}`, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const targetSessionId = activeSessionId;
+        const currentSkillIds = getSessionSkillUseIds(targetSessionId);
+        const alreadyActive = currentSkillIds.some(id => id === skill.id);
+        if (alreadyActive) {
+          pushSystemMessage(
+            targetSessionId
+              ? `Session skill already active: ${skill.id} (session ${targetSessionId})`
+              : `Session skill already queued for next session: ${skill.id}`
+          );
+          clearInput();
+          return;
+        }
+
+        setSessionSkillUseIds(targetSessionId, [...currentSkillIds, skill.id]);
+        pushSystemMessage(
+          targetSessionId
+            ? `Session skill activated: ${skill.id} (${skill.label})\nscope: session ${targetSessionId}`
+            : `Session skill activated: ${skill.id} (${skill.label})\nscope: next new session`
+        );
         clearInput();
         return;
       }
@@ -6314,7 +6871,11 @@ export const useChatApp = ({
         }
 
         setStatus("requesting");
-        const activeSkills = skillsService?.resolveForQuery(submittedTask) ?? [];
+        const autoSkills = skillsService?.resolveForQuery(submittedTask) ?? [];
+        const manualSkills = resolveSessionSkillUseDefinitions(session.id);
+        const activeSkills = [...manualSkills, ...autoSkills].filter(
+          (skill, index, all) => all.findIndex(item => item.id === skill.id) === index
+        );
         const prompt = buildPromptWithContext(
           submittedTask,
           systemPrompt,

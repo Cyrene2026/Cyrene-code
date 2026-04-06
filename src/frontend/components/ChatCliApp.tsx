@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useApp, useInput } from "ink";
 import type { QueryTransport } from "../../core/query/transport";
 import type { SessionStore } from "../../core/session/store";
-import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
+import type { McpRuntime } from "../../core/mcp/types";
 import { useChatApp } from "../../application/chat/useChatApp";
 import { ChatScreen } from "./ChatScreen";
 import { createExitHandler, type ExitSummarySnapshot } from "./exitSummary";
@@ -19,7 +19,7 @@ type ChatCliAppProps = {
   pinMaxCount: number;
   autoSummaryRefresh: boolean;
   queryMaxToolSteps?: number;
-  mcpService: FileMcpService;
+  mcpService: McpRuntime;
   appRoot: string;
 };
 

@@ -29,7 +29,7 @@ import type {
   SessionRecord,
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
-import type { FileMcpService } from "../../core/tools/mcp/fileMcpService";
+import type { McpRuntime } from "../../core/mcp/types";
 import type {
   MpcAction,
   PendingReviewItem,
@@ -67,7 +67,7 @@ type UseChatAppParams = {
   pinMaxCount: number;
   autoSummaryRefresh?: boolean;
   queryMaxToolSteps?: number;
-  mcpService: FileMcpService;
+  mcpService: McpRuntime;
   auth?: {
     status: AuthStatus;
     getStatus: () => Promise<AuthStatus>;

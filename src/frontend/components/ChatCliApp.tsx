@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useApp, useInput } from "ink";
 import type { McpRuntime } from "../../core/mcp";
+import type { SkillsRuntime } from "../../core/skills";
 import type { QueryTransport } from "../../core/query/transport";
 import type { SessionStore } from "../../core/session/store";
 import { useChatApp } from "../../application/chat/useChatApp";
@@ -20,6 +21,7 @@ type ChatCliAppProps = {
   autoSummaryRefresh: boolean;
   queryMaxToolSteps?: number;
   mcpService: McpRuntime;
+  skillsService?: SkillsRuntime;
   appRoot: string;
 };
 
@@ -34,6 +36,7 @@ export const ChatCliApp = ({
   autoSummaryRefresh,
   queryMaxToolSteps,
   mcpService,
+  skillsService,
   appRoot,
 }: ChatCliAppProps) => {
   const { exit } = useApp();
@@ -114,6 +117,7 @@ export const ChatCliApp = ({
     pinMaxCount,
     queryMaxToolSteps,
     mcpService,
+    skillsService,
     autoSummaryRefresh,
     auth: authController,
   });

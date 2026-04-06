@@ -6,6 +6,7 @@ import { loadPromptPolicy } from "../infra/config/loadPromptPolicy";
 import { configureAppRootFromArgs, getCyreneConfigDir } from "../infra/config/appRoot";
 import { createFileSessionStore } from "../infra/session/createFileSessionStore";
 import { createMcpRuntime } from "../core/mcp";
+import { createSkillsRuntime } from "../core/skills";
 import { createAuthRuntime } from "../infra/auth/authRuntime";
 import { join } from "node:path";
 
@@ -20,6 +21,7 @@ const transport = await authRuntime.buildTransport();
 const sessionStore = createFileSessionStore(join(getCyreneConfigDir(appRoot), "session"));
 const promptPolicy = await loadPromptPolicy(cyreneConfig, appRoot);
 const mcpService = await createMcpRuntime(appRoot);
+const skillsService = await createSkillsRuntime(appRoot);
 
 render(
   <ChatCliApp
@@ -33,6 +35,7 @@ render(
     autoSummaryRefresh={cyreneConfig.autoSummaryRefresh}
     queryMaxToolSteps={cyreneConfig.queryMaxToolSteps}
     mcpService={mcpService}
+    skillsService={skillsService}
     appRoot={appRoot}
   />,
   {

@@ -818,6 +818,114 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
+  test("/skills commands expose runtime summary, list and enable/disable flow", async () => {
+    const setSkillEnabled = mock(async (skillId: string, enabled: boolean) => ({
+      ok: true,
+      message: `${enabled ? "Skill enabled" : "Skill disabled"}: ${skillId}\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml`,
+    }));
+    const reloadConfig = mock(async () => ({
+      ok: true,
+      message: "Skills config reloaded\nskills: 3 total | 2 enabled\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml",
+    }));
+    const skillsService = {
+      listSkills: () => [
+        {
+          id: "code-review",
+          label: "Code Review",
+          description: "review findings first",
+          prompt: "focus on concrete findings",
+          triggers: ["review", "审查"],
+          enabled: true,
+          source: "built_in" as const,
+        },
+      ],
+      describeRuntime: () => ({
+        skillCount: 1,
+        enabledSkillCount: 1,
+        configPaths: ["D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml"],
+        editableConfigPath: "D:/Projects/js_projects/Cyrene-code/.cyrene/skills.yaml",
+      }),
+      setSkillEnabled,
+      reloadConfig,
+      resolveForQuery: () => [],
+    };
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        skillsService: skillsService as any,
+      })
+    );
+
+    await runCommand(app, "/skills");
+    await runCommand(app, "/skills list");
+    await runCommand(app, "/skills disable code-review");
+    await runCommand(app, "/skills enable code-review");
+    await runCommand(app, "/skills reload");
+
+    expect(setSkillEnabled).toHaveBeenCalledWith("code-review", false);
+    expect(setSkillEnabled).toHaveBeenCalledWith("code-review", true);
+    expect(reloadConfig).toHaveBeenCalledTimes(1);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("Skills runtime"))
+    ).toBe(true);
+    expect(
+      getTexts(app.getLatest().items).some(text => text.includes("Skill enabled: code-review"))
+    ).toBe(true);
+
+    app.cleanup();
+  });
+
+  test("active skills are injected into composed prompt before query run", async () => {
+    const runQuerySessionImpl = mock(async (params: any) => {
+      expect(String(params.query)).toContain("ACTIVE SKILLS");
+      expect(String(params.query)).toContain("[code-review] Code Review");
+      expect(String(params.query)).toContain("focus on concrete findings");
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          handleToolCall: async () => ({ ok: true, message: "[tool result] noop" }),
+        } as any,
+        skillsService: {
+          listSkills: () => [],
+          resolveForQuery: () => [
+            {
+              id: "code-review",
+              label: "Code Review",
+              description: "review findings first",
+              prompt: "focus on concrete findings",
+              triggers: ["review"],
+              enabled: true,
+              source: "built_in" as const,
+            },
+          ],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "please review this patch");
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(1);
+
+    app.cleanup();
+  });
+
   test("/tag add|list|remove manages current session tags", async () => {
     const sessionStore = createTestSessionStore();
     const app = renderHookHarness(() =>

@@ -39,6 +39,7 @@ import type {
   PendingReviewItem,
   ToolRequest,
 } from "../../core/mcp";
+import type { SkillDefinition, SkillsRuntime } from "../../core/skills";
 import { createApprovalActionLock } from "./approvalActionLock";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import { useInputAdapter } from "./inputAdapter";
@@ -72,6 +73,7 @@ type UseChatAppParams = {
   autoSummaryRefresh?: boolean;
   queryMaxToolSteps?: number;
   mcpService: McpRuntime;
+  skillsService?: SkillsRuntime;
   auth?: {
     status: AuthStatus;
     getStatus: () => Promise<AuthStatus>;
@@ -311,6 +313,11 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/pin <note>", description: "pin important context" },
   { command: "/pins", description: "list pinned context" },
   { command: "/unpin <index>", description: "remove a pin" },
+  { command: "/skills", description: "show skills runtime summary" },
+  { command: "/skills list", description: "list available skills" },
+  { command: "/skills enable <id>", description: "enable one skill in project config" },
+  { command: "/skills disable <id>", description: "disable one skill in project config" },
+  { command: "/skills reload", description: "reload skills config from disk" },
   { command: "/mcp", description: "show MCP runtime summary" },
   { command: "/mcp servers", description: "list registered MCP servers" },
   { command: "/mcp server <id>", description: "inspect one MCP server" },
@@ -418,6 +425,11 @@ const getCommandGroup = (command: string) => {
     return "Context";
   }
   if (
+    command.startsWith("/skills")
+  ) {
+    return "Skills";
+  }
+  if (
     command.startsWith("/mcp")
   ) {
     return "MCP";
@@ -523,6 +535,10 @@ const getSlashInsertValue = (command: string) => {
       return "/pin ";
     case "/unpin <index>":
       return "/unpin ";
+    case "/skills enable <id>":
+      return "/skills enable ";
+    case "/skills disable <id>":
+      return "/skills disable ";
     case "/mcp server <id>":
       return "/mcp server ";
     case "/mcp tools <server>":
@@ -1362,6 +1378,43 @@ const formatMcpRuntimeSummary = (
   ].join("\n");
 };
 
+const formatSkillLine = (skill: SkillDefinition) =>
+  [
+    `- ${skill.id}`,
+    `label ${skill.label}`,
+    skill.enabled ? "enabled" : "disabled",
+    `source ${skill.source}`,
+    skill.triggers.length > 0 ? `triggers ${skill.triggers.join(", ")}` : "",
+    skill.description ? `desc ${skill.description}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+const formatSkillsRuntimeSummary = (
+  summary: ReturnType<NonNullable<SkillsRuntime["describeRuntime"]>>
+) =>
+  [
+    "Skills runtime",
+    `skills: ${summary.skillCount} total | ${summary.enabledSkillCount} enabled`,
+    ...(summary.configPaths.length > 0
+      ? ["config:", ...summary.configPaths.map(path => `- ${path}`)]
+      : ["config: built-in default"]),
+    `editable: ${summary.editableConfigPath}`,
+    "commands: /skills list | /skills enable <id> | /skills disable <id> | /skills reload",
+  ].join("\n");
+
+const formatActiveSkillsPrompt = (skills: SkillDefinition[]) =>
+  skills
+    .map(skill => {
+      const lines = [
+        `[${skill.id}] ${skill.label}`,
+        skill.description ? `description: ${skill.description}` : "",
+        skill.prompt.trim(),
+      ].filter(Boolean);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+
 const tokenizeInlineCommand = (raw: string) =>
   [...raw.matchAll(/"([^"]*)"|'([^']*)'|[^\s]+/g)].map(
     match => match[1] ?? match[2] ?? match[0] ?? ""
@@ -1598,6 +1651,7 @@ export const useChatApp = ({
   autoSummaryRefresh = false,
   queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   mcpService,
+  skillsService,
   auth,
   runQuerySessionImpl = runQuerySession,
   inputAdapterHook = useInputAdapter,
@@ -5369,6 +5423,130 @@ export const useChatApp = ({
         return;
       }
 
+      if (query === "/skills") {
+        if (!skillsService?.describeRuntime) {
+          pushSystemMessage("Skills runtime is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+        pushSystemMessage(formatSkillsRuntimeSummary(skillsService.describeRuntime()), {
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query === "/skills list") {
+        if (!skillsService) {
+          pushSystemMessage("Skills runtime is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const skills = skillsService.listSkills();
+        pushSystemMessage(
+          skills.length > 0
+            ? ["Skills", ...skills.map(formatSkillLine)].join("\n")
+            : "No skills available.",
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/skills reload") {
+        if (!skillsService?.reloadConfig) {
+          pushSystemMessage("Skills runtime reload is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await skillsService.reloadConfig();
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/skills enable ")) {
+        if (!skillsService?.setSkillEnabled) {
+          pushSystemMessage("Skills runtime management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+        const skillId = query.slice("/skills enable ".length).trim();
+        if (!skillId) {
+          pushSystemMessage("Usage: /skills enable <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await skillsService.setSkillEnabled(skillId, true);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/skills disable ")) {
+        if (!skillsService?.setSkillEnabled) {
+          pushSystemMessage("Skills runtime management is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+        const skillId = query.slice("/skills disable ".length).trim();
+        if (!skillId) {
+          pushSystemMessage("Usage: /skills disable <id>", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const result = await skillsService.setSkillEnabled(skillId, false);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
       if (query === "/mcp") {
         const servers = mcpService.listServers();
         const pending = mcpService.listPending();
@@ -6136,11 +6314,13 @@ export const useChatApp = ({
         }
 
         setStatus("requesting");
+        const activeSkills = skillsService?.resolveForQuery(submittedTask) ?? [];
         const prompt = buildPromptWithContext(
           submittedTask,
           systemPrompt,
           projectPrompt,
-          promptContext
+          promptContext,
+          activeSkills.length > 0 ? formatActiveSkillsPrompt(activeSkills) : ""
         );
 
         const runResult = await runQuerySessionImpl({

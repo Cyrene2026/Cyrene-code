@@ -20,7 +20,8 @@ export const buildPromptWithContext = (
   query: string,
   systemPrompt: string,
   projectPrompt: string,
-  promptContext: SessionPromptContext
+  promptContext: SessionPromptContext,
+  activeSkillsPrompt = ""
 ) => {
   const recentLines = promptContext.recent
     .filter(message => message.role !== "system")
@@ -64,6 +65,9 @@ export const buildPromptWithContext = (
     systemPrompt || "(none)",
     ".CYRENE.MD POLICY (second priority):",
     projectPrompt || "(none)",
+    activeSkillsPrompt
+      ? `ACTIVE SKILLS (task-scoped guidance):\n${activeSkillsPrompt}`
+      : "ACTIVE SKILLS (task-scoped guidance):\n(none)",
     "TASK STATE CONTEXT:",
     "Prefer durable working state and confirmed facts over replaying long transcript history. If something is already listed under COMPLETED, treat it as done unless the current user asks to revisit it or new evidence contradicts it.",
     `Working state (durable reducer):\n${durableSummary}`,

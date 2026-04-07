@@ -28,6 +28,30 @@ describe("inputAdapter", () => {
         return: true,
       }),
     });
+
+    expect(normalizeRawInputChunk("\u001b[13;2u")).toEqual({
+      input: "",
+      key: expect.objectContaining({
+        return: true,
+        shift: true,
+      }),
+    });
+
+    expect(normalizeRawInputChunk("\u001b[13;2~")).toEqual({
+      input: "",
+      key: expect.objectContaining({
+        return: true,
+        shift: true,
+      }),
+    });
+
+    expect(normalizeRawInputChunk("\u001b[27;2;13u")).toEqual({
+      input: "",
+      key: expect.objectContaining({
+        return: true,
+        shift: true,
+      }),
+    });
   });
 
   test("normalizes arrow and paging escape sequences", () => {
@@ -147,6 +171,28 @@ describe("inputAdapter", () => {
           escape: false,
           ctrl: true,
           shift: false,
+          tab: false,
+          backspace: false,
+          delete: false,
+          meta: false,
+        },
+      })
+    ).toBe(true);
+
+    expect(
+      shouldDispatchRawInputEvent({
+        input: "",
+        key: {
+          upArrow: false,
+          downArrow: false,
+          leftArrow: false,
+          rightArrow: false,
+          pageDown: false,
+          pageUp: false,
+          return: true,
+          escape: false,
+          ctrl: false,
+          shift: true,
           tab: false,
           backspace: false,
           delete: false,

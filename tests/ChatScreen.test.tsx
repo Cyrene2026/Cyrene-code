@@ -248,6 +248,7 @@ const buildProps = (
     onboardingAvailable: true,
     httpReady: true,
   },
+  composerKeymap: "standard" as const,
   activeSessionId: "session-1",
   currentModel: "gpt-test",
   currentProvider: "https://provider.test/v1",
@@ -305,10 +306,10 @@ describe("ChatScreen", () => {
         "```py",
         "app = FastAPI()",
         "```",
-      ].join("\n"))
+    ].join("\n"))
     ).toEqual([
       { kind: "heading", level: 2, text: "创建 FastAPI 应用" },
-      { kind: "paragraph", text: "这是一段说明， 下一行应并入同一段。" },
+      { kind: "paragraph", lines: ["这是一段说明，", "下一行应并入同一段。"] },
       { kind: "rule" },
       {
         kind: "list",
@@ -325,6 +326,32 @@ describe("ChatScreen", () => {
       },
       { kind: "code", language: "py", content: "app = FastAPI()" },
     ]);
+  });
+
+  test("renders multiline assistant prose and unicode bullets without collapsing them", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: [
+            "请你看一下项目结构",
+            "• .vscode/：编辑器配置",
+            "• SECURITY.md：安全说明",
+            "如果你愿意，我下一步可以继续帮你。",
+          ].join("\n"),
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("请你看一下项目结构");
+    expect(output).toContain("• ");
+    expect(output).toContain(".vscode/：编辑器配置");
+    expect(output).toContain("SECURITY.md：安全说明");
+    expect(output).toContain("如果你愿意，我下一步可以继续帮你。");
+    expect(output).not.toContain("请你看一下项目结构 • .vscode/");
   });
 
   test("approval mode renders an inline approval view with diff stats and paused composer", () => {
@@ -408,7 +435,9 @@ describe("ChatScreen", () => {
     expect(output).toContain("write_file src/a.ts | ok");
     expect(output).toContain("Ask Cyrene, mention files with @, or use / commands...");
     expect(output).toContain("ready  |  prompt ready");
-    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell");
+    expect(output).toContain(
+      "Enter send  |  Ctrl+J newline  |  Shift+Enter if terminal supports it"
+    );
     expect(output).not.toContain("Conversation");
   });
 
@@ -438,8 +467,20 @@ describe("ChatScreen", () => {
     expect(output).toContain("Keep going");
     expect(output).toContain("/login");
     expect(output).toContain("Ask about this workspace, mention files, or use / commands...");
-    expect(output).toContain("Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell");
+    expect(output).toContain(
+      "Enter send  |  Ctrl+J newline  |  Shift+Enter if terminal supports it"
+    );
     expect(output).not.toContain("Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.");
+  });
+
+  test("compat keymap shows ctrl+d send hint instead of shift+enter guidance", () => {
+    const tree = renderScreen({
+      composerKeymap: "compat",
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("Ctrl+D send  |  Enter/Ctrl+J newline");
+    expect(output).not.toContain("Shift+Enter if terminal supports it");
   });
 
   test("auth wizard provider step shows preset shortcut hints", () => {
@@ -649,7 +690,9 @@ describe("ChatScreen", () => {
 
     expect(output).toContain("创建 FastAPI 应用");
     expect(output).not.toContain("## 1. 创建 FastAPI 应用");
-    expect(output).toContain("这是一段说明， 下一行应并入同一段。");
+    expect(output).toContain("这是一段说明，");
+    expect(output).toContain("下一行应并入同一段。");
+    expect(output).not.toContain("这是一段说明， 下一行应并入同一段。");
     expect(output).toContain("• ");
     expect(output).toContain("OAuth2PasswordBearer");
     expect(output).toContain("Token");

@@ -3,6 +3,9 @@ import {
   applyParsedStateUpdate,
   buildFallbackPendingDigest,
   buildStateReducerPrompt,
+  CYRENE_STATE_UPDATE_END_TAG,
+  CYRENE_STATE_UPDATE_START_TAG,
+  parseAssistantStateUpdate,
   sanitizeStoredWorkingState,
 } from "../src/core/session/stateReducer";
 
@@ -276,5 +279,19 @@ describe("stateReducer", () => {
     expect(sanitized.pendingDigest).toContain("REMAINING:\n- (none)");
     expect(sanitized.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
     expect(sanitized.pendingDigest).not.toContain("创建了 FastAPI 应用");
+  });
+
+  test("parseAssistantStateUpdate ignores literal state tags inside inline code spans", () => {
+    const raw = [
+      "核心点：",
+      `• 定义了隐藏标签：\`${CYRENE_STATE_UPDATE_START_TAG}\` / \`${CYRENE_STATE_UPDATE_END_TAG}\``,
+      "• 这只是说明文档，不是隐藏协议输出。",
+    ].join("\n");
+
+    const parsed = parseAssistantStateUpdate(raw);
+
+    expect(parsed.visibleText).toBe(raw);
+    expect(parsed.hasStateTag).toBe(false);
+    expect(parsed.parseStatus).toBe("missing_tag");
   });
 });

@@ -2312,7 +2312,7 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
-  test("enter inserts a newline and ctrl+d submits the full multiline input", async () => {
+  test("enter submits while shift+enter inserts a newline", async () => {
     const submitted: string[] = [];
     const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
       submitted.push(originalTask);
@@ -2342,7 +2342,7 @@ const createScriptedTransport = (
     await flushMicrotasks();
 
     await act(async () => {
-      inputHandler?.("", { return: true } as any);
+      inputHandler?.("", { return: true, shift: true } as any);
       await Promise.resolve();
     });
     await flushMicrotasks();
@@ -2360,7 +2360,7 @@ const createScriptedTransport = (
     expect(app.getLatest().input).toBe("first line\nsecond line");
 
     await act(async () => {
-      inputHandler?.("d", { ctrl: true } as any);
+      inputHandler?.("", { return: true } as any);
       await Promise.resolve();
     });
     await flushMicrotasks();
@@ -2368,6 +2368,159 @@ const createScriptedTransport = (
     expect(submitted).toEqual(["first line\nsecond line"]);
     const record = sessionStore.__listRecords()[0];
     expect(record?.messages[0]?.text).toBe("first line\nsecond line");
+    app.cleanup();
+  });
+
+  test("compat keymap turns enter into newline and keeps ctrl+d as submit", async () => {
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
+      submitted.push(originalTask);
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+    const sessionStore = createTestSessionStore();
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        composerKeymap: "compat",
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("first line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual([]);
+    expect(app.getLatest().input).toBe("first line\n");
+
+    await act(async () => {
+      inputHandler?.("second line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("d", { ctrl: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual(["first line\nsecond line"]);
+    expect(sessionStore.__listRecords()[0]?.messages[0]?.text).toBe(
+      "first line\nsecond line"
+    );
+    app.cleanup();
+  });
+
+  test("ctrl+d with non-empty composer still submits as a compatibility shortcut", async () => {
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
+      submitted.push(originalTask);
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("compat path", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("d", { ctrl: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual(["compat path"]);
+    app.cleanup();
+  });
+
+  test("ctrl+j inserts a newline as a terminal-safe fallback", async () => {
+    const submitted: string[] = [];
+    const runQuerySessionImpl = mock(async ({ originalTask, onState }: any) => {
+      submitted.push(originalTask);
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+    const sessionStore = createTestSessionStore();
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("first line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("j", { ctrl: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual([]);
+    expect(app.getLatest().input).toBe("first line\n");
+
+    await act(async () => {
+      inputHandler?.("second line", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(submitted).toEqual(["first line\nsecond line"]);
+    expect(sessionStore.__listRecords()[0]?.messages[0]?.text).toBe(
+      "first line\nsecond line"
+    );
     app.cleanup();
   });
 
@@ -2594,6 +2747,40 @@ const createScriptedTransport = (
 
     await runCommand(app, "/resume missing");
     expect(getTexts(app.getLatest().items).some(text => text.includes("Session not found: missing"))).toBe(true);
+    app.cleanup();
+  });
+
+  test("/resume notifies the host to switch into the resumed session project root", async () => {
+    const onSessionProjectRootChange = mock(async (_projectRoot: string | null) => {});
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore([
+          createSessionRecord("session-a", {
+            projectRoot: "/tmp/project-a",
+            messages: [
+              {
+                role: "user",
+                text: "resume me",
+                createdAt: "2026-01-01T00:00:00.000Z",
+              },
+            ],
+          }),
+        ]),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        onSessionProjectRootChange,
+      })
+    );
+
+    await runCommand(app, "/resume session-a");
+
+    expect(onSessionProjectRootChange).toHaveBeenCalledWith("/tmp/project-a");
+    expect(getTexts(app.getLatest().items)).toContain("Resumed session: session-a");
     app.cleanup();
   });
 

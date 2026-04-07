@@ -5,10 +5,17 @@ import type { SkillsRuntime } from "../../core/skills";
 import type { QueryTransport } from "../../core/query/transport";
 import type { SessionStore } from "../../core/session/store";
 import { useChatApp } from "../../application/chat/useChatApp";
+import { resolveComposerKeymap } from "../../application/chat/composerKeymap";
 import { ChatScreen } from "./ChatScreen";
 import { createExitHandler, type ExitSummarySnapshot } from "./exitSummary";
-import type { AuthRuntime } from "../../infra/auth/authRuntime";
+import { createAuthRuntime, type AuthRuntime } from "../../infra/auth/authRuntime";
 import type { AuthStatus } from "../../infra/auth/types";
+import { loadCyreneConfig } from "../../infra/config/loadCyreneConfig";
+import { loadPromptPolicy } from "../../infra/config/loadPromptPolicy";
+import { createMcpRuntime } from "../../core/mcp";
+import { createSkillsRuntime } from "../../core/skills";
+import { setConfiguredAppRoot } from "../../infra/config/appRoot";
+import { resolve } from "node:path";
 
 type ChatCliAppProps = {
   transport: QueryTransport;
@@ -40,6 +47,21 @@ export const ChatCliApp = ({
   appRoot,
 }: ChatCliAppProps) => {
   const { exit } = useApp();
+  const composerKeymap = useMemo(() => resolveComposerKeymap(process.env), []);
+  const [runtimeAppRoot, setRuntimeAppRoot] = useState(appRoot);
+  const [runtimeDefaultSystemPrompt, setRuntimeDefaultSystemPrompt] =
+    useState(defaultSystemPrompt);
+  const [runtimeProjectPrompt, setRuntimeProjectPrompt] = useState(projectPrompt);
+  const [runtimePinMaxCount, setRuntimePinMaxCount] = useState(pinMaxCount);
+  const [runtimeAutoSummaryRefresh, setRuntimeAutoSummaryRefresh] =
+    useState(autoSummaryRefresh);
+  const [runtimeQueryMaxToolSteps, setRuntimeQueryMaxToolSteps] =
+    useState(queryMaxToolSteps);
+  const [runtimeMcpService, setRuntimeMcpService] = useState<McpRuntime>(mcpService);
+  const [runtimeSkillsService, setRuntimeSkillsService] =
+    useState<SkillsRuntime | undefined>(skillsService);
+  const [runtimeAuthRuntime, setRuntimeAuthRuntime] =
+    useState<AuthRuntime>(authRuntime);
   const [runtimeTransport, setRuntimeTransport] = useState<QueryTransport>(transport);
   const [authStatus, setAuthStatus] = useState<AuthStatus>(initialAuthStatus);
   const exitSnapshotRef = useRef<ExitSummarySnapshot>({
@@ -56,7 +78,7 @@ export const ChatCliApp = ({
     () => ({
       status: authStatus,
       getStatus: async () => {
-        const nextStatus = await authRuntime.getStatus();
+        const nextStatus = await runtimeAuthRuntime.getStatus();
         setAuthStatus(nextStatus);
         return nextStatus;
       },
@@ -65,7 +87,7 @@ export const ChatCliApp = ({
         apiKey: string;
         model?: string;
       }) => {
-        const result = await authRuntime.saveLogin(input);
+        const result = await runtimeAuthRuntime.saveLogin(input);
         setRuntimeTransport(result.transport);
         setAuthStatus(result.status);
         return {
@@ -75,7 +97,7 @@ export const ChatCliApp = ({
         };
       },
       logout: async () => {
-        const result = await authRuntime.logout();
+        const result = await runtimeAuthRuntime.logout();
         setRuntimeTransport(result.transport);
         setAuthStatus(result.status);
         return {
@@ -85,8 +107,47 @@ export const ChatCliApp = ({
         };
       },
     }),
-    [authRuntime, authStatus]
+    [authStatus, runtimeAuthRuntime]
   );
+  const switchWorkspace = async (nextProjectRoot: string | null) => {
+    if (!nextProjectRoot) {
+      return;
+    }
+
+    const normalizedProjectRoot = resolve(nextProjectRoot);
+    if (normalizedProjectRoot === runtimeAppRoot) {
+      return;
+    }
+
+    const nextConfig = await loadCyreneConfig(normalizedProjectRoot);
+    const nextPromptPolicy = await loadPromptPolicy(nextConfig, normalizedProjectRoot);
+    const nextAuthRuntime = createAuthRuntime({
+      appRoot: normalizedProjectRoot,
+      requestTemperature: nextConfig.requestTemperature,
+    });
+    const [nextAuthStatus, nextTransport, nextMcpService, nextSkillsService] =
+      await Promise.all([
+        nextAuthRuntime.getStatus(),
+        nextAuthRuntime.buildTransport(),
+        createMcpRuntime(normalizedProjectRoot),
+        createSkillsRuntime(normalizedProjectRoot),
+      ]);
+
+    process.chdir(normalizedProjectRoot);
+    setConfiguredAppRoot(normalizedProjectRoot);
+
+    setRuntimeAppRoot(normalizedProjectRoot);
+    setRuntimeDefaultSystemPrompt(nextPromptPolicy.systemPrompt);
+    setRuntimeProjectPrompt(nextPromptPolicy.projectPrompt);
+    setRuntimePinMaxCount(nextConfig.pinMaxCount);
+    setRuntimeAutoSummaryRefresh(nextConfig.autoSummaryRefresh);
+    setRuntimeQueryMaxToolSteps(nextConfig.queryMaxToolSteps);
+    setRuntimeAuthRuntime(nextAuthRuntime);
+    setRuntimeTransport(nextTransport);
+    setAuthStatus(nextAuthStatus);
+    setRuntimeMcpService(nextMcpService);
+    setRuntimeSkillsService(nextSkillsService);
+  };
   const {
     items,
     liveAssistantText,
@@ -112,13 +173,15 @@ export const ChatCliApp = ({
   } = useChatApp({
     transport: runtimeTransport,
     sessionStore,
-    defaultSystemPrompt,
-    projectPrompt,
-    pinMaxCount,
-    queryMaxToolSteps,
-    mcpService,
-    skillsService,
-    autoSummaryRefresh,
+    defaultSystemPrompt: runtimeDefaultSystemPrompt,
+    projectPrompt: runtimeProjectPrompt,
+    pinMaxCount: runtimePinMaxCount,
+    queryMaxToolSteps: runtimeQueryMaxToolSteps,
+    mcpService: runtimeMcpService,
+    skillsService: runtimeSkillsService,
+    autoSummaryRefresh: runtimeAutoSummaryRefresh,
+    composerKeymap,
+    onSessionProjectRootChange: switchWorkspace,
     auth: authController,
   });
 
@@ -134,7 +197,7 @@ export const ChatCliApp = ({
           process.stdout.write(text);
         },
         () => {
-          mcpService.dispose();
+          runtimeMcpService.dispose();
           exit();
         },
         {
@@ -146,7 +209,7 @@ export const ChatCliApp = ({
           },
         }
       ),
-    [exit, mcpService]
+    [exit, runtimeMcpService]
   );
 
   useInput((inputValue, key) => {
@@ -161,15 +224,15 @@ export const ChatCliApp = ({
 
     return () => {
       process.off("SIGINT", handleExit);
-      mcpService.dispose();
+      runtimeMcpService.dispose();
     };
-  }, [handleExit, mcpService]);
+  }, [handleExit, runtimeMcpService]);
 
   return (
     <ChatScreen
       items={items}
       liveAssistantText={liveAssistantText}
-      appRoot={appRoot}
+      appRoot={runtimeAppRoot}
       input={input}
       inputCursorOffset={inputCursorOffset}
       inputCommandState={inputCommandState}
@@ -183,6 +246,7 @@ export const ChatCliApp = ({
       approvalPanel={approvalPanel}
       authPanel={authPanel}
       authStatus={authStatus}
+      composerKeymap={composerKeymap}
       activeSessionId={activeSessionId}
       currentModel={currentModel}
       currentProvider={currentProvider}

@@ -47,8 +47,11 @@ import type {
 } from "../../core/mcp";
 import type { SkillDefinition, SkillsRuntime } from "../../core/skills";
 import { createApprovalActionLock } from "./approvalActionLock";
+import { resolveComposerInputIntent } from "./composerInput";
 import { summarizeToolMessage } from "./toolMessageSummary";
+import type { ComposerKeymap } from "./composerKeymap";
 import { useInputAdapter } from "./inputAdapter";
+import type { InputAdapterHook } from "./inputTypes";
 import {
   clampCursorOffset,
   deleteBackwardAtCursor,
@@ -78,8 +81,10 @@ type UseChatAppParams = {
   pinMaxCount: number;
   autoSummaryRefresh?: boolean;
   queryMaxToolSteps?: number;
+  composerKeymap?: ComposerKeymap;
   mcpService: McpRuntime;
   skillsService?: SkillsRuntime;
+  onSessionProjectRootChange?: (projectRoot: string | null) => Promise<void> | void;
   auth?: {
     status: AuthStatus;
     getStatus: () => Promise<AuthStatus>;
@@ -95,7 +100,7 @@ type UseChatAppParams = {
     }>;
   };
   runQuerySessionImpl?: typeof runQuerySession;
-  inputAdapterHook?: typeof useInputAdapter;
+  inputAdapterHook?: InputAdapterHook;
 };
 
 type ResumePickerState = {
@@ -1718,8 +1723,10 @@ export const useChatApp = ({
   pinMaxCount,
   autoSummaryRefresh = false,
   queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
+  composerKeymap = "standard",
   mcpService,
   skillsService,
+  onSessionProjectRootChange,
   auth,
   runQuerySessionImpl = runQuerySession,
   inputAdapterHook = useInputAdapter,
@@ -1915,6 +1922,10 @@ export const useChatApp = ({
       cancelled = true;
     };
   }, [transport]);
+
+  useEffect(() => {
+    setSystemPrompt(defaultSystemPrompt);
+  }, [defaultSystemPrompt]);
 
   useEffect(() => {
     if (!auth || authPanelRef.current.active) {
@@ -3844,6 +3855,21 @@ export const useChatApp = ({
       });
       return;
     }
+    try {
+      await onSessionProjectRootChange?.(loaded.projectRoot);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown workspace switch failure.";
+      pushSystemMessage(
+        `Failed to switch workspace for resumed session: ${message}`,
+        {
+          kind: "error",
+          tone: "danger",
+          color: "red",
+        }
+      );
+      return;
+    }
     applyLoadedSession(loaded);
   };
 
@@ -5063,18 +5089,26 @@ export const useChatApp = ({
         return;
       }
 
-      if (key.return) {
+      const composerIntent = resolveComposerInputIntent(
+        inputValue,
+        key,
+        composerKeymap
+      );
+
+      if (composerIntent.kind === "insert_newline") {
         applyEditorTransform(state => insertTextAtCursor(state, "\n"));
         return;
       }
 
-      if (key.ctrl && inputValue.toLowerCase() === "d") {
+      if (composerIntent.kind === "submit") {
         submit();
         return;
       }
 
-      if (inputValue && !key.ctrl && !key.meta) {
-        applyEditorTransform(state => insertTextAtCursor(state, inputValue));
+      if (composerIntent.kind === "insert_text") {
+        applyEditorTransform(state =>
+          insertTextAtCursor(state, composerIntent.text)
+        );
         return;
       }
     }

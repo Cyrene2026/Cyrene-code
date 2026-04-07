@@ -185,10 +185,11 @@ export const createFileSessionStore = (
   sessionDir?: string,
   context?: SessionStoreContext
 ): SessionStore => {
-  const resolvedProjectRoot = resolveAppRoot({
-    cwd: context?.cwd,
-    env: context?.env,
-  });
+  const resolveCurrentProjectRoot = () =>
+    resolveAppRoot({
+      cwd: context?.cwd,
+      env: context?.env,
+    });
   const resolvedSessionDir =
     sessionDir ??
     join(
@@ -378,7 +379,7 @@ export const createFileSessionStore = (
         title: sanitizeTitle(title ?? "New session"),
         createdAt: now,
         updatedAt: now,
-        projectRoot: resolvedProjectRoot,
+        projectRoot: resolveCurrentProjectRoot(),
         summary: "",
         pendingDigest: "",
         pendingChoice: null,

@@ -1,6 +1,6 @@
 {
   "name": "cyrenecode",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Terminal-first coding assistant with reviewable tool calls and rolling session state.",
   "license": "MIT",
   "private": false,

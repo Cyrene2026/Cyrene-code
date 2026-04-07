@@ -2,6 +2,10 @@ import React from "react";
 import { Box, Text } from "ink";
 import stringWidth from "string-width";
 import {
+  getComposerHint,
+  type ComposerKeymap,
+} from "../../application/chat/composerKeymap";
+import {
   clampCursorOffset,
   getCursorPosition,
   getInputLines,
@@ -146,6 +150,7 @@ type ChatScreenProps = {
     persistenceTarget: AuthStatus["persistenceTarget"];
   };
   authStatus: AuthStatus;
+  composerKeymap: ComposerKeymap;
   activeSessionId: string | null;
   currentModel: string;
   currentProvider: string;
@@ -203,7 +208,7 @@ type MarkdownInlineSegment = {
 };
 
 type MarkdownBlock =
-  | { kind: "paragraph"; text: string }
+  | { kind: "paragraph"; lines: string[] }
   | { kind: "heading"; level: number; text: string }
   | {
       kind: "list";
@@ -280,8 +285,6 @@ const SECTION_GAP = 1;
 const SPINNER_FRAMES = [".", "o", "O", "o"];
 const STREAMING_IDLE_GLYPH = "*";
 const ENABLE_STREAMING_ANIMATION = process.env.CYRENE_ANIMATE_STREAMING === "1";
-const DEFAULT_COMPOSER_HINT =
-  "Ctrl+D send  |  Enter newline  |  / commands  |  @ files  |  !shell";
 const MAX_COMPOSER_VISIBLE_LINES = 6;
 const COMPOSER_CURSOR_GLYPH = "|";
 const DEFAULT_TERMINAL_COLUMNS = 80;
@@ -1397,7 +1400,7 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
     }
     blocks.push({
       kind: "paragraph",
-      text: paragraphLines.map(line => line.trim()).join(" "),
+      lines: [...paragraphLines],
     });
     paragraphLines = [];
   };
@@ -1497,7 +1500,7 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
       return;
     }
 
-    const unorderedMatch = /^[-*]\s+(.+)$/.exec(trimmed);
+    const unorderedMatch = /^[-*•]\s+(.+)$/.exec(trimmed);
     if (unorderedMatch) {
       const itemText = unorderedMatch[1] ?? "";
       flushParagraph();
@@ -1941,14 +1944,16 @@ const renderMessageItem = (
   } else {
   blocks.forEach((block, blockIndex) => {
     if (block.kind === "paragraph") {
-      nodes.push(
-        renderInlineMarkdownLine(
-          block.text,
-          `paragraph-${itemIndex}-${blockIndex}`,
-          color,
-          "  "
-        )
-      );
+      block.lines.forEach((line, lineIndex) => {
+        nodes.push(
+          renderInlineMarkdownLine(
+            line,
+            `paragraph-${itemIndex}-${blockIndex}-${lineIndex}`,
+            color,
+            "  "
+          )
+        );
+      });
       return;
     }
 
@@ -2172,7 +2177,8 @@ const getComposerTone = (status: ChatStatus): ComposerTone => {
 const getComposerHelperText = (
   activePanel: string,
   inputCommandState: ChatScreenProps["inputCommandState"],
-  shellSession: ChatScreenProps["shellSession"]
+  shellSession: ChatScreenProps["shellSession"],
+  composerKeymap: ComposerKeymap
 ) => {
   if (activePanel === "approval") {
     return "review hotkeys  |  a approve/retry  |  r reject  |  Tab preview  |  Esc close";
@@ -2227,7 +2233,7 @@ const getComposerHelperText = (
     return `history ${inputCommandState.historyPosition}/${inputCommandState.historySize}  |  empty composer: Up/Down recall`;
   }
 
-  return DEFAULT_COMPOSER_HINT;
+  return getComposerHint(composerKeymap);
 };
 
 const getComposerWindow = (input: string, inputCursorOffset: number) => {
@@ -2747,7 +2753,8 @@ const renderMainComposer = (
   showStartupView: boolean,
   inputCommandState: ChatScreenProps["inputCommandState"],
   shellSession: ChatScreenProps["shellSession"],
-  shellClock: number
+  shellClock: number,
+  composerKeymap: ComposerKeymap
 ) => {
   const isPanelActive = activePanel !== "idle";
   const tone = getComposerTone(activePanel === "approval" ? "awaiting_review" : status);
@@ -2768,7 +2775,7 @@ const renderMainComposer = (
                 ? "shell shortcut"
                 : "prompt ready";
   const helperText = shortenValue(
-    getComposerHelperText(activePanel, inputCommandState, shellSession),
+    getComposerHelperText(activePanel, inputCommandState, shellSession, composerKeymap),
     96
   );
   const placeholder =
@@ -3934,6 +3941,7 @@ export const ChatScreen = ({
   approvalPanel,
   authPanel,
   authStatus,
+  composerKeymap,
   activeSessionId,
   currentModel,
   currentProvider,
@@ -4102,9 +4110,11 @@ export const ChatScreen = ({
         showStartupView,
         inputCommandState,
         shellSession,
-        shellClock
+        shellClock,
+        composerKeymap
       ),
     [
+      composerKeymap,
       input,
       inputCommandState,
       inputCursorOffset,
@@ -4120,9 +4130,6 @@ export const ChatScreen = ({
 
   return (
     <Box flexDirection="column">
-      {composerNode}
-      {statusLineNode}
-
       {authPanel.active ? renderAuthWizardPanel(authPanel, authStatus) : null}
 
       {sessionsPanel.active &&
@@ -4251,7 +4258,7 @@ export const ChatScreen = ({
           )
         : null}
 
-      <Box marginTop={SECTION_GAP} flexDirection="column">
+      <Box marginBottom={SECTION_GAP} flexDirection="column">
         {showStartupView
           ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
           : null}
@@ -4263,6 +4270,9 @@ export const ChatScreen = ({
         {transcriptNodes}
         {liveAssistantNode}
       </Box>
+
+      {composerNode}
+      {statusLineNode}
     </Box>
   );
 };

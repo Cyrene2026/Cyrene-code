@@ -1,54 +1,16 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useInput, useStdin } from "ink";
-
-export type InputKeyState = {
-  upArrow: boolean;
-  downArrow: boolean;
-  leftArrow: boolean;
-  rightArrow: boolean;
-  pageDown: boolean;
-  pageUp: boolean;
-  return: boolean;
-  escape: boolean;
-  ctrl: boolean;
-  shift: boolean;
-  tab: boolean;
-  backspace: boolean;
-  delete: boolean;
-  meta: boolean;
-};
-
-type InputHandler = (input: string, key: InputKeyState) => void;
-
-type InputAdapterOptions = {
-  isActive?: boolean;
-};
-
-type NormalizedInputEvent = {
-  input: string;
-  key: InputKeyState;
-};
+import {
+  createEmptyInputKeyState,
+  type InputAdapterOptions,
+  type InputHandler,
+  type InputKeyState,
+  type NormalizedInputEvent,
+} from "./inputTypes";
 
 type DispatchableInputEvent = NormalizedInputEvent & {
   source: "ink" | "raw";
 };
-
-const emptyKeyState = (): InputKeyState => ({
-  upArrow: false,
-  downArrow: false,
-  leftArrow: false,
-  rightArrow: false,
-  pageDown: false,
-  pageUp: false,
-  return: false,
-  escape: false,
-  ctrl: false,
-  shift: false,
-  tab: false,
-  backspace: false,
-  delete: false,
-  meta: false,
-});
 
 const buildSignature = (event: NormalizedInputEvent) =>
   `${event.input}::${JSON.stringify(event.key)}`;
@@ -72,11 +34,39 @@ const hasSpecialKey = (key: InputKeyState) =>
   key.delete ||
   key.meta;
 
+const SHIFT_ENTER_SEQUENCE_PATTERN =
+  /^\u001b\[(?:13;2u|13;2~|27;2;13~|27;2;13u|1;2M)$/;
+const ENABLE_MODIFY_OTHER_KEYS_SEQUENCE = "\u001b[>4;2m";
+const DISABLE_MODIFY_OTHER_KEYS_SEQUENCE = "\u001b[>4;0m";
+
+const shouldUseEnhancedKeyboardProtocol = () =>
+  process.stdout.isTTY !== false &&
+  process.env.CYRENE_ENABLE_ENHANCED_KEYS !== "0";
+
+const shouldDebugKeyProtocol = () => process.env.CYRENE_DEBUG_KEYS === "1";
+
+const formatRawChunkForDebug = (raw: string) => {
+  const printable = raw
+    .replace(/\u001b/g, "\\x1b")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
+  const bytes = Array.from(Buffer.from(raw))
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join(" ");
+  return `${printable} [${bytes}]`;
+};
+
 export const normalizeRawInputChunk = (
   chunk: Buffer | string
 ): NormalizedInputEvent | null => {
   const raw = chunk.toString();
-  const key = emptyKeyState();
+  const key = createEmptyInputKeyState();
+
+  if (SHIFT_ENTER_SEQUENCE_PATTERN.test(raw)) {
+    key.return = true;
+    key.shift = true;
+    return { input: "", key };
+  }
 
   switch (raw) {
     case "\u001b[A":
@@ -145,6 +135,10 @@ export const normalizeRawInputChunk = (
 };
 
 export const shouldDispatchRawInputEvent = (event: NormalizedInputEvent) => {
+  if (event.key.return && event.key.shift) {
+    return true;
+  }
+
   if (event.key.ctrl || event.key.meta) {
     return true;
   }
@@ -245,8 +239,23 @@ export const useInputAdapter = (
       setRawMode(true);
     }
 
+    if (shouldUseEnhancedKeyboardProtocol()) {
+      process.stdout.write(ENABLE_MODIFY_OTHER_KEYS_SEQUENCE);
+    }
+
     const onData = (data: Buffer | string) => {
-      const normalized = normalizeRawInputChunk(data);
+      const raw = data.toString();
+      const normalized = normalizeRawInputChunk(raw);
+
+      if (shouldDebugKeyProtocol() && /[\u001b\r\n]/.test(raw)) {
+        const flags = normalized
+          ? `return=${normalized.key.return} shift=${normalized.key.shift} ctrl=${normalized.key.ctrl} meta=${normalized.key.meta}`
+          : "unrecognized";
+        process.stderr.write(
+          `[cyrene:keys] ${formatRawChunkForDebug(raw)} -> ${flags}\n`
+        );
+      }
+
       if (normalized && shouldDispatchRawInputEvent(normalized)) {
         dispatch({
           ...normalized,
@@ -259,6 +268,9 @@ export const useInputAdapter = (
 
     return () => {
       stdin.off("data", onData);
+      if (shouldUseEnhancedKeyboardProtocol()) {
+        process.stdout.write(DISABLE_MODIFY_OTHER_KEYS_SEQUENCE);
+      }
       if (isRawModeSupported) {
         setRawMode(false);
       }

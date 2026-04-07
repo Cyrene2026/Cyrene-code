@@ -845,6 +845,39 @@ const trimTrailingPartialStateTag = (text: string) => {
   return text;
 };
 
+const isInsideMarkdownCodeContext = (text: string, index: number) => {
+  let inFence = false;
+  const lines = text.slice(0, index).split(/\r?\n/);
+  for (const line of lines) {
+    if (line.trimStart().startsWith("```")) {
+      inFence = !inFence;
+    }
+  }
+  if (inFence) {
+    return true;
+  }
+
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const linePrefix = text.slice(lineStart, index);
+  const inlineBacktickCount = (linePrefix.match(/`/g) ?? []).length;
+  return inlineBacktickCount % 2 === 1;
+};
+
+const findLastProtocolStateTagIndex = (text: string) => {
+  let searchFrom = text.length;
+  while (searchFrom > 0) {
+    const candidate = text.lastIndexOf(CYRENE_STATE_UPDATE_START_TAG, searchFrom - 1);
+    if (candidate < 0) {
+      return -1;
+    }
+    if (!isInsideMarkdownCodeContext(text, candidate)) {
+      return candidate;
+    }
+    searchFrom = candidate;
+  }
+  return -1;
+};
+
 const collectFallbackDigestLines = (text: string) => {
   const lines: string[] = [];
   let inCodeFence = false;
@@ -1121,7 +1154,7 @@ export const buildStateReducerPrompt = ({
 export const parseAssistantStateUpdate = (
   rawAssistantText: string
 ): ParsedAssistantStateUpdate => {
-  const startIndex = rawAssistantText.indexOf(CYRENE_STATE_UPDATE_START_TAG);
+  const startIndex = findLastProtocolStateTagIndex(rawAssistantText);
   if (startIndex < 0) {
     return {
       visibleText: trimTrailingPartialStateTag(rawAssistantText),

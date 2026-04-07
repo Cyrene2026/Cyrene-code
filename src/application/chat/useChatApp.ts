@@ -271,6 +271,7 @@ type ShellSessionState = {
 type InputCommandState = {
   active: boolean;
   mode: InputMode;
+  queryText: string | null;
   currentCommand: string | null;
   suggestions: CommandSuggestion[];
   selectedIndex: number;
@@ -1846,6 +1847,9 @@ export const useChatApp = ({
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
+  const lastCommandEchoIntentRef = useRef<{ token: string; at: number } | null>(
+    null
+  );
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
   const activeTurnRef = useRef<ActiveTurnState | null>(null);
   const nextTurnRunIdRef = useRef(0);
@@ -3072,6 +3076,18 @@ export const useChatApp = ({
     token: string,
     cooldownMs = ACTION_REPEAT_COOLDOWN_MS
   ) => isRepeatedInteraction(lastActionIntentRef, token, cooldownMs);
+
+  const appendLocalCommandEcho = (commandText: string) => {
+    setItems(previous => [
+      ...previous,
+      {
+        role: "user",
+        text: commandText,
+        kind: "transcript",
+        tone: "neutral",
+      },
+    ]);
+  };
 
   const clearApprovalBlock = (
     state: ApprovalPanelState
@@ -5311,6 +5327,17 @@ export const useChatApp = ({
 
     pushInputHistory(rawInput);
 
+    if (
+      query.startsWith("/") &&
+      !isRepeatedInteraction(
+        lastCommandEchoIntentRef,
+        `command-echo:${query}`,
+        ACTION_REPEAT_COOLDOWN_MS
+      )
+    ) {
+      appendLocalCommandEcho(query);
+    }
+
     if (shellShortcutPreview.active) {
       if (!shellShortcutPreview.request) {
         pushSystemMessage(
@@ -7086,6 +7113,7 @@ export const useChatApp = ({
     return {
       active: mode === "command",
       mode,
+      queryText: mode === "command" ? commandQuery : null,
       currentCommand:
         mode === "command"
           ? slashSuggestions[commandSelectedIndex]?.command ??

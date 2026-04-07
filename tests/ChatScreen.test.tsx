@@ -162,10 +162,11 @@ const buildProps = (
   appRoot: "D:/Projects/demo-root",
   input: "",
   inputCursorOffset: 0,
-  inputCommandState: {
-    active: false,
-    mode: "idle",
-    currentCommand: null,
+    inputCommandState: {
+      active: false,
+      mode: "idle",
+      queryText: null,
+      currentCommand: null,
     suggestions: [],
     selectedIndex: 0,
     historyPosition: null,
@@ -425,6 +426,7 @@ describe("ChatScreen", () => {
     const tree = renderScreen();
     const output = JSON.stringify(tree);
 
+    expect(output).toContain(">Cyrene");
     expect(output).toContain("READY");
     expect(output).toContain("model");
     expect(output).toContain("provider");
@@ -456,6 +458,7 @@ describe("ChatScreen", () => {
     });
     const output = JSON.stringify(tree);
 
+    expect(output).toContain(">Cyrene");
     expect(output).toContain("Cyrene Code");
     expect(output).toContain("Terminal-first coding assistant for the current workspace.");
     expect(output).toContain("cwd D:/Projects/demo-root");
@@ -958,6 +961,7 @@ describe("ChatScreen", () => {
       inputCommandState: {
         active: true,
         mode: "command",
+        queryText: "/model",
         currentCommand: "/model <name>",
         suggestions: [
           {
@@ -1021,6 +1025,41 @@ describe("ChatScreen", () => {
     expect(output).not.toContain("history 2/5");
   });
 
+  test("keeps partially typed slash commands visible in the composer", () => {
+    const tree = renderScreen({
+      input: "/mcp",
+      inputCursorOffset: "/mcp".length,
+      inputCommandState: {
+        active: true,
+        mode: "command",
+        queryText: "/mcp",
+        currentCommand: "/mcp",
+        suggestions: [],
+        selectedIndex: 0,
+        historyPosition: null,
+        historySize: 0,
+        shellShortcut: {
+          active: false,
+          action: null,
+          command: "",
+          actionLabel: "",
+          description: "",
+        },
+        fileMentions: {
+          references: [],
+          activeQuery: null,
+          suggestions: [],
+          loading: false,
+        },
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("/mcp");
+    expect(output).toContain("typing /mcp");
+    expect(output).toContain("No command match for /mcp.");
+  });
+
   test("renders file mention palette rows in the composer", () => {
     const tree = renderScreen({
       items: [],
@@ -1028,6 +1067,7 @@ describe("ChatScreen", () => {
       inputCommandState: {
         active: false,
         mode: "file",
+        queryText: null,
         currentCommand: null,
         suggestions: [],
         selectedIndex: 1,
@@ -1101,6 +1141,7 @@ describe("ChatScreen", () => {
         inputCommandState: {
           active: false,
           mode: "shell",
+          queryText: null,
           currentCommand: null,
           suggestions: [],
           selectedIndex: 0,
@@ -1153,6 +1194,7 @@ describe("ChatScreen", () => {
       inputCommandState: {
         active: false,
         mode: "idle",
+        queryText: null,
         currentCommand: null,
         suggestions: [],
         selectedIndex: 0,

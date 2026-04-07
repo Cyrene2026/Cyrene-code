@@ -26,6 +26,7 @@ type ChatScreenProps = {
   inputCommandState: {
     active: boolean;
     mode: "idle" | "command" | "file" | "shell";
+    queryText: string | null;
     currentCommand: string | null;
     suggestions: Array<{
       command: string;
@@ -281,6 +282,16 @@ type GraphemeSegment = {
 };
 
 const APP_NAME = "Cyrene Code";
+// Generated via: figlet -f "ANSI Shadow" ">Cyrene"
+const STARTUP_ANSI_SHADOW_LOGO_LINES = [
+  "██╗   ██████╗██╗   ██╗██████╗ ███████╗███╗   ██╗███████╗",
+  "╚██╗ ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝████╗  ██║██╔════╝",
+  " ╚██╗██║      ╚████╔╝ ██████╔╝█████╗  ██╔██╗ ██║█████╗  ",
+  " ██╔╝██║       ╚██╔╝  ██╔══██╗██╔══╝  ██║╚██╗██║██╔══╝  ",
+  "██╔╝ ╚██████╗   ██║   ██║  ██║███████╗██║ ╚████║███████╗",
+  "╚═╝   ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝",
+];
+const CYRENE_BRAND_CHIP = " >Cyrene ";
 const SECTION_GAP = 1;
 const SPINNER_FRAMES = [".", "o", "O", "o"];
 const STREAMING_IDLE_GLYPH = "*";
@@ -2069,6 +2080,13 @@ const renderStatusLine = (
   return (
     <Box marginTop={SECTION_GAP} flexDirection="column">
       <Box flexWrap="wrap">
+        <Text color="black" backgroundColor="cyan">
+          {CYRENE_BRAND_CHIP}
+        </Text>
+        <Text color="magenta">
+          {" cyber "}
+        </Text>
+        <Text> </Text>
         <Text
           color={statusBadge.textColor}
           backgroundColor={statusBadge.backgroundColor}
@@ -2428,6 +2446,9 @@ const renderComposerPalette = (
         <Text bold color="cyan">
           Command palette
         </Text>
+        {inputCommandState.queryText ? (
+          <Text dimColor>{`typing ${inputCommandState.queryText}`}</Text>
+        ) : null}
         {suggestionWindow.length > 0 ? (
           groupedSuggestions.map(([group, entries]) => (
             <Box
@@ -2590,6 +2611,25 @@ const renderStartupSuggestion = (title: string, detail: string) => (
   </Box>
 );
 
+const renderAsciiShadowLogo = () => (
+  <Box flexDirection="column">
+    <Text color="cyan" bold>
+      {">Cyrene"}
+    </Text>
+    <Box marginTop={1} flexDirection="column">
+      {STARTUP_ANSI_SHADOW_LOGO_LINES.map((line, index) => (
+        <Text
+          key={`startup-logo-${index}`}
+          color={index % 2 === 0 ? "cyan" : "magenta"}
+          bold
+        >
+          {line}
+        </Text>
+      ))}
+    </Box>
+  </Box>
+);
+
 const renderStartupView = (
   appRoot: string,
   currentModel: string,
@@ -2598,9 +2638,12 @@ const renderStartupView = (
   authStatus: AuthStatus
 ) => (
   <Box marginBottom={SECTION_GAP + 1} flexDirection="column">
-    <Text bold color="white">
-      {APP_NAME}
-    </Text>
+    {renderAsciiShadowLogo()}
+    <Box marginTop={1}>
+      <Text bold color="white">
+        {APP_NAME}
+      </Text>
+    </Box>
     <Text dimColor>Terminal-first coding assistant for the current workspace.</Text>
     <Box marginTop={1} flexDirection="column">
       <Text dimColor>{`cwd ${shortenValue(appRoot || "none", 58)}`}</Text>

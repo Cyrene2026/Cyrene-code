@@ -820,6 +820,38 @@ const createScriptedTransport = (
     app.cleanup();
   });
 
+  test("local slash commands are echoed into transcript items", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          listServers: () => [],
+          listTools: () => [],
+          describeRuntime: () => undefined,
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/mcp");
+
+    const items = app.getLatest().items;
+    const commandIndex = items.findIndex(
+      item => item.role === "user" && item.text === "/mcp"
+    );
+    const runtimeIndex = items.findIndex(
+      item => item.role === "system" && item.text.includes("MCP runtime")
+    );
+
+    expect(commandIndex).toBeGreaterThanOrEqual(0);
+    expect(runtimeIndex).toBeGreaterThan(commandIndex);
+    app.cleanup();
+  });
+
   test("/mcp management commands call runtime mutation hooks", async () => {
     const addServer = mock(async () => ({
       ok: true,
@@ -1175,6 +1207,33 @@ const createScriptedTransport = (
     expect(app.getLatest().inputCommandState.currentCommand).toBe("/model refresh");
     expect(app.getLatest().inputCommandState.suggestions[0]?.command).toBe("/model refresh");
 
+    app.cleanup();
+  });
+
+  test("typing a partial slash command keeps the composer text intact", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await act(async () => {
+      inputHandler?.("/mcp", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().input).toBe("/mcp");
+    expect(app.getLatest().inputCursorOffset).toBe("/mcp".length);
+    expect(app.getLatest().inputCommandState.mode).toBe("command");
+    expect(app.getLatest().inputCommandState.currentCommand).toBe("/mcp");
     app.cleanup();
   });
 

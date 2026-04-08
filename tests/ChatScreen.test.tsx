@@ -621,6 +621,26 @@ describe("ChatScreen", () => {
     expect(output).toContain("1/2/3: preset + next");
   });
 
+  test("auth wizard confirm step shows explicit remembered-key replacement entry", () => {
+    const tree = renderScreen({
+      authPanel: {
+        ...buildProps().authPanel,
+        active: true,
+        step: "confirm",
+        providerBaseUrl: "https://relay.test/v1",
+        apiKey: "remembered-relay-key",
+        model: "claude-relay",
+        rememberedKeyAvailable: true,
+        usingRememberedKey: true,
+      },
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("4. replace remembered key");
+    expect(output).toContain("4: replace remembered key");
+    expect(output).toContain("(remembered)");
+  });
+
   test("renders multiline composer content and grows beyond one logical line", () => {
     const tree = renderScreen({
       items: [],
@@ -681,6 +701,7 @@ describe("ChatScreen", () => {
     const tree = renderScreen({
       usage: {
         promptTokens: 128,
+        cachedTokens: 96,
         completionTokens: 64,
         totalTokens: 192,
       },
@@ -689,8 +710,10 @@ describe("ChatScreen", () => {
 
     expect(output).toContain("tokens");
     expect(output).toContain("prompt");
+    expect(output).toContain("cached");
     expect(output).toContain("completion");
     expect(output).toContain("128");
+    expect(output).toContain("96");
     expect(output).toContain("64");
     expect(output).toContain("192");
   });

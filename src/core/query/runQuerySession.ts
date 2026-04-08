@@ -1401,12 +1401,23 @@ export const runQuerySession = async ({
     let streamOpened = false;
     let visibleAnswerChars = 0;
     const toolResults: string[] = [];
+    let latestUsage: TokenUsage | null = null;
+    let usageReported = false;
     const shouldDeferRoundText =
       uncertainty.mode === "simple_multi_file" &&
       uncertainty.phase === "execute";
     let deferredRoundText = "";
 
+    const flushUsage = () => {
+      if (usageReported || !latestUsage) {
+        return;
+      }
+      usageReported = true;
+      onUsage?.(latestUsage);
+    };
+
     const completeRound = () => {
+      flushUsage();
       dispatch({ type: "complete" });
       return COMPLETED_RESULT;
     };
@@ -1422,6 +1433,7 @@ export const runQuerySession = async ({
     const createOneShotResume = (
       resumeImpl: (toolResultMessage: string) => Promise<RunQuerySessionResult>
     ): RunQuerySessionResult => {
+      flushUsage();
       let resumePromise: Promise<RunQuerySessionResult> | null = null;
       return {
         status: "suspended",
@@ -1434,9 +1446,10 @@ export const runQuerySession = async ({
       };
     };
 
-    for await (const chunk of transport.stream(streamUrl)) {
-      const events = parseStreamChunk(chunk);
-      for (const event of events) {
+    try {
+      for await (const chunk of transport.stream(streamUrl)) {
+        const events = parseStreamChunk(chunk);
+        for (const event of events) {
         if (!streamOpened && event.type !== "done") {
           dispatch({ type: "stream_open" });
           streamOpened = true;
@@ -1735,16 +1748,18 @@ export const runQuerySession = async ({
         }
 
         if (event.type === "usage") {
+          latestUsage = {
+            promptTokens: event.promptTokens,
+            cachedTokens: event.cachedTokens,
+            completionTokens: event.completionTokens,
+            totalTokens: event.totalTokens,
+          };
           dispatch({
             type: "usage",
-            promptTokens: event.promptTokens,
-            completionTokens: event.completionTokens,
-            totalTokens: event.totalTokens,
-          });
-          onUsage?.({
-            promptTokens: event.promptTokens,
-            completionTokens: event.completionTokens,
-            totalTokens: event.totalTokens,
+            promptTokens: latestUsage.promptTokens,
+            cachedTokens: latestUsage.cachedTokens,
+            completionTokens: latestUsage.completionTokens,
+            totalTokens: latestUsage.totalTokens,
           });
           continue;
         }
@@ -1755,9 +1770,13 @@ export const runQuerySession = async ({
         }
       }
 
-      if (completed) {
-        break;
+        if (completed) {
+          break;
+        }
       }
+    } catch (error) {
+      flushUsage();
+      throw error;
     }
 
     if (!sawToolCall) {
@@ -1769,6 +1788,7 @@ export const runQuerySession = async ({
             progressLedger
           )
         ) {
+          flushUsage();
           uncertainty.nonProgressAutoContinueUsed = true;
           const nextPrompt = buildRoundPrompt(
             task,
@@ -1801,6 +1821,7 @@ export const runQuerySession = async ({
         emitRoundText(deferredRoundText);
       }
       if (visibleAnswerChars === 0 && options?.allowSilentPostReviewRetry) {
+        flushUsage();
         const nextPrompt = buildRoundPrompt(
           task,
           accumulatedToolResults,
@@ -1824,6 +1845,7 @@ export const runQuerySession = async ({
     }
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
+    flushUsage();
     const nextPrompt = buildRoundPrompt(
       task,
       accumulatedToolResults,

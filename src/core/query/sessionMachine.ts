@@ -74,6 +74,7 @@ export const querySessionReducer = (
         ...state,
         usage: {
           promptTokens: event.promptTokens,
+          cachedTokens: event.cachedTokens,
           completionTokens: event.completionTokens,
           totalTokens: event.totalTokens,
         },

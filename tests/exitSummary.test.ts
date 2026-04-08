@@ -11,6 +11,7 @@ const baseSnapshot = {
   requestCount: 2,
   stateUpdateCount: 1,
   promptTokens: 12,
+  cachedTokens: 9,
   completionTokens: 5,
   totalTokens: 17,
 };
@@ -60,6 +61,7 @@ describe("exitSummary", () => {
         requestCount: 3,
         stateUpdateCount: 1,
         promptTokens: 120,
+        cachedTokens: 90,
         completionTokens: 45,
         totalTokens: 165,
       },
@@ -76,6 +78,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/requests\s+3/);
     expect(screen).toMatch(/state updates\s+1/);
     expect(screen).toMatch(/prompt\s+120/);
+    expect(screen).toMatch(/cached\s+90/);
     expect(screen).toMatch(/completion\s+45/);
     expect(screen).toMatch(/total\s+165/);
     expect(screen).toContain("bye!");
@@ -90,6 +93,7 @@ describe("exitSummary", () => {
         requestCount: 0,
         stateUpdateCount: 0,
         promptTokens: 0,
+        cachedTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
       },
@@ -105,6 +109,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/requests\s+0/);
     expect(screen).toMatch(/state updates\s+0/);
     expect(screen).toMatch(/prompt\s+0/);
+    expect(screen).toMatch(/cached\s+0/);
     expect(screen).toMatch(/completion\s+0/);
     expect(screen).toMatch(/total\s+0/);
   });

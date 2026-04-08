@@ -145,6 +145,8 @@ type ChatScreenProps = {
     providerBaseUrl: string;
     apiKey: string;
     model: string;
+    rememberedKeyAvailable?: boolean;
+    usingRememberedKey?: boolean;
     cursorOffset: number;
     error: string | null;
     info: string | null;
@@ -2218,7 +2220,9 @@ const renderStatusLine = (
   const statusBadge = getStatusBadge(status, spinner);
   const queueColor = pendingCount > 0 ? "yellow" : "green";
   const tokenSummary = usage
-    ? `tokens ${String(usage.totalTokens)}  |  prompt ${String(usage.promptTokens)}  |  completion ${String(
+    ? `tokens ${String(usage.totalTokens)}  |  prompt ${String(
+        usage.promptTokens
+      )}  |  cached ${String(usage.cachedTokens ?? 0)}  |  completion ${String(
         usage.completionTokens
       )}`
     : "tokens -";
@@ -2857,6 +2861,13 @@ const renderAuthWizardPanel = (
           : "Review the target and press Enter to connect.";
   const providerPresetHint = "Quick preset: 1 OpenAI | 2 Gemini | 3 Anthropic";
   const effectiveModel = authPanel.model.trim() || authStatus.model || "gpt-4o-mini";
+  const rememberedKeyAvailable = Boolean(authPanel.rememberedKeyAvailable);
+  const usingRememberedKey = Boolean(authPanel.usingRememberedKey);
+  const apiKeySummary = usingRememberedKey
+    ? `${maskSecretForRender(authPanel.apiKey) || "(empty)"} (remembered)`
+    : rememberedKeyAvailable && authPanel.apiKey.trim()
+      ? `${maskSecretForRender(authPanel.apiKey)} (will replace remembered key)`
+      : maskSecretForRender(authPanel.apiKey) || "(empty)";
 
   return (
     <Box
@@ -2876,6 +2887,9 @@ const renderAuthWizardPanel = (
       {authPanel.info ? <Text dimColor>{authPanel.info}</Text> : null}
       <Text color="white">{fieldPrompt}</Text>
       {authPanel.step === "provider" ? <Text dimColor>{providerPresetHint}</Text> : null}
+      {authPanel.step === "model" && usingRememberedKey ? (
+        <Text dimColor>At confirm, press 4 to replace the remembered key.</Text>
+      ) : null}
 
       {authPanel.step !== "confirm" ? (
         <Box
@@ -2904,13 +2918,14 @@ const renderAuthWizardPanel = (
       ) : (
         <Box marginTop={1} flexDirection="column">
           <Text>{`1. provider  ${authPanel.providerBaseUrl || "(empty)"}`}</Text>
-          <Text>{`2. api key   ${maskSecretForRender(authPanel.apiKey) || "(empty)"}`}</Text>
+          <Text>{`2. api key   ${apiKeySummary}`}</Text>
           <Text>{`3. model     ${effectiveModel}`}</Text>
+          {usingRememberedKey ? <Text>{`4. replace remembered key`}</Text> : null}
           <Text dimColor>
             {`target  ${authPanel.persistenceTarget?.label ?? "unavailable"}  |  ${authPanel.persistenceTarget?.path ?? "(none)"}`}
           </Text>
           <Text dimColor>
-            Enter: connect  |  1/2/3: edit field  |  Esc: {authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}
+            {`Enter: connect  |  1/2/3: edit field${usingRememberedKey ? "  |  4: replace remembered key" : ""}  |  Esc: ${authPanel.mode === "auto_onboarding" ? "skip to local-core" : "close"}`}
           </Text>
         </Box>
       )}

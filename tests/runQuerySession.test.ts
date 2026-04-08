@@ -611,6 +611,7 @@ describe("runQuerySession", () => {
         yield JSON.stringify({
           type: "usage",
           promptTokens: 12,
+          cachedTokens: 9,
           completionTokens: 7,
           totalTokens: 19,
         });
@@ -638,6 +639,103 @@ describe("runQuerySession", () => {
     expect(states[0]).toEqual({ status: "requesting", totalTokens: null });
     expect(states).toContainEqual({ status: "streaming", totalTokens: 19 });
     expect(states.at(-1)).toEqual({ status: "idle", totalTokens: 19 });
+  });
+
+  test("reports usage once per request using the latest streamed snapshot", async () => {
+    let requestCount = 0;
+    const transport: QueryTransport = {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({
+        ok: true,
+        message: `provider ${provider}`,
+        currentProvider: provider,
+        providers: [provider],
+        models: ["gpt-test"],
+      }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async () => `stream://${++requestCount}`,
+      stream: async function* (streamUrl: string) {
+        if (streamUrl === "stream://1") {
+          yield JSON.stringify({
+            type: "usage",
+            promptTokens: 5000,
+            cachedTokens: 4800,
+            completionTokens: 0,
+            totalTokens: 5000,
+          });
+          yield JSON.stringify({
+            type: "usage",
+            promptTokens: 5000,
+            cachedTokens: 4800,
+            completionTokens: 20,
+            totalTokens: 5020,
+          });
+          yield JSON.stringify({
+            type: "tool_call",
+            toolName: "file",
+            input: { action: "read_file", path: "README.md" },
+          });
+          yield JSON.stringify({ type: "done" });
+          return;
+        }
+
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 120,
+          cachedTokens: 80,
+          completionTokens: 0,
+          totalTokens: 120,
+        });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 120,
+          cachedTokens: 80,
+          completionTokens: 30,
+          totalTokens: 150,
+        });
+        yield JSON.stringify({ type: "text_delta", text: "done" });
+        yield JSON.stringify({ type: "done" });
+      },
+    };
+
+    const usages: Array<{
+      promptTokens: number;
+      cachedTokens?: number;
+      completionTokens: number;
+      totalTokens: number;
+    }> = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onUsage: usage => {
+        usages.push(usage);
+      },
+      onToolCall: async () => ({ message: "ok" }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(usages).toEqual([
+      {
+        promptTokens: 5000,
+        cachedTokens: 4800,
+        completionTokens: 20,
+        totalTokens: 5020,
+      },
+      {
+        promptTokens: 120,
+        cachedTokens: 80,
+        completionTokens: 30,
+        totalTokens: 150,
+      },
+    ]);
   });
 
   test("returns from requesting to idle when the stream completes without content chunks", async () => {

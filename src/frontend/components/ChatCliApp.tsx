@@ -71,6 +71,7 @@ export const ChatCliApp = ({
     requestCount: 0,
     stateUpdateCount: 0,
     promptTokens: 0,
+    cachedTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
   });
@@ -82,6 +83,8 @@ export const ChatCliApp = ({
         setAuthStatus(nextStatus);
         return nextStatus;
       },
+      getSavedApiKey: async (providerBaseUrl: string) =>
+        await runtimeAuthRuntime.getSavedApiKey(providerBaseUrl),
       saveLogin: async (input: {
         providerBaseUrl: string;
         apiKey: string;

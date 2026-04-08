@@ -12,6 +12,7 @@ export type ExitSummarySnapshot = {
   requestCount: number;
   stateUpdateCount: number;
   promptTokens: number;
+  cachedTokens: number;
   completionTokens: number;
   totalTokens: number;
 };
@@ -106,6 +107,7 @@ export const buildExitScreen = (
     ["requests", String(summary.requestCount)],
     ["state updates", String(summary.stateUpdateCount)],
     ["prompt", String(summary.promptTokens)],
+    ["cached", String(summary.cachedTokens)],
     ["completion", String(summary.completionTokens)],
     ["total", String(summary.totalTokens)],
   ] as const;

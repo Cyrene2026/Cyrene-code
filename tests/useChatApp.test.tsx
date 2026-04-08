@@ -606,6 +606,290 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("login panel skips the API key step when the provider already has a remembered key", async () => {
+    const getSavedApiKey = mock(async (providerBaseUrl: string) =>
+      providerBaseUrl === "https://api.anthropic.com" ? "remembered-anthropic-key" : undefined
+    );
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "claude-3-7-sonnet-latest",
+          initialProvider: "https://api.anthropic.com",
+          models: ["claude-3-7-sonnet-latest"],
+          providers: ["https://api.anthropic.com"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: {
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: "https://api.anthropic.com",
+            model: "claude-3-7-sonnet-latest",
+            persistenceTarget: null,
+            onboardingAvailable: false,
+            httpReady: true,
+          },
+          getStatus: async () => ({
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: "https://api.anthropic.com",
+            model: "claude-3-7-sonnet-latest",
+            persistenceTarget: null,
+            onboardingAvailable: false,
+            httpReady: true,
+          }),
+          getSavedApiKey,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: {
+              mode: "http" as const,
+              credentialSource: "user_env" as const,
+              provider: "https://api.anthropic.com",
+              model: "claude-3-7-sonnet-latest",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: true,
+            },
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: {
+              mode: "local" as const,
+              credentialSource: "none" as const,
+              provider: "none",
+              model: "gpt-4o-mini",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: false,
+            },
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/login");
+    await flushMicrotasks();
+
+    expect(getSavedApiKey).toHaveBeenCalledWith("https://api.anthropic.com");
+    expect(app.getLatest().authPanel.step).toBe("model");
+    expect(app.getLatest().authPanel.apiKey).toBe("remembered-anthropic-key");
+    expect(app.getLatest().authPanel.info).toContain("Using remembered API key");
+    expect(app.getLatest().authPanel.info).toContain("Press 4 at confirm");
+
+    app.cleanup();
+  });
+
+  test("/auth distinguishes the active key source from an inactive remembered key", async () => {
+    const authStatus = {
+      mode: "http" as const,
+      credentialSource: "process_env" as const,
+      provider: "https://relay.test/v1",
+      model: "claude-relay",
+      persistenceTarget: null,
+      onboardingAvailable: true,
+      httpReady: true,
+    };
+    const getSavedApiKey = mock(async (providerBaseUrl: string) =>
+      providerBaseUrl === "https://relay.test/v1" ? "remembered-relay-key" : undefined
+    );
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "claude-relay",
+          initialProvider: "https://relay.test/v1",
+          models: ["claude-relay"],
+          providers: ["https://relay.test/v1"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: authStatus,
+          getStatus: async () => authStatus,
+          getSavedApiKey,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: authStatus,
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: authStatus,
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/auth");
+    await flushMicrotasks();
+
+    const output = getTexts(app.getLatest().items).join("\n");
+    expect(output).toContain("active key source: process_env");
+    expect(output).toContain(
+      "remembered key for provider: yes (available but inactive)"
+    );
+
+    app.cleanup();
+  });
+
+  test("/auth shows when the remembered key is the active key", async () => {
+    const authStatus = {
+      mode: "http" as const,
+      credentialSource: "user_env" as const,
+      provider: "https://relay.test/v1",
+      model: "claude-relay",
+      persistenceTarget: null,
+      onboardingAvailable: true,
+      httpReady: true,
+    };
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "claude-relay",
+          initialProvider: "https://relay.test/v1",
+          models: ["claude-relay"],
+          providers: ["https://relay.test/v1"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: authStatus,
+          getStatus: async () => authStatus,
+          getSavedApiKey: async () => "remembered-relay-key",
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: authStatus,
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: authStatus,
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/auth");
+    await flushMicrotasks();
+
+    const output = getTexts(app.getLatest().items).join("\n");
+    expect(output).toContain("active key source: user_env");
+    expect(output).toContain("remembered key for provider: yes (active)");
+
+    app.cleanup();
+  });
+
+  test("login panel exposes an explicit replace action for remembered keys", async () => {
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport({
+          initialModel: "claude-relay",
+          initialProvider: "https://relay.test/v1",
+          models: ["claude-relay"],
+          providers: ["https://relay.test/v1"],
+        }),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: {
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: "https://relay.test/v1",
+            model: "claude-relay",
+            persistenceTarget: null,
+            onboardingAvailable: true,
+            httpReady: true,
+          },
+          getStatus: async () => ({
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: "https://relay.test/v1",
+            model: "claude-relay",
+            persistenceTarget: null,
+            onboardingAvailable: true,
+            httpReady: true,
+          }),
+          getSavedApiKey: async () => "remembered-relay-key",
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: {
+              mode: "http" as const,
+              credentialSource: "user_env" as const,
+              provider: "https://relay.test/v1",
+              model: "claude-relay",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: true,
+            },
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: {
+              mode: "local" as const,
+              credentialSource: "none" as const,
+              provider: "none",
+              model: "gpt-4o-mini",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: false,
+            },
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/login");
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.step).toBe("model");
+
+    await act(async () => {
+      inputHandler?.("", { return: true } as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.step).toBe("confirm");
+
+    await act(async () => {
+      inputHandler?.("4", {} as any);
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().authPanel.step).toBe("api_key");
+    expect(app.getLatest().authPanel.apiKey).toBe("");
+    expect(app.getLatest().authPanel.info).toContain("replace the remembered key");
+
+    app.cleanup();
+  });
+
 type ScriptedTransportEvent =
   | { type: "tool_call"; toolName: string; input: unknown }
   | { type: "text_delta"; text: string };
@@ -4304,6 +4588,7 @@ const createScriptedTransport = (
         const usageByTurn = [
           {
             promptTokens: 10,
+            cachedTokens: 6,
             completionTokens: 4,
             totalTokens: 14,
             reply: withStateUpdate("first reply", {
@@ -4326,6 +4611,7 @@ const createScriptedTransport = (
           },
           {
             promptTokens: 8,
+            cachedTokens: 5,
             completionTokens: 3,
             totalTokens: 11,
             reply: withStateUpdate("second reply", {
@@ -4342,6 +4628,7 @@ const createScriptedTransport = (
         onState({ status: "streaming" });
         onUsage?.({
           promptTokens: current.promptTokens,
+          cachedTokens: current.cachedTokens,
           completionTokens: current.completionTokens,
           totalTokens: current.totalTokens,
         });
@@ -4377,6 +4664,7 @@ const createScriptedTransport = (
       requestCount: 1,
       stateUpdateCount: 1,
       promptTokens: 10,
+      cachedTokens: 6,
       completionTokens: 4,
       totalTokens: 14,
     });
@@ -4391,6 +4679,7 @@ const createScriptedTransport = (
       requestCount: 2,
       stateUpdateCount: 2,
       promptTokens: 18,
+      cachedTokens: 11,
       completionTokens: 7,
       totalTokens: 25,
     });

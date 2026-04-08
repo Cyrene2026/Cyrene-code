@@ -52,6 +52,35 @@ describe("createUserScopedApiKeyStore", () => {
     expect(cleared).toContain("# existing");
   });
 
+  test("remembers separate provider-specific keys in the same managed block", async () => {
+    const home = await createTempHome();
+    const targetFile = join(home, ".zshrc");
+
+    const store = createUserScopedApiKeyStore({
+      platform: "linux",
+      env: { SHELL: "/bin/zsh" } as NodeJS.ProcessEnv,
+      homeDir: home,
+    });
+
+    await store.save("openai-key", "CYRENE_OPENAI_API_KEY");
+    await store.save("gemini-key", "CYRENE_GEMINI_API_KEY");
+
+    const saved = await readFile(targetFile, "utf8");
+    expect(saved).toContain('export CYRENE_OPENAI_API_KEY="openai-key"');
+    expect(saved).toContain('export CYRENE_GEMINI_API_KEY="gemini-key"');
+    expect(await store.read("CYRENE_OPENAI_API_KEY")).toBe("openai-key");
+    expect(await store.read("CYRENE_GEMINI_API_KEY")).toBe("gemini-key");
+    expect(await store.readAll?.()).toEqual({
+      CYRENE_OPENAI_API_KEY: "openai-key",
+      CYRENE_GEMINI_API_KEY: "gemini-key",
+    });
+
+    await store.clear("CYRENE_OPENAI_API_KEY");
+    const partiallyCleared = await readFile(targetFile, "utf8");
+    expect(partiallyCleared).not.toContain("CYRENE_OPENAI_API_KEY");
+    expect(partiallyCleared).toContain("CYRENE_GEMINI_API_KEY");
+  });
+
   test("chooses expected bash, fish, and posix targets", async () => {
     const bashHome = await createTempHome();
     await writeFile(join(bashHome, ".bash_profile"), "# bash profile\n", "utf8");

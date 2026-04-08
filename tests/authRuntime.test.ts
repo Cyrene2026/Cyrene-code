@@ -3,7 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAuthRuntime } from "../src/infra/auth/authRuntime";
-import type { UserScopedApiKeyStore } from "../src/infra/auth/userScopedApiKeyStore";
+import type {
+  ManagedAuthEnvName,
+  UserScopedApiKeyStore,
+} from "../src/infra/auth/userScopedApiKeyStore";
 import type { QueryTransport } from "../src/core/query/transport";
 
 const tempRoots: string[] = [];
@@ -37,8 +40,13 @@ const createStubTransport = (
 
 const createMemoryApiKeyStore = (
   initialValue?: string
-): UserScopedApiKeyStore & { current: () => string | undefined } => {
-  let value = initialValue;
+): UserScopedApiKeyStore & {
+  current: (envName?: ManagedAuthEnvName) => string | undefined;
+  currentAll: () => Partial<Record<ManagedAuthEnvName, string>>;
+} => {
+  const values: Partial<Record<ManagedAuthEnvName, string>> = initialValue
+    ? { CYRENE_API_KEY: initialValue }
+    : {};
   return {
     getTarget: async () => ({
       kind: "shell_rc_block",
@@ -47,9 +55,10 @@ const createMemoryApiKeyStore = (
       label: "zsh profile",
       managedByCyrene: true,
     }),
-    read: async () => value,
-    save: async (apiKey: string) => {
-      value = apiKey;
+    read: async (envName = "CYRENE_API_KEY") => values[envName],
+    readAll: async () => ({ ...values }),
+    save: async (apiKey: string, envName = "CYRENE_API_KEY") => {
+      values[envName] = apiKey;
       return {
         kind: "shell_rc_block",
         shell: "zsh",
@@ -58,8 +67,14 @@ const createMemoryApiKeyStore = (
         managedByCyrene: true,
       };
     },
-    clear: async () => {
-      value = undefined;
+    clear: async (envName?: ManagedAuthEnvName) => {
+      if (envName) {
+        delete values[envName];
+      } else {
+        for (const key of Object.keys(values) as ManagedAuthEnvName[]) {
+          delete values[key];
+        }
+      }
       return {
         kind: "shell_rc_block",
         shell: "zsh",
@@ -68,7 +83,8 @@ const createMemoryApiKeyStore = (
         managedByCyrene: true,
       };
     },
-    current: () => value,
+    current: (envName = "CYRENE_API_KEY") => values[envName],
+    currentAll: () => ({ ...values }),
   };
 };
 
@@ -264,7 +280,7 @@ describe("createAuthRuntime", () => {
     expect(result.ok).toBe(true);
     expect(result.status.mode).toBe("http");
     expect(result.status.credentialSource).toBe("user_env");
-    expect(store.current()).toBe("sk-live");
+    expect(store.current("CYRENE_OPENAI_API_KEY")).toBe("sk-live");
     expect(saveModelYamlImpl).toHaveBeenCalledWith(
       ["gpt-a", "gpt-b"],
       "gpt-b",
@@ -274,6 +290,189 @@ describe("createAuthRuntime", () => {
       }),
       appRoot,
       expect.any(Object)
+    );
+  });
+
+  test("saveLogin uses provider profile overrides to validate relays and bind remembered keys", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    const fetchProviderModelCatalogImpl = mock(
+      async (options: { baseUrl: string; familyOverride?: string }) => {
+        expect(options.baseUrl).toBe("https://relay.test/v1");
+        expect(options.familyOverride).toBe("anthropic");
+        return {
+          providerBaseUrl: "https://relay.test/v1",
+          models: ["claude-relay"],
+          selectedModel: "claude-relay",
+        };
+      }
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      fetchProviderModelCatalogImpl: fetchProviderModelCatalogImpl as any,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("claude-relay", "https://relay.test/v1")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["claude-relay"],
+        defaultModel: "claude-relay",
+        lastUsedModel: "claude-relay",
+        providerBaseUrl: "https://relay.test/v1",
+        providers: ["https://relay.test/v1"],
+        providerProfiles: {
+          "https://relay.test/v1": "anthropic" as const,
+        },
+      })),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "https://relay.test/v1",
+      apiKey: "relay-anthropic-key",
+      model: "claude-relay",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.current("CYRENE_ANTHROPIC_API_KEY")).toBe(
+      "relay-anthropic-key"
+    );
+    expect(await runtime.getSavedApiKey("https://relay.test/v1")).toBe(
+      "relay-anthropic-key"
+    );
+  });
+
+  test("saveLogin overrides explicit launch env for the current run", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore("persisted-old-key");
+    const createHttpTransport = mock((options?: { env?: NodeJS.ProcessEnv }) =>
+      createStubTransport(
+        options?.env?.CYRENE_MODEL ?? "gpt-next",
+        options?.env?.CYRENE_BASE_URL ?? "https://next-provider.test/v1"
+      )
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {
+        CYRENE_API_KEY: "launch-key",
+        CYRENE_BASE_URL: "https://launch-provider.test/v1",
+        CYRENE_MODEL: "gpt-launch",
+      } as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      createHttpTransport: createHttpTransport as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      fetchProviderModelCatalogImpl: mock(async () => ({
+        providerBaseUrl: "https://next-provider.test/v1",
+        models: ["gpt-next"],
+        selectedModel: "gpt-next",
+      })),
+      loadModelYamlImpl: mock(async () => ({
+        models: ["gpt-next"],
+        defaultModel: "gpt-next",
+        lastUsedModel: "gpt-next",
+        providerBaseUrl: "https://next-provider.test/v1",
+        providers: ["https://next-provider.test/v1"],
+        providerProfiles: {},
+      })),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "https://next-provider.test/v1",
+      apiKey: "new-key",
+      model: "gpt-next",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.status.mode).toBe("http");
+    expect(result.status.credentialSource).toBe("user_env");
+    expect(result.status.provider).toBe("https://next-provider.test/v1");
+    expect(result.status.model).toBe("gpt-next");
+    expect(result.message).toContain("Switched the current run to the newly saved credential");
+    expect(createHttpTransport).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CYRENE_OPENAI_API_KEY: "new-key",
+          CYRENE_BASE_URL: "https://next-provider.test/v1",
+          CYRENE_MODEL: "gpt-next",
+        }),
+      })
+    );
+  });
+
+  test("buildTransport includes remembered provider-specific keys so provider switching can reuse them", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    await store.save("openai-key", "CYRENE_OPENAI_API_KEY");
+    await store.save("anthropic-key", "CYRENE_ANTHROPIC_API_KEY");
+    const createHttpTransport = mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+      createStubTransport("gpt-openai", "https://api.openai.com/v1")
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {
+        CYRENE_BASE_URL: "https://api.openai.com/v1",
+        CYRENE_MODEL: "gpt-openai",
+      } as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      createHttpTransport: createHttpTransport as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["gpt-openai"],
+        defaultModel: "gpt-openai",
+        lastUsedModel: "gpt-openai",
+        providerBaseUrl: "https://api.openai.com/v1",
+        providers: ["https://api.openai.com/v1", "https://api.anthropic.com"],
+        providerProfiles: {},
+      })),
+    });
+
+    await runtime.buildTransport();
+
+    expect(createHttpTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CYRENE_OPENAI_API_KEY: "openai-key",
+          CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+        }),
+      })
+    );
+    expect(await runtime.getSavedApiKey("https://api.anthropic.com")).toBe(
+      "anthropic-key"
+    );
+  });
+
+  test("status resolves relay remembered keys from provider profile overrides", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    await store.save("relay-key", "CYRENE_ANTHROPIC_API_KEY");
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("claude-relay", "https://relay.test/v1")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["claude-relay"],
+        defaultModel: "claude-relay",
+        lastUsedModel: "claude-relay",
+        providerBaseUrl: "https://relay.test/v1",
+        providers: ["https://relay.test/v1"],
+        providerProfiles: {
+          "https://relay.test/v1": "anthropic" as const,
+        },
+      })),
+    });
+
+    const status = await runtime.getStatus();
+
+    expect(status.mode).toBe("http");
+    expect(status.credentialSource).toBe("user_env");
+    expect(status.provider).toBe("https://relay.test/v1");
+    expect(await runtime.getSavedApiKey("https://relay.test/v1")).toBe(
+      "relay-key"
     );
   });
 
@@ -307,7 +506,7 @@ describe("createAuthRuntime", () => {
     expect(result.ok).toBe(true);
     expect(result.status.mode).toBe("http");
     expect(result.status.credentialSource).toBe("process_env");
-    expect(result.message).toContain("still active for this run");
-    expect(store.current()).toBeUndefined();
+    expect(result.message).toContain("Reverted to the explicit CYRENE_API_KEY");
+    expect(store.currentAll()).toEqual({});
   });
 });

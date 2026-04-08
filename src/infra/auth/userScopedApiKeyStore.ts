@@ -4,9 +4,20 @@ import { resolveUserHomeDir } from "../config/appRoot";
 import type { AuthPersistenceTarget } from "./types";
 
 const AUTH_ENV_NAME = "CYRENE_API_KEY";
+const PROVIDER_AUTH_ENV_NAMES = [
+  "CYRENE_OPENAI_API_KEY",
+  "CYRENE_GEMINI_API_KEY",
+  "CYRENE_ANTHROPIC_API_KEY",
+] as const;
+export const MANAGED_AUTH_ENV_NAMES = [
+  AUTH_ENV_NAME,
+  ...PROVIDER_AUTH_ENV_NAMES,
+] as const;
+export type ManagedAuthEnvName = (typeof MANAGED_AUTH_ENV_NAMES)[number];
 const MANAGED_BLOCK_START = "# >>> CYRENE API KEY >>>";
 const MANAGED_BLOCK_END = "# <<< CYRENE API KEY <<<";
 const WINDOWS_ENV_PATH = "HKCU\\Environment";
+type ManagedAuthEnvValues = Partial<Record<ManagedAuthEnvName, string>>;
 
 type ExecFileResult = {
   stdout: string;
@@ -33,9 +44,13 @@ type UserScopedApiKeyStoreOptions = {
 
 export type UserScopedApiKeyStore = {
   getTarget: () => Promise<AuthPersistenceTarget>;
-  read: () => Promise<string | undefined>;
-  save: (apiKey: string) => Promise<AuthPersistenceTarget>;
-  clear: () => Promise<AuthPersistenceTarget>;
+  read: (envName?: ManagedAuthEnvName) => Promise<string | undefined>;
+  readAll?: () => Promise<ManagedAuthEnvValues>;
+  save: (
+    apiKey: string,
+    envName?: ManagedAuthEnvName
+  ) => Promise<AuthPersistenceTarget>;
+  clear: (envName?: ManagedAuthEnvName) => Promise<AuthPersistenceTarget>;
 };
 
 const trimNonEmpty = (value: string | undefined | null) => {
@@ -77,17 +92,41 @@ const getShellName = (env: NodeJS.ProcessEnv) => {
   return "posix" as const;
 };
 
-const createManagedShellBlock = (apiKey: string) =>
+const normalizeManagedAuthEnvValues = (
+  values: ManagedAuthEnvValues
+): ManagedAuthEnvValues =>
+  Object.fromEntries(
+    Object.entries(values)
+      .map(([envName, value]) => [
+        envName,
+        trimNonEmpty(value),
+      ] as const)
+      .filter(
+        (entry): entry is [ManagedAuthEnvName, string] =>
+          Boolean(entry[1]) &&
+          (MANAGED_AUTH_ENV_NAMES as readonly string[]).includes(entry[0])
+      )
+  ) as ManagedAuthEnvValues;
+
+const createManagedShellBlock = (values: ManagedAuthEnvValues) =>
   [
     MANAGED_BLOCK_START,
-    `export ${AUTH_ENV_NAME}="${escapeDoubleQuotedShellValue(apiKey)}"`,
+    ...MANAGED_AUTH_ENV_NAMES.flatMap(envName =>
+      values[envName]
+        ? [`export ${envName}="${escapeDoubleQuotedShellValue(values[envName]!)}"`]
+        : []
+    ),
     MANAGED_BLOCK_END,
   ].join("\n");
 
-const createManagedFishFile = (apiKey: string) =>
+const createManagedFishFile = (values: ManagedAuthEnvValues) =>
   [
     "# Managed by Cyrene",
-    `set -gx ${AUTH_ENV_NAME} "${escapeDoubleQuotedShellValue(apiKey)}"`,
+    ...MANAGED_AUTH_ENV_NAMES.flatMap(envName =>
+      values[envName]
+        ? [`set -gx ${envName} "${escapeDoubleQuotedShellValue(values[envName]!)}"`]
+        : []
+    ),
     "",
   ].join("\n");
 
@@ -102,40 +141,58 @@ const removeManagedBlock = (content: string) =>
     )
     .replace(/\n{3,}/g, "\n\n");
 
-const upsertManagedBlock = (content: string, apiKey: string) => {
+const upsertManagedBlock = (content: string, values: ManagedAuthEnvValues) => {
   const withoutManaged = removeManagedBlock(content).trimEnd();
-  const block = createManagedShellBlock(apiKey);
+  const block = createManagedShellBlock(values);
   if (!withoutManaged) {
     return `${block}\n`;
   }
   return `${withoutManaged}\n\n${block}\n`;
 };
 
-const parseManagedBlockApiKey = (content: string) => {
+const parseManagedBlockApiKeys = (content: string) => {
   const blockMatch = content.match(
     new RegExp(
       `${MANAGED_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([\\s\\S]*?)${MANAGED_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
     )
   );
   if (!blockMatch?.[1]) {
-    return undefined;
+    return {};
   }
-  const exportMatch = blockMatch[1].match(
-    new RegExp(`export\\s+${AUTH_ENV_NAME}\\s*=\\s*"([\\s\\S]*)"`)
-  );
-  return exportMatch?.[1]
-    ? unescapeDoubleQuotedShellValue(exportMatch[1])
-    : undefined;
+  const values: ManagedAuthEnvValues = {};
+  for (const envName of MANAGED_AUTH_ENV_NAMES) {
+    const exportMatch = blockMatch[1].match(
+      new RegExp(`export\\s+${envName}\\s*=\\s*"([\\s\\S]*?)"`)
+    );
+    if (exportMatch?.[1]) {
+      values[envName] = unescapeDoubleQuotedShellValue(exportMatch[1]);
+    }
+  }
+  return normalizeManagedAuthEnvValues(values);
 };
 
-const parseManagedFishApiKey = (content: string) => {
-  const lineMatch = content.match(
-    new RegExp(`set\\s+-gx\\s+${AUTH_ENV_NAME}\\s+"([\\s\\S]*)"`)
-  );
-  return lineMatch?.[1]
-    ? unescapeDoubleQuotedShellValue(lineMatch[1])
-    : undefined;
+const parseManagedBlockApiKey = (
+  content: string,
+  envName: ManagedAuthEnvName = AUTH_ENV_NAME
+) => parseManagedBlockApiKeys(content)[envName];
+
+const parseManagedFishApiKeys = (content: string) => {
+  const values: ManagedAuthEnvValues = {};
+  for (const envName of MANAGED_AUTH_ENV_NAMES) {
+    const lineMatch = content.match(
+      new RegExp(`set\\s+-gx\\s+${envName}\\s+"([\\s\\S]*?)"`)
+    );
+    if (lineMatch?.[1]) {
+      values[envName] = unescapeDoubleQuotedShellValue(lineMatch[1]);
+    }
+  }
+  return normalizeManagedAuthEnvValues(values);
 };
+
+const parseManagedFishApiKey = (
+  content: string,
+  envName: ManagedAuthEnvName = AUTH_ENV_NAME
+) => parseManagedFishApiKeys(content)[envName];
 
 const runDefaultExecFile = async (
   file: string,
@@ -267,14 +324,14 @@ export const createUserScopedApiKeyStore = (
     };
   };
 
-  const readWindowsValue = async () => {
+  const readWindowsValue = async (envName: ManagedAuthEnvName = AUTH_ENV_NAME) => {
     const result = await execFile(
       "powershell.exe",
       [
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `$value = [Environment]::GetEnvironmentVariable('${AUTH_ENV_NAME}', 'User'); if ($null -ne $value) { [Console]::Out.Write($value) }`,
+        `$value = [Environment]::GetEnvironmentVariable('${envName}', 'User'); if ($null -ne $value) { [Console]::Out.Write($value) }`,
       ],
       {
         env,
@@ -283,7 +340,22 @@ export const createUserScopedApiKeyStore = (
     return trimNonEmpty(result.stdout.replace(/\r/g, ""));
   };
 
-  const writeWindowsValue = async (apiKey: string | null) => {
+  const readWindowsValues = async () => {
+    const entries = await Promise.all(
+      MANAGED_AUTH_ENV_NAMES.map(async envName => {
+        const value = await readWindowsValue(envName);
+        return value ? ([envName, value] as const) : null;
+      })
+    );
+    return Object.fromEntries(
+      entries.filter((entry): entry is [ManagedAuthEnvName, string] => Boolean(entry))
+    ) as ManagedAuthEnvValues;
+  };
+
+  const writeWindowsValue = async (
+    apiKey: string | null,
+    envName: ManagedAuthEnvName = AUTH_ENV_NAME
+  ) => {
     const mergedEnv: NodeJS.ProcessEnv = {
       ...env,
       CYRENE_AUTH_VALUE: apiKey ?? "",
@@ -295,8 +367,8 @@ export const createUserScopedApiKeyStore = (
         "-NonInteractive",
         "-Command",
         apiKey === null
-          ? `[Environment]::SetEnvironmentVariable('${AUTH_ENV_NAME}', $null, 'User')`
-          : `[Environment]::SetEnvironmentVariable('${AUTH_ENV_NAME}', $env:CYRENE_AUTH_VALUE, 'User')`,
+          ? `[Environment]::SetEnvironmentVariable('${envName}', $null, 'User')`
+          : `[Environment]::SetEnvironmentVariable('${envName}', $env:CYRENE_AUTH_VALUE, 'User')`,
       ],
       {
         env: mergedEnv,
@@ -306,49 +378,88 @@ export const createUserScopedApiKeyStore = (
 
   return {
     getTarget,
-    read: async () => {
+    read: async (envName = AUTH_ENV_NAME) => {
       const target = await getTarget();
       if (target.kind === "windows_user_env") {
-        return await readWindowsValue();
+        return await readWindowsValue(envName);
       }
 
       try {
         const content = await readText(target.path);
         return target.kind === "fish_conf_d"
-          ? parseManagedFishApiKey(content)
-          : parseManagedBlockApiKey(content);
+          ? parseManagedFishApiKey(content, envName)
+          : parseManagedBlockApiKey(content, envName);
       } catch {
         return undefined;
       }
     },
-    save: async (apiKey: string) => {
+    readAll: async () => {
+      const target = await getTarget();
+      if (target.kind === "windows_user_env") {
+        return await readWindowsValues();
+      }
+
+      try {
+        const content = await readText(target.path);
+        return target.kind === "fish_conf_d"
+          ? parseManagedFishApiKeys(content)
+          : parseManagedBlockApiKeys(content);
+      } catch {
+        return {};
+      }
+    },
+    save: async (apiKey: string, envName = AUTH_ENV_NAME) => {
       const nextKey = trimNonEmpty(apiKey);
       if (!nextKey) {
-        throw new Error("CYRENE_API_KEY cannot be empty.");
+        throw new Error(`${envName} cannot be empty.`);
       }
 
       const target = await getTarget();
       if (target.kind === "windows_user_env") {
-        await writeWindowsValue(nextKey);
+        await writeWindowsValue(nextKey, envName);
         return target;
       }
 
+      const existingValues =
+        target.kind === "fish_conf_d" || (await pathExists(target.path))
+          ? await (async () => {
+              try {
+                const content = await readText(target.path);
+                return target.kind === "fish_conf_d"
+                  ? parseManagedFishApiKeys(content)
+                  : parseManagedBlockApiKeys(content);
+              } catch {
+                return {} as ManagedAuthEnvValues;
+              }
+            })()
+          : ({} as ManagedAuthEnvValues);
+      const nextValues = normalizeManagedAuthEnvValues({
+        ...existingValues,
+        [envName]: nextKey,
+      });
+
       if (target.kind === "fish_conf_d") {
         await mkdirp(join(homeDir, ".config", "fish", "conf.d"));
-        await writeText(target.path, createManagedFishFile(nextKey));
+        await writeText(target.path, createManagedFishFile(nextValues));
         return target;
       }
 
       const existing = (await pathExists(target.path))
         ? await readText(target.path)
         : "";
-      await writeText(target.path, upsertManagedBlock(existing, nextKey));
+      await writeText(target.path, upsertManagedBlock(existing, nextValues));
       return target;
     },
-    clear: async () => {
+    clear: async (envName?: ManagedAuthEnvName) => {
       const target = await getTarget();
       if (target.kind === "windows_user_env") {
-        await writeWindowsValue(null);
+        if (envName) {
+          await writeWindowsValue(null, envName);
+        } else {
+          await Promise.all(
+            MANAGED_AUTH_ENV_NAMES.map(name => writeWindowsValue(null, name))
+          );
+        }
         return target;
       }
 
@@ -357,21 +468,63 @@ export const createUserScopedApiKeyStore = (
       }
 
       if (target.kind === "fish_conf_d") {
-        try {
-          await unlinkPath(target.path);
-        } catch {
-          // Ignore missing managed file on logout.
+        if (!envName) {
+          try {
+            await unlinkPath(target.path);
+          } catch {
+            // Ignore missing managed file on logout.
+          }
+          return target;
         }
+        const existingValues = parseManagedFishApiKeys(await readText(target.path));
+        const nextValues = normalizeManagedAuthEnvValues(
+          Object.fromEntries(
+            Object.entries(existingValues).filter(([name]) => name !== envName)
+          ) as ManagedAuthEnvValues
+        );
+        if (Object.keys(nextValues).length === 0) {
+          try {
+            await unlinkPath(target.path);
+          } catch {
+            // Ignore missing managed file on logout.
+          }
+          return target;
+        }
+        await writeText(target.path, createManagedFishFile(nextValues));
         return target;
       }
 
       const existing = await readText(target.path);
-      const nextContent = removeManagedBlock(existing).trim();
-      if (!nextContent) {
-        await writeText(target.path, "");
+      if (!envName) {
+        const nextContent = removeManagedBlock(existing).trim();
+        if (!nextContent) {
+          await writeText(target.path, "");
+          return target;
+        }
+        await writeText(target.path, `${nextContent}\n`);
         return target;
       }
-      await writeText(target.path, `${nextContent}\n`);
+
+      const existingValues = parseManagedBlockApiKeys(existing);
+      const nextValues = normalizeManagedAuthEnvValues(
+        Object.fromEntries(
+          Object.entries(existingValues).filter(([name]) => name !== envName)
+        ) as ManagedAuthEnvValues
+      );
+      if (Object.keys(nextValues).length === 0) {
+        try {
+          const nextContent = removeManagedBlock(existing).trim();
+          if (!nextContent) {
+            await writeText(target.path, "");
+            return target;
+          }
+          await writeText(target.path, `${nextContent}\n`);
+          return target;
+        } catch {
+          return target;
+        }
+      }
+      await writeText(target.path, upsertManagedBlock(existing, nextValues));
       return target;
     },
   };
@@ -379,11 +532,14 @@ export const createUserScopedApiKeyStore = (
 
 export const __internalUserScopedApiKeyStore = {
   AUTH_ENV_NAME,
+  MANAGED_AUTH_ENV_NAMES,
   MANAGED_BLOCK_START,
   MANAGED_BLOCK_END,
   createManagedShellBlock,
   createManagedFishFile,
+  parseManagedBlockApiKeys,
   parseManagedBlockApiKey,
+  parseManagedFishApiKeys,
   parseManagedFishApiKey,
   removeManagedBlock,
   upsertManagedBlock,

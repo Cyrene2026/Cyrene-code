@@ -25,7 +25,8 @@ const PROVIDER_ALIASES = {
 } as const;
 
 type ProviderAlias = keyof typeof PROVIDER_ALIASES;
-type ProviderFamily = "openai" | "gemini" | "anthropic";
+type ProviderFamily = "openai" | "gemini" | "anthropic" | "glm";
+type ManualProviderProfile = Exclude<ProviderProfile, "custom">;
 const PROVIDER_PROFILE_VALUES = ["openai", "gemini", "anthropic"] as const;
 
 type ParsedProvider = {
@@ -33,7 +34,9 @@ type ParsedProvider = {
   family: ProviderFamily;
 };
 
-const isProviderFamily = (value: string): value is ProviderFamily =>
+const isManualProviderProfile = (
+  value: string
+): value is ManualProviderProfile =>
   (PROVIDER_PROFILE_VALUES as readonly string[]).includes(value);
 
 const parseSseEventData = (rawEvent: string): string[] => {
@@ -47,7 +50,13 @@ const usagePayloadSchema = z.object({
   prompt_tokens: z.number().int().nonnegative(),
   completion_tokens: z.number().int().nonnegative(),
   total_tokens: z.number().int().nonnegative(),
-});
+  prompt_tokens_details: z
+    .object({
+      cached_tokens: z.number().int().nonnegative().optional(),
+    })
+    .passthrough()
+    .optional(),
+}).passthrough();
 
 const extractUsage = (payload: unknown): TokenUsage | null => {
   if (!payload || typeof payload !== "object" || !("usage" in payload)) {
@@ -63,10 +72,14 @@ const extractUsage = (payload: unknown): TokenUsage | null => {
 
   return {
     promptTokens: parsedUsage.data.prompt_tokens,
+    cachedTokens: parsedUsage.data.prompt_tokens_details?.cached_tokens,
     completionTokens: parsedUsage.data.completion_tokens,
     totalTokens: parsedUsage.data.total_tokens,
   };
 };
+
+const buildUsageSignature = (usage: TokenUsage) =>
+  `${usage.promptTokens}:${usage.cachedTokens ?? 0}:${usage.completionTokens}:${usage.totalTokens}`;
 
 const extractUsageEvent = (payload: unknown) => {
   const usage = extractUsage(payload);
@@ -74,12 +87,18 @@ const extractUsageEvent = (payload: unknown) => {
     return null;
   }
 
-  return JSON.stringify({
-    type: "usage",
-    promptTokens: usage.promptTokens,
-    completionTokens: usage.completionTokens,
-    totalTokens: usage.totalTokens,
-  });
+  return {
+    usage,
+    event: JSON.stringify({
+      type: "usage",
+      promptTokens: usage.promptTokens,
+      ...(typeof usage.cachedTokens === "number"
+        ? { cachedTokens: usage.cachedTokens }
+        : {}),
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+    }),
+  };
 };
 
 export const FILE_TOOL = {
@@ -395,7 +414,9 @@ const parseProviderBaseUrl = (provider: string): ParsedProvider => {
     ? "anthropic"
     : host.includes("generativelanguage.googleapis.com")
       ? "gemini"
-      : "openai";
+      : host.includes("bigmodel.cn") || host.includes("zhipuai.cn")
+        ? "glm"
+        : "openai";
 
   return {
     providerBaseUrl: normalized,
@@ -411,8 +432,14 @@ const resolveProviderFamily = (providerBaseUrl: string): ProviderFamily =>
 
 const resolveChatCompletionsUrl = (baseUrl: string) => {
   const normalized = normalizeProviderBaseUrl(baseUrl);
+  const family = resolveProviderFamily(normalized);
   if (normalized.endsWith("/chat/completions")) {
     return normalized;
+  }
+  if (family === "glm") {
+    return normalized.endsWith("/api/paas/v4") || normalized.endsWith("/v4")
+      ? `${normalized}/chat/completions`
+      : `${normalized}/chat/completions`;
   }
   if (normalized.endsWith("/openai")) {
     return `${normalized}/chat/completions`;
@@ -424,8 +451,14 @@ const resolveChatCompletionsUrl = (baseUrl: string) => {
 };
 const resolveModelsUrl = (baseUrl: string) => {
   const normalized = normalizeProviderBaseUrl(baseUrl);
+  const family = resolveProviderFamily(normalized);
   if (normalized.endsWith("/models")) {
     return normalized;
+  }
+  if (family === "glm") {
+    return normalized.endsWith("/api/paas/v4") || normalized.endsWith("/v4")
+      ? `${normalized}/models`
+      : `${normalized}/models`;
   }
   if (normalized.endsWith("/openai")) {
     return `${normalized}/models`;
@@ -658,6 +691,7 @@ async function* streamSseOpenAI(
   const decoder = new TextDecoder();
   let buffer = "";
   const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
+  let lastUsageSignature = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -695,7 +729,11 @@ async function* streamSseOpenAI(
           };
           const usageEvent = extractUsageEvent(parsed);
           if (usageEvent) {
-            yield usageEvent;
+            const signature = buildUsageSignature(usageEvent.usage);
+            if (signature !== lastUsageSignature) {
+              lastUsageSignature = signature;
+              yield usageEvent.event;
+            }
           }
           const choice = parsed.choices?.[0];
           const delta = choice?.delta;
@@ -1138,10 +1176,7 @@ export const fetchProviderModelCatalog = async (options: {
     throw new Error("Model fetch returned empty list.");
   }
 
-  const fallbackModel =
-    providerFamily === "anthropic"
-      ? "claude-3-7-sonnet-latest"
-      : "gpt-4o-mini";
+  const fallbackModel = resolveDefaultModelForFamily(providerFamily);
   const firstModel = models[0] ?? options.currentModel ?? fallbackModel;
   const selectedModel =
     (options.preferredModel && models.includes(options.preferredModel)
@@ -1169,7 +1204,11 @@ export type HttpQueryTransportOptions = {
 type ParsedHttpEnv = z.infer<typeof envSchema>;
 
 const resolveDefaultModelForFamily = (family: ProviderFamily) =>
-  family === "anthropic" ? "claude-3-7-sonnet-latest" : "gpt-4o-mini";
+  family === "anthropic"
+    ? "claude-3-7-sonnet-latest"
+    : family === "glm"
+      ? "glm-4-flash"
+      : "gpt-4o-mini";
 
 const resolveApiKeySourceForFamily = (
   family: ProviderFamily,
@@ -1180,6 +1219,9 @@ const resolveApiKeySourceForFamily = (
   }
   if (family === "gemini" && env.CYRENE_GEMINI_API_KEY) {
     return "CYRENE_GEMINI_API_KEY";
+  }
+  if (family === "glm") {
+    return env.CYRENE_API_KEY ? "CYRENE_API_KEY" : "none";
   }
   if (family === "openai" && env.CYRENE_OPENAI_API_KEY) {
     return "CYRENE_OPENAI_API_KEY";
@@ -1196,6 +1238,9 @@ const resolveApiKeyForFamily = (
   }
   if (family === "gemini") {
     return env.CYRENE_GEMINI_API_KEY ?? env.CYRENE_API_KEY;
+  }
+  if (family === "glm") {
+    return env.CYRENE_API_KEY;
   }
   return env.CYRENE_OPENAI_API_KEY ?? env.CYRENE_API_KEY;
 };
@@ -1308,7 +1353,7 @@ export const createHttpQueryTransport = (
   };
   const setProviderProfileOverride = (
     provider: string | undefined,
-    profile: ProviderFamily | null
+    profile: ManualProviderProfile | null
   ) => {
     const normalizedProvider = resolveProviderBaseUrl(provider);
     if (!normalizedProvider) {
@@ -1334,18 +1379,18 @@ export const createHttpQueryTransport = (
   const normalizeLoadedProviderProfiles = (
     profiles: Record<string, string | undefined> | undefined
   ): ProviderProfileOverrideMap => {
-    const normalizedEntries: Array<[string, ProviderFamily]> = [];
+    const normalizedEntries: Array<[string, ManualProviderProfile]> = [];
     for (const [provider, profile] of Object.entries(profiles ?? {})) {
       const normalizedProvider = resolveProviderBaseUrl(provider);
       if (!normalizedProvider) {
         continue;
       }
-      if (!profile || !isProviderFamily(profile)) {
+      if (!profile || !isManualProviderProfile(profile)) {
         continue;
       }
       normalizedEntries.push([normalizedProvider, profile]);
     }
-    return Object.fromEntries(normalizedEntries);
+    return Object.fromEntries(normalizedEntries) as ProviderProfileOverrideMap;
   };
   const resolvePersistedModels = () =>
     availableModels.length > 0
@@ -1481,9 +1526,10 @@ export const createHttpQueryTransport = (
         parsedEnv,
         resolveFamilyForProvider
       );
+      const vendor = family === "glm" ? "custom" : family;
       return {
         provider: normalizedProvider,
-        vendor: family,
+        vendor,
         keySource,
       };
     },
@@ -1498,10 +1544,8 @@ export const createHttpQueryTransport = (
       }
 
       const normalizedProfile = profile.trim().toLowerCase();
-      if (
-        normalizedProfile !== "custom" &&
-        !isProviderFamily(normalizedProfile)
-      ) {
+      const isCustomProfile = normalizedProfile === "custom";
+      if (!isCustomProfile && !isManualProviderProfile(normalizedProfile)) {
         return {
           ok: false,
           message:
@@ -1517,7 +1561,7 @@ export const createHttpQueryTransport = (
 
       setProviderProfileOverride(
         normalizedProvider,
-        normalizedProfile === "custom" ? null : normalizedProfile
+        isCustomProfile ? null : normalizedProfile
       );
       providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
 

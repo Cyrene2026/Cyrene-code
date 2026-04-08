@@ -261,7 +261,7 @@ describe("createHttpQueryTransport streaming usage", () => {
             [
               'data: {"choices":[{"delta":{"content":"hello"}}]}',
               "",
-              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}}',
+              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":9}}}',
               "",
               "data: [DONE]",
               "",
@@ -308,6 +308,91 @@ describe("createHttpQueryTransport streaming usage", () => {
       JSON.stringify({
         type: "usage",
         promptTokens: 11,
+        cachedTokens: 9,
+        completionTokens: 5,
+        totalTokens: 16,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("dedupes repeated usage snapshots while preserving later updates", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"hello"}}]}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":9}}}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":9}}}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":9}}}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(
+      async () =>
+        new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        })
+    ) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 11,
+        cachedTokens: 9,
+        completionTokens: 0,
+        totalTokens: 11,
+      }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 11,
+        cachedTokens: 9,
         completionTokens: 5,
         totalTokens: 16,
       }),
@@ -831,6 +916,101 @@ describe("createHttpQueryTransport streaming usage", () => {
       vendor: "gemini",
       keySource: "CYRENE_GEMINI_API_KEY",
     });
+  });
+
+  test("detects glm providers, reuses the generic key, and calls GLM endpoints", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"glm"}}]}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24,"prompt_tokens_details":{"cached_tokens":18}}}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url.endsWith("/models")) {
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "glm-4-flash" }],
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+      if (url.endsWith("/chat/completions")) {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://open.bigmodel.cn/api/paas/v4",
+        CYRENE_API_KEY: "glm-key",
+      },
+    });
+
+    expect(await transport.listModels()).toEqual(["glm-4-flash"]);
+    expect(transport.getModel()).toBe("glm-4-flash");
+    expect(transport.describeProvider?.()).toEqual({
+      provider: "https://open.bigmodel.cn/api/paas/v4",
+      vendor: "custom",
+      keySource: "CYRENE_API_KEY",
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls[0]?.url).toBe("https://open.bigmodel.cn/api/paas/v4/models");
+    expect(
+      (fetchCalls[0]?.init?.headers as Record<string, string>)?.Authorization
+    ).toBe("Bearer glm-key");
+    expect(fetchCalls[1]?.url).toBe(
+      "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    );
+    expect(
+      (fetchCalls[1]?.init?.headers as Record<string, string>)?.Authorization
+    ).toBe("Bearer glm-key");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "glm" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 20,
+        cachedTokens: 18,
+        completionTokens: 4,
+        totalTokens: 24,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
   });
 
   test("setProvider accepts gemini preset and uses provider-specific API key", async () => {

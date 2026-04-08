@@ -90,6 +90,7 @@ type UseChatAppParams = {
   auth?: {
     status: AuthStatus;
     getStatus: () => Promise<AuthStatus>;
+    getSavedApiKey?: (providerBaseUrl: string) => Promise<string | undefined>;
     saveLogin: (input: AuthLoginInput) => Promise<{
       ok: boolean;
       message: string;
@@ -167,6 +168,8 @@ type AuthPanelState = {
   providerBaseUrl: string;
   apiKey: string;
   model: string;
+  rememberedKeyAvailable: boolean;
+  usingRememberedKey: boolean;
   cursorOffset: number;
   error: string | null;
   info: string | null;
@@ -290,6 +293,7 @@ type RuntimeUsageSummary = {
   requestCount: number;
   stateUpdateCount: number;
   promptTokens: number;
+  cachedTokens: number;
   completionTokens: number;
   totalTokens: number;
 };
@@ -1912,6 +1916,7 @@ const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
   requestCount: 0,
   stateUpdateCount: 0,
   promptTokens: 0,
+  cachedTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
 });
@@ -1940,6 +1945,7 @@ const addUsageToRuntimeSummary = (
   ...summary,
   requestCount: summary.requestCount + 1,
   promptTokens: summary.promptTokens + usage.promptTokens,
+  cachedTokens: summary.cachedTokens + (usage.cachedTokens ?? 0),
   completionTokens: summary.completionTokens + usage.completionTokens,
   totalTokens: summary.totalTokens + usage.totalTokens,
 });
@@ -1967,13 +1973,26 @@ const maskApiKey = (apiKey: string) => {
   return `${"•".repeat(Math.max(4, apiKey.length - 4))}${apiKey.slice(-4)}`;
 };
 
-const formatAuthStatusMessage = (status: AuthStatus) => {
+const formatAuthStatusMessage = (
+  status: AuthStatus,
+  options?: {
+    hasRememberedKey?: boolean;
+  }
+) => {
+  const rememberedKeyLabel = options?.hasRememberedKey
+    ? status.credentialSource === "user_env"
+      ? "yes (active)"
+      : status.credentialSource === "process_env"
+        ? "yes (available but inactive)"
+        : "yes"
+    : "no";
   const lines = [
     "Auth status:",
     `mode: ${status.mode}`,
     `provider: ${status.provider}`,
     `model: ${status.model}`,
-    `credential source: ${status.credentialSource}`,
+    `active key source: ${status.credentialSource}`,
+    `remembered key for provider: ${rememberedKeyLabel}`,
     `persistence target: ${status.persistenceTarget?.label ?? "unavailable"}`,
     `persistence path: ${status.persistenceTarget?.path ?? "(none)"}`,
   ];
@@ -2083,6 +2102,8 @@ export const useChatApp = ({
     providerBaseUrl: "",
     apiKey: "",
     model: "gpt-4o-mini",
+    rememberedKeyAvailable: false,
+    usingRememberedKey: false,
     cursorOffset: 0,
     error: null,
     info: null,
@@ -3119,6 +3140,64 @@ export const useChatApp = ({
     return isUsableHttpProvider(currentProvider) ? currentProvider : "";
   };
 
+  const hydrateAuthPanelRememberedKey = async (
+    providerBaseUrl: string,
+    options?: {
+      infoPrefix?: string;
+      preferredStep?: Exclude<AuthPanelStep, "confirm">;
+      clearWhenMissing?: boolean;
+    }
+  ) => {
+    const normalizedProviderBaseUrl = providerBaseUrl.trim();
+    if (!normalizedProviderBaseUrl || !authRef.current?.getSavedApiKey) {
+      return;
+    }
+    const savedApiKey =
+      (await authRef.current.getSavedApiKey(normalizedProviderBaseUrl)) ?? "";
+    setAuthPanel(previous => {
+      if (!previous.active || previous.saving) {
+        return previous;
+      }
+      if (previous.providerBaseUrl.trim() !== normalizedProviderBaseUrl) {
+        return previous;
+      }
+      const nextStep =
+        savedApiKey.length > 0
+          ? "model"
+          : (options?.preferredStep ?? previous.step);
+      const infoLines = [
+        options?.infoPrefix?.trim(),
+        savedApiKey
+          ? "Using remembered API key for this provider. Press 4 at confirm to replace it."
+          : "",
+      ].filter(Boolean);
+      return {
+        ...previous,
+        apiKey:
+          savedApiKey.length > 0
+            ? savedApiKey
+            : options?.clearWhenMissing
+              ? ""
+              : previous.apiKey,
+        rememberedKeyAvailable: savedApiKey.length > 0,
+        usingRememberedKey: savedApiKey.length > 0,
+        step: nextStep,
+        cursorOffset:
+          nextStep === "provider"
+            ? previous.providerBaseUrl.length
+            : nextStep === "api_key"
+              ? (savedApiKey.length > 0
+                  ? savedApiKey.length
+                  : options?.clearWhenMissing
+                    ? 0
+                    : previous.apiKey.length)
+              : previous.model.length,
+        error: null,
+        info: infoLines.length > 0 ? infoLines.join(" ") : null,
+      };
+    });
+  };
+
   const getAuthPanelFieldValue = (panel: AuthPanelState) => {
     if (panel.step === "provider") {
       return panel.providerBaseUrl;
@@ -3140,6 +3219,14 @@ export const useChatApp = ({
       return {
         ...panel,
         providerBaseUrl: sanitizedValue,
+        rememberedKeyAvailable:
+          sanitizedValue === panel.providerBaseUrl
+            ? panel.rememberedKeyAvailable
+            : false,
+        usingRememberedKey:
+          sanitizedValue === panel.providerBaseUrl
+            ? panel.usingRememberedKey
+            : false,
         cursorOffset,
         error: null,
       };
@@ -3148,6 +3235,8 @@ export const useChatApp = ({
       return {
         ...panel,
         apiKey: sanitizedValue,
+        usingRememberedKey:
+          sanitizedValue === panel.apiKey ? panel.usingRememberedKey : false,
         cursorOffset,
         error: null,
       };
@@ -3175,6 +3264,28 @@ export const useChatApp = ({
     }));
   };
 
+  const startRememberedKeyReplacement = () => {
+    setAuthPanel(previous => {
+      if (
+        !previous.active ||
+        previous.saving ||
+        !previous.rememberedKeyAvailable ||
+        !previous.usingRememberedKey
+      ) {
+        return previous;
+      }
+      return {
+        ...previous,
+        step: "api_key",
+        apiKey: "",
+        usingRememberedKey: false,
+        cursorOffset: 0,
+        error: null,
+        info: "Enter a new API key. Saving will replace the remembered key for this provider.",
+      };
+    });
+  };
+
   const applyAuthProviderPreset = (presetKey: keyof typeof AUTH_PROVIDER_PRESETS) => {
     const preset = AUTH_PROVIDER_PRESETS[presetKey];
     if (!preset) {
@@ -3194,10 +3305,18 @@ export const useChatApp = ({
         ...previous,
         providerBaseUrl,
         step: "api_key",
-        cursorOffset: previous.apiKey.length,
+        apiKey: "",
+        rememberedKeyAvailable: false,
+        usingRememberedKey: false,
+        cursorOffset: 0,
         error: null,
         info: `Preset selected: ${preset.label} (${providerBaseUrl})`,
       };
+    });
+    void hydrateAuthPanelRememberedKey(providerBaseUrl, {
+      infoPrefix: `Preset selected: ${preset.label} (${providerBaseUrl})`,
+      preferredStep: "api_key",
+      clearWhenMissing: true,
     });
   };
 
@@ -3932,6 +4051,8 @@ export const useChatApp = ({
       providerBaseUrl: "",
       apiKey: "",
       model: getPreferredLoginModel(),
+      rememberedKeyAvailable: false,
+      usingRememberedKey: false,
       cursorOffset: 0,
       error: null,
       info: null,
@@ -3993,6 +4114,8 @@ export const useChatApp = ({
       providerBaseUrl,
       apiKey: "",
       model,
+      rememberedKeyAvailable: false,
+      usingRememberedKey: false,
       cursorOffset: providerBaseUrl.length,
       error: null,
       info:
@@ -4004,6 +4127,12 @@ export const useChatApp = ({
     };
     authPanelRef.current = nextState;
     setAuthPanel(nextState);
+    if (providerBaseUrl) {
+      void hydrateAuthPanelRememberedKey(providerBaseUrl, {
+        preferredStep: "model",
+        clearWhenMissing: true,
+      });
+    }
   };
 
   const closeAuthPanel = (options?: { skipped?: boolean; silent?: boolean }) => {
@@ -4032,19 +4161,12 @@ export const useChatApp = ({
 
     if (panel.step === "provider") {
       const providerBaseUrl = panel.providerBaseUrl.trim();
+      let normalizedProviderBaseUrl = providerBaseUrl;
       try {
-        const normalized = normalizeProviderBaseUrl(providerBaseUrl);
-        const parsed = new URL(normalized);
+        normalizedProviderBaseUrl = normalizeProviderBaseUrl(providerBaseUrl);
+        const parsed = new URL(normalizedProviderBaseUrl);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
           throw new Error("Provider base URL must use http or https.");
-        }
-        if (normalized !== providerBaseUrl) {
-          setAuthPanel(previous => ({
-            ...previous,
-            providerBaseUrl: normalized,
-            cursorOffset: normalized.length,
-            error: null,
-          }));
         }
       } catch (error) {
         setAuthPanel(previous => ({
@@ -4056,7 +4178,21 @@ export const useChatApp = ({
         }));
         return;
       }
-      setAuthPanelStep("api_key");
+      setAuthPanel(previous => ({
+        ...previous,
+        providerBaseUrl: normalizedProviderBaseUrl,
+        apiKey: "",
+        rememberedKeyAvailable: false,
+        usingRememberedKey: false,
+        step: "api_key",
+        cursorOffset: 0,
+        error: null,
+        info: null,
+      }));
+      void hydrateAuthPanelRememberedKey(normalizedProviderBaseUrl, {
+        preferredStep: "api_key",
+        clearWhenMissing: true,
+      });
       return;
     }
 
@@ -4985,6 +5121,16 @@ export const useChatApp = ({
       }
 
       if (authPanelRef.current.step === "confirm") {
+        if (
+          !key.ctrl &&
+          !key.meta &&
+          inputValue === "4" &&
+          authPanelRef.current.rememberedKeyAvailable &&
+          authPanelRef.current.usingRememberedKey
+        ) {
+          startRememberedKeyReplacement();
+          return;
+        }
         if (!key.ctrl && !key.meta && /^[123]$/.test(inputValue)) {
           const index = Number(inputValue) - 1;
           const targetStep = AUTH_PANEL_STEPS[index];
@@ -5673,7 +5819,11 @@ export const useChatApp = ({
               onboardingAvailable: false,
               httpReady: transport.getProvider() !== "local-core",
             } as AuthStatus);
-        pushSystemMessage(formatAuthStatusMessage(nextStatus), {
+        const hasRememberedKey =
+          authRef.current?.getSavedApiKey && isUsableHttpProvider(nextStatus.provider)
+            ? Boolean(await authRef.current.getSavedApiKey(nextStatus.provider))
+            : false;
+        pushSystemMessage(formatAuthStatusMessage(nextStatus, { hasRememberedKey }), {
           kind: "system_hint",
           tone: "info",
           color: "cyan",

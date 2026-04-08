@@ -1,7 +1,11 @@
 import { createHttpQueryTransport, fetchProviderModelCatalog, normalizeProviderBaseUrl } from "../http/createHttpQueryTransport";
 import { createLocalCoreTransport } from "../local/createLocalCoreTransport";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
-import { createUserScopedApiKeyStore, type UserScopedApiKeyStore } from "./userScopedApiKeyStore";
+import {
+  createUserScopedApiKeyStore,
+  type ManagedAuthEnvName,
+  type UserScopedApiKeyStore,
+} from "./userScopedApiKeyStore";
 import type {
   ProviderProfileOverrideMap,
   QueryTransport,
@@ -20,7 +24,9 @@ type ResolvedAuthState = {
   apiKey?: string;
   providerBaseUrl?: string;
   currentModel: string;
+  selectedApiKeyEnvName?: ManagedAuthEnvName;
   persistedApiKey?: string;
+  storedApiKeys: Partial<Record<ManagedAuthEnvName, string>>;
   hasExplicitProcessKey: boolean;
 };
 
@@ -46,6 +52,7 @@ export type AuthRuntimeMutationResult = {
 
 export type AuthRuntime = {
   getStatus: () => Promise<AuthStatus>;
+  getSavedApiKey: (providerBaseUrl: string) => Promise<string | undefined>;
   validateLoginInput: (input: AuthLoginInput) => Promise<AuthValidationResult>;
   saveLogin: (input: AuthLoginInput) => Promise<AuthRuntimeMutationResult>;
   logout: () => Promise<AuthRuntimeMutationResult>;
@@ -56,6 +63,44 @@ const trimNonEmpty = (value: string | undefined | null) => {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 };
+
+const GENERIC_API_KEY_ENV_NAME = "CYRENE_API_KEY" as const;
+const PROVIDER_API_KEY_ENV_BY_FAMILY = {
+  openai: "CYRENE_OPENAI_API_KEY",
+  gemini: "CYRENE_GEMINI_API_KEY",
+  anthropic: "CYRENE_ANTHROPIC_API_KEY",
+} as const satisfies Record<string, ManagedAuthEnvName>;
+type ProviderFamily = keyof typeof PROVIDER_API_KEY_ENV_BY_FAMILY | "glm";
+type ManagedAuthEnvValues = Partial<Record<ManagedAuthEnvName, string>>;
+
+const inferProviderFamilyFromBaseUrl = (
+  providerBaseUrl: string
+): ProviderFamily => {
+  const normalized = normalizeProviderBaseUrl(providerBaseUrl);
+  const host = new URL(normalized).hostname.toLowerCase();
+  return host.includes("anthropic.com")
+    ? "anthropic"
+    : host.includes("generativelanguage.googleapis.com")
+      ? "gemini"
+      : host.includes("bigmodel.cn") || host.includes("zhipuai.cn")
+        ? "glm"
+      : "openai";
+};
+
+const resolveProviderFamily = (
+  providerBaseUrl: string,
+  providerProfiles?: ProviderProfileOverrideMap
+): ProviderFamily => {
+  const normalized = normalizeProviderBaseUrl(providerBaseUrl);
+  return providerProfiles?.[normalized] ?? inferProviderFamilyFromBaseUrl(normalized);
+};
+
+const resolveApiKeyEnvNameForFamily = (
+  family: ProviderFamily
+): ManagedAuthEnvName =>
+  family === "glm"
+    ? GENERIC_API_KEY_ENV_NAME
+    : PROVIDER_API_KEY_ENV_BY_FAMILY[family];
 
 const formatPersistenceTarget = (status: AuthStatus) =>
   status.persistenceTarget
@@ -104,7 +149,108 @@ export const createAuthRuntime = (
   const fetchProviderModelCatalogImpl =
     options.fetchProviderModelCatalogImpl ?? fetchProviderModelCatalog;
 
-  let ownsProcessApiKey = false;
+  let runtimeApiKeyOverrides: ManagedAuthEnvValues = {};
+  let runtimeProviderBaseUrlOverride: string | undefined;
+  let runtimeModelOverride: string | undefined;
+
+  const readStoredApiKeys = async (): Promise<ManagedAuthEnvValues> => {
+    if (apiKeyStore.readAll) {
+      return Object.fromEntries(
+        Object.entries(await apiKeyStore.readAll()).filter(
+          (entry): entry is [ManagedAuthEnvName, string] => Boolean(trimNonEmpty(entry[1]))
+        )
+      ) as ManagedAuthEnvValues;
+    }
+    const genericApiKey = trimNonEmpty(await apiKeyStore.read());
+    return genericApiKey ? { [GENERIC_API_KEY_ENV_NAME]: genericApiKey } : {};
+  };
+
+  const resolveEffectiveApiKeyValue = (
+    envName: ManagedAuthEnvName,
+    storedApiKeys: ManagedAuthEnvValues
+  ) =>
+    trimNonEmpty(runtimeApiKeyOverrides[envName]) ??
+    trimNonEmpty(effectiveEnv[envName]) ??
+    trimNonEmpty(storedApiKeys[envName]);
+
+  const resolveRememberedApiKeyForProvider = (
+    providerBaseUrl: string | undefined,
+    storedApiKeys: ManagedAuthEnvValues,
+    providerProfiles?: ProviderProfileOverrideMap
+  ) => {
+    const family = providerBaseUrl
+      ? resolveProviderFamily(providerBaseUrl, providerProfiles)
+      : "openai";
+    const familyEnvName = resolveApiKeyEnvNameForFamily(family);
+    const familySpecificKey = trimNonEmpty(storedApiKeys[familyEnvName]);
+    if (familySpecificKey) {
+      return {
+        apiKey: familySpecificKey,
+        envName: familyEnvName,
+        source: "user_env",
+      } as const;
+    }
+
+    const genericKey = trimNonEmpty(storedApiKeys[GENERIC_API_KEY_ENV_NAME]);
+    if (!genericKey) {
+      return null;
+    }
+    return {
+      apiKey: genericKey,
+      envName: GENERIC_API_KEY_ENV_NAME,
+      source: "user_env",
+    } as const;
+  };
+
+  const resolveEffectiveApiKeyForProvider = (
+    providerBaseUrl: string | undefined,
+    storedApiKeys: ManagedAuthEnvValues,
+    providerProfiles?: ProviderProfileOverrideMap
+  ) => {
+    const family = providerBaseUrl
+      ? resolveProviderFamily(providerBaseUrl, providerProfiles)
+      : "openai";
+    const familyEnvName = resolveApiKeyEnvNameForFamily(family);
+    const familySpecificKey = resolveEffectiveApiKeyValue(familyEnvName, storedApiKeys);
+    if (familySpecificKey) {
+      const launchValue = trimNonEmpty(effectiveEnv[familyEnvName]);
+      const storedValue = trimNonEmpty(storedApiKeys[familyEnvName]);
+      const source =
+        runtimeApiKeyOverrides[familyEnvName] ||
+        (launchValue && storedValue && launchValue === storedValue)
+          ? "user_env"
+          : launchValue
+            ? "process_env"
+            : "user_env";
+      return {
+        apiKey: familySpecificKey,
+        envName: familyEnvName,
+        source,
+      } as const;
+    }
+
+    const genericKey = resolveEffectiveApiKeyValue(
+      GENERIC_API_KEY_ENV_NAME,
+      storedApiKeys
+    );
+    if (!genericKey) {
+      return null;
+    }
+    const launchValue = trimNonEmpty(effectiveEnv[GENERIC_API_KEY_ENV_NAME]);
+    const storedValue = trimNonEmpty(storedApiKeys[GENERIC_API_KEY_ENV_NAME]);
+    const source =
+      runtimeApiKeyOverrides[GENERIC_API_KEY_ENV_NAME] ||
+      (launchValue && storedValue && launchValue === storedValue)
+        ? "user_env"
+        : launchValue
+          ? "process_env"
+          : "user_env";
+    return {
+      apiKey: genericKey,
+      envName: GENERIC_API_KEY_ENV_NAME,
+      source,
+    } as const;
+  };
 
   const loadProviderMetadata = async (): Promise<LoadedProviderMetadata> => {
     try {
@@ -161,10 +307,11 @@ export const createAuthRuntime = (
   const resolveEffectiveAuth = async (): Promise<ResolvedAuthState> => {
     const persistenceTarget = await apiKeyStore.getTarget();
     const metadata = await loadProviderMetadata();
-    const processApiKey = trimNonEmpty(effectiveEnv.CYRENE_API_KEY);
-    const persistedApiKey = trimNonEmpty(await apiKeyStore.read());
-    const processProviderBaseUrl = trimNonEmpty(effectiveEnv.CYRENE_BASE_URL);
-    const processModel = trimNonEmpty(effectiveEnv.CYRENE_MODEL);
+    const storedApiKeys = await readStoredApiKeys();
+    const processProviderBaseUrl =
+      runtimeProviderBaseUrlOverride ?? trimNonEmpty(effectiveEnv.CYRENE_BASE_URL);
+    const processModel =
+      runtimeModelOverride ?? trimNonEmpty(effectiveEnv.CYRENE_MODEL);
     const providerBaseUrl =
       processProviderBaseUrl ??
       trimNonEmpty(metadata.providerBaseUrl);
@@ -176,18 +323,17 @@ export const createAuthRuntime = (
     let credentialSource: AuthStatus["credentialSource"] = "none";
     let apiKey: string | undefined;
     let hasExplicitProcessKey = false;
-
-    if (processApiKey) {
-      if (persistedApiKey && processApiKey === persistedApiKey) {
-        credentialSource = "user_env";
-      } else {
-        credentialSource = "process_env";
-        hasExplicitProcessKey = true;
-      }
-      apiKey = processApiKey;
-    } else if (persistedApiKey) {
-      credentialSource = "user_env";
-      apiKey = persistedApiKey;
+    let selectedApiKeyEnvName: ManagedAuthEnvName | undefined;
+    const resolvedApiKey = resolveEffectiveApiKeyForProvider(
+      providerBaseUrl,
+      storedApiKeys,
+      metadata.providerProfiles
+    );
+    if (resolvedApiKey?.apiKey) {
+      apiKey = resolvedApiKey.apiKey;
+      credentialSource = resolvedApiKey.source;
+      selectedApiKeyEnvName = resolvedApiKey.envName;
+      hasExplicitProcessKey = credentialSource === "process_env";
     }
 
     return {
@@ -201,7 +347,12 @@ export const createAuthRuntime = (
       apiKey,
       providerBaseUrl,
       currentModel,
-      persistedApiKey,
+      selectedApiKeyEnvName,
+      persistedApiKey:
+        selectedApiKeyEnvName && storedApiKeys[selectedApiKeyEnvName]
+          ? storedApiKeys[selectedApiKeyEnvName]
+          : storedApiKeys[GENERIC_API_KEY_ENV_NAME],
+      storedApiKeys,
       hasExplicitProcessKey,
     };
   };
@@ -215,15 +366,37 @@ export const createAuthRuntime = (
       };
     }
 
+    const mergedEnv: NodeJS.ProcessEnv = {
+      ...effectiveEnv,
+      CYRENE_API_KEY: resolveEffectiveApiKeyValue(
+        GENERIC_API_KEY_ENV_NAME,
+        resolved.storedApiKeys
+      ),
+      CYRENE_OPENAI_API_KEY: resolveEffectiveApiKeyValue(
+        "CYRENE_OPENAI_API_KEY",
+        resolved.storedApiKeys
+      ),
+      CYRENE_GEMINI_API_KEY: resolveEffectiveApiKeyValue(
+        "CYRENE_GEMINI_API_KEY",
+        resolved.storedApiKeys
+      ),
+      CYRENE_ANTHROPIC_API_KEY: resolveEffectiveApiKeyValue(
+        "CYRENE_ANTHROPIC_API_KEY",
+        resolved.storedApiKeys
+      ),
+      CYRENE_BASE_URL:
+        runtimeProviderBaseUrlOverride ??
+        trimNonEmpty(effectiveEnv.CYRENE_BASE_URL) ??
+        resolved.providerBaseUrl,
+      CYRENE_MODEL:
+        runtimeModelOverride ??
+        trimNonEmpty(effectiveEnv.CYRENE_MODEL) ??
+        resolved.currentModel,
+    };
+
     return {
       resolved,
-      env: {
-        ...effectiveEnv,
-        CYRENE_API_KEY: resolved.apiKey,
-        CYRENE_BASE_URL:
-          resolved.providerBaseUrl ?? effectiveEnv.CYRENE_BASE_URL,
-        CYRENE_MODEL: resolved.currentModel,
-      } satisfies NodeJS.ProcessEnv,
+      env: mergedEnv,
     };
   };
 
@@ -274,12 +447,19 @@ export const createAuthRuntime = (
 
     const preferredModel = trimNonEmpty(input.model);
     try {
-      const resolved = await resolveEffectiveAuth();
+      const [resolved, metadata] = await Promise.all([
+        resolveEffectiveAuth(),
+        loadProviderMetadata(),
+      ]);
       const catalog = await fetchProviderModelCatalogImpl({
         baseUrl: normalizedProviderBaseUrl,
         apiKey,
         preferredModel,
         currentModel: preferredModel ?? resolved.currentModel ?? "gpt-4o-mini",
+        familyOverride: resolveProviderFamily(
+          normalizedProviderBaseUrl,
+          metadata.providerProfiles
+        ),
       });
       return {
         ok: true,
@@ -311,6 +491,28 @@ export const createAuthRuntime = (
     });
   };
 
+  const getSavedApiKey = async (providerBaseUrl: string) => {
+    const normalizedProviderBaseUrl = trimNonEmpty(providerBaseUrl);
+    if (!normalizedProviderBaseUrl) {
+      return undefined;
+    }
+    let normalized: string;
+    try {
+      normalized = normalizeProviderBaseUrl(normalizedProviderBaseUrl);
+    } catch {
+      return undefined;
+    }
+    const [storedApiKeys, metadata] = await Promise.all([
+      readStoredApiKeys(),
+      loadProviderMetadata(),
+    ]);
+    return resolveRememberedApiKeyForProvider(
+      normalized,
+      storedApiKeys,
+      metadata.providerProfiles
+    )?.apiKey;
+  };
+
   const saveLogin = async (
     input: AuthLoginInput
   ): Promise<AuthRuntimeMutationResult> => {
@@ -332,6 +534,11 @@ export const createAuthRuntime = (
     }
 
     const existingMetadata = await loadProviderMetadata();
+    const providerFamily = resolveProviderFamily(
+      validation.normalizedProviderBaseUrl,
+      existingMetadata.providerProfiles
+    );
+    const providerEnvName = resolveApiKeyEnvNameForFamily(providerFamily);
     const nextProviders = Array.from(
       new Set(
         [
@@ -355,17 +562,18 @@ export const createAuthRuntime = (
         env: effectiveEnv,
       }
     );
-    await apiKeyStore.save(input.apiKey);
-
-    if (!before.hasExplicitProcessKey) {
-      effectiveEnv.CYRENE_API_KEY = input.apiKey;
-      ownsProcessApiKey = true;
-    }
+    await apiKeyStore.save(input.apiKey, providerEnvName);
+    runtimeApiKeyOverrides = {
+      ...runtimeApiKeyOverrides,
+      [providerEnvName]: trimNonEmpty(input.apiKey),
+    };
+    runtimeProviderBaseUrlOverride = validation.normalizedProviderBaseUrl;
+    runtimeModelOverride = validation.selectedModel;
 
     const transport = await buildTransport();
     const status = await getStatus();
     const message = before.hasExplicitProcessKey
-      ? `Saved login to ${formatPersistenceTarget(status)}. An explicit CYRENE_API_KEY from this launch environment is still active for this run.`
+      ? `Saved login to ${formatPersistenceTarget(status)}. Switched the current run to the newly saved credential.`
       : `Saved login to ${formatPersistenceTarget(status)}. Switched to HTTP mode.`;
     return {
       ok: true,
@@ -378,15 +586,14 @@ export const createAuthRuntime = (
   const logout = async (): Promise<AuthRuntimeMutationResult> => {
     const before = await resolveEffectiveAuth();
     await apiKeyStore.clear();
-    if (ownsProcessApiKey) {
-      delete effectiveEnv.CYRENE_API_KEY;
-      ownsProcessApiKey = false;
-    }
+    runtimeApiKeyOverrides = {};
+    runtimeProviderBaseUrlOverride = undefined;
+    runtimeModelOverride = undefined;
 
     const transport = await buildTransport();
     const status = await getStatus();
     const message = before.hasExplicitProcessKey
-      ? "Removed the managed user-scoped API key. An explicit CYRENE_API_KEY from this launch environment is still active for this run."
+      ? "Removed the managed user-scoped API key. Reverted to the explicit CYRENE_API_KEY from this launch environment."
       : status.mode === "local"
         ? "Removed the managed user-scoped API key. Switched to local core."
         : "Removed the managed user-scoped API key.";
@@ -401,6 +608,7 @@ export const createAuthRuntime = (
 
   return {
     getStatus,
+    getSavedApiKey,
     validateLoginInput,
     saveLogin,
     logout,

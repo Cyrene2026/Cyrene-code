@@ -25,7 +25,18 @@ export type FileAction =
   | "git_diff"
   | "git_log"
   | "git_show"
-  | "git_blame";
+  | "git_blame"
+  | "ts_hover"
+  | "ts_definition"
+  | "ts_references"
+  | "ts_diagnostics"
+  | "ts_prepare_rename"
+  | "lsp_hover"
+  | "lsp_definition"
+  | "lsp_references"
+  | "lsp_document_symbols"
+  | "lsp_diagnostics"
+  | "lsp_prepare_rename";
 
 export type ShellSessionAction =
   | "open_shell"
@@ -209,6 +220,94 @@ export type GitBlameToolRequest = {
   endLine?: number;
 };
 
+export type TsHoverToolRequest = {
+  action: "ts_hover";
+  path: string;
+  line: number;
+  column: number;
+};
+
+export type TsDefinitionToolRequest = {
+  action: "ts_definition";
+  path: string;
+  line: number;
+  column: number;
+};
+
+export type TsReferencesToolRequest = {
+  action: "ts_references";
+  path: string;
+  line: number;
+  column: number;
+  maxResults?: number;
+};
+
+export type TsDiagnosticsToolRequest = {
+  action: "ts_diagnostics";
+  path: string;
+  maxResults?: number;
+};
+
+export type TsPrepareRenameToolRequest = {
+  action: "ts_prepare_rename";
+  path: string;
+  line: number;
+  column: number;
+  newName: string;
+  findInComments?: boolean;
+  findInStrings?: boolean;
+  maxResults?: number;
+};
+
+export type LspHoverToolRequest = {
+  action: "lsp_hover";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+};
+
+export type LspDefinitionToolRequest = {
+  action: "lsp_definition";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+};
+
+export type LspReferencesToolRequest = {
+  action: "lsp_references";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspDocumentSymbolsToolRequest = {
+  action: "lsp_document_symbols";
+  path: string;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspDiagnosticsToolRequest = {
+  action: "lsp_diagnostics";
+  path: string;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspPrepareRenameToolRequest = {
+  action: "lsp_prepare_rename";
+  path: string;
+  line: number;
+  column: number;
+  newName: string;
+  serverId?: string;
+  maxResults?: number;
+};
+
 export type FileToolRequest =
   | ReadFileToolRequest
   | ReadFilesToolRequest
@@ -236,7 +335,18 @@ export type FileToolRequest =
   | GitDiffToolRequest
   | GitLogToolRequest
   | GitShowToolRequest
-  | GitBlameToolRequest;
+  | GitBlameToolRequest
+  | TsHoverToolRequest
+  | TsDefinitionToolRequest
+  | TsReferencesToolRequest
+  | TsDiagnosticsToolRequest
+  | TsPrepareRenameToolRequest
+  | LspHoverToolRequest
+  | LspDefinitionToolRequest
+  | LspReferencesToolRequest
+  | LspDocumentSymbolsToolRequest
+  | LspDiagnosticsToolRequest
+  | LspPrepareRenameToolRequest;
 
 export type CommandToolRequest = {
   action: "run_command";
@@ -306,8 +416,21 @@ export type PendingReviewItem = {
   createdAt: string;
 };
 
+export type LspServerConfig = {
+  id: string;
+  command: string;
+  args: string[];
+  filePatterns: string[];
+  rootMarkers: string[];
+  workspaceRoot?: string;
+  initializationOptions?: unknown;
+  settings?: unknown;
+  env?: Record<string, string>;
+};
+
 export type RuleConfig = {
   workspaceRoot: string;
   maxReadBytes: number;
   requireReview: MpcAction[];
+  lspServers?: LspServerConfig[];
 };

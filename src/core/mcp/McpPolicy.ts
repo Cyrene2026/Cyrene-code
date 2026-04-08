@@ -25,6 +25,17 @@ const READ_ACTIONS = new Set<ToolRequest["action"]>([
   "git_log",
   "git_show",
   "git_blame",
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "ts_diagnostics",
+  "ts_prepare_rename",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_document_symbols",
+  "lsp_diagnostics",
+  "lsp_prepare_rename",
   "read_shell",
   "shell_status",
 ]);
@@ -75,6 +86,12 @@ export const getMcpToolCapabilities = (
     action === "find_symbol" ||
     action === "find_references" ||
     action === "search_text" ||
+    action === "ts_definition" ||
+    action === "ts_references" ||
+    action === "ts_prepare_rename" ||
+    action === "lsp_definition" ||
+    action === "lsp_references" ||
+    action === "lsp_prepare_rename" ||
     action === "search_text_context"
   ) {
     capabilities.add("search");

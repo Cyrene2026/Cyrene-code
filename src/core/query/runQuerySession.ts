@@ -579,6 +579,30 @@ const buildToolStatusMessage = (toolName: string, input: unknown) => {
     const symbol =
       pickTrimmedString(record, "symbol") ?? pickTrimmedString(record, "query");
     detail = symbol ? `symbol ${formatQuotedPreview(symbol)}` : undefined;
+  } else if (
+    action === "ts_hover" ||
+    action === "ts_definition" ||
+    action === "ts_references" ||
+    action === "lsp_hover" ||
+    action === "lsp_definition" ||
+    action === "lsp_references"
+  ) {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    detail =
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined;
+  } else if (action === "ts_prepare_rename" || action === "lsp_prepare_rename") {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    const newName = pickTrimmedString(record, "newName");
+    detail = [newName ? `to ${formatQuotedPreview(newName)}` : undefined,
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined]
+      .filter(Boolean)
+      .join(" ");
   } else if (action === "git_show") {
     const revision = pickTrimmedString(record, "revision");
     detail = revision ? `revision ${revision}` : undefined;
@@ -707,6 +731,49 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         path,
         startLine: pickFiniteNumber(record, "startLine"),
         endLine: pickFiniteNumber(record, "endLine"),
+      };
+    case "ts_hover":
+    case "ts_definition":
+    case "lsp_hover":
+    case "lsp_definition":
+      return {
+        action,
+        path,
+        line: pickFiniteNumber(record, "line"),
+        column: pickFiniteNumber(record, "column"),
+        serverId: pickTrimmedString(record, "serverId"),
+      };
+    case "ts_references":
+    case "lsp_references":
+      return {
+        action,
+        path,
+        line: pickFiniteNumber(record, "line"),
+        column: pickFiniteNumber(record, "column"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
+      };
+    case "ts_diagnostics":
+    case "lsp_document_symbols":
+    case "lsp_diagnostics":
+      return {
+        action,
+        path,
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
+      };
+    case "ts_prepare_rename":
+    case "lsp_prepare_rename":
+      return {
+        action,
+        path,
+        line: pickFiniteNumber(record, "line"),
+        column: pickFiniteNumber(record, "column"),
+        newName: pickTrimmedString(record, "newName"),
+        findInComments: pickBoolean(record, "findInComments"),
+        findInStrings: pickBoolean(record, "findInStrings"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
       };
     case "copy_path":
     case "move_path":
@@ -1159,6 +1226,9 @@ const buildHeuristicNudges = (
     recentResults.includes("[tool result] find_files ") ||
     recentResults.includes("[tool result] find_symbol ") ||
     recentResults.includes("[tool result] find_references ") ||
+    recentResults.includes("[tool result] lsp_definition ") ||
+    recentResults.includes("[tool result] lsp_references ") ||
+    recentResults.includes("[tool result] lsp_document_symbols ") ||
     recentResults.includes("[tool result] search_text ") ||
     recentResults.includes("[tool result] search_text_context ") ||
     recentResults.includes("[tool result] stat_path ")

@@ -151,6 +151,7 @@ export const ChatCliApp = ({
   const {
     items,
     liveAssistantText,
+    recentLocalCommand,
     input,
     inputCursorOffset,
     inputCommandState,
@@ -232,6 +233,7 @@ export const ChatCliApp = ({
     <ChatScreen
       items={items}
       liveAssistantText={liveAssistantText}
+      recentLocalCommand={recentLocalCommand}
       appRoot={runtimeAppRoot}
       input={input}
       inputCursorOffset={inputCursorOffset}

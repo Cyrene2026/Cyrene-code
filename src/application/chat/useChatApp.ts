@@ -37,6 +37,8 @@ import type {
 } from "../../core/session/types";
 import type {
   McpRuntime,
+  McpRuntimeLspServerDescriptor,
+  McpRuntimeLspServerInput,
   McpRuntimeSummary,
   McpServerDescriptor,
   McpRuntimeServerInput,
@@ -360,6 +362,14 @@ const COMMAND_SPECS: CommandSpec[] = [
   { command: "/mcp add stdio <id> <command...>", description: "add a stdio MCP server to project config" },
   { command: "/mcp add http <id> <url>", description: "add an HTTP MCP server to project config" },
   { command: "/mcp add filesystem <id> [workspace]", description: "add a filesystem MCP server to project config" },
+  { command: "/mcp lsp list [filesystem-server]", description: "list configured LSP servers for filesystem MCP servers" },
+  {
+    command:
+      "/mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...",
+    description: "add or update one LSP server config on a filesystem MCP server",
+  },
+  { command: "/mcp lsp remove <filesystem-server> <lsp-id>", description: "remove one LSP server config from a filesystem MCP server" },
+  { command: "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]", description: "inspect LSP matching and startup for one file path" },
   { command: "/mcp remove <id>", description: "remove one MCP server from active project config" },
   { command: "/mcp enable <id>", description: "enable one MCP server in project config" },
   { command: "/mcp disable <id>", description: "disable one MCP server in project config" },
@@ -607,6 +617,14 @@ const getSlashInsertValue = (command: string) => {
       return "/mcp add http ";
     case "/mcp add filesystem <id> [workspace]":
       return "/mcp add filesystem ";
+    case "/mcp lsp list [filesystem-server]":
+      return "/mcp lsp list ";
+    case "/mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...":
+      return "/mcp lsp add ";
+    case "/mcp lsp remove <filesystem-server> <lsp-id>":
+      return "/mcp lsp remove ";
+    case "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]":
+      return "/mcp lsp doctor ";
     case "/mcp remove <id>":
       return "/mcp remove ";
     case "/mcp enable <id>":
@@ -1356,6 +1374,13 @@ const formatMcpAliases = (aliases?: string[]) =>
 const formatMcpCapabilities = (tool: McpToolDescriptor) =>
   tool.capabilities.length > 0 ? tool.capabilities.join(", ") : "-";
 
+const formatMcpLspSummary = (server: McpServerDescriptor) =>
+  server.transport === "filesystem"
+    ? server.lsp && server.lsp.configuredCount > 0
+      ? `lsp ${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
+      : "lsp none configured"
+    : "";
+
 const resolveMcpServerDescriptor = (
   servers: McpServerDescriptor[],
   idOrAlias: string
@@ -1368,6 +1393,29 @@ const resolveMcpServerDescriptor = (
   );
 };
 
+const resolveFilesystemMcpServerDescriptor = (
+  servers: McpServerDescriptor[],
+  idOrAlias: string
+) => {
+  const server = resolveMcpServerDescriptor(servers, idOrAlias);
+  if (!server) {
+    return {
+      ok: false as const,
+      message: `MCP server not found: ${idOrAlias}`,
+    };
+  }
+  if (server.transport !== "filesystem") {
+    return {
+      ok: false as const,
+      message: `MCP server is not a filesystem server: ${server.id}`,
+    };
+  }
+  return {
+    ok: true as const,
+    server,
+  };
+};
+
 const formatMcpServerLine = (server: McpServerDescriptor) =>
   [
     `- ${server.id}`,
@@ -1377,6 +1425,7 @@ const formatMcpServerLine = (server: McpServerDescriptor) =>
     `health ${server.health}`,
     server.enabled ? "enabled" : "disabled",
     `tools ${server.tools.length}`,
+    formatMcpLspSummary(server),
     `aliases ${formatMcpAliases(server.aliases)}`,
   ]
     .filter(Boolean)
@@ -1402,6 +1451,41 @@ const formatMcpPendingLine = (item: PendingReviewItem) =>
     `path ${item.request.path}`,
     `risk ${getApprovalRisk(item.request.action)}`,
   ].join(" | ");
+
+const formatMcpToolSectionHeader = (server: McpServerDescriptor, toolCount: number) =>
+  [
+    `[${server.id}] ${server.label}`,
+    `tools ${toolCount}`,
+    formatMcpLspSummary(server),
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+const buildMcpToolSectionLines = (
+  server: McpServerDescriptor,
+  tools: McpToolDescriptor[]
+) => [
+  formatMcpToolSectionHeader(server, tools.length),
+  ...(server.transport === "filesystem" && (!server.lsp || server.lsp.configuredCount === 0)
+    ? ["tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server"]
+    : []),
+  ...(tools.length > 0 ? tools.map(formatMcpToolLine) : ["- (no tools registered)"]),
+];
+
+const formatMcpLspArgs = (args: string[]) => (args.length > 0 ? args.join(" ") : "(none)");
+
+const formatMcpLspListLine = (entry: McpRuntimeLspServerDescriptor) =>
+  [
+    `- ${entry.id}`,
+    `command ${entry.command}`,
+    `args ${formatMcpLspArgs(entry.args)}`,
+    `patterns ${entry.filePatterns.join(", ")}`,
+    `roots ${entry.rootMarkers.length > 0 ? entry.rootMarkers.join(", ") : "(none)"}`,
+    entry.workspaceRoot ? `workspace ${entry.workspaceRoot}` : "",
+    entry.envKeys.length > 0 ? `env_keys ${entry.envKeys.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
 
 const formatMcpRuntimeSummary = (
   summary: McpRuntimeSummary | undefined,
@@ -1432,7 +1516,7 @@ const formatMcpRuntimeSummary = (
     ...(summary?.editableConfigPath
       ? [`editable: ${summary.editableConfigPath}`]
       : []),
-    "commands: /mcp servers | /mcp server <id> | /mcp tools [server] | /mcp pending | /mcp add/remove/enable/disable/reload",
+    "commands: /mcp servers | /mcp server <id> | /mcp tools [server] | /mcp pending | /mcp add/remove/enable/disable/reload | /mcp lsp ...",
   ].join("\n");
 };
 
@@ -1562,6 +1646,195 @@ const parseMcpAddCommand = (
     ok: false,
     message:
       "Usage: /mcp add stdio <id> <command...> | /mcp add http <id> <url> | /mcp add filesystem <id> [workspace]",
+  };
+};
+
+type ParsedMcpLspCommand =
+  | {
+      ok: true;
+      action: "list";
+      filesystemServerId?: string;
+    }
+  | {
+      ok: true;
+      action: "add";
+      filesystemServerId: string;
+      input: McpRuntimeLspServerInput;
+    }
+  | {
+      ok: true;
+      action: "remove";
+      filesystemServerId: string;
+      lspServerId: string;
+    }
+  | {
+      ok: true;
+      action: "doctor";
+      filesystemServerId: string;
+      path: string;
+      lspServerId?: string;
+    }
+  | {
+      ok: false;
+      message: string;
+    };
+
+const MCP_LSP_LIST_USAGE = "Usage: /mcp lsp list [filesystem-server]";
+const MCP_LSP_ADD_USAGE =
+  "Usage: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...";
+const MCP_LSP_REMOVE_USAGE = "Usage: /mcp lsp remove <filesystem-server> <lsp-id>";
+const MCP_LSP_DOCTOR_USAGE =
+  "Usage: /mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]";
+
+const parseMcpLspCommand = (query: string): ParsedMcpLspCommand => {
+  const raw = query.slice("/mcp lsp ".length).trim();
+  const tokens = tokenizeInlineCommand(raw);
+  const action = (tokens[0] ?? "").toLowerCase();
+
+  if (action === "list") {
+    if (tokens.length > 2) {
+      return { ok: false, message: MCP_LSP_LIST_USAGE };
+    }
+    return {
+      ok: true,
+      action: "list",
+      filesystemServerId: tokens[1]?.trim() || undefined,
+    };
+  }
+
+  if (action === "remove") {
+    const filesystemServerId = tokens[1]?.trim();
+    const lspServerId = tokens[2]?.trim();
+    if (!filesystemServerId || !lspServerId || tokens.length !== 3) {
+      return { ok: false, message: MCP_LSP_REMOVE_USAGE };
+    }
+    return {
+      ok: true,
+      action: "remove",
+      filesystemServerId,
+      lspServerId,
+    };
+  }
+
+  if (action === "doctor") {
+    const filesystemServerId = tokens[1]?.trim();
+    const path = tokens[2]?.trim();
+    if (!filesystemServerId || !path) {
+      return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
+    }
+    let lspServerId: string | undefined;
+    for (let index = 3; index < tokens.length; index += 1) {
+      const token = tokens[index] ?? "";
+      if (token !== "--lsp") {
+        return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
+      }
+      const value = tokens[index + 1]?.trim();
+      if (!value) {
+        return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
+      }
+      lspServerId = value;
+      index += 1;
+    }
+    return {
+      ok: true,
+      action: "doctor",
+      filesystemServerId,
+      path,
+      lspServerId,
+    };
+  }
+
+  if (action === "add") {
+    const filesystemServerId = tokens[1]?.trim();
+    const lspServerId = tokens[2]?.trim();
+    if (!filesystemServerId || !lspServerId) {
+      return { ok: false, message: MCP_LSP_ADD_USAGE };
+    }
+
+    let command = "";
+    const args: string[] = [];
+    const filePatterns: string[] = [];
+    const rootMarkers: string[] = [];
+    let workspaceRoot: string | undefined;
+    const env: Record<string, string> = {};
+
+    for (let index = 3; index < tokens.length; index += 1) {
+      const token = tokens[index] ?? "";
+      const value = tokens[index + 1]?.trim();
+      if (
+        token !== "--command" &&
+        token !== "--arg" &&
+        token !== "--pattern" &&
+        token !== "--root" &&
+        token !== "--workspace" &&
+        token !== "--env"
+      ) {
+        return { ok: false, message: MCP_LSP_ADD_USAGE };
+      }
+      if (!value) {
+        return { ok: false, message: MCP_LSP_ADD_USAGE };
+      }
+
+      switch (token) {
+        case "--command":
+          command = value;
+          break;
+        case "--arg":
+          args.push(value);
+          break;
+        case "--pattern":
+          filePatterns.push(value);
+          break;
+        case "--root":
+          rootMarkers.push(value);
+          break;
+        case "--workspace":
+          workspaceRoot = value;
+          break;
+        case "--env": {
+          const separator = value.indexOf("=");
+          if (separator <= 0 || separator === value.length - 1) {
+            return {
+              ok: false,
+              message: `${MCP_LSP_ADD_USAGE}\ninvalid --env: expected KEY=VALUE`,
+            };
+          }
+          env[value.slice(0, separator)] = value.slice(separator + 1);
+          break;
+        }
+      }
+
+      index += 1;
+    }
+
+    if (!command || filePatterns.length === 0) {
+      return { ok: false, message: MCP_LSP_ADD_USAGE };
+    }
+
+    return {
+      ok: true,
+      action: "add",
+      filesystemServerId,
+      input: {
+        id: lspServerId,
+        command,
+        args,
+        filePatterns,
+        rootMarkers,
+        workspaceRoot,
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    message: [
+      MCP_LSP_LIST_USAGE,
+      MCP_LSP_ADD_USAGE,
+      MCP_LSP_REMOVE_USAGE,
+      MCP_LSP_DOCTOR_USAGE,
+    ].join("\n"),
   };
 };
 
@@ -1734,6 +2007,7 @@ export const useChatApp = ({
 }: UseChatAppParams) => {
   const [input, setInput] = useState("");
   const [inputCursorOffset, setInputCursorOffset] = useState(0);
+  const [recentLocalCommand, setRecentLocalCommand] = useState<string | null>(null);
   const [status, setStatus] = useState<ChatStatus>("idle");
   const [items, setItems] = useState<ChatItem[]>([
     {
@@ -1847,9 +2121,6 @@ export const useChatApp = ({
   const lastApprovalIntentRef = useRef<{ token: string; at: number } | null>(null);
   const lastApprovalHintRef = useRef<{ token: string; at: number } | null>(null);
   const lastActionIntentRef = useRef<{ token: string; at: number } | null>(null);
-  const lastCommandEchoIntentRef = useRef<{ token: string; at: number } | null>(
-    null
-  );
   const suspendedTaskRef = useRef<SuspendedTaskState | null>(null);
   const activeTurnRef = useRef<ActiveTurnState | null>(null);
   const nextTurnRunIdRef = useRef(0);
@@ -3076,18 +3347,6 @@ export const useChatApp = ({
     token: string,
     cooldownMs = ACTION_REPEAT_COOLDOWN_MS
   ) => isRepeatedInteraction(lastActionIntentRef, token, cooldownMs);
-
-  const appendLocalCommandEcho = (commandText: string) => {
-    setItems(previous => [
-      ...previous,
-      {
-        role: "user",
-        text: commandText,
-        kind: "transcript",
-        tone: "neutral",
-      },
-    ]);
-  };
 
   const clearApprovalBlock = (
     state: ApprovalPanelState
@@ -5326,17 +5585,7 @@ export const useChatApp = ({
     }
 
     pushInputHistory(rawInput);
-
-    if (
-      query.startsWith("/") &&
-      !isRepeatedInteraction(
-        lastCommandEchoIntentRef,
-        `command-echo:${query}`,
-        ACTION_REPEAT_COOLDOWN_MS
-      )
-    ) {
-      appendLocalCommandEcho(query);
-    }
+    setRecentLocalCommand(query.startsWith("/") ? query : null);
 
     if (shellShortcutPreview.active) {
       if (!shellShortcutPreview.request) {
@@ -5467,9 +5716,6 @@ export const useChatApp = ({
         };
         providerPickerRef.current = nextState;
         setProviderPicker(nextState);
-        pushSystemMessage(
-          "Provider picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
-        );
       });
       clearInput();
       return;
@@ -5661,9 +5907,6 @@ export const useChatApp = ({
         };
         modelPickerRef.current = nextState;
         setModelPicker(nextState);
-        pushSystemMessage(
-          "Model picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel."
-        );
       });
       clearInput();
       return;
@@ -5911,10 +6154,6 @@ export const useChatApp = ({
           };
           sessionsPanelRef.current = nextState;
           setSessionsPanel(nextState);
-          pushSystemMessage(
-            "Sessions panel opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
-            { kind: "system_hint", tone: "info", color: "cyan" }
-          );
         }
         clearInput();
         return;
@@ -6192,18 +6431,28 @@ export const useChatApp = ({
         const servers = mcpService.listServers();
         const lines = servers.flatMap(server => {
           const tools = mcpService.listTools(server.id);
-          return [
-            `[${server.id}] ${server.label} | tools ${tools.length}`,
-            ...(tools.length > 0
-              ? tools.map(formatMcpToolLine)
-              : ["- (no tools registered)"]),
-          ];
+          return buildMcpToolSectionLines(server, tools);
         });
 
         pushSystemMessage(
           lines.length > 0
             ? ["MCP tools", ...lines].join("\n")
             : "No MCP tools registered.",
+          { kind: "system_hint", tone: "info", color: "cyan" }
+        );
+        clearInput();
+        return;
+      }
+
+      if (query === "/mcp lsp") {
+        pushSystemMessage(
+          [
+            "MCP LSP commands",
+            MCP_LSP_LIST_USAGE,
+            MCP_LSP_ADD_USAGE,
+            MCP_LSP_REMOVE_USAGE,
+            MCP_LSP_DOCTOR_USAGE,
+          ].join("\n"),
           { kind: "system_hint", tone: "info", color: "cyan" }
         );
         clearInput();
@@ -6266,6 +6515,160 @@ export const useChatApp = ({
         }
 
         const result = await mcpService.addServer(parsed.input);
+        pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+          tone: result.ok ? "info" : "danger",
+          color: result.ok ? "cyan" : "red",
+        });
+        clearInput();
+        return;
+      }
+
+      if (query.startsWith("/mcp lsp ")) {
+        const parsed = parseMcpLspCommand(query);
+        if (!parsed.ok) {
+          pushSystemMessage(parsed.message, {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const servers = mcpService.listServers();
+        const resolveTarget = (serverRef: string) => {
+          const resolved = resolveFilesystemMcpServerDescriptor(servers, serverRef);
+          if (!resolved.ok) {
+            pushSystemMessage(resolved.message, {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            });
+            clearInput();
+            return null;
+          }
+          return resolved.server;
+        };
+
+        if (parsed.action === "list") {
+          if (!mcpService.listLspServers) {
+            pushSystemMessage("MCP LSP listing is unavailable in this build.", {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            });
+            clearInput();
+            return;
+          }
+
+          const targetServer = parsed.filesystemServerId
+            ? resolveTarget(parsed.filesystemServerId)
+            : null;
+          if (parsed.filesystemServerId && !targetServer) {
+            return;
+          }
+
+          const filesystemServers = parsed.filesystemServerId
+            ? [targetServer!]
+            : servers.filter(server => server.transport === "filesystem");
+          const lspEntries = mcpService.listLspServers(targetServer?.id);
+          if (filesystemServers.length === 0) {
+            pushSystemMessage("No filesystem MCP servers registered.", {
+              kind: "system_hint",
+              tone: "neutral",
+              color: "white",
+            });
+            clearInput();
+            return;
+          }
+
+          const lines = filesystemServers.flatMap(server => {
+            const entries = lspEntries.filter(entry => entry.filesystemServerId === server.id);
+            return [
+              `[${
+                server.id
+              }] ${server.label} | workspace ${entries[0]?.filesystemWorkspaceRoot ?? "(unknown)"} | ${formatMcpLspSummary(server)}`,
+              ...(entries.length > 0
+                ? entries.map(formatMcpLspListLine)
+                : ["- (no configured lsp_servers)"]),
+            ];
+          });
+
+          pushSystemMessage(["MCP LSP servers", ...lines].join("\n"), {
+            kind: "system_hint",
+            tone: "info",
+            color: "cyan",
+          });
+          clearInput();
+          return;
+        }
+
+        if (parsed.action === "add") {
+          if (!mcpService.addLspServer) {
+            pushSystemMessage("MCP LSP management is unavailable in this build.", {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            });
+            clearInput();
+            return;
+          }
+          const targetServer = resolveTarget(parsed.filesystemServerId);
+          if (!targetServer) {
+            return;
+          }
+          const result = await mcpService.addLspServer(targetServer.id, parsed.input);
+          pushSystemMessage(result.message, {
+            kind: result.ok ? "system_hint" : "error",
+            tone: result.ok ? "info" : "danger",
+            color: result.ok ? "cyan" : "red",
+          });
+          clearInput();
+          return;
+        }
+
+        if (parsed.action === "remove") {
+          if (!mcpService.removeLspServer) {
+            pushSystemMessage("MCP LSP management is unavailable in this build.", {
+              kind: "error",
+              tone: "danger",
+              color: "red",
+            });
+            clearInput();
+            return;
+          }
+          const targetServer = resolveTarget(parsed.filesystemServerId);
+          if (!targetServer) {
+            return;
+          }
+          const result = await mcpService.removeLspServer(targetServer.id, parsed.lspServerId);
+          pushSystemMessage(result.message, {
+            kind: result.ok ? "system_hint" : "error",
+            tone: result.ok ? "info" : "danger",
+            color: result.ok ? "cyan" : "red",
+          });
+          clearInput();
+          return;
+        }
+
+        if (!mcpService.doctorLsp) {
+          pushSystemMessage("MCP LSP doctor is unavailable in this build.", {
+            kind: "error",
+            tone: "danger",
+            color: "red",
+          });
+          clearInput();
+          return;
+        }
+
+        const targetServer = resolveTarget(parsed.filesystemServerId);
+        if (!targetServer) {
+          return;
+        }
+        const result = await mcpService.doctorLsp(targetServer.id, parsed.path, {
+          lspServerId: parsed.lspServerId,
+        });
         pushSystemMessage(result.message, {
           kind: result.ok ? "system_hint" : "error",
           tone: result.ok ? "info" : "danger",
@@ -6401,6 +6804,13 @@ export const useChatApp = ({
             `health: ${server.health}`,
             `enabled: ${server.enabled ? "true" : "false"}`,
             `aliases: ${formatMcpAliases(server.aliases)}`,
+            `lsp: ${
+              server.transport === "filesystem"
+                ? server.lsp && server.lsp.configuredCount > 0
+                  ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
+                  : "none configured"
+                : "n/a"
+            }`,
             `tools: ${tools.length}`,
           ].join("\n"),
           { kind: "system_hint", tone: "info", color: "cyan" }
@@ -6433,9 +6843,21 @@ export const useChatApp = ({
         pushSystemMessage(
           [
             `MCP tools for ${server.id}`,
-            ...(tools.length > 0
-              ? tools.map(formatMcpToolLine)
-              : ["- (no tools registered)"]),
+            ...(server.transport === "filesystem"
+              ? [
+                  `lsp: ${
+                    server.lsp && server.lsp.configuredCount > 0
+                      ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
+                      : "none configured"
+                  }`,
+                  ...((!server.lsp || server.lsp.configuredCount === 0)
+                    ? [
+                        "tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server",
+                      ]
+                    : []),
+                ]
+              : []),
+            ...(tools.length > 0 ? tools.map(formatMcpToolLine) : ["- (no tools registered)"]),
           ].join("\n"),
           { kind: "system_hint", tone: "info", color: "cyan" }
         );
@@ -6722,10 +7144,6 @@ export const useChatApp = ({
           };
           resumePickerRef.current = nextState;
           setResumePicker(nextState);
-          pushSystemMessage(
-            "Resume picker opened: Up/Down select, Left/Right page, Enter resume, Esc cancel.",
-            { kind: "system_hint", tone: "info", color: "cyan" }
-          );
         }
         clearInput();
         return;
@@ -7163,6 +7581,7 @@ export const useChatApp = ({
     shellSession,
     items,
     liveAssistantText,
+    recentLocalCommand,
     status,
     sessionState,
     usage: sessionState?.usage ?? null,

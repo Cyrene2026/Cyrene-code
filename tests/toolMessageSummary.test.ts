@@ -5,16 +5,27 @@ import {
 } from "../src/application/chat/toolMessageSummary";
 
 describe("toolMessageSummary", () => {
-  test("summarizes tool result to a single readable line", () => {
+  test("summarizes file mutations with full diff lines", () => {
     const result = summarizeToolMessage(
-      "[tool result] create_file test_files/u4.py\nCreated file: test_files/u4.py"
+      [
+        "[tool result] create_file test_files/u4.py",
+        "Created file: test_files/u4.py",
+        "[confirmed file mutation] create_file test_files/u4.py",
+        "postcondition: file now exists and content was written successfully",
+        "diff_stats: +1 -0",
+        "[diff preview]",
+        "+    1 | print('ok')",
+        "+    2 | print('still ok')",
+      ].join("\n")
     );
 
     expect(result.kind).toBe("tool_status");
     expect(result.tone).toBe("info");
-    expect(result.text).toBe(
-      "Tool: create_file test_files/u4.py | Created file: test_files/u4.py"
+    expect(result.text).toContain(
+      "Tool: create_file test_files/u4.py | Created file: test_files/u4.py | +1 -0"
     );
+    expect(result.text).toContain("+    1 | print('ok')");
+    expect(result.text).toContain("+    2 | print('still ok')");
   });
 
   test("summarizes tool error to a single readable line", () => {

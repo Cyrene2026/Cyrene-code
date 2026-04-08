@@ -92,12 +92,18 @@ describe("config loaders", () => {
     ]);
   });
 
-  test("loadFilesystemRuleConfig default review list keeps write_shell but not open_shell", async () => {
+  test("loadFilesystemRuleConfig default review list keeps dangerous ops but skips normal file writes", async () => {
     const root = await createWorkspace("");
 
     const config = await loadFilesystemRuleConfig(root);
 
     expect(config.workspaceRoot).toBe(root);
+    expect(config.requireReview).not.toContain("create_file");
+    expect(config.requireReview).not.toContain("write_file");
+    expect(config.requireReview).not.toContain("edit_file");
+    expect(config.requireReview).not.toContain("apply_patch");
+    expect(config.requireReview).toContain("delete_file");
+    expect(config.requireReview).toContain("run_command");
     expect(config.requireReview).toContain("write_shell");
     expect(config.requireReview).not.toContain("open_shell");
   });
@@ -194,6 +200,13 @@ describe("config loaders", () => {
         "    workspace_root: ./packages/app",
         "    max_read_bytes: 8192",
         "    require_review: [write_file, run_command]",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: rust-analyzer",
+        "        file_patterns: [\"**/*.rs\"]",
+        "        root_markers: [Cargo.toml, .git]",
+        "        env:",
+        "          RUST_LOG: info",
       ].join("\n"),
       "utf8"
     );
@@ -226,6 +239,18 @@ describe("config loaders", () => {
         workspaceRoot: join(root, "packages", "app"),
         maxReadBytes: 8192,
         requireReview: ["write_file", "run_command"],
+        lspServers: [
+          {
+            id: "rust",
+            command: "rust-analyzer",
+            args: [],
+            filePatterns: ["**/*.rs"],
+            rootMarkers: ["Cargo.toml", ".git"],
+            env: {
+              RUST_LOG: "info",
+            },
+          },
+        ],
       })
     );
     expect(
@@ -268,5 +293,42 @@ describe("config loaders", () => {
 
     expect(config.servers.some(server => server.id === "docs")).toBe(false);
     expect(config.editableConfigPath).toBe(join(root, ".cyrene", "mcp.yaml"));
+  });
+
+  test("loadMcpConfig treats explicit empty lsp_servers as clearing inherited LSP config", async () => {
+    const root = await createWorkspace("");
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await writeFile(
+      join(globalHome, "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: rust-analyzer",
+        "        file_patterns: [\"**/*.rs\"]",
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    lsp_servers: []",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = await loadMcpConfig(undefined, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    expect(config.servers.find(server => server.id === "repo")?.lspServers).toEqual([]);
   });
 });

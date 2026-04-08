@@ -163,6 +163,50 @@ const parseListDirBody = (body: string) => {
   };
 };
 
+const FILE_MUTATION_ACTIONS = new Set([
+  "create_file",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+]);
+
+const DIFF_PREVIEW_LINE_PATTERN = /^[+-]\s+\d+\s+\|/;
+
+const summarizeFileMutationToolMessage = (detail: string, body: string) => {
+  const action = detail.split(/\s+/, 1)[0] ?? "";
+  if (!FILE_MUTATION_ACTIONS.has(action)) {
+    return null;
+  }
+
+  const lines = body
+    .split("\n")
+    .map(line => line.trimEnd())
+    .filter(line => line.trim().length > 0);
+  const resultLine = lines[0] ?? "";
+  if (!resultLine) {
+    return `Tool: ${detail}`;
+  }
+
+  const diffStats = getFieldValue(lines, "diff_stats");
+  const diffPreviewLines = lines
+    .filter(line => DIFF_PREVIEW_LINE_PATTERN.test(line))
+    .map(line => line);
+  const omittedRaw = getFieldValue(lines, "diff_preview_omitted");
+  const omitted = Number.parseInt(omittedRaw, 10);
+
+  let summary = `Tool: ${detail} | ${resultLine}`;
+  if (diffStats) {
+    summary += ` | ${diffStats}`;
+  }
+  if (diffPreviewLines.length > 0) {
+    summary += `\n${diffPreviewLines.join("\n")}`;
+  }
+  if (Number.isFinite(omitted) && omitted > 0) {
+    summary += `\n... ${omitted} more changed line(s)`;
+  }
+  return summary;
+};
+
 export const summarizeToolMessage = (raw: string): {
   text: string;
   kind: ChatItem["kind"];
@@ -196,6 +240,13 @@ export const summarizeToolMessage = (raw: string): {
       return {
         ...normalized,
         text: `Tool: ${detail} | ${bodyLine}`,
+      };
+    }
+    const fileMutationSummary = summarizeFileMutationToolMessage(detail, body);
+    if (fileMutationSummary) {
+      return {
+        ...normalized,
+        text: fileMutationSummary,
       };
     }
     let summary = `Tool: ${detail}`;

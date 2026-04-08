@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMcpRuntime } from "../src/core/mcp";
@@ -11,8 +12,34 @@ const createWorkspace = async () => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-runtime-"));
   tempRoots.push(root);
   await mkdir(join(root, ".cyrene"), { recursive: true });
-  return root;
+  const cyreneHome = join(root, "user-home");
+  await mkdir(cyreneHome, { recursive: true });
+  return { root, cyreneHome };
 };
+
+const getAvailablePort = () =>
+  new Promise<number>((resolvePort, rejectPort) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on("error", rejectPort);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close(() => {
+          rejectPort(new Error("Failed to allocate an ephemeral port."));
+        });
+        return;
+      }
+      const { port } = address;
+      probe.close(error => {
+        if (error) {
+          rejectPort(error);
+          return;
+        }
+        resolvePort(port);
+      });
+    });
+  });
 
 afterEach(async () => {
   await Promise.all(
@@ -27,9 +54,10 @@ afterEach(async () => {
 
 describe("createMcpRuntime", () => {
   test("loads configured http server, discovers tools and calls remote tool", async () => {
-    const root = await createWorkspace();
+    const { root, cyreneHome } = await createWorkspace();
+    const port = await getAvailablePort();
     const server = Bun.serve({
-      port: 0,
+      port,
       fetch: async request => {
         const payload = (await request.json()) as {
           id?: number;
@@ -129,12 +157,17 @@ describe("createMcpRuntime", () => {
         "servers:",
         "  - id: webdocs",
         "    transport: http",
-        `    url: "http://127.0.0.1:${server.port}/mcp"`,
+        `    url: "http://127.0.0.1:${port}/mcp"`,
       ].join("\n"),
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root);
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
 
     expect(runtime.listTools("webdocs")).toEqual(
       expect.arrayContaining([
@@ -155,8 +188,13 @@ describe("createMcpRuntime", () => {
   });
 
   test("runtime mutations persist project mcp config and refresh active servers", async () => {
-    const root = await createWorkspace();
-    const runtime = await createMcpRuntime(root);
+    const { root, cyreneHome } = await createWorkspace();
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
 
     const addResult = await runtime.addServer?.({
       id: "docs",
@@ -181,6 +219,125 @@ describe("createMcpRuntime", () => {
     const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
     expect(configText).toContain("remove_servers");
     expect(configText).toContain("- docs");
+
+    runtime.dispose();
+  });
+
+  test("builtin filesystem tool descriptors include semantic tool descriptions", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const tsHover = runtime.listTools("filesystem").find(tool => tool.name === "ts_hover");
+    const lspHover = runtime.listTools("filesystem").find(tool => tool.name === "lsp_hover");
+
+    expect(tsHover?.description).toBe(
+      "TypeScript/JavaScript quick info at an exact file position."
+    );
+    expect(lspHover?.description).toContain("configured `lsp_servers`");
+
+    runtime.dispose();
+  });
+
+  test("LSP mutations persist per-filesystem config and support explicit clearing", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await writeFile(
+      join(cyreneHome, "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: rust-analyzer",
+        "        file_patterns: [\"**/*.rs\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    expect(runtime.listLspServers?.("repo")).toEqual([
+      expect.objectContaining({
+        filesystemServerId: "repo",
+        id: "rust",
+        filePatterns: ["**/*.rs"],
+      }),
+    ]);
+
+    const addResult = await runtime.addLspServer?.("repo", {
+      id: "python",
+      command: "pyright-langserver",
+      args: ["--stdio"],
+      filePatterns: ["**/*.py"],
+      rootMarkers: ["pyproject.toml", ".git"],
+      env: {
+        PYRIGHT_PYTHON_FORCE_VERSION: "latest",
+      },
+    });
+    expect(addResult?.ok).toBe(true);
+    expect(
+      runtime.listLspServers?.("repo").map(entry => entry.id).sort()
+    ).toEqual(["python", "rust"]);
+
+    const removeRust = await runtime.removeLspServer?.("repo", "rust");
+    expect(removeRust?.ok).toBe(true);
+    expect(runtime.listLspServers?.("repo").map(entry => entry.id)).toEqual(["python"]);
+
+    const removePython = await runtime.removeLspServer?.("repo", "python");
+    expect(removePython?.ok).toBe(true);
+    expect(runtime.listLspServers?.("repo")).toEqual([]);
+
+    const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(configText).toContain("lsp_servers:");
+    expect(configText).toContain("[]");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp reports startup errors for invalid language-server commands", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn main() {}\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: definitely-not-a-real-lsp-binary",
+        "        file_patterns: [\"**/*.rs\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "src/demo.rs");
+
+    expect(result?.ok).toBe(false);
+    expect(result?.status).toBe("startup_error");
+    expect(result?.message).toContain("MCP LSP doctor");
+    expect(result?.message).toContain("status: startup_error");
+    expect(result?.message).toContain("definitely-not-a-real-lsp-binary");
 
     runtime.dispose();
   });

@@ -39,6 +39,10 @@ export type McpServerDescriptor = {
   health: "unknown" | "online" | "offline" | "error";
   transport?: McpServerTransport;
   aliases?: string[];
+  lsp?: {
+    configuredCount: number;
+    serverIds: string[];
+  };
   tools: McpToolDescriptor[];
 };
 
@@ -81,6 +85,42 @@ export type McpRuntimeServerInput = {
   tools?: McpRuntimeToolInput[];
 };
 
+export type McpRuntimeLspServerInput = {
+  id: string;
+  command: string;
+  args?: string[];
+  filePatterns: string[];
+  rootMarkers?: string[];
+  workspaceRoot?: string;
+  env?: Record<string, string>;
+};
+
+export type McpRuntimeLspServerDescriptor = {
+  filesystemServerId: string;
+  filesystemWorkspaceRoot: string;
+  id: string;
+  command: string;
+  args: string[];
+  filePatterns: string[];
+  rootMarkers: string[];
+  workspaceRoot?: string;
+  envKeys: string[];
+};
+
+export type McpRuntimeLspDoctorResult = {
+  ok: boolean;
+  status: "ready" | "config_error" | "startup_error";
+  filesystemServerId: string;
+  workspaceRoot: string;
+  inputPath: string;
+  resolvedPath: string;
+  configuredServerIds: string[];
+  matchedServerIds: string[];
+  selectedServerId?: string;
+  resolvedRoot?: string;
+  message: string;
+};
+
 export type McpRuntimeMutationResult = {
   ok: boolean;
   message: string;
@@ -114,5 +154,19 @@ export interface McpRuntime {
     serverId: string,
     enabled: boolean
   ): Promise<McpRuntimeMutationResult>;
+  listLspServers?(filesystemServerId?: string): McpRuntimeLspServerDescriptor[];
+  addLspServer?(
+    filesystemServerId: string,
+    input: McpRuntimeLspServerInput
+  ): Promise<McpRuntimeMutationResult>;
+  removeLspServer?(
+    filesystemServerId: string,
+    lspServerId: string
+  ): Promise<McpRuntimeMutationResult>;
+  doctorLsp?(
+    filesystemServerId: string,
+    path: string,
+    options?: { lspServerId?: string }
+  ): Promise<McpRuntimeLspDoctorResult>;
   dispose(): void;
 }

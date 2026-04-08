@@ -81,6 +81,12 @@ export class McpManager implements McpRuntime {
       health: "online",
       transport: "filesystem",
       aliases: Object.keys(buildFileServerAliases(serverId)),
+      lsp: ruleConfig.lspServers
+        ? {
+            configuredCount: ruleConfig.lspServers.length,
+            serverIds: ruleConfig.lspServers.map(entry => entry.id),
+          }
+        : undefined,
       tools: buildBuiltinToolDescriptors(serverId, ruleConfig),
     };
     const toolNames = new Set(descriptor.tools.map(tool => tool.name));

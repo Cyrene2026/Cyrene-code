@@ -35,6 +35,17 @@ import type {
   RuleConfig,
   SearchTextContextToolRequest,
   SearchTextToolRequest,
+  LspDefinitionToolRequest,
+  LspDiagnosticsToolRequest,
+  LspDocumentSymbolsToolRequest,
+  LspHoverToolRequest,
+  LspPrepareRenameToolRequest,
+  LspReferencesToolRequest,
+  TsDefinitionToolRequest,
+  TsDiagnosticsToolRequest,
+  TsHoverToolRequest,
+  TsPrepareRenameToolRequest,
+  TsReferencesToolRequest,
   ShellToolRequest,
   OpenShellToolRequest,
   WriteShellToolRequest,
@@ -46,6 +57,24 @@ import type {
   ToolRequest,
 } from "../../toolTypes";
 import { parseYamlDocument } from "../../simpleYaml";
+import {
+  TsServerClient,
+  type TsServerClientLike,
+  type TsServerDiagnostic,
+  type TsServerFileSpan,
+  type TsServerRenameLocation,
+} from "./tsserverClient";
+import {
+  LspManager,
+  pathFromLspUri,
+  type LspDiagnostic,
+  type LspDocumentSymbol,
+  type LspLocation,
+  type LspManagerLike,
+  type LspRange,
+  type LspTextEdit,
+  type LspWorkspaceEdit,
+} from "./lspClient";
 
 type HandleResult = {
   ok: boolean;
@@ -89,6 +118,8 @@ type FileMcpServiceOptions = {
   ) => Promise<string | CommandExecutionResult>;
   ptyFactory?: PtyFactory;
   shellSettleMs?: number;
+  tsServerClient?: TsServerClientLike;
+  lspManager?: LspManagerLike;
 };
 
 type CommandExecutionResult = {
@@ -211,7 +242,19 @@ const READ_ONLY_ACTIONS: FileAction[] = [
   "git_log",
   "git_show",
   "git_blame",
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "ts_diagnostics",
+  "ts_prepare_rename",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_document_symbols",
+  "lsp_diagnostics",
+  "lsp_prepare_rename",
 ];
+const TYPESCRIPT_LANGUAGE_EXTENSIONS = /\.(?:d\.)?(?:[cm]?[jt]sx?)$/i;
 const SHELL_MUTATING_COMMANDS = new Set([
   "rm",
   "remove-item",
@@ -300,6 +343,7 @@ const PENDING_CONFLICT_ACTIONS: FileAction[] = [
 ];
 const MAX_PREVIEW_SUMMARY_LINES = 24;
 const lineNoWidth = 4;
+const MAX_MUTATION_DIFF_MATRIX_CELLS = 40_000;
 
 const clip = (text: string, max = 320) =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
@@ -317,10 +361,12 @@ const countTextLines = (text: string) => {
 const formatConfirmedFileMutationReceipt = (
   action: "create_file" | "write_file" | "edit_file" | "apply_patch",
   path: string,
-  content: string,
+  beforeContent: string,
+  afterContent: string,
   postcondition: string
-) =>
-  [
+) => {
+  const diff = summarizeMutationDiff(beforeContent, afterContent);
+  return [
     `${
       action === "create_file"
         ? "Created file"
@@ -332,10 +378,170 @@ const formatConfirmedFileMutationReceipt = (
     }: ${path}`,
     `[confirmed file mutation] ${action} ${path}`,
     `postcondition: ${postcondition}`,
-    `bytes: ${Buffer.byteLength(content, "utf8")}`,
-    `lines: ${countTextLines(content)}`,
+    `bytes_before: ${Buffer.byteLength(beforeContent, "utf8")}`,
+    `bytes_after: ${Buffer.byteLength(afterContent, "utf8")}`,
+    `lines_before: ${countTextLines(beforeContent)}`,
+    `lines_after: ${countTextLines(afterContent)}`,
+    `diff_stats: +${diff.additions} -${diff.deletions}`,
+    ...(diff.previewLines.length > 0 ? ["[diff preview]", ...diff.previewLines] : []),
+    ...(diff.omitted > 0 ? [`diff_preview_omitted: ${diff.omitted}`] : []),
     "next: do not call read_file on this path just to confirm the write; continue unless explicit verification is required",
   ].join("\n");
+};
+
+const splitTextLinesForDiff = (text: string) => {
+  if (text.length === 0) {
+    return [] as string[];
+  }
+  const normalized = text.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
+};
+
+type MutationDiffEntry = {
+  kind: "equal" | "add" | "delete";
+  text: string;
+  lineNumber: number;
+};
+
+const getCommonPrefixLineCount = (beforeLines: string[], afterLines: string[]) => {
+  let index = 0;
+  while (
+    index < beforeLines.length &&
+    index < afterLines.length &&
+    beforeLines[index] === afterLines[index]
+  ) {
+    index += 1;
+  }
+  return index;
+};
+
+const getCommonSuffixLineCount = (
+  beforeLines: string[],
+  afterLines: string[],
+  prefixCount: number
+) => {
+  let suffix = 0;
+  while (
+    suffix < beforeLines.length - prefixCount &&
+    suffix < afterLines.length - prefixCount &&
+    beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  return suffix;
+};
+
+const buildMutationDiffEntries = (
+  beforeLines: string[],
+  afterLines: string[],
+  startLine: number
+): MutationDiffEntry[] => {
+  const rows = beforeLines.length;
+  const cols = afterLines.length;
+  if (rows === 0 && cols === 0) {
+    return [];
+  }
+
+  if (rows * cols > MAX_MUTATION_DIFF_MATRIX_CELLS) {
+    return [
+      ...beforeLines.map((text, index) => ({
+        kind: "delete" as const,
+        text,
+        lineNumber: startLine + index,
+      })),
+      ...afterLines.map((text, index) => ({
+        kind: "add" as const,
+        text,
+        lineNumber: startLine + index,
+      })),
+    ];
+  }
+
+  const matrix = Array.from({ length: rows + 1 }, () => new Uint16Array(cols + 1));
+  for (let row = 1; row <= rows; row += 1) {
+    for (let col = 1; col <= cols; col += 1) {
+      matrix[row]![col] =
+        beforeLines[row - 1] === afterLines[col - 1]
+          ? (matrix[row - 1]![col - 1] ?? 0) + 1
+          : Math.max(matrix[row - 1]![col] ?? 0, matrix[row]![col - 1] ?? 0);
+    }
+  }
+
+  const entries: MutationDiffEntry[] = [];
+  let row = rows;
+  let col = cols;
+  while (row > 0 && col > 0) {
+    if (beforeLines[row - 1] === afterLines[col - 1]) {
+      entries.push({
+        kind: "equal",
+        text: beforeLines[row - 1] ?? "",
+        lineNumber: startLine + row - 1,
+      });
+      row -= 1;
+      col -= 1;
+      continue;
+    }
+    if ((matrix[row - 1]![col] ?? 0) >= (matrix[row]![col - 1] ?? 0)) {
+      entries.push({
+        kind: "delete",
+        text: beforeLines[row - 1] ?? "",
+        lineNumber: startLine + row - 1,
+      });
+      row -= 1;
+      continue;
+    }
+    entries.push({
+      kind: "add",
+      text: afterLines[col - 1] ?? "",
+      lineNumber: startLine + col - 1,
+    });
+    col -= 1;
+  }
+  while (row > 0) {
+    entries.push({
+      kind: "delete",
+      text: beforeLines[row - 1] ?? "",
+      lineNumber: startLine + row - 1,
+    });
+    row -= 1;
+  }
+  while (col > 0) {
+    entries.push({
+      kind: "add",
+      text: afterLines[col - 1] ?? "",
+      lineNumber: startLine + col - 1,
+    });
+    col -= 1;
+  }
+  return entries.reverse();
+};
+
+const summarizeMutationDiff = (beforeContent: string, afterContent: string) => {
+  const beforeLines = splitTextLinesForDiff(beforeContent);
+  const afterLines = splitTextLinesForDiff(afterContent);
+  const prefixCount = getCommonPrefixLineCount(beforeLines, afterLines);
+  const suffixCount = getCommonSuffixLineCount(beforeLines, afterLines, prefixCount);
+  const beforeChanged = beforeLines.slice(prefixCount, beforeLines.length - suffixCount);
+  const afterChanged = afterLines.slice(prefixCount, afterLines.length - suffixCount);
+  const diffEntries = buildMutationDiffEntries(beforeChanged, afterChanged, prefixCount + 1);
+  const changedEntries = diffEntries.filter(entry => entry.kind !== "equal");
+  const previewLines = changedEntries.map(entry => {
+    const marker = entry.kind === "add" ? "+" : "-";
+    const lineNo = String(entry.lineNumber).padStart(lineNoWidth, " ");
+    return `${marker} ${lineNo} | ${entry.text}`;
+  });
+
+  return {
+    additions: changedEntries.filter(entry => entry.kind === "add").length,
+    deletions: changedEntries.filter(entry => entry.kind === "delete").length,
+    previewLines,
+    omitted: 0,
+  };
+};
 
 const lineNumberAtIndex = (text: string, index: number) =>
   text.slice(0, Math.max(0, index)).split("\n").length;
@@ -475,6 +681,39 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "git_blame":
     case "blame_git":
       return "git_blame";
+    case "ts_hover":
+    case "hover":
+    case "quickinfo":
+      return "ts_hover";
+    case "ts_definition":
+    case "definition":
+    case "go_to_definition":
+      return "ts_definition";
+    case "ts_references":
+    case "semantic_references":
+      return "ts_references";
+    case "ts_diagnostics":
+    case "diagnostics":
+      return "ts_diagnostics";
+    case "ts_prepare_rename":
+    case "prepare_rename":
+    case "rename_preview":
+      return "ts_prepare_rename";
+    case "lsp_hover":
+      return "lsp_hover";
+    case "lsp_definition":
+      return "lsp_definition";
+    case "lsp_references":
+      return "lsp_references";
+    case "lsp_document_symbols":
+    case "document_symbols":
+    case "lsp_symbols":
+      return "lsp_document_symbols";
+    case "lsp_diagnostics":
+      return "lsp_diagnostics";
+    case "lsp_prepare_rename":
+    case "lsp_rename_preview":
+      return "lsp_prepare_rename";
     case "run_shell":
     case "shell_command":
     case "terminal":
@@ -1006,17 +1245,27 @@ const buildNormalizedFileRequest = (
     pickString(record, ["query", "needle"]);
   const query = pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
   const revision = pickString(record, ["revision", "rev", "commit", "ref"]);
+  const newName = pickString(record, ["newName", "new_name", "renameTo", "rename_to"]);
+  const serverId = pickString(record, ["serverId", "server_id", "lspServer", "lsp_server"]);
   const jsonPath = pickString(record, ["jsonPath", "json_path", "pointer", "key"]);
   const yamlPath = pickString(record, ["yamlPath", "yaml_path", "pointer", "key"]);
   const maxResults = normalizeSearchLimit(
     pickNumber(record, ["maxResults", "max_results", "limit"])
   );
   const caseSensitive = pickBoolean(record, ["caseSensitive", "case_sensitive"]);
+  const findInComments = pickBoolean(record, ["findInComments", "find_in_comments"]);
+  const findInStrings = pickBoolean(record, ["findInStrings", "find_in_strings"]);
   const startLine = normalizePositiveInteger(
     pickNumber(record, ["startLine", "start_line", "lineStart", "line_start"])
   );
   const endLine = normalizePositiveInteger(
     pickNumber(record, ["endLine", "end_line", "lineEnd", "line_end"])
+  );
+  const line = normalizePositiveInteger(
+    pickNumber(record, ["line", "lineNumber", "line_number"])
+  );
+  const column = normalizePositiveInteger(
+    pickNumber(record, ["column", "col", "character", "offset"])
   );
   const before = normalizeNonNegativeInteger(
     pickNumber(record, ["before", "contextBefore", "context_before"])
@@ -1201,6 +1450,109 @@ const buildNormalizedFileRequest = (
         endLine: normalizedEnd,
       };
     }
+    case "ts_hover":
+    case "ts_definition":
+      if (!path || typeof line !== "number" || typeof column !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+      };
+    case "ts_references":
+      if (!path || typeof line !== "number" || typeof column !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        maxResults,
+      };
+    case "ts_diagnostics":
+      if (!path) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        maxResults,
+      };
+    case "ts_prepare_rename":
+      if (
+        !path ||
+        typeof line !== "number" ||
+        typeof column !== "number" ||
+        !newName
+      ) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        newName,
+        findInComments,
+        findInStrings,
+        maxResults,
+      };
+    case "lsp_hover":
+    case "lsp_definition":
+      if (!path || typeof line !== "number" || typeof column !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        serverId,
+      };
+    case "lsp_references":
+      if (!path || typeof line !== "number" || typeof column !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        serverId,
+        maxResults,
+      };
+    case "lsp_document_symbols":
+    case "lsp_diagnostics":
+      if (!path) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        serverId,
+        maxResults,
+      };
+    case "lsp_prepare_rename":
+      if (
+        !path ||
+        typeof line !== "number" ||
+        typeof column !== "number" ||
+        !newName
+      ) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        newName,
+        serverId,
+        maxResults,
+      };
     case "copy_path":
     case "move_path":
       if (!path || !destination) {
@@ -1435,6 +1787,10 @@ const normalizeToolInput = (
           ("destination" in normalized ? 2 : 0) +
           ("startLine" in normalized ? 2 : 0) +
           ("endLine" in normalized ? 2 : 0) +
+          ("line" in normalized ? 2 : 0) +
+          ("column" in normalized ? 2 : 0) +
+          ("newName" in normalized ? 2 : 0) +
+          ("serverId" in normalized && normalized.serverId ? 1 : 0) +
           ("jsonPath" in normalized && normalized.jsonPath ? 1 : 0) +
           ("yamlPath" in normalized && normalized.yamlPath ? 1 : 0) +
           ("pattern" in normalized ? 2 : 0) +
@@ -1527,6 +1883,41 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
         pickString(record, ["query", "needle"]);
       if (!symbol) {
         return "Invalid tool input for find_references: find_references requires `symbol`.";
+      }
+    }
+
+    if (
+      action === "ts_hover" ||
+      action === "ts_definition" ||
+      action === "ts_references" ||
+      action === "lsp_hover" ||
+      action === "lsp_definition" ||
+      action === "lsp_references"
+    ) {
+      const line = normalizePositiveInteger(
+        pickNumber(record, ["line", "lineNumber", "line_number"])
+      );
+      const column = normalizePositiveInteger(
+        pickNumber(record, ["column", "col", "character", "offset"])
+      );
+      if (typeof line !== "number" || typeof column !== "number") {
+        return `Invalid tool input for ${action}: ${action} requires positive integer \`line\` and \`column\`.`;
+      }
+    }
+
+    if (action === "ts_prepare_rename" || action === "lsp_prepare_rename") {
+      const line = normalizePositiveInteger(
+        pickNumber(record, ["line", "lineNumber", "line_number"])
+      );
+      const column = normalizePositiveInteger(
+        pickNumber(record, ["column", "col", "character", "offset"])
+      );
+      const newName = pickString(record, ["newName", "new_name", "renameTo", "rename_to"]);
+      if (typeof line !== "number" || typeof column !== "number") {
+        return `Invalid tool input for ${action}: ${action} requires positive integer \`line\` and \`column\`.`;
+      }
+      if (!newName) {
+        return `Invalid tool input for ${action}: ${action} requires \`newName\`.`;
       }
     }
 
@@ -1728,6 +2119,54 @@ const validateRequest = (request: ToolRequest): string | null => {
       }
       return null;
     }
+    case "ts_hover":
+    case "ts_definition":
+    case "ts_references":
+    case "lsp_hover":
+    case "lsp_definition":
+    case "lsp_references":
+      if (!Number.isInteger(request.line) || request.line <= 0) {
+        return `${request.action} requires a positive integer \`line\`.`;
+      }
+      if (!Number.isInteger(request.column) || request.column <= 0) {
+        return `${request.action} requires a positive integer \`column\`.`;
+      }
+      if (
+        (request.action === "ts_references" || request.action === "lsp_references") &&
+        typeof request.maxResults === "number" &&
+        (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
+      ) {
+        return `${request.action} requires \`maxResults\` to be a positive integer when provided.`;
+      }
+      return null;
+    case "ts_diagnostics":
+    case "lsp_document_symbols":
+    case "lsp_diagnostics":
+      if (
+        typeof request.maxResults === "number" &&
+        (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
+      ) {
+        return `${request.action} requires \`maxResults\` to be a positive integer when provided.`;
+      }
+      return null;
+    case "ts_prepare_rename":
+    case "lsp_prepare_rename":
+      if (!Number.isInteger(request.line) || request.line <= 0) {
+        return `${request.action} requires a positive integer \`line\`.`;
+      }
+      if (!Number.isInteger(request.column) || request.column <= 0) {
+        return `${request.action} requires a positive integer \`column\`.`;
+      }
+      if (!request.newName.trim()) {
+        return `${request.action} requires \`newName\`.`;
+      }
+      if (
+        typeof request.maxResults === "number" &&
+        (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
+      ) {
+        return `${request.action} requires \`maxResults\` to be a positive integer when provided.`;
+      }
+      return null;
     case "copy_path":
     case "move_path":
       if (!request.destination.trim()) {
@@ -1920,11 +2359,16 @@ export class FileMcpService {
   private undoHistory: UndoEntry[] = [];
   private suppressUndoRecording = false;
   private shellSession: ActiveShellSession | null = null;
+  private tsServerClient: TsServerClientLike | null;
+  private lspManager: LspManagerLike | null;
 
   constructor(
     private readonly rules: RuleConfig,
     private readonly options: FileMcpServiceOptions = {}
-  ) {}
+  ) {
+    this.tsServerClient = options.tsServerClient ?? null;
+    this.lspManager = options.lspManager ?? null;
+  }
 
   private toWorkspaceRelativePath(inputPath: string) {
     const raw = inputPath.trim();
@@ -1957,6 +2401,481 @@ export class FileMcpService {
       .replace(/\\/g, "/")
       .replace(/^\.\/+/, "");
     return normalized || ".";
+  }
+
+  private normalizeWorkspacePathFromAbsolute(absolutePath: string) {
+    const normalized = relative(resolve(this.rules.workspaceRoot), absolutePath)
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "");
+    return normalized || ".";
+  }
+
+  private getTsServerClient() {
+    if (!this.tsServerClient) {
+      this.tsServerClient = new TsServerClient({
+        workspaceRoot: this.rules.workspaceRoot,
+      });
+    }
+    return this.tsServerClient;
+  }
+
+  private invalidateTsServer(inputPath?: string) {
+    if (!this.tsServerClient) {
+      return;
+    }
+    if (!inputPath) {
+      this.tsServerClient.invalidate();
+      return;
+    }
+    try {
+      this.tsServerClient.invalidate(this.resolvePath(inputPath));
+    } catch {
+      this.tsServerClient.invalidate();
+    }
+  }
+
+  private async ensureTypescriptLanguageFile(path: string, absolutePath: string) {
+    const info = await stat(absolutePath);
+    if (!info.isFile()) {
+      throw new Error(`TypeScript semantic tools only support files: ${path}`);
+    }
+    if (!TYPESCRIPT_LANGUAGE_EXTENSIONS.test(path)) {
+      throw new Error(
+        `TypeScript semantic tools only support TS/JS files: ${path}`
+      );
+    }
+  }
+
+  private formatTsLocation(location: { line: number; offset: number }) {
+    return `${location.line}:${location.offset}`;
+  }
+
+  private formatTsWorkspacePath(absolutePath: string) {
+    return isPathInsideWorkspaceRoot(absolutePath, this.rules.workspaceRoot)
+      ? this.normalizeWorkspacePathFromAbsolute(absolutePath)
+      : absolutePath.replace(/\\/g, "/");
+  }
+
+  private async getFileLineSnippet(absolutePath: string, lineNumber: number) {
+    const content = await readFile(absolutePath, "utf8");
+    const line = splitFileLines(content)[lineNumber - 1] ?? "";
+    const trimmed = line.trim();
+    return trimmed ? clipSnippet(trimmed) : "(blank line)";
+  }
+
+  private async formatTsFileSpan(span: TsServerFileSpan) {
+    const absolutePath = resolve(span.file);
+    const workspacePath = this.formatTsWorkspacePath(absolutePath);
+    const snippet = await this.getFileLineSnippet(absolutePath, span.start.line).catch(
+      () => ""
+    );
+    return [
+      `${workspacePath}:${this.formatTsLocation(span.start)}-${this.formatTsLocation(span.end)}`,
+      snippet ? `| ${snippet}` : "",
+      span.unverified ? "[unverified]" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private formatTsTag(tag: { name: string; text?: string }) {
+    return `- @${tag.name}${tag.text ? ` ${tag.text}` : ""}`;
+  }
+
+  private formatTsDiagnostic(
+    diagnostic: TsServerDiagnostic,
+    category: "syntactic" | "semantic" | "suggestion"
+  ) {
+    const workspacePath = this.formatTsWorkspacePath(diagnostic.file);
+    const location = diagnostic.start
+      ? `:${diagnostic.start.line}:${diagnostic.start.offset}`
+      : "";
+    return `[${category}] ${workspacePath}${location} | ${diagnostic.category} TS${diagnostic.code} | ${diagnostic.text}`;
+  }
+
+  private buildTsRenameReplacement(
+    location: TsServerRenameLocation,
+    newName: string
+  ) {
+    return `${location.prefixText ?? ""}${newName}${location.suffixText ?? ""}`;
+  }
+
+  private async formatTsRenameLocation(
+    filePath: string,
+    location: TsServerRenameLocation,
+    newName: string
+  ) {
+    const absolutePath = resolve(filePath);
+    const workspacePath = this.formatTsWorkspacePath(absolutePath);
+    const snippet = await this.getFileLineSnippet(absolutePath, location.start.line).catch(
+      () => ""
+    );
+    return [
+      `${workspacePath}:${this.formatTsLocation(location.start)}-${this.formatTsLocation(location.end)}`,
+      `=> ${this.buildTsRenameReplacement(location, newName)}`,
+      snippet ? `| ${snippet}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private getTsLineStartOffsets(content: string) {
+    const offsets = [0];
+    for (let index = 0; index < content.length; index += 1) {
+      const char = content.charCodeAt(index);
+      if (char === 13) {
+        if (content.charCodeAt(index + 1) === 10) {
+          index += 1;
+        }
+        offsets.push(index + 1);
+        continue;
+      }
+      if (char === 10) {
+        offsets.push(index + 1);
+      }
+    }
+    return offsets;
+  }
+
+  private getTsLineEndIndex(
+    content: string,
+    lineStarts: number[],
+    lineNumber: number
+  ) {
+    const lineStart = lineStarts[lineNumber - 1];
+    if (typeof lineStart !== "number") {
+      throw new Error(`TypeScript rename location line out of range: ${lineNumber}`);
+    }
+    const nextLineStart =
+      lineNumber < lineStarts.length
+        ? (lineStarts[lineNumber] ?? content.length)
+        : content.length;
+    let lineEnd = nextLineStart;
+    if (lineEnd > lineStart && content[lineEnd - 1] === "\n") {
+      lineEnd -= 1;
+    }
+    if (lineEnd > lineStart && content[lineEnd - 1] === "\r") {
+      lineEnd -= 1;
+    }
+    return lineEnd;
+  }
+
+  private tsLocationToIndex(
+    content: string,
+    lineStarts: number[],
+    location: { line: number; offset: number }
+  ) {
+    if (
+      !Number.isInteger(location.line) ||
+      location.line < 1 ||
+      !Number.isInteger(location.offset) ||
+      location.offset < 1
+    ) {
+      throw new Error(
+        `Invalid TypeScript rename location: ${location.line}:${location.offset}`
+      );
+    }
+    const lineStart = lineStarts[location.line - 1];
+    if (typeof lineStart !== "number") {
+      throw new Error(`TypeScript rename location line out of range: ${location.line}`);
+    }
+    const lineEnd = this.getTsLineEndIndex(content, lineStarts, location.line);
+    const index = lineStart + location.offset - 1;
+    if (index > lineEnd) {
+      throw new Error(
+        `TypeScript rename location offset out of range: ${location.line}:${location.offset}`
+      );
+    }
+    return index;
+  }
+
+  private applyTsRenameLocationsToContent(
+    content: string,
+    locations: TsServerRenameLocation[],
+    newName: string
+  ) {
+    const lineStarts = this.getTsLineStartOffsets(content);
+    const edits = locations
+      .map(location => {
+        const start = this.tsLocationToIndex(content, lineStarts, location.start);
+        const end = this.tsLocationToIndex(content, lineStarts, location.end);
+        if (end < start) {
+          throw new Error(
+            `TypeScript rename span is invalid: ${this.formatTsLocation(location.start)}-${this.formatTsLocation(location.end)}`
+          );
+        }
+        return {
+          start,
+          end,
+          replacement: this.buildTsRenameReplacement(location, newName),
+        };
+      })
+      .sort((left, right) => right.start - left.start || right.end - left.end);
+
+    let nextContent = content;
+    let lastAppliedStart = Number.POSITIVE_INFINITY;
+    const seen = new Set<string>();
+    for (const edit of edits) {
+      const key = `${edit.start}:${edit.end}:${edit.replacement}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      if (edit.end > lastAppliedStart) {
+        throw new Error("TypeScript rename preview produced overlapping text spans.");
+      }
+      nextContent =
+        nextContent.slice(0, edit.start) +
+        edit.replacement +
+        nextContent.slice(edit.end);
+      lastAppliedStart = edit.start;
+    }
+    return nextContent;
+  }
+
+  private formatApplyPatchPlan(path: string, before: string, after: string) {
+    return [
+      `[apply_patch plan] ${path}`,
+      "```json",
+      JSON.stringify(
+        {
+          action: "apply_patch",
+          path,
+          find: before,
+          replace: after,
+        },
+        null,
+        2
+      ),
+      "```",
+    ].join("\n");
+  }
+
+  private getLspManager() {
+    if (!this.lspManager) {
+      this.lspManager = new LspManager(
+        this.rules.workspaceRoot,
+        this.rules.lspServers ?? []
+      );
+    }
+    return this.lspManager;
+  }
+
+  private invalidateLsp(inputPath?: string) {
+    if (!this.lspManager) {
+      return;
+    }
+    if (!inputPath) {
+      this.lspManager.invalidate();
+      return;
+    }
+    try {
+      this.lspManager.invalidate(this.resolvePath(inputPath));
+    } catch {
+      this.lspManager.invalidate();
+    }
+  }
+
+  private async ensureRegularFile(path: string, absolutePath: string, label: string) {
+    const info = await stat(absolutePath);
+    if (!info.isFile()) {
+      throw new Error(`${label} only support files: ${path}`);
+    }
+  }
+
+  private formatLspPosition(position: { line: number; character: number }) {
+    return `${position.line + 1}:${position.character + 1}`;
+  }
+
+  private formatLspRange(range: LspRange) {
+    return `${this.formatLspPosition(range.start)}-${this.formatLspPosition(range.end)}`;
+  }
+
+  private getAbsolutePathFromLspUri(uri: string) {
+    if (!uri.startsWith("file://")) {
+      return null;
+    }
+    return resolve(pathFromLspUri(uri));
+  }
+
+  private async formatLspLocation(location: LspLocation, suffix?: string) {
+    const absolutePath = this.getAbsolutePathFromLspUri(location.uri);
+    const workspacePath = absolutePath
+      ? this.formatTsWorkspacePath(absolutePath)
+      : location.uri;
+    const snippet = absolutePath
+      ? await this.getFileLineSnippet(absolutePath, location.range.start.line + 1).catch(
+          () => ""
+        )
+      : "";
+    return [
+      `${workspacePath}:${this.formatLspRange(location.range)}`,
+      suffix ?? "",
+      snippet ? `| ${snippet}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private formatLspDiagnostic(filePath: string, diagnostic: LspDiagnostic) {
+    const workspacePath = this.formatTsWorkspacePath(resolve(filePath));
+    const severity =
+      diagnostic.severity === 1
+        ? "error"
+        : diagnostic.severity === 2
+          ? "warning"
+          : diagnostic.severity === 3
+            ? "info"
+            : diagnostic.severity === 4
+              ? "hint"
+              : "unknown";
+    return [
+      `[${severity}] ${workspacePath}:${this.formatLspPosition(diagnostic.range.start)}`,
+      diagnostic.source ? `${diagnostic.source}` : "",
+      diagnostic.code !== undefined ? `${diagnostic.code}` : "",
+      `| ${diagnostic.message}`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private flattenLspDocumentSymbols(
+    symbols: LspDocumentSymbol[],
+    depth = 0
+  ): Array<{ symbol: LspDocumentSymbol; depth: number }> {
+    const entries: Array<{ symbol: LspDocumentSymbol; depth: number }> = [];
+    for (const symbol of symbols) {
+      entries.push({ symbol, depth });
+      if (symbol.children.length > 0) {
+        entries.push(...this.flattenLspDocumentSymbols(symbol.children, depth + 1));
+      }
+    }
+    return entries;
+  }
+
+  private formatLspDocumentSymbolEntry(symbol: LspDocumentSymbol, depth: number) {
+    const indent = "  ".repeat(depth);
+    const location = this.formatLspPosition(symbol.selectionRange?.start ?? symbol.range.start);
+    return [
+      `${indent}${symbol.name}`,
+      symbol.detail ? `(${symbol.detail})` : "",
+      `@ ${location}`,
+      symbol.containerName ? `[${symbol.containerName}]` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private lspPositionToIndex(
+    content: string,
+    lineStarts: number[],
+    position: { line: number; character: number }
+  ) {
+    if (
+      !Number.isInteger(position.line) ||
+      position.line < 0 ||
+      !Number.isInteger(position.character) ||
+      position.character < 0
+    ) {
+      throw new Error(
+        `Invalid LSP position: ${position.line}:${position.character}`
+      );
+    }
+    const lineStart = lineStarts[position.line];
+    if (typeof lineStart !== "number") {
+      throw new Error(`LSP position line out of range: ${position.line}`);
+    }
+    const nextLineStart =
+      position.line + 1 < lineStarts.length
+        ? (lineStarts[position.line + 1] ?? content.length)
+        : content.length;
+    let lineEnd = nextLineStart;
+    if (lineEnd > lineStart && content[lineEnd - 1] === "\n") {
+      lineEnd -= 1;
+    }
+    if (lineEnd > lineStart && content[lineEnd - 1] === "\r") {
+      lineEnd -= 1;
+    }
+    const index = lineStart + position.character;
+    if (index > lineEnd) {
+      throw new Error(
+        `LSP position character out of range: ${position.line}:${position.character}`
+      );
+    }
+    return index;
+  }
+
+  private applyLspTextEditsToContent(content: string, edits: LspTextEdit[]) {
+    const lineStarts = this.getTsLineStartOffsets(content);
+    const normalizedEdits = edits
+      .map(edit => {
+        const start = this.lspPositionToIndex(content, lineStarts, edit.range.start);
+        const end = this.lspPositionToIndex(content, lineStarts, edit.range.end);
+        if (end < start) {
+          throw new Error(
+            `LSP edit range is invalid: ${this.formatLspRange(edit.range)}`
+          );
+        }
+        return {
+          start,
+          end,
+          newText: edit.newText,
+        };
+      })
+      .sort((left, right) => right.start - left.start || right.end - left.end);
+
+    let nextContent = content;
+    let lastAppliedStart = Number.POSITIVE_INFINITY;
+    const seen = new Set<string>();
+    for (const edit of normalizedEdits) {
+      const key = `${edit.start}:${edit.end}:${edit.newText}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      if (edit.end > lastAppliedStart) {
+        throw new Error("LSP rename preview produced overlapping text edits.");
+      }
+      nextContent =
+        nextContent.slice(0, edit.start) +
+        edit.newText +
+        nextContent.slice(edit.end);
+      lastAppliedStart = edit.start;
+    }
+    return nextContent;
+  }
+
+  private collectLspWorkspaceEdits(workspaceEdit: LspWorkspaceEdit) {
+    const byUri = new Map<string, LspTextEdit[]>();
+    for (const [uri, edits] of Object.entries(workspaceEdit.changes)) {
+      if (edits.length === 0) {
+        continue;
+      }
+      byUri.set(uri, [...(byUri.get(uri) ?? []), ...edits]);
+    }
+    for (const change of workspaceEdit.documentChanges) {
+      if (change.kind === "resource") {
+        throw new Error(
+          `LSP rename preview does not support resource operations: ${change.operation}`
+        );
+      }
+      byUri.set(change.uri, [...(byUri.get(change.uri) ?? []), ...change.edits]);
+    }
+    return [...byUri.entries()].map(([uri, edits]) => ({ uri, edits }));
+  }
+
+  private async formatLspRenameEdit(uri: string, edit: LspTextEdit) {
+    const absolutePath = this.getAbsolutePathFromLspUri(uri);
+    if (!absolutePath) {
+      throw new Error(`LSP rename preview does not support non-file URI edits: ${uri}`);
+    }
+    return this.formatLspLocation(
+      {
+        uri,
+        range: edit.range,
+      },
+      `=> ${clipSnippet(edit.newText)}`
+    );
   }
 
   private async pathExists(inputPath: string) {
@@ -2734,6 +3653,10 @@ export class FileMcpService {
   dispose() {
     const session = this.shellSession;
     if (!session) {
+      this.tsServerClient?.dispose();
+      this.tsServerClient = null;
+      void this.lspManager?.dispose();
+      this.lspManager = null;
       return;
     }
     session.dataSubscription?.dispose();
@@ -2744,6 +3667,10 @@ export class FileMcpService {
       // Best effort cleanup on exit.
     }
     this.shellSession = null;
+    this.tsServerClient?.dispose();
+    this.tsServerClient = null;
+    void this.lspManager?.dispose();
+    this.lspManager = null;
   }
 
   private buildShellSpawnArgs(shell: PersistentShellFlavor) {
@@ -2999,6 +3926,8 @@ export class FileMcpService {
   private noteFilesystemMutation() {
     this.filesystemMutationVersion += 1;
     this.recentListDir.clear();
+    this.invalidateTsServer();
+    this.invalidateLsp();
   }
 
   private pushUndoEntry(entry: UndoEntry) {
@@ -3365,6 +4294,18 @@ export class FileMcpService {
     }
     if ("endLine" in request && typeof request.endLine === "number") {
       chunks.push(`endLine=${request.endLine}`);
+    }
+    if ("line" in request && typeof request.line === "number") {
+      chunks.push(`line=${request.line}`);
+    }
+    if ("column" in request && typeof request.column === "number") {
+      chunks.push(`column=${request.column}`);
+    }
+    if ("newName" in request && request.newName) {
+      chunks.push(`newName=${request.newName}`);
+    }
+    if ("serverId" in request && request.serverId) {
+      chunks.push(`serverId=${request.serverId}`);
     }
     if ("find" in request && request.find) {
       chunks.push(`find=${request.find}`);
@@ -4628,6 +5569,461 @@ export class FileMcpService {
     ].join("\n");
   }
 
+  private async executeTsHover(request: TsHoverToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+    const info = await this.getTsServerClient().hover(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    if (!info) {
+      return `(no TypeScript quick info at: ${request.path}:${request.line}:${request.column})`;
+    }
+
+    const sections = [
+      `kind: ${info.kind}${info.kindModifiers ? ` (${info.kindModifiers})` : ""}`,
+      `range: ${request.path}:${this.formatTsLocation(info.start)}-${this.formatTsLocation(info.end)}`,
+      info.displayString ? `display: ${info.displayString}` : "",
+      info.documentation ? `documentation:\n${info.documentation}` : "",
+      info.tags.length > 0 ? ["tags:", ...info.tags.map(tag => this.formatTsTag(tag))].join("\n") : "",
+    ].filter(Boolean);
+    return sections.join("\n");
+  }
+
+  private async executeTsDefinition(request: TsDefinitionToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+    const result = await this.getTsServerClient().definition(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    if (!result || result.definitions.length === 0) {
+      return `(no TypeScript definitions at: ${request.path}:${request.line}:${request.column})`;
+    }
+
+    const formattedDefinitions = await Promise.all(
+      result.definitions.map(definition => this.formatTsFileSpan(definition))
+    );
+    return [
+      `Found ${formattedDefinitions.length} TypeScript definition(s):`,
+      ...formattedDefinitions,
+    ].join("\n");
+  }
+
+  private async executeTsReferences(request: TsReferencesToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+    const result = await this.getTsServerClient().references(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    const refs = result?.refs ?? [];
+    const limitedRefs = refs.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
+    if (limitedRefs.length === 0) {
+      return `(no TypeScript references at: ${request.path}:${request.line}:${request.column})`;
+    }
+
+    return [
+      `Found ${limitedRefs.length} TypeScript reference(s):`,
+      ...(result?.symbolDisplayString
+        ? [`symbol: ${result.symbolDisplayString}`]
+        : result?.symbolName
+          ? [`symbol: ${result.symbolName}`]
+          : []),
+      ...limitedRefs.map(reference => {
+        const workspacePath = isPathInsideWorkspaceRoot(
+          reference.file,
+          this.rules.workspaceRoot
+        )
+          ? this.normalizeWorkspacePathFromAbsolute(reference.file)
+          : reference.file.replace(/\\/g, "/");
+        return [
+          `${workspacePath}:${this.formatTsLocation(reference.start)}-${this.formatTsLocation(reference.end)}`,
+          reference.isDefinition ? "[definition]" : "",
+          reference.isWriteAccess ? "[write]" : "[read]",
+          reference.lineText ? `| ${clipSnippet(reference.lineText)}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+      }),
+    ].join("\n");
+  }
+
+  private async executeTsDiagnostics(request: TsDiagnosticsToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+    const result = await this.getTsServerClient().diagnostics(absolutePath);
+    const entries = [
+      ...result.syntactic.map(diagnostic =>
+        this.formatTsDiagnostic(diagnostic, "syntactic")
+      ),
+      ...result.semantic.map(diagnostic =>
+        this.formatTsDiagnostic(diagnostic, "semantic")
+      ),
+      ...result.suggestion.map(diagnostic =>
+        this.formatTsDiagnostic(diagnostic, "suggestion")
+      ),
+    ];
+    const limitedEntries = entries.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
+    if (limitedEntries.length === 0) {
+      return `(no TypeScript diagnostics for: ${request.path})`;
+    }
+
+    return [
+      `Found ${limitedEntries.length} TypeScript diagnostic(s):`,
+      ...limitedEntries,
+    ].join("\n");
+  }
+
+  private async executeTsPrepareRename(request: TsPrepareRenameToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+    const result = await this.getTsServerClient().rename(
+      absolutePath,
+      request.line,
+      request.column,
+      {
+        findInComments: request.findInComments,
+        findInStrings: request.findInStrings,
+      }
+    );
+
+    if (!result) {
+      return `(TypeScript rename preview unavailable at: ${request.path}:${request.line}:${request.column})`;
+    }
+    if (!result.info.canRename) {
+      return `TypeScript rename unavailable: ${result.info.localizedErrorMessage}`;
+    }
+
+    const allLocations = result.locs.flatMap(group =>
+      group.locs.map(location => ({ file: group.file, location }))
+    );
+    const limitedLocations = allLocations.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    const formattedLocations = await Promise.all(
+      limitedLocations.map(entry =>
+        this.formatTsRenameLocation(entry.file, entry.location, request.newName)
+      )
+    );
+    const workspacePlanBlocks: string[] = [];
+    const skippedPlanPaths: string[] = [];
+    for (const group of result.locs) {
+      const groupAbsolutePath = resolve(group.file);
+      if (!isPathInsideWorkspaceRoot(groupAbsolutePath, this.rules.workspaceRoot)) {
+        skippedPlanPaths.push(this.formatTsWorkspacePath(groupAbsolutePath));
+        continue;
+      }
+      const before = await readFile(groupAbsolutePath, "utf8");
+      const after = this.applyTsRenameLocationsToContent(
+        before,
+        group.locs,
+        request.newName
+      );
+      if (before === after) {
+        continue;
+      }
+      workspacePlanBlocks.push(
+        this.formatApplyPatchPlan(
+          this.normalizeWorkspacePathFromAbsolute(groupAbsolutePath),
+          before,
+          after
+        )
+      );
+    }
+
+    const baseBody = [
+      `Prepared TypeScript rename preview:`,
+      `symbol: ${result.info.fullDisplayName || result.info.displayName}`,
+      `rename_to: ${request.newName}`,
+      `occurrences: ${allLocations.length}`,
+      `files: ${new Set(allLocations.map(entry => this.formatTsWorkspacePath(resolve(entry.file)))).size}`,
+      ...(typeof request.findInComments === "boolean"
+        ? [`include_comments: ${request.findInComments}`]
+        : []),
+      ...(typeof request.findInStrings === "boolean"
+        ? [`include_strings: ${request.findInStrings}`]
+        : []),
+      formattedLocations.length > 0 ? "edits:" : "",
+      ...formattedLocations,
+      `apply_patch_plan_files: ${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      ...(skippedPlanPaths.length > 0
+        ? [
+            `apply_patch_plan_skipped_outside_workspace: ${skippedPlanPaths.length}`,
+            ...skippedPlanPaths.slice(0, 5).map(path => `- ${path}`),
+            ...(skippedPlanPaths.length > 5
+              ? [`- ... ${skippedPlanPaths.length - 5} more path(s)`]
+              : []),
+          ]
+        : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    let inlinePlanCount = 0;
+    let omittedPlanCount = 0;
+    let body = baseBody.replace(
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: ${inlinePlanCount}/${workspacePlanBlocks.length}`
+    );
+    for (const planBlock of workspacePlanBlocks) {
+      const nextBody = `${body}\n${planBlock}`;
+      if (nextBody.length > MAX_COMMAND_OUTPUT_CHARS) {
+        omittedPlanCount += 1;
+        continue;
+      }
+      body = nextBody;
+      inlinePlanCount += 1;
+    }
+    body = body.replace(
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: ${inlinePlanCount}/${workspacePlanBlocks.length}`
+    );
+    if (omittedPlanCount > 0) {
+      const omissionLine = `apply_patch_plan_omitted_for_size: ${omittedPlanCount}`;
+      if (`${body}\n${omissionLine}`.length <= MAX_COMMAND_OUTPUT_CHARS) {
+        body = `${body}\n${omissionLine}`;
+      }
+    }
+    return body;
+  }
+
+  private async executeLspHover(request: LspHoverToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const info = await session.hover(absolutePath, request.line, request.column);
+    if (!info) {
+      return `(no LSP hover at: ${request.path}:${request.line}:${request.column})`;
+    }
+
+    return [
+      `server: ${session.getInfo().serverId}`,
+      info.range ? `range: ${request.path}:${this.formatLspRange(info.range)}` : "",
+      `contents:\n${info.contents}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async executeLspDefinition(request: LspDefinitionToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const definitions = await session.definition(absolutePath, request.line, request.column);
+    const limitedDefinitions = definitions.slice(0, DEFAULT_SEARCH_RESULTS);
+    if (limitedDefinitions.length === 0) {
+      return `(no LSP definitions at: ${request.path}:${request.line}:${request.column})`;
+    }
+    const formattedDefinitions = await Promise.all(
+      limitedDefinitions.map(definition => this.formatLspLocation(definition))
+    );
+    return [
+      `Found ${formattedDefinitions.length} LSP definition(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...formattedDefinitions,
+    ].join("\n");
+  }
+
+  private async executeLspReferences(request: LspReferencesToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const references = await session.references(absolutePath, request.line, request.column);
+    const limitedReferences = references.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    if (limitedReferences.length === 0) {
+      return `(no LSP references at: ${request.path}:${request.line}:${request.column})`;
+    }
+    const formattedReferences = await Promise.all(
+      limitedReferences.map(reference => this.formatLspLocation(reference))
+    );
+    return [
+      `Found ${formattedReferences.length} LSP reference(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...formattedReferences,
+    ].join("\n");
+  }
+
+  private async executeLspDocumentSymbols(request: LspDocumentSymbolsToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const symbols = await session.documentSymbols(absolutePath);
+    const flattened = this.flattenLspDocumentSymbols(symbols).slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    if (flattened.length === 0) {
+      return `(no LSP document symbols for: ${request.path})`;
+    }
+    return [
+      `Found ${flattened.length} LSP document symbol(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...flattened.map(entry =>
+        this.formatLspDocumentSymbolEntry(entry.symbol, entry.depth)
+      ),
+    ].join("\n");
+  }
+
+  private async executeLspDiagnostics(request: LspDiagnosticsToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const diagnostics = await session.diagnostics(absolutePath);
+    const limitedDiagnostics = diagnostics.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    if (limitedDiagnostics.length === 0) {
+      return `(no LSP diagnostics for: ${request.path})`;
+    }
+    return [
+      `Found ${limitedDiagnostics.length} LSP diagnostic(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...limitedDiagnostics.map(diagnostic =>
+        this.formatLspDiagnostic(absolutePath, diagnostic)
+      ),
+    ].join("\n");
+  }
+
+  private async executeLspPrepareRename(request: LspPrepareRenameToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const prepare = await session.prepareRename(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    if (!prepare) {
+      return `(LSP rename preview unavailable at: ${request.path}:${request.line}:${request.column})`;
+    }
+    const workspaceEdit = await session.rename(
+      absolutePath,
+      request.line,
+      request.column,
+      request.newName
+    );
+    if (!workspaceEdit) {
+      return `LSP rename unavailable: no workspace edit was returned.`;
+    }
+
+    const groupedEdits = this.collectLspWorkspaceEdits(workspaceEdit);
+    const allLocations = groupedEdits.flatMap(group =>
+      group.edits.map(edit => ({ uri: group.uri, edit }))
+    );
+    const limitedLocations = allLocations.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    const formattedLocations = await Promise.all(
+      limitedLocations.map(entry => this.formatLspRenameEdit(entry.uri, entry.edit))
+    );
+
+    const workspacePlanBlocks: string[] = [];
+    const skippedPlanPaths: string[] = [];
+    for (const group of groupedEdits) {
+      const filePath = this.getAbsolutePathFromLspUri(group.uri);
+      if (!filePath) {
+        throw new Error(
+          `LSP rename preview does not support non-file URI edits: ${group.uri}`
+        );
+      }
+      if (!isPathInsideWorkspaceRoot(filePath, this.rules.workspaceRoot)) {
+        skippedPlanPaths.push(this.formatTsWorkspacePath(filePath));
+        continue;
+      }
+      const before = await readFile(filePath, "utf8");
+      const after = this.applyLspTextEditsToContent(before, group.edits);
+      if (before === after) {
+        continue;
+      }
+      workspacePlanBlocks.push(
+        this.formatApplyPatchPlan(
+          this.normalizeWorkspacePathFromAbsolute(filePath),
+          before,
+          after
+        )
+      );
+    }
+
+    const baseBody = [
+      `Prepared LSP rename preview:`,
+      `server: ${session.getInfo().serverId}`,
+      `symbol: ${prepare.placeholder || "(unknown symbol)"}`,
+      `rename_to: ${request.newName}`,
+      `occurrences: ${allLocations.length}`,
+      `files: ${new Set(
+        allLocations.map(entry => {
+          const absolutePath = this.getAbsolutePathFromLspUri(entry.uri);
+          return absolutePath ? this.formatTsWorkspacePath(absolutePath) : entry.uri;
+        })
+      ).size}`,
+      formattedLocations.length > 0 ? "edits:" : "",
+      ...formattedLocations,
+      `apply_patch_plan_files: ${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      ...(skippedPlanPaths.length > 0
+        ? [
+            `apply_patch_plan_skipped_outside_workspace: ${skippedPlanPaths.length}`,
+            ...skippedPlanPaths.slice(0, 5).map(path => `- ${path}`),
+            ...(skippedPlanPaths.length > 5
+              ? [`- ... ${skippedPlanPaths.length - 5} more path(s)`]
+              : []),
+          ]
+        : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    let inlinePlanCount = 0;
+    let omittedPlanCount = 0;
+    let body = baseBody.replace(
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: ${inlinePlanCount}/${workspacePlanBlocks.length}`
+    );
+    for (const planBlock of workspacePlanBlocks) {
+      const nextBody = `${body}\n${planBlock}`;
+      if (nextBody.length > MAX_COMMAND_OUTPUT_CHARS) {
+        omittedPlanCount += 1;
+        continue;
+      }
+      body = nextBody;
+      inlinePlanCount += 1;
+    }
+    body = body.replace(
+      `apply_patch_plan_inline: 0/${workspacePlanBlocks.length}`,
+      `apply_patch_plan_inline: ${inlinePlanCount}/${workspacePlanBlocks.length}`
+    );
+    if (omittedPlanCount > 0) {
+      const omissionLine = `apply_patch_plan_omitted_for_size: ${omittedPlanCount}`;
+      if (`${body}\n${omissionLine}`.length <= MAX_COMMAND_OUTPUT_CHARS) {
+        body = `${body}\n${omissionLine}`;
+      }
+    }
+    return body;
+  }
+
   private async findGitRepoRoot(inputPath: string) {
     const workspaceRoot = resolve(this.rules.workspaceRoot);
     let current = this.resolvePath(inputPath);
@@ -5035,6 +6431,28 @@ export class FileMcpService {
         return this.executeGitShow(request);
       case "git_blame":
         return this.executeGitBlame(request);
+      case "ts_hover":
+        return this.executeTsHover(request);
+      case "ts_definition":
+        return this.executeTsDefinition(request);
+      case "ts_references":
+        return this.executeTsReferences(request);
+      case "ts_diagnostics":
+        return this.executeTsDiagnostics(request);
+      case "ts_prepare_rename":
+        return this.executeTsPrepareRename(request);
+      case "lsp_hover":
+        return this.executeLspHover(request);
+      case "lsp_definition":
+        return this.executeLspDefinition(request);
+      case "lsp_references":
+        return this.executeLspReferences(request);
+      case "lsp_document_symbols":
+        return this.executeLspDocumentSymbols(request);
+      case "lsp_diagnostics":
+        return this.executeLspDiagnostics(request);
+      case "lsp_prepare_rename":
+        return this.executeLspPrepareRename(request);
       case "create_file": {
         const content = request.content ?? "";
         await mkdir(dirname(abs), { recursive: true });
@@ -5048,6 +6466,7 @@ export class FileMcpService {
         return formatConfirmedFileMutationReceipt(
           request.action,
           request.path,
+          "",
           content,
           "file now exists and content was written successfully"
         );
@@ -5082,6 +6501,7 @@ export class FileMcpService {
         return formatConfirmedFileMutationReceipt(
           request.action,
           request.path,
+          existedBefore ? Buffer.from(before).toString("utf8") : "",
           content,
           existedBefore
             ? "file content was overwritten successfully"
@@ -5112,6 +6532,7 @@ export class FileMcpService {
         return formatConfirmedFileMutationReceipt(
           request.action,
           request.path,
+          before,
           after,
           "file content was updated successfully"
         );
@@ -5140,6 +6561,7 @@ export class FileMcpService {
         return formatConfirmedFileMutationReceipt(
           request.action,
           request.path,
+          before,
           after,
           "patch was applied successfully and file content was updated"
         );
@@ -5185,7 +6607,7 @@ export class FileMcpService {
         ok: false,
         message:
           describeInvalidToolInput(normalizedName, input) ??
-          `Invalid tool input. Expected { action, path, content?, paths?, startLine?, endLine?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, destination?, revision?, command?, input?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
+          `Invalid tool input. Expected { action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
       };
     }
     const validationError = validateRequest(request);
@@ -5459,4 +6881,3 @@ export class FileMcpService {
     };
   }
 }
-

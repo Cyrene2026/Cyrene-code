@@ -92,10 +92,25 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(actionEnum).toContain("git_log");
     expect(actionEnum).toContain("git_show");
     expect(actionEnum).toContain("git_blame");
+    expect(actionEnum).toContain("ts_hover");
+    expect(actionEnum).toContain("ts_definition");
+    expect(actionEnum).toContain("ts_references");
+    expect(actionEnum).toContain("ts_diagnostics");
+    expect(actionEnum).toContain("ts_prepare_rename");
+    expect(actionEnum).toContain("lsp_hover");
+    expect(actionEnum).toContain("lsp_definition");
+    expect(actionEnum).toContain("lsp_references");
+    expect(actionEnum).toContain("lsp_document_symbols");
+    expect(actionEnum).toContain("lsp_diagnostics");
+    expect(actionEnum).toContain("lsp_prepare_rename");
     expect(actionEnum).toContain("apply_patch");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("paths");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("startLine");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("endLine");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("line");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("column");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("newName");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("serverId");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("jsonPath");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("yamlPath");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("pattern");
@@ -127,6 +142,17 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("git_log");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("git_show");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("git_blame");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_hover");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_definition");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_diagnostics");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_prepare_rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_hover");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_definition");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_document_symbols");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_diagnostics");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_prepare_rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("apply_patch");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("run_command");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("run_shell");
@@ -144,6 +170,17 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use outline_file before full reads on large source files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_symbol when you need to locate symbol definitions");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_references when you need cross-file symbol usages");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_hover for TypeScript/JavaScript quick info");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_definition for TypeScript/JavaScript definition lookup");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_references for semantic TypeScript/JavaScript references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_diagnostics for TypeScript/JavaScript diagnostics");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_prepare_rename to preview a semantic TypeScript/JavaScript rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_hover for generic language-server hover info");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_definition for generic language-server definition lookup");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_references for generic language-server references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_document_symbols for generic language-server document symbols");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_diagnostics for generic language-server diagnostics");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_prepare_rename to preview a generic language-server rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use search_text_context when surrounding lines around each match matter");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_log to inspect recent commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_show to inspect one revision in detail");
@@ -155,10 +192,21 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_yaml, provide `yamlPath` only when you want one nested field");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_symbol, provide the exact symbol name in `symbol`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_references, provide the exact symbol name in `symbol`");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, and lsp_references, provide exact 1-based `line` and `column`"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For ts_diagnostics, provide a TS/JS file path");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For ts_prepare_rename, provide exact 1-based `line`, `column`, and a non-empty `newName`");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_document_symbols and lsp_diagnostics, provide a file path and optional `serverId`"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_prepare_rename, provide exact 1-based `line`, `column`, a non-empty `newName`, and optional `serverId`"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_log, use `maxResults` to limit how many commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_show, use `revision`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_blame, provide a file path");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use apply_patch for reviewed targeted patches");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use apply_patch for targeted patches");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not put shell syntax");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("When a persistent shell may already exist, call shell_status before opening another one");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use open_shell and write_shell when shell state must persist across steps");

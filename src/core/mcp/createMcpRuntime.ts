@@ -1,8 +1,13 @@
-import { relative, resolve } from "node:path";
-import { FileMcpService } from "./adapters/filesystem";
+import { stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+import {
+  FileMcpService,
+  LspManager,
+  createLspServerConfig,
+} from "./adapters/filesystem";
 import { HttpMcpAdapter } from "./adapters/http";
 import { StdioMcpAdapter } from "./adapters/stdio";
-import type { RuleConfig } from "./toolTypes";
+import type { LspServerConfig, RuleConfig } from "./toolTypes";
 import { McpManager } from "./McpManager";
 import { buildBuiltinToolDescriptors } from "./builtinTools";
 import {
@@ -15,6 +20,9 @@ import {
 } from "./loadMcpConfig";
 import type {
   McpRuntime,
+  McpRuntimeLspDoctorResult,
+  McpRuntimeLspServerDescriptor,
+  McpRuntimeLspServerInput,
   McpRuntimeMutationResult,
   McpRuntimeServerInput,
   McpRuntimeSummary,
@@ -33,6 +41,22 @@ type InitializableMcpAdapter = McpServerAdapter & {
 
 const FILE_ALIAS_NAMES = ["file", "fs", "mcp.file"];
 
+const cloneLspServerConfig = (entry: LspServerConfig): LspServerConfig => ({
+  ...entry,
+  args: [...entry.args],
+  filePatterns: [...entry.filePatterns],
+  rootMarkers: [...entry.rootMarkers],
+  ...(entry.env ? { env: { ...entry.env } } : {}),
+});
+
+const buildFilesystemLspSummary = (lspServers?: LspServerConfig[]) =>
+  lspServers
+    ? {
+        configuredCount: lspServers.length,
+        serverIds: lspServers.map(entry => entry.id),
+      }
+    : undefined;
+
 const createRuleConfigFromServer = (
   appRoot: string,
   server: McpConfiguredServer
@@ -40,6 +64,7 @@ const createRuleConfigFromServer = (
   workspaceRoot: resolve(appRoot, server.workspaceRoot ?? appRoot),
   maxReadBytes: server.maxReadBytes ?? 120_000,
   requireReview: [...(server.requireReview ?? [])],
+  lspServers: (server.lspServers ?? []).map(entry => cloneLspServerConfig(entry)),
 });
 
 const createFilesystemServerAdapter = (
@@ -56,6 +81,7 @@ const createFilesystemServerAdapter = (
     health: server.enabled ? "online" : "offline",
     transport: "filesystem",
     aliases: [...server.aliases],
+    lsp: buildFilesystemLspSummary(server.lspServers),
     tools: buildBuiltinToolDescriptors(server.id, ruleConfig),
   };
   const toolNames = new Set(descriptor.tools.map(tool => tool.name.toLowerCase()));
@@ -151,6 +177,7 @@ const cloneConfiguredServer = (server: McpConfiguredServer): McpConfiguredServer
   aliases: [...server.aliases],
   requireReview: server.requireReview ? [...server.requireReview] : undefined,
   args: server.args ? [...server.args] : undefined,
+  ...(server.lspServers ? { lspServers: server.lspServers.map(entry => cloneLspServerConfig(entry)) } : {}),
   tools: server.tools.map(tool => cloneConfiguredTool(tool)),
 });
 
@@ -238,6 +265,7 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
     command: input.command?.trim(),
     args: input.args ? [...input.args] : undefined,
     url: input.url?.trim(),
+    lspServers: [],
     tools: (input.tools ?? []).map(tool => ({
       name: tool.name.trim(),
       label: tool.label?.trim(),
@@ -249,6 +277,64 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
     })),
   };
 };
+
+const normalizeEnvRecord = (env?: Record<string, string>) => {
+  if (!env) {
+    return undefined;
+  }
+  const entries = Object.entries(env)
+    .map(([key, value]) => [key.trim(), value.trim()] as const)
+    .filter(([key, value]) => Boolean(key) && value.length > 0);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+};
+
+const normalizeLspServerInput = (
+  input: McpRuntimeLspServerInput
+): LspServerConfig => {
+  const id = input.id.trim();
+  const command = input.command.trim();
+  const filePatterns = input.filePatterns
+    .map(pattern => pattern.trim())
+    .filter(Boolean);
+  const rootMarkers = (input.rootMarkers ?? [])
+    .map(marker => marker.trim())
+    .filter(Boolean);
+
+  if (!id) {
+    throw new Error("LSP server id is required.");
+  }
+  if (!command) {
+    throw new Error(`LSP server command is required: ${id}`);
+  }
+  if (filePatterns.length === 0) {
+    throw new Error(`LSP server requires at least one file pattern: ${id}`);
+  }
+
+  return createLspServerConfig({
+    id,
+    command,
+    args: (input.args ?? []).map(arg => arg.trim()).filter(Boolean),
+    filePatterns,
+    rootMarkers,
+    workspaceRoot: input.workspaceRoot?.trim() || undefined,
+    env: normalizeEnvRecord(input.env),
+  });
+};
+
+const toRuntimeLspServerDescriptor = (
+  server: McpConfiguredServer,
+  lsp: LspServerConfig
+): McpRuntimeLspServerDescriptor => ({
+  filesystemServerId: server.id,
+  filesystemWorkspaceRoot: resolve(server.workspaceRoot ?? "."),
+  id: lsp.id,
+  command: lsp.command,
+  args: [...lsp.args],
+  filePatterns: [...lsp.filePatterns],
+  rootMarkers: [...lsp.rootMarkers],
+  workspaceRoot: lsp.workspaceRoot,
+  envKeys: Object.keys(lsp.env ?? {}),
+});
 
 const buildMutationMessage = (
   action: string,
@@ -305,6 +391,59 @@ class ManagedMcpRuntime implements McpRuntime {
     return this.config;
   }
 
+  private resolveFilesystemServer(serverId: string) {
+    const normalizedId = serverId.trim();
+    const server = this.getConfig().servers.find(
+      entry => entry.id === normalizedId
+    );
+    if (!server) {
+      return {
+        ok: false as const,
+        normalizedId,
+        message: `MCP filesystem server not found: ${serverId}`,
+      };
+    }
+    if (server.transport !== "filesystem") {
+      return {
+        ok: false as const,
+        normalizedId,
+        message: `MCP server is not a filesystem server: ${serverId}`,
+      };
+    }
+    return {
+      ok: true as const,
+      normalizedId,
+      server,
+    };
+  }
+
+  private getEditableFilesystemPatchServer(serverId: string) {
+    const resolved = this.resolveFilesystemServer(serverId);
+    if (!resolved.ok) {
+      return resolved;
+    }
+
+    const currentConfig = this.getConfig();
+    const existingPatchServer =
+      currentConfig.projectPatch.servers.find(server => server.id === resolved.normalizedId) ??
+      toPatchServer(this.appRoot, resolved.server);
+
+    return {
+      ...resolved,
+      patchServer: existingPatchServer,
+    };
+  }
+
+  private resolveFilesystemDoctorPath(server: McpConfiguredServer, inputPath: string) {
+    const trimmed = inputPath.trim();
+    if (!trimmed) {
+      throw new Error("LSP doctor requires a file path.");
+    }
+
+    const workspaceRoot = resolve(server.workspaceRoot ?? this.appRoot);
+    return isAbsolute(trimmed) ? resolve(trimmed) : resolve(workspaceRoot, trimmed);
+  }
+
   async load(config?: LoadedMcpConfig) {
     const nextConfig = config ?? (await loadMcpConfig(this.appRoot, this.context));
     const nextManager = await buildManagerFromConfig(this.appRoot, nextConfig, this.context);
@@ -335,7 +474,12 @@ class ManagedMcpRuntime implements McpRuntime {
 
     return {
       ok: true,
-      message: buildMutationMessage("MCP server added", server.id, saved.path),
+      message: [
+        buildMutationMessage("MCP server added", server.id, saved.path),
+        ...(server.transport === "filesystem"
+          ? ["tip: use /mcp lsp add ... to configure lsp_servers for this filesystem server"]
+          : []),
+      ].join("\n"),
       serverId: server.id,
       configPath: saved.path,
     };
@@ -409,6 +553,236 @@ class ManagedMcpRuntime implements McpRuntime {
       serverId: normalizedId,
       configPath: saved.path,
     };
+  }
+
+  listLspServers(filesystemServerId?: string): McpRuntimeLspServerDescriptor[] {
+    const servers = this.getConfig().servers.filter(server => server.transport === "filesystem");
+    const filtered = filesystemServerId
+      ? servers.filter(server => server.id === filesystemServerId.trim())
+      : servers;
+
+    return filtered.flatMap(server =>
+      (server.lspServers ?? []).map(lsp => toRuntimeLspServerDescriptor(server, lsp))
+    );
+  }
+
+  async addLspServer(
+    filesystemServerId: string,
+    input: McpRuntimeLspServerInput
+  ): Promise<McpRuntimeMutationResult> {
+    const editable = this.getEditableFilesystemPatchServer(filesystemServerId);
+    if (!editable.ok) {
+      return {
+        ok: false,
+        message: editable.message,
+      };
+    }
+
+    const nextLsp = normalizeLspServerInput(input);
+    const patch = cloneConfigPatch(this.getConfig().projectPatch);
+    patch.removeServerIds = patch.removeServerIds.filter(id => id !== editable.normalizedId);
+    const nextPatchServer = cloneConfiguredServer(editable.patchServer);
+    nextPatchServer.lspServers = [
+      ...(nextPatchServer.lspServers ?? []).filter(server => server.id !== nextLsp.id),
+      nextLsp,
+    ];
+    upsertPatchServer(patch, nextPatchServer);
+
+    const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: [
+        `MCP LSP server added: ${editable.normalizedId}/${nextLsp.id}`,
+        `config: ${saved.path}`,
+      ].join("\n"),
+      serverId: editable.normalizedId,
+      configPath: saved.path,
+    };
+  }
+
+  async removeLspServer(
+    filesystemServerId: string,
+    lspServerId: string
+  ): Promise<McpRuntimeMutationResult> {
+    const editable = this.getEditableFilesystemPatchServer(filesystemServerId);
+    if (!editable.ok) {
+      return {
+        ok: false,
+        message: editable.message,
+      };
+    }
+
+    const normalizedLspId = lspServerId.trim();
+    if (!normalizedLspId) {
+      return {
+        ok: false,
+        message: "LSP server id is required.",
+      };
+    }
+
+    const currentLspServers = editable.server.lspServers ?? [];
+    if (!currentLspServers.some(server => server.id === normalizedLspId)) {
+      return {
+        ok: false,
+        message: `MCP LSP server not found: ${editable.normalizedId}/${normalizedLspId}`,
+      };
+    }
+
+    const patch = cloneConfigPatch(this.getConfig().projectPatch);
+    patch.removeServerIds = patch.removeServerIds.filter(id => id !== editable.normalizedId);
+    const nextPatchServer = cloneConfiguredServer(editable.patchServer);
+    nextPatchServer.lspServers = currentLspServers
+      .filter(server => server.id !== normalizedLspId)
+      .map(server => cloneLspServerConfig(server));
+    upsertPatchServer(patch, nextPatchServer);
+
+    const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: [
+        `MCP LSP server removed: ${editable.normalizedId}/${normalizedLspId}`,
+        `config: ${saved.path}`,
+      ].join("\n"),
+      serverId: editable.normalizedId,
+      configPath: saved.path,
+    };
+  }
+
+  async doctorLsp(
+    filesystemServerId: string,
+    path: string,
+    options?: { lspServerId?: string }
+  ): Promise<McpRuntimeLspDoctorResult> {
+    const resolved = this.resolveFilesystemServer(filesystemServerId);
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        status: "config_error",
+        filesystemServerId: resolved.normalizedId || filesystemServerId,
+        workspaceRoot: this.appRoot,
+        inputPath: path,
+        resolvedPath: path,
+        configuredServerIds: [],
+        matchedServerIds: [],
+        message: resolved.message,
+      };
+    }
+
+    const workspaceRoot = resolve(resolved.server.workspaceRoot ?? this.appRoot);
+    const resolvedPath = this.resolveFilesystemDoctorPath(resolved.server, path);
+    const configuredServerIds = (resolved.server.lspServers ?? []).map(entry => entry.id);
+    const manager = new LspManager(workspaceRoot, (resolved.server.lspServers ?? []).map(entry =>
+      cloneLspServerConfig(entry)
+    ), {
+      env: this.context?.env,
+    });
+
+    const baseLines = [
+      "MCP LSP doctor",
+      `filesystem_server: ${resolved.server.id}`,
+      `workspace_root: ${workspaceRoot}`,
+      `input_path: ${path}`,
+      `resolved_path: ${resolvedPath}`,
+      `configured: ${configuredServerIds.length > 0 ? configuredServerIds.join(", ") : "(none)"}`,
+    ];
+
+    try {
+      const fileInfo = await stat(resolvedPath);
+      if (!fileInfo.isFile()) {
+        return {
+          ok: false,
+          status: "config_error",
+          filesystemServerId: resolved.server.id,
+          workspaceRoot,
+          inputPath: path,
+          resolvedPath,
+          configuredServerIds,
+          matchedServerIds: [],
+          message: [
+            ...baseLines,
+            "status: config_error",
+            "hint: the requested path must point to an existing file inside the filesystem workspace",
+          ].join("\n"),
+        };
+      }
+    } catch {
+      return {
+        ok: false,
+        status: "config_error",
+        filesystemServerId: resolved.server.id,
+        workspaceRoot,
+        inputPath: path,
+        resolvedPath,
+        configuredServerIds,
+        matchedServerIds: [],
+        message: [
+          ...baseLines,
+          "status: config_error",
+          "hint: the requested path does not exist or is not readable from the filesystem workspace",
+        ].join("\n"),
+      };
+    }
+
+    try {
+      const inspection = await manager.inspectPath(resolvedPath, {
+        serverId: options?.lspServerId,
+      });
+      const session = await manager.getSession(resolvedPath, {
+        serverId: options?.lspServerId,
+      });
+      await session.probe(resolvedPath);
+
+      return {
+        ok: true,
+        status: "ready",
+        filesystemServerId: resolved.server.id,
+        workspaceRoot,
+        inputPath: path,
+        resolvedPath,
+        configuredServerIds,
+        matchedServerIds: [...inspection.matchedServerIds],
+        selectedServerId: inspection.selectedServerId,
+        resolvedRoot: inspection.resolvedRoot,
+        message: [
+          ...baseLines,
+          `matched: ${inspection.matchedServerIds.length > 0 ? inspection.matchedServerIds.join(", ") : "(none)"}`,
+          `selected: ${inspection.selectedServerId ?? "(none)"}`,
+          `resolved_root: ${inspection.resolvedRoot ?? "(none)"}`,
+          "status: ready",
+          "hint: lsp_* tools can use this file now; pass serverId only when multiple servers could match",
+        ].join("\n"),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status =
+        message.startsWith("LSP startup error:") || message.startsWith("LSP request failed:")
+          ? "startup_error"
+          : "config_error";
+      return {
+        ok: false,
+        status,
+        filesystemServerId: resolved.server.id,
+        workspaceRoot,
+        inputPath: path,
+        resolvedPath,
+        configuredServerIds,
+        matchedServerIds: [],
+        message: [
+          ...baseLines,
+          `status: ${status}`,
+          `error: ${message}`,
+          status === "startup_error"
+            ? "hint: install the language server binary or fix the configured command/args/env"
+            : "hint: adjust file_patterns/root_markers or re-run with --lsp <id>",
+        ].join("\n"),
+      };
+    } finally {
+      await manager.dispose().catch(() => undefined);
+    }
   }
 
   async handleToolCall(toolName: string, input: unknown) {

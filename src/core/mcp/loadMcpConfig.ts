@@ -5,7 +5,7 @@ import {
   getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
 } from "../../infra/config/appRoot";
-import type { MpcAction } from "./toolTypes";
+import type { LspServerConfig, MpcAction } from "./toolTypes";
 import { loadFilesystemRuleConfig } from "./adapters/filesystem";
 import { parseYamlDocument, stringifyYamlDocument } from "./simpleYaml";
 import type {
@@ -43,6 +43,7 @@ export type McpConfiguredServer = {
   command?: string;
   args?: string[];
   url?: string;
+  lspServers?: LspServerConfig[];
   tools: McpConfiguredTool[];
 };
 
@@ -100,6 +101,17 @@ const SUPPORTED_MCP_ACTIONS: MpcAction[] = [
   "git_log",
   "git_show",
   "git_blame",
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "ts_diagnostics",
+  "ts_prepare_rename",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_document_symbols",
+  "lsp_diagnostics",
+  "lsp_prepare_rename",
   "run_command",
   "run_shell",
   "open_shell",
@@ -142,6 +154,20 @@ const normalizeStringArray = (value: unknown) => {
   }
   const single = normalizeString(value);
   return single ? [single] : [];
+};
+
+const normalizeStringRecord = (value: unknown) => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const next: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizeString(entry);
+    if (normalized) {
+      next[key] = normalized;
+    }
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
 };
 
 const normalizeActionArray = (value: unknown) =>
@@ -205,6 +231,45 @@ const normalizeTool = (value: unknown): McpConfiguredTool | null => {
   };
 };
 
+const normalizeLspServer = (value: unknown): LspServerConfig | null => {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const id = normalizeString(value.id);
+  const command = normalizeString(value.command);
+  if (!id || !command) {
+    return null;
+  }
+
+  const filePatterns = normalizeStringArray(
+    value.file_patterns ?? value.filePatterns ?? value.patterns ?? value.glob
+  );
+  const rootMarkers = normalizeStringArray(
+    value.root_markers ?? value.rootMarkers ?? value.roots ?? value.markers
+  );
+
+  if (filePatterns.length === 0) {
+    return null;
+  }
+
+  return {
+    id,
+    command,
+    args: normalizeStringArray(value.args),
+    filePatterns,
+    rootMarkers,
+    workspaceRoot: normalizeString(value.workspace_root ?? value.workspaceRoot),
+    ...(value.initialization_options !== undefined
+      ? { initializationOptions: value.initialization_options }
+      : value.initializationOptions !== undefined
+        ? { initializationOptions: value.initializationOptions }
+        : {}),
+    ...(value.settings !== undefined ? { settings: value.settings } : {}),
+    ...(normalizeStringRecord(value.env) ? { env: normalizeStringRecord(value.env) } : {}),
+  };
+};
+
 const normalizeServer = (value: unknown): McpConfiguredServer | null => {
   if (!isRecord(value)) {
     return null;
@@ -221,6 +286,12 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
         .map(item => normalizeTool(item))
         .filter((item): item is McpConfiguredTool => Boolean(item))
     : [];
+  const rawLspServers = value.lsp_servers ?? value.lspServers;
+  const lspServers = Array.isArray(rawLspServers)
+    ? rawLspServers
+        .map(item => normalizeLspServer(item))
+        .filter((item): item is LspServerConfig => Boolean(item))
+    : undefined;
 
   const aliases = Array.from(
     new Set(
@@ -247,6 +318,7 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     command: normalizeString(value.command),
     args: normalizeStringArray(value.args),
     url: normalizeString(value.url),
+    ...(lspServers !== undefined ? { lspServers } : {}),
     tools,
   };
 };
@@ -315,6 +387,27 @@ const mergeServer = (
       ? [...patch.args]
       : [...(base?.args ?? [])],
   url: patch.url ?? base?.url,
+  ...(patch.lspServers !== undefined
+    ? {
+        lspServers: patch.lspServers.map(server => ({
+          ...server,
+          args: [...server.args],
+          filePatterns: [...server.filePatterns],
+          rootMarkers: [...server.rootMarkers],
+          ...(server.env ? { env: { ...server.env } } : {}),
+        })),
+      }
+    : base?.lspServers
+      ? {
+          lspServers: base.lspServers.map(server => ({
+            ...server,
+            args: [...server.args],
+            filePatterns: [...server.filePatterns],
+            rootMarkers: [...server.rootMarkers],
+            ...(server.env ? { env: { ...server.env } } : {}),
+          })),
+        }
+      : {}),
   tools: patch.tools.length > 0 ? [...patch.tools] : [...(base?.tools ?? [])],
 });
 
@@ -360,6 +453,7 @@ const buildDefaultFilesystemServer = async (
     workspaceRoot: ruleConfig.workspaceRoot,
     maxReadBytes: ruleConfig.maxReadBytes,
     requireReview: [...ruleConfig.requireReview],
+    lspServers: [...(ruleConfig.lspServers ?? [])],
     tools: [],
   };
 };
@@ -424,6 +518,20 @@ const serializeConfiguredTool = (tool: McpConfiguredTool) => ({
     : {}),
 });
 
+const serializeConfiguredLspServer = (server: LspServerConfig) => ({
+  id: server.id,
+  command: server.command,
+  ...(server.args.length > 0 ? { args: [...server.args] } : {}),
+  file_patterns: [...server.filePatterns],
+  ...(server.rootMarkers.length > 0 ? { root_markers: [...server.rootMarkers] } : {}),
+  ...(server.workspaceRoot ? { workspace_root: server.workspaceRoot } : {}),
+  ...(server.initializationOptions !== undefined
+    ? { initialization_options: server.initializationOptions }
+    : {}),
+  ...(server.settings !== undefined ? { settings: server.settings } : {}),
+  ...(server.env && Object.keys(server.env).length > 0 ? { env: { ...server.env } } : {}),
+});
+
 const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   id: server.id,
   transport: server.transport,
@@ -442,6 +550,9 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   ...(server.command ? { command: server.command } : {}),
   ...(server.args && server.args.length > 0 ? { args: [...server.args] } : {}),
   ...(server.url ? { url: server.url } : {}),
+  ...(server.lspServers !== undefined
+    ? { lsp_servers: server.lspServers.map(entry => serializeConfiguredLspServer(entry)) }
+    : {}),
   ...(server.tools.length > 0
     ? { tools: server.tools.map(tool => serializeConfiguredTool(tool)) }
     : {}),

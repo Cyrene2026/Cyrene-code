@@ -13,6 +13,18 @@ describe("McpPolicy", () => {
     expect(getMcpToolCapabilities("git_diff")).toEqual(
       expect.arrayContaining(["read", "git"])
     );
+    expect(getMcpToolCapabilities("ts_references")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("ts_prepare_rename")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_references")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_prepare_rename")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
   });
 
   test("classifies write and shell risks", () => {

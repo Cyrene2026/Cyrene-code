@@ -136,6 +136,70 @@ const createPending = (
                             startLine: 1,
                             endLine: 3,
                           }
+                        : action === "ts_hover" || action === "ts_definition"
+                          ? {
+                              action,
+                              path,
+                              line: 1,
+                              column: 1,
+                            }
+                          : action === "ts_references"
+                            ? {
+                                action,
+                                path,
+                                line: 1,
+                                column: 1,
+                                maxResults: 5,
+                              }
+                            : action === "ts_diagnostics"
+                              ? {
+                                  action,
+                                  path,
+                                  maxResults: 5,
+                                }
+                        : action === "ts_prepare_rename"
+                                ? {
+                                    action,
+                                    path,
+                                    line: 1,
+                                    column: 1,
+                                    newName: "RenamedSymbol",
+                                    maxResults: 5,
+                                  }
+                              : action === "lsp_hover" || action === "lsp_definition"
+                                ? {
+                                    action,
+                                    path,
+                                    line: 1,
+                                    column: 1,
+                                    serverId: "rust",
+                                  }
+                                : action === "lsp_references"
+                                  ? {
+                                      action,
+                                      path,
+                                      line: 1,
+                                      column: 1,
+                                      serverId: "rust",
+                                      maxResults: 5,
+                                    }
+                                  : action === "lsp_document_symbols" || action === "lsp_diagnostics"
+                                    ? {
+                                        action,
+                                        path,
+                                        serverId: "rust",
+                                        maxResults: 5,
+                                      }
+                                    : action === "lsp_prepare_rename"
+                                      ? {
+                                          action,
+                                          path,
+                                          line: 1,
+                                          column: 1,
+                                          newName: "RenamedSymbol",
+                                          serverId: "rust",
+                                          maxResults: 5,
+                                        }
           : action === "copy_path" || action === "move_path"
             ? {
                 action,
@@ -723,6 +787,10 @@ const createScriptedTransport = (
           health: "online" as const,
           transport: "filesystem" as const,
           aliases: ["file", "fs", "mcp.file"],
+          lsp: {
+            configuredCount: 1,
+            serverIds: ["rust"],
+          },
           tools: [
             {
               id: "filesystem.read_file",
@@ -807,20 +875,23 @@ const createScriptedTransport = (
     await runCommand(app, "/mcp");
     await runCommand(app, "/mcp servers");
     await runCommand(app, "/mcp tools docs");
+    await runCommand(app, "/mcp tools filesystem");
     await runCommand(app, "/mcp pending");
 
     const texts = getTexts(app.getLatest().items);
     expect(texts.some(text => text.includes("MCP runtime"))).toBe(true);
     expect(texts.some(text => text.includes("config:"))).toBe(true);
     expect(texts.some(text => text.includes("- filesystem |"))).toBe(true);
+    expect(texts.some(text => text.includes("lsp 1 configured | rust"))).toBe(true);
     expect(texts.some(text => text.includes("MCP tools for docs"))).toBe(true);
+    expect(texts.some(text => text.includes("MCP tools for filesystem"))).toBe(true);
     expect(texts.some(text => text.includes("search_docs"))).toBe(true);
     expect(texts.some(text => text.includes("server filesystem"))).toBe(true);
 
     app.cleanup();
   });
 
-  test("local slash commands are echoed into transcript items", async () => {
+  test("local slash commands stay near the composer instead of entering transcript", async () => {
     const app = renderHookHarness(() =>
       useChatAppWithTestInput({
         transport: createTestTransport(),
@@ -839,16 +910,12 @@ const createScriptedTransport = (
 
     await runCommand(app, "/mcp");
 
-    const items = app.getLatest().items;
-    const commandIndex = items.findIndex(
-      item => item.role === "user" && item.text === "/mcp"
-    );
-    const runtimeIndex = items.findIndex(
-      item => item.role === "system" && item.text.includes("MCP runtime")
-    );
-
-    expect(commandIndex).toBeGreaterThanOrEqual(0);
-    expect(runtimeIndex).toBeGreaterThan(commandIndex);
+    expect(app.getLatest().recentLocalCommand).toBe("/mcp");
+    expect(
+      app.getLatest().items.some(
+        item => item.role === "user" && item.text === "/mcp"
+      )
+    ).toBe(false);
     app.cleanup();
   });
 
@@ -906,6 +973,117 @@ const createScriptedTransport = (
     expect(
       getTexts(app.getLatest().items).some(text => text.includes("MCP config reloaded"))
     ).toBe(true);
+
+    app.cleanup();
+  });
+
+  test("/mcp lsp commands expose list/add/remove/doctor flows", async () => {
+    const addLspServer = mock(async (_serverId: string, _input: unknown) => ({
+      ok: true,
+      message:
+        "MCP LSP server added: repo/rust\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+    }));
+    const removeLspServer = mock(async (_serverId: string, _lspServerId: string) => ({
+      ok: true,
+      message:
+        "MCP LSP server removed: repo/rust\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+    }));
+    const doctorLsp = mock(async (_serverId: string, _path: string, _options?: unknown) => ({
+      ok: true,
+      status: "ready" as const,
+      filesystemServerId: "repo",
+      workspaceRoot: "D:/Projects/js_projects/Cyrene-code",
+      inputPath: "src/demo.rs",
+      resolvedPath: "D:/Projects/js_projects/Cyrene-code/src/demo.rs",
+      configuredServerIds: ["rust"],
+      matchedServerIds: ["rust"],
+      selectedServerId: "rust",
+      resolvedRoot: "D:/Projects/js_projects/Cyrene-code",
+      message: [
+        "MCP LSP doctor",
+        "filesystem_server: repo",
+        "status: ready",
+      ].join("\n"),
+    }));
+    const listLspServers = mock((serverId?: string) =>
+      serverId === "repo" || serverId === undefined
+        ? [
+            {
+              filesystemServerId: "repo",
+              filesystemWorkspaceRoot: "D:/Projects/js_projects/Cyrene-code",
+              id: "rust",
+              command: "rust-analyzer",
+              args: [],
+              filePatterns: ["**/*.rs"],
+              rootMarkers: ["Cargo.toml", ".git"],
+              envKeys: ["RUST_LOG"],
+            },
+          ]
+        : []
+    );
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+          listServers: () => [
+            {
+              id: "repo",
+              label: "Repo",
+              enabled: true,
+              source: "built_in" as const,
+              health: "online" as const,
+              transport: "filesystem" as const,
+              aliases: ["repofs"],
+              lsp: {
+                configuredCount: 1,
+                serverIds: ["rust"],
+              },
+              tools: [],
+            },
+          ],
+          listTools: () => [],
+          listLspServers,
+          addLspServer,
+          removeLspServer,
+          doctorLsp,
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/mcp lsp list");
+    await runCommand(
+      app,
+      '/mcp lsp add repofs rust --command rust-analyzer --pattern "**/*.rs" --root Cargo.toml --root .git --env RUST_LOG=info'
+    );
+    await runCommand(app, "/mcp lsp doctor repofs src/demo.rs --lsp rust");
+    await runCommand(app, "/mcp lsp remove repofs rust");
+
+    expect(listLspServers).toHaveBeenCalledWith(undefined);
+    expect(addLspServer).toHaveBeenCalledWith("repo", {
+      id: "rust",
+      command: "rust-analyzer",
+      args: [],
+      filePatterns: ["**/*.rs"],
+      rootMarkers: ["Cargo.toml", ".git"],
+      env: {
+        RUST_LOG: "info",
+      },
+    });
+    expect(doctorLsp).toHaveBeenCalledWith("repo", "src/demo.rs", {
+      lspServerId: "rust",
+    });
+    expect(removeLspServer).toHaveBeenCalledWith("repo", "rust");
+
+    const texts = getTexts(app.getLatest().items);
+    expect(texts.some(text => text.includes("MCP LSP servers"))).toBe(true);
+    expect(texts.some(text => text.includes("env_keys RUST_LOG"))).toBe(true);
+    expect(texts.some(text => text.includes("MCP LSP doctor"))).toBe(true);
 
     app.cleanup();
   });

@@ -158,6 +158,53 @@ Session and context:
 - Pin count comes from `.cyrene/config.yaml` via `pin_max_count`.
 - Older context is tracked through the rolling working-state pair: durable `summary` + lagging `pendingDigest`, while recent turns are kept for prompt context.
 
+## Semantic code tools and LSP
+
+The built-in filesystem MCP server can expose semantic navigation helpers in
+addition to plain text file/search tools.
+
+- **TypeScript / JavaScript** tools are available through the bundled tsserver
+  client: `ts_hover`, `ts_definition`, `ts_references`, `ts_diagnostics`, and
+  `ts_prepare_rename`.
+- **Generic LSP** tools are available when you configure one or more language
+  servers under a filesystem MCP server:
+  `lsp_hover`, `lsp_definition`, `lsp_references`,
+  `lsp_document_symbols`, `lsp_diagnostics`, and `lsp_prepare_rename`.
+
+Example `.cyrene/mcp.yaml`:
+
+```yaml
+primary_server: filesystem
+servers:
+  - id: repo
+    transport: filesystem
+    workspace_root: .
+    lsp_servers:
+      - id: rust
+        command: rust-analyzer
+        file_patterns: ["**/*.rs"]
+        root_markers: ["Cargo.toml", ".git"]
+      - id: python
+        command: pyright-langserver
+        args: ["--stdio"]
+        file_patterns: ["**/*.py"]
+        root_markers: ["pyproject.toml", "setup.py", ".git"]
+```
+
+Notes:
+
+- `command` / `args` should launch the language server already installed on your
+  machine. Cyrene does not bundle the external LSP binaries.
+- `file_patterns` decide which files are routed to each language server.
+- `root_markers` help Cyrene choose the nearest project root for each LSP
+  session.
+- `workspace_root`, `env`, `initialization_options`, and `settings` are also
+  supported per `lsp_servers` entry when you need them.
+- If more than one configured LSP server can match the same file, pass
+  `serverId` with the `lsp_*` action.
+- `ts_prepare_rename` and `lsp_prepare_rename` only prepare a rename preview;
+  they do not mutate files by themselves.
+
 ## Rolling context architecture
 
 Cyrene keeps long-running coding context in three layers instead of stuffing the

@@ -1,10 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { join, posix, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   FileMcpService,
   isPathInsideWorkspaceRoot,
+  type LspDiagnostic,
+  type LspDocumentSymbol,
+  type LspHoverResult,
+  type LspLocation,
+  type LspManagerLike,
+  type LspPrepareRenameResult,
+  type LspWorkspaceEdit,
+  type LspWorkspaceLike,
+  type TsServerClientLike,
 } from "../src/core/mcp";
 
 const tempRoots: string[] = [];
@@ -60,6 +70,50 @@ const createIsolatedService = async (
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     },
   };
+};
+
+const createLspService = async (serverId = "rust") => {
+  const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+  tempRoots.push(root);
+  const lspManager = createFakeLspManager(root, serverId);
+  const service = new FileMcpService({
+    workspaceRoot: root,
+    maxReadBytes: 1024 * 1024,
+    requireReview: [
+      "create_file",
+      "write_file",
+      "edit_file",
+      "apply_patch",
+      "delete_file",
+      "copy_path",
+      "move_path",
+      "open_shell",
+      "write_shell",
+    ],
+  }, { lspManager });
+  services.push(service);
+  return { root, service, lspManager };
+};
+
+const createRelaxedReviewService = async (
+  options?: ConstructorParameters<typeof FileMcpService>[1]
+) => {
+  const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+  tempRoots.push(root);
+  const service = new FileMcpService({
+    workspaceRoot: root,
+    maxReadBytes: 1024 * 1024,
+    requireReview: [
+      "delete_file",
+      "copy_path",
+      "move_path",
+      "run_command",
+      "run_shell",
+      "write_shell",
+    ],
+  }, options);
+  services.push(service);
+  return { root, service };
 };
 
 const createFakePersistentShellFactory = () => {
@@ -213,6 +267,355 @@ const createFakePersistentShellFactory = () => {
   };
 };
 
+const createFakeTsServerClient = (): TsServerClientLike & {
+  calls: Array<{ method: string; args: unknown[] }>;
+  invalidations: Array<string | undefined>;
+} => {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const invalidations: Array<string | undefined> = [];
+
+  return {
+    calls,
+    invalidations,
+    async open(filePath: string) {
+      calls.push({ method: "open", args: [filePath] });
+    },
+    async reload(filePath: string) {
+      calls.push({ method: "reload", args: [filePath] });
+    },
+    async hover(filePath: string, line: number, column: number) {
+      calls.push({ method: "hover", args: [filePath, line, column] });
+      return {
+        kind: "function",
+        kindModifiers: "export",
+        start: { line, offset: column },
+        end: { line, offset: column + 5 },
+        displayString: "function greet(name: string): string",
+        documentation: "Return a greeting.",
+        tags: [{ name: "param", text: "name the target name" }],
+      };
+    },
+    async definition(filePath: string, line: number, column: number) {
+      calls.push({ method: "definition", args: [filePath, line, column] });
+      return {
+        definitions: [
+          {
+            file: filePath,
+            start: { line: 1, offset: 17 },
+            end: { line: 1, offset: 22 },
+          },
+        ],
+      };
+    },
+    async references(filePath: string, line: number, column: number) {
+      calls.push({ method: "references", args: [filePath, line, column] });
+      return {
+        refs: [
+          {
+            file: filePath,
+            start: { line: 1, offset: 17 },
+            end: { line: 1, offset: 22 },
+            lineText: "export function greet(name: string) {",
+            isWriteAccess: false,
+            isDefinition: true,
+          },
+          {
+            file: filePath,
+            start: { line: 5, offset: 13 },
+            end: { line: 5, offset: 18 },
+            lineText: "console.log(greet('Cyrene'));",
+            isWriteAccess: false,
+          },
+        ],
+        symbolName: "greet",
+        symbolDisplayString: "function greet(name: string): string",
+      };
+    },
+    async rename(filePath: string, line: number, column: number, options) {
+      calls.push({ method: "rename", args: [filePath, line, column, options] });
+      return {
+        info: {
+          canRename: true,
+          displayName: "greet",
+          fullDisplayName: "function greet(name: string): string",
+          kind: "function",
+          kindModifiers: "export",
+          triggerSpan: {
+            start: { line: 1, offset: 17 },
+            end: { line: 1, offset: 22 },
+          },
+        },
+        locs: [
+          {
+            file: filePath,
+            locs: [
+              {
+                start: { line: 1, offset: 17 },
+                end: { line: 1, offset: 22 },
+              },
+              {
+                start: { line: 5, offset: 13 },
+                end: { line: 5, offset: 18 },
+              },
+            ],
+          },
+        ],
+      };
+    },
+    async diagnostics(filePath: string) {
+      calls.push({ method: "diagnostics", args: [filePath] });
+      return {
+        syntactic: [],
+        semantic: [
+          {
+            file: filePath,
+            start: { line: 1, offset: 14 },
+            end: { line: 1, offset: 20 },
+            code: 2322,
+            category: "error",
+            text: "Type 'number' is not assignable to type 'string'.",
+          },
+        ],
+        suggestion: [
+          {
+            file: filePath,
+            start: { line: 2, offset: 7 },
+            end: { line: 2, offset: 13 },
+            code: 6133,
+            category: "suggestion",
+            text: "'unused' is declared but its value is never read.",
+          },
+        ],
+      };
+    },
+    invalidate(filePath?: string) {
+      invalidations.push(filePath);
+    },
+    dispose() {
+      calls.push({ method: "dispose", args: [] });
+    },
+  };
+};
+
+const createFakeLspManager = (
+  rootPath: string,
+  serverId = "rust-analyzer"
+): LspManagerLike & {
+  calls: Array<{ method: string; args: unknown[] }>;
+  invalidations: Array<string | undefined>;
+  sessionRequests: Array<{ filePath: string; options?: { serverId?: string } }>;
+} => {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const invalidations: Array<string | undefined> = [];
+  const sessionRequests: Array<{ filePath: string; options?: { serverId?: string } }> = [];
+  const toUri = (filePath: string) => pathToFileURL(filePath).href;
+
+  const hoverResult: LspHoverResult = {
+    contents: "```rust\nfn greet(name: &str) -> String\n```",
+    range: {
+      start: { line: 0, character: 3 },
+      end: { line: 0, character: 8 },
+    },
+  };
+
+  const definitionResult = (filePath: string): LspLocation[] => [
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 0, character: 3 },
+        end: { line: 0, character: 8 },
+      },
+    },
+  ];
+
+  const referencesResult = (filePath: string): LspLocation[] => [
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 0, character: 3 },
+        end: { line: 0, character: 8 },
+      },
+    },
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 5, character: 16 },
+        end: { line: 5, character: 21 },
+      },
+    },
+  ];
+
+  const documentSymbolsResult: LspDocumentSymbol[] = [
+    {
+      name: "greet",
+      detail: "fn",
+      kind: 12,
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 2, character: 1 },
+      },
+      selectionRange: {
+        start: { line: 0, character: 3 },
+        end: { line: 0, character: 8 },
+      },
+      children: [],
+    },
+    {
+      name: "main",
+      detail: "fn",
+      kind: 12,
+      range: {
+        start: { line: 4, character: 0 },
+        end: { line: 7, character: 1 },
+      },
+      selectionRange: {
+        start: { line: 4, character: 3 },
+        end: { line: 4, character: 7 },
+      },
+      children: [
+        {
+          name: "message",
+          detail: "let",
+          kind: 13,
+          range: {
+            start: { line: 5, character: 2 },
+            end: { line: 5, character: 34 },
+          },
+          selectionRange: {
+            start: { line: 5, character: 6 },
+            end: { line: 5, character: 13 },
+          },
+          containerName: "main",
+          children: [],
+        },
+      ],
+    },
+  ];
+
+  const diagnosticsResult: LspDiagnostic[] = [
+    {
+      range: {
+        start: { line: 0, character: 3 },
+        end: { line: 0, character: 8 },
+      },
+      severity: 1,
+      code: "E0308",
+      source: "rustc",
+      message: "mismatched types",
+    },
+    {
+      range: {
+        start: { line: 5, character: 6 },
+        end: { line: 5, character: 13 },
+      },
+      severity: 2,
+      source: "clippy",
+      message: "unused variable: `message`",
+    },
+  ];
+
+  const prepareRenameResult: LspPrepareRenameResult = {
+    range: {
+      start: { line: 0, character: 3 },
+      end: { line: 0, character: 8 },
+    },
+    placeholder: "greet",
+  };
+
+  const renameResult = (filePath: string): LspWorkspaceEdit => ({
+    changes: {
+      [toUri(filePath)]: [
+        {
+          range: {
+            start: { line: 0, character: 3 },
+            end: { line: 0, character: 8 },
+          },
+          newText: "welcome",
+        },
+        {
+          range: {
+            start: { line: 5, character: 16 },
+            end: { line: 5, character: 21 },
+          },
+          newText: "welcome",
+        },
+      ],
+    },
+    documentChanges: [],
+  });
+
+  const workspace: LspWorkspaceLike = {
+    getInfo() {
+      return { serverId, rootPath };
+    },
+    async probe(filePath: string) {
+      calls.push({ method: "probe", args: [filePath] });
+      return { serverId, rootPath };
+    },
+    async hover(filePath: string, line: number, column: number) {
+      calls.push({ method: "hover", args: [filePath, line, column] });
+      return hoverResult;
+    },
+    async definition(filePath: string, line: number, column: number) {
+      calls.push({ method: "definition", args: [filePath, line, column] });
+      return definitionResult(filePath);
+    },
+    async references(filePath: string, line: number, column: number) {
+      calls.push({ method: "references", args: [filePath, line, column] });
+      return referencesResult(filePath);
+    },
+    async documentSymbols(filePath: string) {
+      calls.push({ method: "documentSymbols", args: [filePath] });
+      return documentSymbolsResult;
+    },
+    async diagnostics(filePath: string) {
+      calls.push({ method: "diagnostics", args: [filePath] });
+      return diagnosticsResult;
+    },
+    async prepareRename(filePath: string, line: number, column: number) {
+      calls.push({ method: "prepareRename", args: [filePath, line, column] });
+      return prepareRenameResult;
+    },
+    async rename(filePath: string, line: number, column: number, newName: string) {
+      calls.push({ method: "rename", args: [filePath, line, column, newName] });
+      return renameResult(filePath);
+    },
+    invalidate(filePath?: string) {
+      invalidations.push(filePath);
+    },
+    dispose() {
+      calls.push({ method: "dispose", args: [] });
+    },
+  };
+
+  return {
+    calls,
+    invalidations,
+    sessionRequests,
+    async getSession(filePath: string, options?: { serverId?: string }) {
+      sessionRequests.push({ filePath, options });
+      return workspace;
+    },
+    async inspectPath(filePath: string, options?: { serverId?: string }) {
+      sessionRequests.push({ filePath, options });
+      return {
+        workspaceRoot: rootPath,
+        relativePath: relative(rootPath, filePath),
+        configuredServerIds: [serverId],
+        matchedServerIds: [options?.serverId ?? serverId],
+        selectedServerId: options?.serverId ?? serverId,
+        resolvedRoot: rootPath,
+      };
+    },
+    invalidate(filePath?: string) {
+      invalidations.push(filePath);
+    },
+    dispose() {
+      calls.push({ method: "manager.dispose", args: [] });
+    },
+  };
+};
+
 afterEach(async () => {
   for (const service of services.splice(0)) {
     service.dispose();
@@ -347,10 +750,68 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("[approved]");
     expect(approved.message).toContain("[confirmed file mutation] create_file nested/example.py");
     expect(approved.message).toContain("postcondition: file now exists and content was written successfully");
+    expect(approved.message).toContain("diff_stats: +1 -0");
+    expect(approved.message).toContain("[diff preview]");
+    expect(approved.message).toContain("+    1 | print('ok')");
     expect(service.listPending()).toHaveLength(0);
 
     const content = await readFile(join(root, "nested", "example.py"), "utf8");
     expect(content).toBe("print('ok')\n");
+  });
+
+  test("create_file confirmation includes the full diff preview without omission", async () => {
+    const { service } = await createService();
+    const content = Array.from({ length: 14 }, (_, index) => `line ${index + 1}`).join("\n");
+
+    const queued = await service.handleToolCall("file", {
+      action: "create_file",
+      path: "full-diff.txt",
+      content: `${content}\n`,
+    });
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("+    1 | line 1");
+    expect(approved.message).toContain("+   14 | line 14");
+    expect(approved.message).not.toContain("diff_preview_omitted");
+  });
+
+  test("relaxed review mode executes normal file writes immediately", async () => {
+    const { root, service } = await createRelaxedReviewService();
+
+    const createResult = await service.handleToolCall("file", {
+      action: "create_file",
+      path: "nested/example.py",
+      content: "print('ok')\n",
+    });
+    const editResult = await service.handleToolCall("file", {
+      action: "edit_file",
+      path: "nested/example.py",
+      find: "ok",
+      replace: "great",
+    });
+    const patchResult = await service.handleToolCall("file", {
+      action: "apply_patch",
+      path: "nested/example.py",
+      find: "print('great')\n",
+      replace: "print('patched')\n",
+    });
+
+    expect(createResult.ok).toBe(true);
+    expect(createResult.pending).toBeUndefined();
+    expect(createResult.message).toContain("[tool result] create_file nested/example.py");
+
+    expect(editResult.ok).toBe(true);
+    expect(editResult.pending).toBeUndefined();
+    expect(editResult.message).toContain("[tool result] edit_file nested/example.py");
+
+    expect(patchResult.ok).toBe(true);
+    expect(patchResult.pending).toBeUndefined();
+    expect(patchResult.message).toContain("[tool result] apply_patch nested/example.py");
+
+    const content = await readFile(join(root, "nested", "example.py"), "utf8");
+    expect(content).toBe("print('patched')\n");
   });
 
   test("approve returns error when create_file target already exists", async () => {
@@ -733,6 +1194,8 @@ describe("FileMcpService", () => {
 
     expect(approved.ok).toBe(true);
     expect(approved.message).toContain("[confirmed file mutation] write_file new-write.txt");
+    expect(approved.message).toContain("diff_stats: +1 -0");
+    expect(approved.message).toContain("+    1 | written");
     expect(approved.message).toContain("next: do not call read_file on this path just to confirm the write");
     expect(await readFile(join(root, "new-write.txt"), "utf8")).toBe("written\n");
   });
@@ -1164,6 +1627,389 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
     expect(result.message).toContain("src/huge-ref.ts:2502 | console.log(HugeDemoService);");
     expect(result.message).not.toContain("src/huge-ref.ts:1 | export class HugeDemoService {}");
+  });
+
+  test("ts_hover delegates to the tsserver client and formats quick info", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.ts"),
+      [
+        "export function greet(name: string) {",
+        "  return `hello ${name}`;",
+        "}",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "ts_hover",
+      path: "src/demo.ts",
+      line: 1,
+      column: 17,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] ts_hover src/demo.ts");
+    expect(result.message).toContain("kind: function (export)");
+    expect(result.message).toContain("display: function greet(name: string): string");
+    expect(result.message).toContain("Return a greeting.");
+    expect(tsServerClient.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "hover" }),
+      ])
+    );
+  });
+
+  test("ts_definition and ts_references delegate to the tsserver client", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.ts"),
+      [
+        "export function greet(name: string) {",
+        "  return `hello ${name}`;",
+        "}",
+        "",
+        "console.log(greet('Cyrene'));",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const definitionResult = await service.handleToolCall("file", {
+      action: "ts_definition",
+      path: "src/demo.ts",
+      line: 5,
+      column: 13,
+    });
+    const referencesResult = await service.handleToolCall("file", {
+      action: "ts_references",
+      path: "src/demo.ts",
+      line: 5,
+      column: 13,
+      maxResults: 1,
+    });
+
+    expect(definitionResult.ok).toBe(true);
+    expect(definitionResult.message).toContain("[tool result] ts_definition src/demo.ts");
+    expect(definitionResult.message).toContain("Found 1 TypeScript definition(s):");
+    expect(definitionResult.message).toContain("src/demo.ts:1:17-1:22");
+
+    expect(referencesResult.ok).toBe(true);
+    expect(referencesResult.message).toContain("[tool result] ts_references src/demo.ts");
+    expect(referencesResult.message).toContain("Found 1 TypeScript reference(s):");
+    expect(referencesResult.message).toContain("symbol: function greet(name: string): string");
+    expect(referencesResult.message).toContain("[definition]");
+    expect(referencesResult.message).not.toContain("console.log(greet('Cyrene'));");
+  });
+
+  test("ts_diagnostics formats combined semantic diagnostics and invalidates on mutation", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.ts"),
+      [
+        "export const value: string = 'ok';",
+        "const unused = 1;",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const diagnosticsResult = await service.handleToolCall("file", {
+      action: "ts_diagnostics",
+      path: "src/demo.ts",
+    });
+    const mutationResult = await service.handleToolCall("file", {
+      action: "create_dir",
+      path: "generated",
+    });
+
+    expect(diagnosticsResult.ok).toBe(true);
+    expect(diagnosticsResult.message).toContain("[tool result] ts_diagnostics src/demo.ts");
+    expect(diagnosticsResult.message).toContain("Found 2 TypeScript diagnostic(s):");
+    expect(diagnosticsResult.message).toContain("[semantic] src/demo.ts:1:14 | error TS2322");
+    expect(diagnosticsResult.message).toContain("[suggestion] src/demo.ts:2:7 | suggestion TS6133");
+
+    expect(mutationResult.ok).toBe(true);
+    expect(tsServerClient.invalidations.length).toBeGreaterThan(0);
+  });
+
+  test("ts_prepare_rename returns a semantic rename preview without mutating files", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    const originalContent = [
+      "export function greet(name: string) {",
+      "  return `hello ${name}`;",
+      "}",
+      "",
+      "console.log(greet('Cyrene'));",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.ts"), originalContent, "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "ts_prepare_rename",
+      path: "src/demo.ts",
+      line: 5,
+      column: 13,
+      newName: "welcome",
+      findInComments: true,
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] ts_prepare_rename src/demo.ts");
+    expect(result.message).toContain("Prepared TypeScript rename preview:");
+    expect(result.message).toContain("symbol: function greet(name: string): string");
+    expect(result.message).toContain("rename_to: welcome");
+    expect(result.message).toContain("occurrences: 2");
+    expect(result.message).toContain("include_comments: true");
+    expect(result.message).toContain("src/demo.ts:1:17-1:22 => welcome");
+    expect(result.message).not.toContain("src/demo.ts:5:13-5:18 => welcome");
+    expect(result.message).toContain("apply_patch_plan_files: 1");
+    expect(result.message).toContain("apply_patch_plan_inline: 1/1");
+    const planMatch = result.message.match(/```json\n([\s\S]*?)\n```/);
+    expect(planMatch).not.toBeNull();
+    const applyPatchPlan = JSON.parse(planMatch?.[1] ?? "{}");
+    expect(applyPatchPlan).toEqual({
+      action: "apply_patch",
+      path: "src/demo.ts",
+      find: originalContent,
+      replace: [
+        "export function welcome(name: string) {",
+        "  return `hello ${name}`;",
+        "}",
+        "",
+        "console.log(welcome('Cyrene'));",
+      ].join("\n"),
+    });
+    expect(await readFile(join(root, "src", "demo.ts"), "utf8")).toBe(originalContent);
+    expect(tsServerClient.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "rename" }),
+      ])
+    );
+  });
+
+  test("lsp_hover delegates to the configured LSP manager and passes serverId", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      [
+        "fn greet(name: &str) -> String {",
+        '  format!(\"hello {}\", name)',
+        "}",
+        "",
+        "fn main() {",
+        '  let message = greet(\"Cyrene\");',
+        '  println!(\"{}\", message);',
+        "}",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_hover",
+      path: "src/demo.rs",
+      line: 1,
+      column: 4,
+      serverId: "rust",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] lsp_hover src/demo.rs");
+    expect(result.message).toContain("server: rust");
+    expect(result.message).toContain("range: src/demo.rs:1:4-1:9");
+    expect(result.message).toContain("fn greet(name: &str) -> String");
+    expect(lspManager.sessionRequests).toEqual([
+      expect.objectContaining({
+        filePath: join(root, "src", "demo.rs"),
+        options: { serverId: "rust" },
+      }),
+    ]);
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "hover" }),
+      ])
+    );
+  });
+
+  test("lsp tools return actionable config errors when no LSP servers are configured", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn main() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_hover",
+      path: "src/demo.rs",
+      line: 1,
+      column: 4,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("LSP config error: no lsp_servers are configured");
+    expect(result.message).toContain("/mcp lsp add");
+  });
+
+  test("lsp_definition and lsp_references delegate to the LSP manager", async () => {
+    const { root, service } = await createLspService("rust-analyzer");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      [
+        "fn greet(name: &str) -> String {",
+        '  format!(\"hello {}\", name)',
+        "}",
+        "",
+        "fn main() {",
+        '  let message = greet(\"Cyrene\");',
+        '  println!(\"{}\", message);',
+        "}",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const definitionResult = await service.handleToolCall("file", {
+      action: "lsp_definition",
+      path: "src/demo.rs",
+      line: 6,
+      column: 17,
+    });
+    const referencesResult = await service.handleToolCall("file", {
+      action: "lsp_references",
+      path: "src/demo.rs",
+      line: 6,
+      column: 17,
+    });
+
+    expect(definitionResult.ok).toBe(true);
+    expect(definitionResult.message).toContain("[tool result] lsp_definition src/demo.rs");
+    expect(definitionResult.message).toContain("Found 1 LSP definition(s):");
+    expect(definitionResult.message).toContain("server: rust-analyzer");
+    expect(definitionResult.message).toContain("src/demo.rs:1:4-1:9");
+
+    expect(referencesResult.ok).toBe(true);
+    expect(referencesResult.message).toContain("[tool result] lsp_references src/demo.rs");
+    expect(referencesResult.message).toContain("Found 2 LSP reference(s):");
+    expect(referencesResult.message).toContain("src/demo.rs:1:4-1:9");
+    expect(referencesResult.message).toContain("src/demo.rs:6:17-6:22");
+  });
+
+  test("lsp_document_symbols formats a flattened document outline", async () => {
+    const { root, service } = await createLspService("rust");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn main() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_document_symbols",
+      path: "src/demo.rs",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] lsp_document_symbols src/demo.rs");
+    expect(result.message).toContain("Found 3 LSP document symbol(s):");
+    expect(result.message).toContain("server: rust");
+    expect(result.message).toContain("greet (fn) @ 1:4");
+    expect(result.message).toContain("main (fn) @ 5:4");
+    expect(result.message).toContain("  message (let) @ 6:7 [main]");
+  });
+
+  test("lsp_diagnostics formats diagnostics and invalidates on mutation", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn greet() {}\n", "utf8");
+
+    const diagnosticsResult = await service.handleToolCall("file", {
+      action: "lsp_diagnostics",
+      path: "src/demo.rs",
+      maxResults: 2,
+    });
+    const mutationResult = await service.handleToolCall("file", {
+      action: "create_dir",
+      path: "generated",
+    });
+
+    expect(diagnosticsResult.ok).toBe(true);
+    expect(diagnosticsResult.message).toContain("[tool result] lsp_diagnostics src/demo.rs");
+    expect(diagnosticsResult.message).toContain("Found 2 LSP diagnostic(s):");
+    expect(diagnosticsResult.message).toContain("server: rust");
+    expect(diagnosticsResult.message).toContain("[error] src/demo.rs:1:4 rustc E0308 | mismatched types");
+    expect(diagnosticsResult.message).toContain("[warning] src/demo.rs:6:7 clippy | unused variable: `message`");
+
+    expect(mutationResult.ok).toBe(true);
+    expect(lspManager.invalidations.length).toBeGreaterThan(0);
+  });
+
+  test("lsp_prepare_rename returns an apply_patch plan without mutating files", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    const originalContent = [
+      "fn greet(name: &str) -> String {",
+      '  format!(\"hello {}\", name)',
+      "}",
+      "",
+      "fn main() {",
+      '  let message = greet(\"Cyrene\");',
+      '  println!(\"{}\", message);',
+      "}",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), originalContent, "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_prepare_rename",
+      path: "src/demo.rs",
+      line: 6,
+      column: 17,
+      newName: "welcome",
+      maxResults: 1,
+      serverId: "rust",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] lsp_prepare_rename src/demo.rs");
+    expect(result.message).toContain("Prepared LSP rename preview:");
+    expect(result.message).toContain("server: rust");
+    expect(result.message).toContain("symbol: greet");
+    expect(result.message).toContain("rename_to: welcome");
+    expect(result.message).toContain("occurrences: 2");
+    expect(result.message).toContain("apply_patch_plan_files: 1");
+    expect(result.message).toContain("apply_patch_plan_inline: 1/1");
+    expect(result.message).toContain("src/demo.rs:1:4-1:9 => welcome");
+    expect(result.message).not.toContain("src/demo.rs:6:17-6:22 => welcome");
+    const planMatch = result.message.match(/```json\n([\s\S]*?)\n```/);
+    expect(planMatch).not.toBeNull();
+    const applyPatchPlan = JSON.parse(planMatch?.[1] ?? "{}");
+    expect(applyPatchPlan).toEqual({
+      action: "apply_patch",
+      path: "src/demo.rs",
+      find: originalContent,
+      replace: [
+        "fn welcome(name: &str) -> String {",
+        '  format!(\"hello {}\", name)',
+        "}",
+        "",
+        "fn main() {",
+        '  let message = welcome(\"Cyrene\");',
+        '  println!(\"{}\", message);',
+        "}",
+      ].join("\n"),
+    });
+    expect(await readFile(join(root, "src", "demo.rs"), "utf8")).toBe(originalContent);
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "prepareRename" }),
+        expect.objectContaining({ method: "rename" }),
+      ])
+    );
   });
 
   test("find_files executes immediately and returns matching workspace-relative paths", async () => {
@@ -1722,6 +2568,9 @@ describe("FileMcpService", () => {
     expect(approved.ok).toBe(true);
     expect(approved.message).toContain("Patched file: patch-me.ts");
     expect(approved.message).toContain("[confirmed file mutation] apply_patch patch-me.ts");
+    expect(approved.message).toContain("diff_stats: +1 -1");
+    expect(approved.message).toContain("-    1 | const label = 'before';");
+    expect(approved.message).toContain("+    1 | const label = 'after';");
     expect(await readFile(join(root, "patch-me.ts"), "utf8")).toBe("const label = 'after';\n");
   });
 

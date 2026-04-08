@@ -158,15 +158,16 @@ const buildProps = (
     },
   ],
   liveAssistantText: "",
+  recentLocalCommand: null,
   status: "idle" as const,
   appRoot: "D:/Projects/demo-root",
   input: "",
   inputCursorOffset: 0,
-    inputCommandState: {
-      active: false,
-      mode: "idle",
-      queryText: null,
-      currentCommand: null,
+  inputCommandState: {
+    active: false,
+    mode: "idle",
+    queryText: null,
+    currentCommand: null,
     suggestions: [],
     selectedIndex: 0,
     historyPosition: null,
@@ -441,6 +442,125 @@ describe("ChatScreen", () => {
       "Enter send  |  Ctrl+J newline  |  Shift+Enter if terminal supports it"
     );
     expect(output).not.toContain("Conversation");
+  });
+
+  test("renders file mutation tool diffs as separate colored rows instead of one collapsed line", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          text: [
+            "Tool: create_file dual_simplex.py | Created file: dual_simplex.py | +148 -0",
+            '+    1 | """',
+            "+    2 | 对偶单纯形法（Dual Simplex Method）示例实现",
+            "+    3 | 说明：",
+          ].join("\n"),
+          kind: "tool_status",
+          tone: "info",
+          color: "cyan",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("[tool]");
+    expect(output).toContain("create_file dual_simplex.py | Created file: dual_simplex.py");
+    expect(output).toContain("+148");
+    expect(output).toContain("-0");
+    expect(output).toContain(' +    1 | \\"\\"\\" ');
+    expect(output).toContain(" +    2 | 对偶单纯形法（Dual Simplex Method）示例实现 ");
+    expect(output).toContain(" +    3 | 说明： ");
+    expect(output).not.toContain(
+      'Created file: dual_simplex.py | +148 -0 | +    1 | """'
+    );
+  });
+
+  test("does not clip long file mutation tool diffs", () => {
+    const diffLines = Array.from({ length: 430 }, (_, index) => {
+      const lineNo = String(index + 1).padStart(4, " ");
+      return `+ ${lineNo} | line ${index + 1}`;
+    });
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          text: [
+            "Tool: create_file long_diff.txt | Created file: long_diff.txt | +430 -0",
+            ...diffLines,
+          ].join("\n"),
+          kind: "tool_status",
+          tone: "info",
+          color: "cyan",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain(" +    1 | line 1 ");
+    expect(output).toContain(" +  430 | line 430 ");
+    expect(output).not.toContain("[render clipped]");
+  });
+
+  test("renders recent local slash commands above the composer input", () => {
+    const tree = renderScreen({
+      recentLocalCommand: "/model",
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("recent command");
+    expect(output).toContain("/model");
+  });
+
+  test("shows slash-command output instead of the startup view once a recent command exists", () => {
+    const tree = renderScreen({
+      recentLocalCommand: "/mcp",
+      items: [
+        {
+          role: "system",
+          text: "MCP runtime\npending: 0",
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("MCP runtime");
+    expect(output).not.toContain("Start here");
+  });
+
+  test("suppresses legacy slash command echoes and picker-open hints in transcript", () => {
+    const tree = renderScreen({
+      recentLocalCommand: "/model",
+      items: [
+        {
+          role: "system",
+          text: "Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.",
+          kind: "system_hint",
+          tone: "neutral",
+          color: "gray",
+        },
+        {
+          role: "user",
+          text: "/model",
+          kind: "transcript",
+          tone: "neutral",
+        },
+        {
+          role: "system",
+          text: "Model picker opened: Up/Down select, Left/Right page, Enter switch, Esc cancel.",
+          kind: "system_hint",
+          tone: "info",
+          color: "cyan",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("recent command");
+    expect(output).toContain("/model");
+    expect(output).not.toContain("Model picker opened:");
   });
 
   test("empty startup mode renders a lightweight workspace-first welcome prompt", () => {

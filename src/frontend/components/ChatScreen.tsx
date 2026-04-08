@@ -19,6 +19,7 @@ import type { AuthStatus } from "../../infra/auth/types";
 type ChatScreenProps = {
   items: ChatItem[];
   liveAssistantText: string;
+  recentLocalCommand: string | null;
   status: ChatStatus;
   appRoot: string;
   input: string;
@@ -282,6 +283,14 @@ type GraphemeSegment = {
 };
 
 const APP_NAME = "Cyrene Code";
+const DEFAULT_HELP_NOTE_TEXT =
+  "Type /help to view commands. Use /login for HTTP auth or /resume to open session picker.";
+const PANEL_OPEN_HINT_PREFIXES = [
+  "Model picker opened:",
+  "Provider picker opened:",
+  "Sessions panel opened:",
+  "Resume picker opened:",
+];
 // Generated via: figlet -f "ANSI Shadow" ">Cyrene"
 const STARTUP_ANSI_SHADOW_LOGO_LINES = [
   "██╗   ██████╗██╗   ██╗██████╗ ███████╗███╗   ██╗███████╗",
@@ -302,12 +311,12 @@ const DEFAULT_TERMINAL_COLUMNS = 80;
 const COMPOSER_CHROME_WIDTH = 24;
 const MIN_COMPOSER_WRAP_WIDTH = 16;
 const MAX_COMPOSER_WRAP_WIDTH = 96;
-const APPROVAL_DIFF_ADD_FOREGROUND = "#dcfce7";
-const APPROVAL_DIFF_ADD_BACKGROUND = "#14532d";
-const APPROVAL_DIFF_REMOVE_FOREGROUND = "#fee2e2";
-const APPROVAL_DIFF_REMOVE_BACKGROUND = "#7f1d1d";
-const APPROVAL_DIFF_ADD_ACCENT = "#166534";
-const APPROVAL_DIFF_REMOVE_ACCENT = "#991b1b";
+const APPROVAL_DIFF_ADD_FOREGROUND = "#052e16";
+const APPROVAL_DIFF_ADD_BACKGROUND = "#4ade80";
+const APPROVAL_DIFF_REMOVE_FOREGROUND = "#450a0a";
+const APPROVAL_DIFF_REMOVE_BACKGROUND = "#f87171";
+const APPROVAL_DIFF_ADD_ACCENT = "#16a34a";
+const APPROVAL_DIFF_REMOVE_ACCENT = "#ef4444";
 const MAX_RENDERED_TRANSCRIPT_ITEMS = 80;
 const MAX_TRANSCRIPT_WINDOW_LINES = 20_000;
 const MAX_TRANSCRIPT_WINDOW_CHARS = 1_000_000;
@@ -896,12 +905,32 @@ const formatRenderClipNotice = (
   return `[render clipped] ${prefix}omitted ${parts.join(" / ")} to keep terminal stable`;
 };
 
-const getMessageClipOptions = (item: ChatItem): RenderClipOptions =>
-  item.role === "assistant" && item.kind === "transcript"
-    ? {
-        preferTail: true,
-      }
-    : {};
+const FILE_MUTATION_TOOL_MESSAGE_PATTERN =
+  /^Tool:\s+(create_file|write_file|edit_file|apply_patch)\b/m;
+const FILE_MUTATION_DIFF_LINE_PATTERN = /^[+-]\s+\d+\s+\|/m;
+
+const isExpandedMutationToolMessage = (item: ChatItem) =>
+  item.kind === "tool_status" &&
+  FILE_MUTATION_TOOL_MESSAGE_PATTERN.test(item.text) &&
+  FILE_MUTATION_DIFF_LINE_PATTERN.test(item.text);
+
+const getMessageClipOptions = (item: ChatItem): RenderClipOptions => {
+  if (isExpandedMutationToolMessage(item)) {
+    const lineCount = item.text ? item.text.split("\n").length : 0;
+    return {
+      maxLines: lineCount + 1,
+      maxChars: (item.text?.length ?? 0) + 1,
+    };
+  }
+
+  if (item.role === "assistant" && item.kind === "transcript") {
+    return {
+      preferTail: true,
+    };
+  }
+
+  return {};
+};
 
 const getApproximateMessageRenderCost = (item: ChatItem) => {
   const text = item.text ?? "";
@@ -952,6 +981,28 @@ const getTranscriptWindow = (items: ChatItem[]) => {
     items: items.slice(startIndex),
     hiddenCount: startIndex,
   };
+};
+
+const shouldSuppressTranscriptItem = (item: ChatItem) => {
+  const text = item.text.trim();
+  if (!text) {
+    return true;
+  }
+
+  if (item.role === "user" && !text.includes("\n") && text.startsWith("/")) {
+    return true;
+  }
+
+  if (item.role === "system" && item.kind === "system_hint") {
+    if (text === DEFAULT_HELP_NOTE_TEXT) {
+      return true;
+    }
+    if (PANEL_OPEN_HINT_PREFIXES.some(prefix => text.startsWith(prefix))) {
+      return true;
+    }
+  }
+
+  return false;
 };
 
 const formatProviderLabel = (provider: string, max = 22) => {
@@ -1898,6 +1949,52 @@ const summarizeCompactEventText = (text: string) => {
   return [normalizedFirstLine, ...restLines].join(" | ");
 };
 
+type CompactToolMutationEvent = {
+  summary: string;
+  additions: number | null;
+  deletions: number | null;
+  diffLines: ApprovalPreviewLine[];
+  omittedNotice: string | null;
+};
+
+const parseCompactToolMutationEvent = (text: string): CompactToolMutationEvent | null => {
+  const lines = text
+    .split("\n")
+    .map(line => line.trimEnd())
+    .filter(line => line.trim().length > 0);
+  const [firstLine = "", ...restLines] = lines;
+  if (!firstLine.startsWith("Tool: ")) {
+    return null;
+  }
+
+  const header = firstLine.replace(/^Tool:\s*/, "").trim();
+  const parts = header.split(/\s+\|\s+/);
+  const lastPart = parts[parts.length - 1] ?? "";
+  const statsMatch = /^\+(\d+)\s+-\s*(\d+)$/.exec(lastPart);
+  const summary = statsMatch ? parts.slice(0, -1).join(" | ") : header;
+  const diffLines = restLines
+    .map(line => classifyApprovalPreviewLine(line))
+    .filter(
+      (line): line is ApprovalPreviewLine =>
+        line.kind === "add" || line.kind === "remove" || line.kind === "hunk"
+    );
+
+  if (diffLines.length === 0) {
+    return null;
+  }
+
+  const omittedNotice =
+    restLines.find(line => /^\.\.\.\s+\d+\s+more changed line\(s\)$/.test(line.trim())) ?? null;
+
+  return {
+    summary,
+    additions: statsMatch ? Number.parseInt(statsMatch[1] ?? "0", 10) : null,
+    deletions: statsMatch ? Number.parseInt(statsMatch[2] ?? "0", 10) : null,
+    diffLines,
+    omittedNotice,
+  };
+};
+
 const renderCompactEventRow = (
   item: ChatItem,
   itemIndex: number,
@@ -1907,6 +2004,55 @@ const renderCompactEventRow = (
 ) => {
   const messageLabel = getMessageLabel(item);
   const eventLabel = item.kind === "system_hint" ? "note" : messageLabel.label;
+  const toolMutationEvent =
+    item.kind === "tool_status" ? parseCompactToolMutationEvent(text) : null;
+
+  if (toolMutationEvent) {
+    const gutterWidth = getApprovalDiffGutterWidth(toolMutationEvent.diffLines);
+    return (
+      <Box key={`item-${itemIndex}`} flexDirection="column" marginBottom={1}>
+        <Box flexWrap="wrap">
+          <Text color={messageLabel.color}>{`[${eventLabel}]`}</Text>
+          <Text> </Text>
+          <Text color={color}>{toolMutationEvent.summary}</Text>
+          {typeof toolMutationEvent.additions === "number" ? (
+            <>
+              <Text> </Text>
+              <Text
+                color={APPROVAL_DIFF_ADD_FOREGROUND}
+                backgroundColor={APPROVAL_DIFF_ADD_BACKGROUND}
+                bold
+              >
+                {` +${toolMutationEvent.additions} `}
+              </Text>
+            </>
+          ) : null}
+          {typeof toolMutationEvent.deletions === "number" ? (
+            <>
+              <Text> </Text>
+              <Text
+                color={APPROVAL_DIFF_REMOVE_FOREGROUND}
+                backgroundColor={APPROVAL_DIFF_REMOVE_BACKGROUND}
+                bold
+              >
+                {` -${toolMutationEvent.deletions} `}
+              </Text>
+            </>
+          ) : null}
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          {toolMutationEvent.diffLines.map((line, index) =>
+            renderCompactApprovalLine(line, index, "write_file", gutterWidth)
+          )}
+          {toolMutationEvent.omittedNotice ? (
+            <Text dimColor>{toolMutationEvent.omittedNotice}</Text>
+          ) : null}
+        </Box>
+        {clipNotice ? <Text dimColor>{clipNotice}</Text> : null}
+      </Box>
+    );
+  }
+
   const summaryText = summarizeCompactEventText(text);
 
   return (
@@ -2790,6 +2936,7 @@ const renderMainComposer = (
   status: ChatStatus,
   input: string,
   inputCursorOffset: number,
+  recentLocalCommand: string | null,
   _onInputChange: (next: string) => void,
   _onSubmit: () => void,
   activePanel: string,
@@ -2862,6 +3009,13 @@ const renderMainComposer = (
         </Text>
       </Box>
       {shellSessionNode}
+      {recentLocalCommand ? (
+        <Box marginTop={1} flexWrap="wrap">
+          <Text color="magenta">recent command</Text>
+          <Text> </Text>
+          <Text color="white">{recentLocalCommand}</Text>
+        </Box>
+      ) : null}
       <Box marginTop={1} flexDirection="column">
         {input ? (
           composerWindow.rows.map((row, visibleIndex) => {
@@ -3679,7 +3833,8 @@ const renderCompactApprovalLine = (
       <Text
         key={`approval-hunk-${index}`}
         color="black"
-        backgroundColor="cyan"
+        backgroundColor="#67e8f9"
+        bold
       >
         {` ${parsed.raw} `}
       </Text>
@@ -3693,10 +3848,17 @@ const renderCompactApprovalLine = (
       : " ".repeat(gutterWidth);
     return (
       <Box key={`approval-diff-${index}`}>
-        <Text color={palette.accent}>▌</Text>
+        <Text
+          color={palette.foreground}
+          backgroundColor={palette.accent}
+          bold
+        >
+          ▌
+        </Text>
         <Text
           color={palette.foreground}
           backgroundColor={palette.background}
+          bold
         >
           {` ${palette.marker} ${lineNumber} | ${parsed.content ?? ""} `}
         </Text>
@@ -3970,6 +4132,7 @@ const renderCompactApprovalPanel = (
 export const ChatScreen = ({
   items,
   liveAssistantText,
+  recentLocalCommand,
   status,
   appRoot,
   input,
@@ -4076,11 +4239,21 @@ export const ChatScreen = ({
 
   const showStartupView =
     activePanel === "idle" &&
+    recentLocalCommand === null &&
     !liveAssistantText &&
-    items.every(item => item.role === "system" && item.kind === "system_hint");
+    items.length === 1 &&
+    items[0]?.role === "system" &&
+    items[0]?.kind === "system_hint";
+  const renderedTranscriptItems = React.useMemo(
+    () => items.filter(item => !shouldSuppressTranscriptItem(item)),
+    [items]
+  );
   const transcriptWindow = React.useMemo(
-    () => (showStartupView ? getTranscriptWindow([]) : getTranscriptWindow(items)),
-    [items, showStartupView]
+    () =>
+      showStartupView
+        ? getTranscriptWindow([])
+        : getTranscriptWindow(renderedTranscriptItems),
+    [renderedTranscriptItems, showStartupView]
   );
   const showTranscriptWindowNotice =
     transcriptWindow.hiddenCount > 0 &&
@@ -4147,6 +4320,7 @@ export const ChatScreen = ({
         status,
         input,
         inputCursorOffset,
+        recentLocalCommand,
         onInputChange,
         onSubmit,
         activePanel,
@@ -4161,6 +4335,7 @@ export const ChatScreen = ({
       input,
       inputCommandState,
       inputCursorOffset,
+      recentLocalCommand,
       isPanelActive,
       onInputChange,
       onSubmit,
@@ -4173,6 +4348,19 @@ export const ChatScreen = ({
 
   return (
     <Box flexDirection="column">
+      <Box marginBottom={SECTION_GAP} flexDirection="column">
+        {showStartupView
+          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
+          : null}
+        {showTranscriptWindowNotice ? (
+          <Text dimColor>
+            {`[render window] showing latest ${transcriptWindow.items.length} of ${renderedTranscriptItems.length} messages`}
+          </Text>
+        ) : null}
+        {transcriptNodes}
+        {liveAssistantNode}
+      </Box>
+
       {authPanel.active ? renderAuthWizardPanel(authPanel, authStatus) : null}
 
       {sessionsPanel.active &&
@@ -4300,19 +4488,6 @@ export const ChatScreen = ({
             appRoot
           )
         : null}
-
-      <Box marginBottom={SECTION_GAP} flexDirection="column">
-        {showStartupView
-          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
-          : null}
-        {showTranscriptWindowNotice ? (
-          <Text dimColor>
-            {`[render window] showing latest ${transcriptWindow.items.length} of ${items.length} messages`}
-          </Text>
-        ) : null}
-        {transcriptNodes}
-        {liveAssistantNode}
-      </Box>
 
       {composerNode}
       {statusLineNode}

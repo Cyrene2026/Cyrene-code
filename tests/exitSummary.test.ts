@@ -77,7 +77,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/runtime\s+2m 5s/);
     expect(screen).toMatch(/requests\s+3/);
     expect(screen).toMatch(/state updates\s+1/);
-    expect(screen).toMatch(/prompt\s+120/);
+    expect(screen).toMatch(/prompt uncached\s+30/);
     expect(screen).toMatch(/cached\s+90/);
     expect(screen).toMatch(/completion\s+45/);
     expect(screen).toMatch(/total\s+165/);
@@ -108,7 +108,7 @@ describe("exitSummary", () => {
     expect(screen).toMatch(/runtime\s+0s/);
     expect(screen).toMatch(/requests\s+0/);
     expect(screen).toMatch(/state updates\s+0/);
-    expect(screen).toMatch(/prompt\s+0/);
+    expect(screen).toMatch(/prompt uncached\s+0/);
     expect(screen).toMatch(/cached\s+0/);
     expect(screen).toMatch(/completion\s+0/);
     expect(screen).toMatch(/total\s+0/);

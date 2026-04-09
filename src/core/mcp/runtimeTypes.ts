@@ -110,6 +110,23 @@ export type McpRuntimeLspServerDescriptor = {
 export type McpRuntimeLspDoctorResult = {
   ok: boolean;
   status: "ready" | "config_error" | "startup_error";
+  reason?:
+    | "path_not_readable"
+    | "path_not_file"
+    | "no_configured_servers"
+    | "server_not_configured"
+    | "server_id_required"
+    | "path_mismatch"
+    | "no_matching_server"
+    | "multiple_matching_servers"
+    | "command_not_found"
+    | "permission_denied"
+    | "invalid_protocol_output"
+    | "process_exited_early"
+    | "unsupported_request"
+    | "startup_failed"
+    | "request_failed"
+    | "unknown";
   filesystemServerId: string;
   workspaceRoot: string;
   inputPath: string;

@@ -20,7 +20,6 @@ import {
 import type { SessionStore } from "../../core/session/store";
 import type { QuerySessionState } from "../../core/query/sessionMachine";
 import type {
-  ProviderProfile,
   ProviderProfileOverrideMap,
   ProviderRuntimeInfo,
   QueryTransport,
@@ -37,19 +36,91 @@ import type {
 } from "../../core/session/types";
 import type {
   McpRuntime,
-  McpRuntimeLspServerDescriptor,
-  McpRuntimeLspServerInput,
-  McpRuntimeSummary,
-  McpServerDescriptor,
-  McpRuntimeServerInput,
-  McpToolDescriptor,
   MpcAction,
   PendingReviewItem,
   ToolRequest,
 } from "../../core/mcp";
 import type { SkillDefinition, SkillsRuntime } from "../../core/skills";
 import { createApprovalActionLock } from "./approvalActionLock";
+import {
+  executeCurrentPendingReviewAction,
+} from "./chatApprovalController";
+import {
+  getApprovalPreviewText,
+  getPendingQueueSignature,
+  parseToolDetail,
+  type ApprovalPreviewMode,
+} from "./chatApprovalHelpers";
+import {
+  clearApprovalBlock,
+  clearApprovalInFlight,
+  closeApprovalPanelState,
+  createInitialApprovalPanelState,
+  createNextApprovalPanelState,
+  syncApprovalBlockToQueue,
+  type ApprovalActionKind,
+  type ApprovalPanelState,
+  type ApprovalStateUpdateOptions,
+} from "./chatApprovalPanelState";
+import { handleApprovalCommand } from "./chatApprovalCommandHandler";
+import {
+  executeApprovePendingReview,
+  executePendingBatch,
+  executeRejectPendingReview,
+} from "./chatApprovalExecution";
+import {
+  AUTH_PANEL_STEPS,
+  applyAuthProviderPresetState,
+  applyRememberedKeyToAuthPanel,
+  getAuthPanelFieldValue,
+  startRememberedKeyReplacementState,
+  transitionAuthPanelStep,
+  updateAuthPanelFieldValue,
+  type AuthPanelMode,
+  type AuthPanelState,
+  type AuthPanelStep,
+} from "./chatAuthPanelHelpers";
+import { handleAuthCommand } from "./chatAuthCommandHandler";
+import {
+  AUTH_PROVIDER_PRESETS,
+  HELP_TEXT,
+  getSlashSuggestions,
+  type CommandSuggestion,
+} from "./chatCommandHelpers";
 import { resolveComposerInputIntent } from "./composerInput";
+import {
+  buildFileSearchPattern,
+  getActiveFileMention,
+  getFileMentionReferences,
+  getFilePreviewCacheKey,
+  isCodeLikePath,
+  parseFindFilesSuggestions,
+  type FileMentionSuggestion,
+} from "./chatFileMentionHelpers";
+import {
+  EMPTY_SHELL_SESSION_STATE,
+  SHELL_SESSION_ACTIONS,
+  areShellSessionsEqual,
+  formatSymbolPreviewMeta,
+  parseOutlineEntries,
+  parseReadRangePreview,
+  parseSearchTextContextPreview,
+  parseShellSessionMessage,
+  pickOutlineEntry,
+  type FilePreviewResult,
+  type OutlineEntry,
+  type ShellSessionState,
+} from "./chatFilePreviewHelpers";
+import { hasLegacyCompressedMarkdown } from "./chatLegacySessionHelpers";
+import { handleMcpCommand } from "./chatMcpCommandHandler";
+import { formatActiveSkillsPrompt } from "./chatMcpSkillsFormatting";
+import { handleProviderModelCommand } from "./chatProviderModelCommandHandler";
+import { handleSessionCommand } from "./chatSessionCommandHandler";
+import {
+  parseShellShortcut,
+  type ShellShortcutAction,
+} from "./chatShellHelpers";
+import { handleSkillsCommand } from "./chatSkillsCommandHandler";
 import { summarizeToolMessage } from "./toolMessageSummary";
 import type { ComposerKeymap } from "./composerKeymap";
 import { useInputAdapter } from "./inputAdapter";
@@ -65,13 +136,10 @@ import {
   type MultilineEditorState,
 } from "./multilineInput";
 import {
-  canRetryBlockedApproval,
   clampPreviewOffset,
   clearApprovalBlockOnSelectionChange,
-  computeNextApprovalSelection,
   cycleSelection,
   movePagedSelection,
-  shouldKeepApprovalPanelOpen,
   shouldBlockRepeatedApproval,
 } from "./chatStateHelpers";
 
@@ -91,6 +159,10 @@ type UseChatAppParams = {
     status: AuthStatus;
     getStatus: () => Promise<AuthStatus>;
     getSavedApiKey?: (providerBaseUrl: string) => Promise<string | undefined>;
+    syncSelection?: (input: {
+      providerBaseUrl?: string;
+      model?: string;
+    }) => Promise<AuthStatus>;
     saveLogin: (input: AuthLoginInput) => Promise<{
       ok: boolean;
       message: string;
@@ -140,43 +212,6 @@ type ProviderPickerState = {
   >;
 };
 
-type ApprovalPreviewMode = "summary" | "full";
-type ApprovalActionKind = "approve" | "reject";
-
-type ApprovalPanelState = {
-  active: boolean;
-  selectedIndex: number;
-  previewMode: ApprovalPreviewMode;
-  previewOffset: number;
-  lastOpenedAt: string | null;
-  blockedItemId: string | null;
-  blockedReason: string | null;
-  blockedAt: number | null;
-  lastAction: ApprovalActionKind | null;
-  inFlightId: string | null;
-  actionState: ApprovalActionKind | null;
-  resumePending: boolean;
-};
-
-type AuthPanelMode = "auto_onboarding" | "manual_login";
-type AuthPanelStep = "provider" | "api_key" | "model" | "confirm";
-
-type AuthPanelState = {
-  active: boolean;
-  mode: AuthPanelMode;
-  step: AuthPanelStep;
-  providerBaseUrl: string;
-  apiKey: string;
-  model: string;
-  rememberedKeyAvailable: boolean;
-  usingRememberedKey: boolean;
-  cursorOffset: number;
-  error: string | null;
-  info: string | null;
-  saving: boolean;
-  persistenceTarget: AuthStatus["persistenceTarget"];
-};
-
 type SuspendedTaskState = {
   sessionId: string;
   assistantBufferRef: { current: string };
@@ -191,38 +226,7 @@ type ActiveTurnState = {
   clearInFlightState?: () => Promise<void>;
 };
 
-type MatchRange = {
-  start: number;
-  end: number;
-};
-
-type CommandArgumentHint = {
-  label: string;
-  optional: boolean;
-};
-
-type CommandSpec = {
-  command: string;
-  description: string;
-  group?: string;
-  matchRanges?: MatchRange[];
-};
-
-type CommandSuggestion = CommandSpec & {
-  group: string;
-  matchRanges: MatchRange[];
-  baseCommand: string;
-  template: string | null;
-  argumentHints: CommandArgumentHint[];
-  insertValue: string;
-};
-
 type InputMode = "idle" | "command" | "file" | "shell";
-
-type FileMentionSuggestion = {
-  path: string;
-  description: string;
-};
 
 type FileMentionPreviewState = {
   path: string | null;
@@ -239,38 +243,12 @@ type FileMentionState = {
   preview: FileMentionPreviewState;
 };
 
-type ShellShortcutAction =
-  | "run_shell"
-  | "open_shell"
-  | "read_shell"
-  | "shell_status"
-  | "interrupt_shell"
-  | "close_shell";
-
 type ShellShortcutState = {
   active: boolean;
   action: ShellShortcutAction | null;
   command: string;
   actionLabel: string;
   description: string;
-};
-
-type ShellSessionStatus = "none" | "idle" | "running" | "exited" | "closed";
-
-type ShellSessionState = {
-  visible: boolean;
-  status: ShellSessionStatus;
-  shell: string | null;
-  cwd: string | null;
-  busy: boolean;
-  alive: boolean;
-  pendingOutput: boolean;
-  lastExit: string | null;
-  lastEvent: "opened" | "interrupted" | null;
-  openedAt: number | null;
-  runningSince: number | null;
-  lastOutputSummary: string | null;
-  lastOutputAt: number | null;
 };
 
 type InputCommandState = {
@@ -308,1003 +286,12 @@ const STREAMING_RENDER_BATCH_MS = 60;
 const STREAMING_RENDER_BATCH_MS_MEDIUM = 110;
 const STREAMING_RENDER_BATCH_MS_LARGE = 180;
 const TURN_CANCELLED_ERROR = "__CYRENE_TURN_CANCELLED__";
-const COMMAND_SPECS: CommandSpec[] = [
-  { command: "/help", description: "show command list" },
-  { command: "/login", description: "open HTTP login wizard" },
-  { command: "/logout", description: "remove managed user auth and rebuild transport" },
-  { command: "/auth", description: "show auth mode, source, and persistence target" },
-  { command: "/provider", description: "open provider picker" },
-  { command: "/provider refresh", description: "refresh current provider models" },
-  {
-    command: "/provider profile list",
-    description: "list manual provider profile overrides",
-  },
-  {
-    command: "/provider profile <openai|gemini|anthropic|custom> [url]",
-    description: "override provider profile (custom clears override)",
-  },
-  {
-    command: "/provider profile clear [url]",
-    description: "clear manual provider profile override",
-  },
-  { command: "/provider <url>", description: "switch provider directly (also accepts openai/gemini/anthropic)" },
-  { command: "/model", description: "open model picker" },
-  { command: "/model refresh", description: "refresh available models" },
-  { command: "/model <name>", description: "switch model directly" },
-  { command: "/system", description: "show current system prompt" },
-  { command: "/system <text>", description: "set system prompt for this runtime" },
-  { command: "/system reset", description: "restore default system prompt" },
-  { command: "/state", description: "show reducer/session state diagnostics" },
-  { command: "/sessions", description: "open sessions panel" },
-  { command: "/resume", description: "open session resume picker" },
-  { command: "/resume <id>", description: "resume a session by id" },
-  { command: "/new", description: "start a fresh session" },
-  { command: "/cancel", description: "cancel the current running turn" },
-  { command: "/undo", description: "undo last approved filesystem mutation" },
-  { command: "/search-session <query>", description: "search sessions by id/title/content" },
-  { command: "/search-session #<tag> [query]", description: "search sessions by tag + query" },
-  { command: "/tag list", description: "list tags of current session" },
-  { command: "/tag add <tag>", description: "add tag to current session" },
-  { command: "/tag remove <tag>", description: "remove tag from current session" },
-  { command: "/pin <note>", description: "pin important context" },
-  { command: "/pins", description: "list pinned context" },
-  { command: "/unpin <index>", description: "remove a pin" },
-  { command: "/skills", description: "show skills runtime summary" },
-  { command: "/skills list", description: "list available skills" },
-  { command: "/skills show <id>", description: "show one skill details" },
-  { command: "/skills enable <id>", description: "enable one skill in project config" },
-  { command: "/skills disable <id>", description: "disable one skill in project config" },
-  { command: "/skills remove <id>", description: "remove one skill via project remove_skills override" },
-  { command: "/skills use <id>", description: "use one skill for the current session only" },
-  { command: "/skills reload", description: "reload skills config from disk" },
-  { command: "/mcp", description: "show MCP runtime summary" },
-  { command: "/mcp servers", description: "list registered MCP servers" },
-  { command: "/mcp server <id>", description: "inspect one MCP server" },
-  { command: "/mcp tools", description: "list tools across registered MCP servers" },
-  { command: "/mcp tools <server>", description: "list tools for one MCP server" },
-  { command: "/mcp pending", description: "show pending MCP operations" },
-  { command: "/mcp add stdio <id> <command...>", description: "add a stdio MCP server to project config" },
-  { command: "/mcp add http <id> <url>", description: "add an HTTP MCP server to project config" },
-  { command: "/mcp add filesystem <id> [workspace]", description: "add a filesystem MCP server to project config" },
-  { command: "/mcp lsp list [filesystem-server]", description: "list configured LSP servers for filesystem MCP servers" },
-  {
-    command:
-      "/mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...",
-    description: "add or update one LSP server config on a filesystem MCP server",
-  },
-  { command: "/mcp lsp remove <filesystem-server> <lsp-id>", description: "remove one LSP server config from a filesystem MCP server" },
-  { command: "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]", description: "inspect LSP matching and startup for one file path" },
-  { command: "/mcp remove <id>", description: "remove one MCP server from active project config" },
-  { command: "/mcp enable <id>", description: "enable one MCP server in project config" },
-  { command: "/mcp disable <id>", description: "disable one MCP server in project config" },
-  { command: "/mcp reload", description: "reload MCP config from disk" },
-  { command: "/review", description: "open approval queue" },
-  { command: "/review <id>", description: "inspect one pending operation" },
-  { command: "/approve [id]", description: "approve pending operation(s)" },
-  { command: "/approve low", description: "approve all non-high-risk operations" },
-  { command: "/approve all", description: "approve all pending operations" },
-  { command: "/reject [id]", description: "reject pending operation(s)" },
-  { command: "/reject all", description: "reject all pending operations" },
-];
-const HELP_TEXT = [
-  "Commands:",
-  ...COMMAND_SPECS.map(spec => `${spec.command} - ${spec.description}`),
-].join("\n");
-
-const AUTH_PROVIDER_PRESETS = {
-  "1": {
-    alias: "openai",
-    label: "OpenAI",
-  },
-  "2": {
-    alias: "gemini",
-    label: "Gemini",
-  },
-  "3": {
-    alias: "anthropic",
-    label: "Anthropic",
-  },
-} as const;
-
-const mergeMatchRanges = (ranges: MatchRange[]) => {
-  if (ranges.length === 0) {
-    return [];
-  }
-
-  const ordered = [...ranges].sort((left, right) =>
-    left.start === right.start ? left.end - right.end : left.start - right.start
-  );
-  const merged: MatchRange[] = [];
-
-  for (const range of ordered) {
-    const previous = merged[merged.length - 1];
-    if (!previous || range.start > previous.end) {
-      merged.push({ ...range });
-      continue;
-    }
-    previous.end = Math.max(previous.end, range.end);
-  }
-
-  return merged;
-};
-
-const collectOrderedMatchRanges = (text: string, tokens: string[]) => {
-  if (tokens.length === 0) {
-    return [];
-  }
-
-  const normalizedText = text.toLowerCase();
-  const ranges: MatchRange[] = [];
-  let searchStart = 0;
-
-  for (const token of tokens) {
-    if (!token) {
-      continue;
-    }
-    const index = normalizedText.indexOf(token, searchStart);
-    if (index < 0) {
-      return null;
-    }
-    ranges.push({
-      start: index,
-      end: index + token.length,
-    });
-    searchStart = index + token.length;
-  }
-
-  return mergeMatchRanges(ranges);
-};
-
-const getCommandGroup = (command: string) => {
-  if (
-    command.startsWith("/login") ||
-    command.startsWith("/logout") ||
-    command.startsWith("/auth")
-  ) {
-    return "Auth";
-  }
-  if (command.startsWith("/provider") || command.startsWith("/model")) {
-    return "Model & provider";
-  }
-  if (
-    command.startsWith("/sessions") ||
-    command.startsWith("/resume") ||
-    command === "/new" ||
-    command === "/cancel"
-  ) {
-    return "Session";
-  }
-  if (command.startsWith("/system") || command === "/state") {
-    return "Prompt & state";
-  }
-  if (
-    command.startsWith("/search-session") ||
-    command.startsWith("/tag") ||
-    command.startsWith("/pin") ||
-    command.startsWith("/pins") ||
-    command.startsWith("/unpin")
-  ) {
-    return "Context";
-  }
-  if (
-    command.startsWith("/skills")
-  ) {
-    return "Skills";
-  }
-  if (
-    command.startsWith("/mcp")
-  ) {
-    return "MCP";
-  }
-  if (
-    command === "/undo" ||
-    command.startsWith("/review") ||
-    command.startsWith("/approve") ||
-    command.startsWith("/reject")
-  ) {
-    return "Review";
-  }
-  return "General";
-};
-
-const getSlashSuggestions = (rawInput: string) => {
-  const value = rawInput.trimStart();
-  if (!value.startsWith("/")) {
-    return [];
-  }
-
-  const normalized = value.toLowerCase();
-  const primaryToken = normalized.split(/\s+/, 1)[0] ?? normalized;
-  const queryTokens = normalized.split(/\s+/).filter(Boolean);
-
-  const matches: Array<CommandSuggestion & { score: number }> = [];
-  for (const spec of COMMAND_SPECS) {
-    const specNormalized = spec.command.toLowerCase();
-    const compactCommand = specNormalized.replace(/\s+<.*$/, "");
-    const matchRanges = collectOrderedMatchRanges(spec.command, queryTokens);
-    const startsWithNormalized = specNormalized.startsWith(normalized);
-    const startsWithPrimary = specNormalized.startsWith(primaryToken);
-    const directCommand = normalized.startsWith(compactCommand);
-    if (
-      !startsWithNormalized &&
-      !startsWithPrimary &&
-      !directCommand &&
-      matchRanges === null
-    ) {
-      continue;
-    }
-
-    const exact = specNormalized === normalized ? 1 : 0;
-    const rangePenalty = matchRanges?.[0]?.start ?? specNormalized.length;
-    const score =
-      exact * 400 +
-      (startsWithNormalized ? 220 : 0) +
-      (directCommand ? 180 : 0) +
-      (startsWithPrimary ? 80 : 0) +
-      Math.max(0, 40 - Math.min(rangePenalty, 40)) +
-      queryTokens.length * 4;
-
-    matches.push({
-      ...spec,
-      group: spec.group ?? getCommandGroup(spec.command),
-      matchRanges: matchRanges ?? [],
-      ...getCommandTemplateMeta(spec.command),
-      score,
-    });
-  }
-
-  matches.sort((left, right) => {
-    if (left.score !== right.score) {
-      return right.score - left.score;
-    }
-
-    const leftNormalized = left.command.toLowerCase();
-    const rightNormalized = right.command.toLowerCase();
-
-    if (leftNormalized.includes(" ") !== rightNormalized.includes(" ")) {
-      return leftNormalized.includes(" ") ? -1 : 1;
-    }
-
-    if (leftNormalized.length !== rightNormalized.length) {
-      return rightNormalized.length - leftNormalized.length;
-    }
-
-    return leftNormalized.localeCompare(rightNormalized);
-  });
-
-  return matches.slice(0, 8).map(({ score: _score, ...spec }) => spec);
-};
-
-const getSlashInsertValue = (command: string) => {
-  switch (command) {
-    case "/provider <url>":
-      return "/provider ";
-    case "/provider profile <openai|gemini|anthropic|custom> [url]":
-      return "/provider profile ";
-    case "/provider profile clear [url]":
-      return "/provider profile clear ";
-    case "/model <name>":
-      return "/model ";
-    case "/system <text>":
-      return "/system ";
-    case "/resume <id>":
-      return "/resume ";
-    case "/search-session <query>":
-      return "/search-session ";
-    case "/search-session #<tag> [query]":
-      return "/search-session #";
-    case "/tag add <tag>":
-      return "/tag add ";
-    case "/tag remove <tag>":
-      return "/tag remove ";
-    case "/pin <note>":
-      return "/pin ";
-    case "/unpin <index>":
-      return "/unpin ";
-    case "/skills enable <id>":
-      return "/skills enable ";
-    case "/skills disable <id>":
-      return "/skills disable ";
-    case "/skills remove <id>":
-      return "/skills remove ";
-    case "/skills use <id>":
-      return "/skills use ";
-    case "/skills show <id>":
-      return "/skills show ";
-    case "/mcp server <id>":
-      return "/mcp server ";
-    case "/mcp tools <server>":
-      return "/mcp tools ";
-    case "/mcp add stdio <id> <command...>":
-      return "/mcp add stdio ";
-    case "/mcp add http <id> <url>":
-      return "/mcp add http ";
-    case "/mcp add filesystem <id> [workspace]":
-      return "/mcp add filesystem ";
-    case "/mcp lsp list [filesystem-server]":
-      return "/mcp lsp list ";
-    case "/mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...":
-      return "/mcp lsp add ";
-    case "/mcp lsp remove <filesystem-server> <lsp-id>":
-      return "/mcp lsp remove ";
-    case "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]":
-      return "/mcp lsp doctor ";
-    case "/mcp remove <id>":
-      return "/mcp remove ";
-    case "/mcp enable <id>":
-      return "/mcp enable ";
-    case "/mcp disable <id>":
-      return "/mcp disable ";
-    case "/review <id>":
-      return "/review ";
-    case "/approve [id]":
-      return "/approve ";
-    case "/reject [id]":
-      return "/reject ";
-    default:
-      return command;
-  }
-};
-
-function getCommandTemplateMeta(command: string): {
-  baseCommand: string;
-  template: string | null;
-  argumentHints: CommandArgumentHint[];
-  insertValue: string;
-} {
-  const [baseCommand = command, ...rest] = command.trim().split(/\s+/);
-  const template = rest.length > 0 ? rest.join(" ") : null;
-  const argumentHints: CommandArgumentHint[] = [];
-  const argumentPattern = /#?<([^>]+)>|\[([^\]]+)\]/g;
-
-  let match: RegExpExecArray | null = null;
-  while ((match = argumentPattern.exec(template ?? "")) !== null) {
-    const label = (match[1] ?? match[2] ?? "").trim().replace(/^#/, "");
-    if (!label) {
-      continue;
-    }
-    argumentHints.push({
-      label,
-      optional: Boolean(match[2]),
-    });
-  }
-
-  return {
-    baseCommand,
-    template,
-    argumentHints,
-    insertValue: getSlashInsertValue(command),
-  };
-}
-
-type ActiveFileMention = {
-  start: number;
-  end: number;
-  query: string;
-};
-
-const FILE_MENTION_REGEX = /(^|\s)@([^\s@]*)/g;
-
-const getActiveFileMention = (
-  rawInput: string,
-  cursorOffset: number
-): ActiveFileMention | null => {
-  const clampedOffset = clampCursorOffset(rawInput, cursorOffset);
-  const beforeCursor = rawInput.slice(0, clampedOffset);
-  const match = beforeCursor.match(/(?:^|\s)@([^\s@]*)$/);
-  if (!match) {
-    return null;
-  }
-
-  const query = match[1] ?? "";
-  const start = beforeCursor.length - query.length - 1;
-  return {
-    start,
-    end: clampedOffset,
-    query,
-  };
-};
-
-const getFileMentionReferences = (rawInput: string) => {
-  const references: string[] = [];
-  let match: RegExpExecArray | null = null;
-  const pattern = new RegExp(FILE_MENTION_REGEX);
-  while ((match = pattern.exec(rawInput)) !== null) {
-    const reference = (match[2] ?? "").trim();
-    if (!reference) {
-      continue;
-    }
-    if (!references.includes(reference)) {
-      references.push(reference);
-    }
-  }
-  return references;
-};
-
-const buildFileSearchPattern = (query: string) =>
-  `*${query.replace(/\s+/g, "*")}*`;
-
-const buildFileSuggestionDescription = (path: string) => {
-  const normalized = path.replace(/\\/g, "/");
-  const slashIndex = normalized.lastIndexOf("/");
-  if (slashIndex <= 0) {
-    return "workspace root";
-  }
-  return normalized.slice(0, slashIndex);
-};
-
-const parseFindFilesSuggestions = (raw: string): FileMentionSuggestion[] => {
-  const body = raw.split("\n").slice(1);
-  const paths = body
-    .map(line => line.trim())
-    .filter(
-      line =>
-        Boolean(line) &&
-        !line.startsWith("Found ") &&
-        !line.startsWith("note:") &&
-        !line.startsWith("(no matches")
-    );
-
-  return paths.slice(0, 6).map(path => ({
-    path,
-    description: buildFileSuggestionDescription(path),
-  }));
-};
-
-const getFieldValues = (lines: string[], key: string) =>
-  lines
-    .map(line => line.trim())
-    .filter(line => line.toLowerCase().startsWith(`${key.toLowerCase()}:`))
-    .map(line =>
-      line.replace(new RegExp(`^${key}:\\s*`, "i"), "").trim()
-    );
-
-const getLastFieldValue = (lines: string[], key: string) => {
-  const values = getFieldValues(lines, key);
-  return values[values.length - 1] ?? "";
-};
-
-const normalizeNullableField = (value: string) => {
-  const trimmed = value.trim();
-  if (!trimmed || trimmed.toLowerCase() === "none") {
-    return null;
-  }
-  return trimmed;
-};
-
-const parseBooleanField = (value: string) => value.trim().toLowerCase() === "true";
-
-type FilePreviewResult = {
-  text: string;
-  meta: string | null;
-};
-
-type OutlineEntry = {
-  line: number;
-  label: string;
-};
-
-type ParsedShellSessionSnapshot = Omit<
-  ShellSessionState,
-  "openedAt" | "runningSince" | "lastOutputSummary" | "lastOutputAt"
-> & {
-  outputSummary: string | null;
-  hasOutputSummary: boolean;
-};
-
-const CODE_LIKE_EXTENSIONS = new Set([
-  ".c",
-  ".cc",
-  ".cpp",
-  ".cs",
-  ".css",
-  ".go",
-  ".h",
-  ".hpp",
-  ".html",
-  ".java",
-  ".js",
-  ".json",
-  ".jsx",
-  ".kt",
-  ".mjs",
-  ".py",
-  ".rb",
-  ".rs",
-  ".sh",
-  ".sql",
-  ".swift",
-  ".toml",
-  ".ts",
-  ".tsx",
-  ".vue",
-  ".xml",
-  ".yaml",
-  ".yml",
-]);
-
-const getFilePreviewCacheKey = (path: string, query: string) =>
-  `${path.toLowerCase()}::${query.trim().toLowerCase()}`;
-
-const isCodeLikePath = (path: string) => {
-  const normalized = path.replace(/\\/g, "/").toLowerCase();
-  const fileName = normalized.split("/").pop() ?? normalized;
-  const extensionIndex = fileName.lastIndexOf(".");
-  if (extensionIndex < 0) {
-    return false;
-  }
-  return CODE_LIKE_EXTENSIONS.has(fileName.slice(extensionIndex));
-};
-
-const parseNumberedPreviewLine = (line: string) => {
-  const match = line.match(/^\s*(>\s*)?(\d+)\s+\|\s?(.*)$/);
-  if (!match) {
-    return null;
-  }
-
-  return {
-    highlighted: Boolean(match[1]),
-    lineNumber: Number.parseInt(match[2] ?? "0", 10),
-    text: match[3] ?? "",
-  };
-};
-
-const parseReadRangePreview = (
-  raw: string
-): FilePreviewResult => {
-  const body = extractMessageBody(raw);
-  if (!body) {
-    return {
-      text: "",
-      meta: null,
-    };
-  }
-
-  const lines = body.split("\n");
-  const range = getLastFieldValue(lines, "lines");
-  const previewLines = lines
-    .map(parseNumberedPreviewLine)
-    .filter((line): line is NonNullable<typeof line> => line !== null)
-    .map(line => line.text)
-    .filter(Boolean);
-  const fallbackLines =
-    previewLines.length > 0
-      ? previewLines
-      : lines
-          .map(line => line.trim())
-          .filter(
-            line =>
-              Boolean(line) &&
-              !line.toLowerCase().startsWith("path:") &&
-              !line.toLowerCase().startsWith("lines:") &&
-              !line.toLowerCase().startsWith("note:")
-          );
-
-  return {
-    text: fallbackLines.slice(0, 6).join("\n"),
-    meta: range ? `lines ${range}` : null,
-  };
-};
-
-const parseSearchTextContextPreview = (raw: string): FilePreviewResult => {
-  const body = extractMessageBody(raw);
-  if (!body) {
-    return {
-      text: "",
-      meta: null,
-    };
-  }
-
-  const lines = body.split("\n");
-  const previewLines = lines
-    .map(parseNumberedPreviewLine)
-    .filter((line): line is NonNullable<typeof line> => line !== null);
-
-  if (previewLines.length === 0) {
-    return {
-      text: "",
-      meta: null,
-    };
-  }
-
-  const startLine = previewLines[0]?.lineNumber ?? null;
-  const endLine = previewLines[previewLines.length - 1]?.lineNumber ?? startLine;
-  const rangeLabel =
-    startLine === null
-      ? null
-      : startLine === endLine
-        ? `line ${startLine}`
-        : `lines ${startLine}-${endLine}`;
-
-  return {
-    text: previewLines
-      .slice(0, 6)
-      .map(line => `${line.highlighted ? "› " : ""}${line.text}`)
-      .join("\n"),
-    meta: rangeLabel ? `context hit  |  ${rangeLabel}` : "context hit",
-  };
-};
-
-const parseOutlineEntries = (raw: string): OutlineEntry[] =>
-  extractMessageBody(raw)
-    .split("\n")
-    .map(parseNumberedPreviewLine)
-    .filter((line): line is NonNullable<typeof line> => line !== null)
-    .map(line => ({
-      line: line.lineNumber,
-      label: line.text.trim(),
-    }))
-    .filter(entry => Boolean(entry.label));
-
-const pickOutlineEntry = (
-  entries: OutlineEntry[],
-  query: string
-): OutlineEntry | null => {
-  if (entries.length === 0) {
-    return null;
-  }
-
-  const normalizedTokens = query
-    .toLowerCase()
-    .split(/[^a-z0-9_]+/i)
-    .filter(Boolean);
-
-  if (normalizedTokens.length === 0) {
-    return entries[0] ?? null;
-  }
-
-  for (const entry of entries) {
-    const normalizedLabel = entry.label.toLowerCase();
-    let searchStart = 0;
-    let matched = true;
-    for (const token of normalizedTokens) {
-      const index = normalizedLabel.indexOf(token, searchStart);
-      if (index < 0) {
-        matched = false;
-        break;
-      }
-      searchStart = index + token.length;
-    }
-    if (matched) {
-      return entry;
-    }
-  }
-
-  return (
-    entries.find(entry =>
-      normalizedTokens.some(token => entry.label.toLowerCase().includes(token))
-    ) ??
-    entries[0] ??
-    null
-  );
-};
-
-const formatSymbolPreviewMeta = (
-  entry: OutlineEntry,
-  rangeMeta: string | null
-) => `symbol ${entry.label}${rangeMeta ? `  |  ${rangeMeta}` : ""}`;
-
 const EMPTY_FILE_MENTION_PREVIEW: FileMentionPreviewState = {
   path: null,
   text: "",
   meta: null,
   loading: false,
 };
-
-const SHELL_SESSION_ACTIONS = new Set([
-  "open_shell",
-  "write_shell",
-  "read_shell",
-  "shell_status",
-  "interrupt_shell",
-  "close_shell",
-]);
-
-const EMPTY_SHELL_SESSION_STATE: ShellSessionState = {
-  visible: false,
-  status: "none",
-  shell: null,
-  cwd: null,
-  busy: false,
-  alive: false,
-  pendingOutput: false,
-  lastExit: null,
-  lastEvent: null,
-  openedAt: null,
-  runningSince: null,
-  lastOutputSummary: null,
-  lastOutputAt: null,
-};
-
-const parseShellOutputSummary = (lines: string[]) => {
-  const outputIndex = lines.findIndex(
-    line => line.trim().toLowerCase() === "output:"
-  );
-
-  if (outputIndex < 0) {
-    return {
-      summary: null,
-      present: false,
-    };
-  }
-
-  const meaningfulLines = lines
-    .slice(outputIndex + 1)
-    .map(line => line.trim())
-    .filter(line => Boolean(line) && line !== "(no new output)");
-
-  if (meaningfulLines.length === 0) {
-    return {
-      summary: null,
-      present: true,
-    };
-  }
-
-  const outputTruncated = parseBooleanField(getLastFieldValue(lines, "output_truncated"));
-  const summary = meaningfulLines
-    .slice(-2)
-    .map(line => line.replace(/\s+/g, " "))
-    .join("  ·  ");
-
-  return {
-    summary:
-      summary.length > 120
-        ? `${summary.slice(0, 117)}...`
-        : outputTruncated
-          ? `${summary} ...`
-          : summary,
-    present: true,
-  };
-};
-
-const parseShellSessionMessage = (raw: string): ParsedShellSessionSnapshot | null => {
-  const body = extractMessageBody(raw);
-  if (!body) {
-    return null;
-  }
-
-  const lines = body.split("\n");
-  const statusValues = getFieldValues(lines, "status").map(value =>
-    value.toLowerCase()
-  );
-  const primaryStatus = statusValues[0] ?? "";
-  const effectiveStatus =
-    [...statusValues]
-      .reverse()
-      .find(value =>
-        value === "none" ||
-        value === "idle" ||
-        value === "running" ||
-        value === "exited"
-      ) ?? primaryStatus;
-
-  const shell = normalizeNullableField(getLastFieldValue(lines, "shell"));
-  const cwd = normalizeNullableField(getLastFieldValue(lines, "cwd"));
-  const busy = parseBooleanField(getLastFieldValue(lines, "busy"));
-  const alive = parseBooleanField(getLastFieldValue(lines, "alive"));
-  const pendingOutput = parseBooleanField(
-    getLastFieldValue(lines, "pending_output")
-  );
-  const lastExitValue = getLastFieldValue(lines, "last_exit");
-  const lastExit =
-    !lastExitValue ||
-    lastExitValue.toLowerCase() === "unknown" ||
-    lastExitValue.toLowerCase() === "none"
-      ? null
-      : lastExitValue;
-  const outputSummary = parseShellOutputSummary(lines);
-
-  if (
-    statusValues.length === 0 &&
-    !shell &&
-    !cwd &&
-    !busy &&
-    !alive &&
-    !pendingOutput &&
-    !lastExit &&
-    !outputSummary.present
-  ) {
-    return null;
-  }
-
-  const isClosed = primaryStatus === "closed";
-  const status: ShellSessionStatus = isClosed
-    ? "closed"
-    : effectiveStatus === "running"
-      ? "running"
-      : effectiveStatus === "idle"
-        ? "idle"
-        : effectiveStatus === "exited"
-          ? "exited"
-          : "none";
-
-  return {
-    visible:
-      !isClosed &&
-      status !== "none" &&
-      (shell !== null ||
-        cwd !== null ||
-        busy ||
-        alive ||
-        pendingOutput ||
-        lastExit !== null ||
-        status === "exited"),
-    status,
-    shell,
-    cwd,
-    busy,
-    alive,
-    pendingOutput,
-    lastExit,
-    lastEvent:
-      primaryStatus === "opened" || primaryStatus === "interrupted"
-        ? primaryStatus
-        : null,
-    outputSummary: outputSummary.summary,
-    hasOutputSummary: outputSummary.present,
-  };
-};
-
-const areShellSessionsEqual = (
-  left: ShellSessionState,
-  right: ShellSessionState
-) =>
-  left.visible === right.visible &&
-  left.status === right.status &&
-  left.shell === right.shell &&
-  left.cwd === right.cwd &&
-  left.busy === right.busy &&
-  left.alive === right.alive &&
-  left.pendingOutput === right.pendingOutput &&
-  left.lastExit === right.lastExit &&
-  left.lastEvent === right.lastEvent &&
-  left.openedAt === right.openedAt &&
-  left.runningSince === right.runningSince &&
-  left.lastOutputSummary === right.lastOutputSummary &&
-  left.lastOutputAt === right.lastOutputAt;
-
-type ParsedShellShortcut = {
-  active: boolean;
-  request: ToolRequest | null;
-  action: ShellShortcutAction | null;
-  command: string;
-  actionLabel: string;
-  description: string;
-};
-
-const parseShellShortcut = (rawInput: string): ParsedShellShortcut => {
-  const trimmed = rawInput.trim();
-  if (!trimmed.startsWith("!shell")) {
-    return {
-      active: false,
-      request: null,
-      action: null,
-      command: "",
-      actionLabel: "",
-      description: "",
-    };
-  }
-
-  const remainder = trimmed.slice("!shell".length).trim();
-  if (!remainder) {
-    return {
-      active: true,
-      request: null,
-      action: null,
-      command: "",
-      actionLabel: "!shell",
-      description:
-        "Run a safe shell command, or use open/read/status/interrupt/close.",
-    };
-  }
-
-  const [subcommandRaw = "", ...rest] = remainder.split(/\s+/);
-  const subcommand = subcommandRaw.toLowerCase();
-  const tail = rest.join(" ").trim();
-
-  if (subcommand === "open") {
-    return {
-      active: true,
-      request: {
-        action: "open_shell",
-        path: ".",
-        ...(tail ? { cwd: tail } : {}),
-      },
-      action: "open_shell",
-      command: tail || ".",
-      actionLabel: "open_shell",
-      description: tail
-        ? `Open a persistent shell session in ${tail}.`
-        : "Open a persistent shell session in the workspace root.",
-    };
-  }
-
-  if (subcommand === "read") {
-    return {
-      active: true,
-      request: { action: "read_shell", path: "." },
-      action: "read_shell",
-      command: "read",
-      actionLabel: "read_shell",
-      description: "Read buffered output from the persistent shell session.",
-    };
-  }
-
-  if (subcommand === "status") {
-    return {
-      active: true,
-      request: { action: "shell_status", path: "." },
-      action: "shell_status",
-      command: "status",
-      actionLabel: "shell_status",
-      description: "Inspect persistent shell status, cwd, and pending output.",
-    };
-  }
-
-  if (subcommand === "interrupt") {
-    return {
-      active: true,
-      request: { action: "interrupt_shell", path: "." },
-      action: "interrupt_shell",
-      command: "interrupt",
-      actionLabel: "interrupt_shell",
-      description: "Interrupt the currently running persistent shell command.",
-    };
-  }
-
-  if (subcommand === "close") {
-    return {
-      active: true,
-      request: { action: "close_shell", path: "." },
-      action: "close_shell",
-      command: "close",
-      actionLabel: "close_shell",
-      description: "Close the persistent shell session and discard its state.",
-    };
-  }
-
-  return {
-    active: true,
-    request: {
-      action: "run_shell",
-      path: ".",
-      command: remainder,
-    },
-    action: "run_shell",
-    command: remainder,
-    actionLabel: "run_shell",
-    description: "Run a one-shot shell command through the review lane.",
-  };
-};
-
-const isLikelyLegacyCompressedMarkdown = (text: string) => {
-  if (text.includes("\n")) {
-    return false;
-  }
-
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return false;
-  }
-
-  const signalCount = [
-    /(^|\s)#{1,6}\s+\S/.test(normalized),
-    /```/.test(normalized),
-    /\*\*[^*]+\*\*/.test(normalized),
-    /(?:^|\s)(?:-|\*|\d+\.)\s+\S/.test(normalized),
-    /(?:---|\*\*\*|___)/.test(normalized),
-    /\s\.\.\.\s/.test(normalized),
-  ].filter(Boolean).length;
-
-  return signalCount >= 2;
-};
-
-const hasLegacyCompressedMarkdown = (session: SessionRecord) =>
-  session.messages.some(
-    message =>
-      message.role === "assistant" &&
-      isLikelyLegacyCompressedMarkdown(message.text)
-  );
 
 const actionColor = (action?: MpcAction): ChatItem["color"] => {
   if (!action) {
@@ -1328,7 +315,10 @@ const actionColor = (action?: MpcAction): ChatItem["color"] => {
     action === "edit_file" ||
     action === "apply_patch" ||
     action === "copy_path" ||
-    action === "move_path"
+    action === "move_path" ||
+    action === "lsp_rename" ||
+    action === "lsp_code_actions" ||
+    action === "lsp_format_document"
   ) {
     return "green";
   }
@@ -1355,7 +345,10 @@ const getApprovalRisk = (action: MpcAction): ApprovalRisk => {
     action === "create_dir" ||
     action === "write_file" ||
     action === "move_path" ||
-    action === "copy_path"
+    action === "copy_path" ||
+    action === "lsp_rename" ||
+    action === "lsp_code_actions" ||
+    action === "lsp_format_document"
   ) {
     return "medium";
   }
@@ -1372,542 +365,9 @@ const summarizePendingRisk = (pending: PendingReviewItem[]) =>
     { high: 0, medium: 0, low: 0 } as Record<ApprovalRisk, number>
   );
 
-const formatMcpAliases = (aliases?: string[]) =>
-  aliases && aliases.length > 0 ? aliases.join(", ") : "(none)";
-
-const formatMcpCapabilities = (tool: McpToolDescriptor) =>
-  tool.capabilities.length > 0 ? tool.capabilities.join(", ") : "-";
-
-const formatMcpLspSummary = (server: McpServerDescriptor) =>
-  server.transport === "filesystem"
-    ? server.lsp && server.lsp.configuredCount > 0
-      ? `lsp ${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-      : "lsp none configured"
-    : "";
-
-const resolveMcpServerDescriptor = (
-  servers: McpServerDescriptor[],
-  idOrAlias: string
-) => {
-  const normalized = idOrAlias.trim().toLowerCase();
-  return servers.find(
-    server =>
-      server.id.toLowerCase() === normalized ||
-      (server.aliases ?? []).some(alias => alias.toLowerCase() === normalized)
-  );
-};
-
-const resolveFilesystemMcpServerDescriptor = (
-  servers: McpServerDescriptor[],
-  idOrAlias: string
-) => {
-  const server = resolveMcpServerDescriptor(servers, idOrAlias);
-  if (!server) {
-    return {
-      ok: false as const,
-      message: `MCP server not found: ${idOrAlias}`,
-    };
-  }
-  if (server.transport !== "filesystem") {
-    return {
-      ok: false as const,
-      message: `MCP server is not a filesystem server: ${server.id}`,
-    };
-  }
-  return {
-    ok: true as const,
-    server,
-  };
-};
-
-const formatMcpServerLine = (server: McpServerDescriptor) =>
-  [
-    `- ${server.id}`,
-    server.label !== server.id ? `label ${server.label}` : "",
-    `transport ${server.transport ?? "unknown"}`,
-    `source ${server.source}`,
-    `health ${server.health}`,
-    server.enabled ? "enabled" : "disabled",
-    `tools ${server.tools.length}`,
-    formatMcpLspSummary(server),
-    `aliases ${formatMcpAliases(server.aliases)}`,
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-const formatMcpToolLine = (tool: McpToolDescriptor) =>
-  [
-    `- ${tool.name}`,
-    `caps ${formatMcpCapabilities(tool)}`,
-    `risk ${tool.risk}`,
-    tool.requiresReview ? "review yes" : "review no",
-    tool.enabled ? "enabled" : "disabled",
-    tool.description ? `desc ${tool.description}` : "",
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-const formatMcpPendingLine = (item: PendingReviewItem) =>
-  [
-    `- ${item.id}`,
-    `server ${item.serverId ?? "unknown"}`,
-    `action ${item.request.action}`,
-    `path ${item.request.path}`,
-    `risk ${getApprovalRisk(item.request.action)}`,
-  ].join(" | ");
-
-const formatMcpToolSectionHeader = (server: McpServerDescriptor, toolCount: number) =>
-  [
-    `[${server.id}] ${server.label}`,
-    `tools ${toolCount}`,
-    formatMcpLspSummary(server),
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-const buildMcpToolSectionLines = (
-  server: McpServerDescriptor,
-  tools: McpToolDescriptor[]
-) => [
-  formatMcpToolSectionHeader(server, tools.length),
-  ...(server.transport === "filesystem" && (!server.lsp || server.lsp.configuredCount === 0)
-    ? ["tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server"]
-    : []),
-  ...(tools.length > 0 ? tools.map(formatMcpToolLine) : ["- (no tools registered)"]),
-];
-
-const formatMcpLspArgs = (args: string[]) => (args.length > 0 ? args.join(" ") : "(none)");
-
-const formatMcpLspListLine = (entry: McpRuntimeLspServerDescriptor) =>
-  [
-    `- ${entry.id}`,
-    `command ${entry.command}`,
-    `args ${formatMcpLspArgs(entry.args)}`,
-    `patterns ${entry.filePatterns.join(", ")}`,
-    `roots ${entry.rootMarkers.length > 0 ? entry.rootMarkers.join(", ") : "(none)"}`,
-    entry.workspaceRoot ? `workspace ${entry.workspaceRoot}` : "",
-    entry.envKeys.length > 0 ? `env_keys ${entry.envKeys.join(", ")}` : "",
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-const formatMcpRuntimeSummary = (
-  summary: McpRuntimeSummary | undefined,
-  servers: McpServerDescriptor[],
-  pending: PendingReviewItem[]
-) => {
-  const enabledCount = servers.filter(server => server.enabled).length;
-  const healthCounts = servers.reduce(
-    (acc, server) => {
-      acc[server.health] = (acc[server.health] ?? 0) + 1;
-      return acc;
-    },
-    {} as Record<McpServerDescriptor["health"], number>
-  );
-
-  return [
-    "MCP runtime",
-    `primary: ${summary?.primaryServerId ?? servers[0]?.id ?? "(none)"}`,
-    `servers: ${summary?.serverCount ?? servers.length} total | ${summary?.enabledServerCount ?? enabledCount} enabled`,
-    `health: online ${healthCounts.online ?? 0} | unknown ${healthCounts.unknown ?? 0} | offline ${healthCounts.offline ?? 0} | error ${healthCounts.error ?? 0}`,
-    `pending: ${pending.length}`,
-    ...(summary?.configPaths.length
-      ? [
-          "config:",
-          ...summary.configPaths.map(path => `- ${path}`),
-        ]
-      : ["config: built-in default filesystem profile"]),
-    ...(summary?.editableConfigPath
-      ? [`editable: ${summary.editableConfigPath}`]
-      : []),
-    "commands: /mcp servers | /mcp server <id> | /mcp tools [server] | /mcp pending | /mcp add/remove/enable/disable/reload | /mcp lsp ...",
-  ].join("\n");
-};
-
-const formatSkillLine = (skill: SkillDefinition) =>
-  [
-    `- ${skill.id}`,
-    `label ${skill.label}`,
-    skill.enabled ? "enabled" : "disabled",
-    `source ${skill.source}`,
-    skill.configPath ? `config ${skill.configPath}` : "",
-    skill.triggers.length > 0 ? `triggers ${skill.triggers.join(", ")}` : "",
-    skill.description ? `desc ${skill.description}` : "",
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-const formatSkillDetail = (skill: SkillDefinition) =>
-  [
-    `Skill ${skill.id}`,
-    `label: ${skill.label}`,
-    `enabled: ${skill.enabled ? "yes" : "no"}`,
-    `source: ${skill.source}`,
-    skill.configPath ? `config: ${skill.configPath}` : "",
-    skill.triggers.length > 0 ? `triggers: ${skill.triggers.join(", ")}` : "triggers: (none)",
-    skill.description ? `description: ${skill.description}` : "",
-    "prompt:",
-    skill.prompt.trim() || "(empty)",
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-const formatSkillsRuntimeSummary = (
-  summary: ReturnType<NonNullable<SkillsRuntime["describeRuntime"]>>
-) =>
-  [
-    "Skills runtime",
-    `skills: ${summary.skillCount} total | ${summary.enabledSkillCount} enabled`,
-    ...(summary.configPaths.length > 0
-      ? ["config:", ...summary.configPaths.map(path => `- ${path}`)]
-      : ["config: built-in default"]),
-    `editable: ${summary.editableConfigPath}`,
-    "commands: /skills list | /skills show <id> | /skills enable <id> | /skills disable <id> | /skills remove <id> | /skills use <id> | /skills reload",
-  ].join("\n");
-
-const formatActiveSkillsPrompt = (skills: SkillDefinition[]) =>
-  skills
-    .map(skill => {
-      const lines = [
-        `[${skill.id}] ${skill.label}`,
-        skill.description ? `description: ${skill.description}` : "",
-        skill.prompt.trim(),
-      ].filter(Boolean);
-      return lines.join("\n");
-    })
-    .join("\n\n");
-
-const tokenizeInlineCommand = (raw: string) =>
-  [...raw.matchAll(/"([^"]*)"|'([^']*)'|[^\s]+/g)].map(
-    match => match[1] ?? match[2] ?? match[0] ?? ""
-  );
-
-const parseMcpAddCommand = (
-  query: string
-): { ok: true; input: McpRuntimeServerInput } | { ok: false; message: string } => {
-  const raw = query.slice("/mcp add ".length).trim();
-  const tokens = tokenizeInlineCommand(raw);
-  const transport = (tokens[0] ?? "").toLowerCase();
-
-  if (transport === "stdio") {
-    const id = tokens[1]?.trim();
-    const command = tokens[2]?.trim();
-    if (!id || !command) {
-      return {
-        ok: false,
-        message: "Usage: /mcp add stdio <id> <command...>",
-      };
-    }
-    return {
-      ok: true,
-      input: {
-        id,
-        transport: "stdio",
-        command,
-        args: tokens.slice(3),
-      },
-    };
-  }
-
-  if (transport === "http") {
-    const id = tokens[1]?.trim();
-    const url = tokens[2]?.trim();
-    if (!id || !url) {
-      return {
-        ok: false,
-        message: "Usage: /mcp add http <id> <url>",
-      };
-    }
-    return {
-      ok: true,
-      input: {
-        id,
-        transport: "http",
-        url,
-      },
-    };
-  }
-
-  if (transport === "filesystem") {
-    const id = tokens[1]?.trim();
-    if (!id) {
-      return {
-        ok: false,
-        message: "Usage: /mcp add filesystem <id> [workspace]",
-      };
-    }
-    return {
-      ok: true,
-      input: {
-        id,
-        transport: "filesystem",
-        workspaceRoot: tokens[2]?.trim() || ".",
-      },
-    };
-  }
-
-  return {
-    ok: false,
-    message:
-      "Usage: /mcp add stdio <id> <command...> | /mcp add http <id> <url> | /mcp add filesystem <id> [workspace]",
-  };
-};
-
-type ParsedMcpLspCommand =
-  | {
-      ok: true;
-      action: "list";
-      filesystemServerId?: string;
-    }
-  | {
-      ok: true;
-      action: "add";
-      filesystemServerId: string;
-      input: McpRuntimeLspServerInput;
-    }
-  | {
-      ok: true;
-      action: "remove";
-      filesystemServerId: string;
-      lspServerId: string;
-    }
-  | {
-      ok: true;
-      action: "doctor";
-      filesystemServerId: string;
-      path: string;
-      lspServerId?: string;
-    }
-  | {
-      ok: false;
-      message: string;
-    };
-
-const MCP_LSP_LIST_USAGE = "Usage: /mcp lsp list [filesystem-server]";
-const MCP_LSP_ADD_USAGE =
-  "Usage: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...";
-const MCP_LSP_REMOVE_USAGE = "Usage: /mcp lsp remove <filesystem-server> <lsp-id>";
-const MCP_LSP_DOCTOR_USAGE =
-  "Usage: /mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]";
-
-const parseMcpLspCommand = (query: string): ParsedMcpLspCommand => {
-  const raw = query.slice("/mcp lsp ".length).trim();
-  const tokens = tokenizeInlineCommand(raw);
-  const action = (tokens[0] ?? "").toLowerCase();
-
-  if (action === "list") {
-    if (tokens.length > 2) {
-      return { ok: false, message: MCP_LSP_LIST_USAGE };
-    }
-    return {
-      ok: true,
-      action: "list",
-      filesystemServerId: tokens[1]?.trim() || undefined,
-    };
-  }
-
-  if (action === "remove") {
-    const filesystemServerId = tokens[1]?.trim();
-    const lspServerId = tokens[2]?.trim();
-    if (!filesystemServerId || !lspServerId || tokens.length !== 3) {
-      return { ok: false, message: MCP_LSP_REMOVE_USAGE };
-    }
-    return {
-      ok: true,
-      action: "remove",
-      filesystemServerId,
-      lspServerId,
-    };
-  }
-
-  if (action === "doctor") {
-    const filesystemServerId = tokens[1]?.trim();
-    const path = tokens[2]?.trim();
-    if (!filesystemServerId || !path) {
-      return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
-    }
-    let lspServerId: string | undefined;
-    for (let index = 3; index < tokens.length; index += 1) {
-      const token = tokens[index] ?? "";
-      if (token !== "--lsp") {
-        return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
-      }
-      const value = tokens[index + 1]?.trim();
-      if (!value) {
-        return { ok: false, message: MCP_LSP_DOCTOR_USAGE };
-      }
-      lspServerId = value;
-      index += 1;
-    }
-    return {
-      ok: true,
-      action: "doctor",
-      filesystemServerId,
-      path,
-      lspServerId,
-    };
-  }
-
-  if (action === "add") {
-    const filesystemServerId = tokens[1]?.trim();
-    const lspServerId = tokens[2]?.trim();
-    if (!filesystemServerId || !lspServerId) {
-      return { ok: false, message: MCP_LSP_ADD_USAGE };
-    }
-
-    let command = "";
-    const args: string[] = [];
-    const filePatterns: string[] = [];
-    const rootMarkers: string[] = [];
-    let workspaceRoot: string | undefined;
-    const env: Record<string, string> = {};
-
-    for (let index = 3; index < tokens.length; index += 1) {
-      const token = tokens[index] ?? "";
-      const value = tokens[index + 1]?.trim();
-      if (
-        token !== "--command" &&
-        token !== "--arg" &&
-        token !== "--pattern" &&
-        token !== "--root" &&
-        token !== "--workspace" &&
-        token !== "--env"
-      ) {
-        return { ok: false, message: MCP_LSP_ADD_USAGE };
-      }
-      if (!value) {
-        return { ok: false, message: MCP_LSP_ADD_USAGE };
-      }
-
-      switch (token) {
-        case "--command":
-          command = value;
-          break;
-        case "--arg":
-          args.push(value);
-          break;
-        case "--pattern":
-          filePatterns.push(value);
-          break;
-        case "--root":
-          rootMarkers.push(value);
-          break;
-        case "--workspace":
-          workspaceRoot = value;
-          break;
-        case "--env": {
-          const separator = value.indexOf("=");
-          if (separator <= 0 || separator === value.length - 1) {
-            return {
-              ok: false,
-              message: `${MCP_LSP_ADD_USAGE}\ninvalid --env: expected KEY=VALUE`,
-            };
-          }
-          env[value.slice(0, separator)] = value.slice(separator + 1);
-          break;
-        }
-      }
-
-      index += 1;
-    }
-
-    if (!command || filePatterns.length === 0) {
-      return { ok: false, message: MCP_LSP_ADD_USAGE };
-    }
-
-    return {
-      ok: true,
-      action: "add",
-      filesystemServerId,
-      input: {
-        id: lspServerId,
-        command,
-        args,
-        filePatterns,
-        rootMarkers,
-        workspaceRoot,
-        ...(Object.keys(env).length > 0 ? { env } : {}),
-      },
-    };
-  }
-
-  return {
-    ok: false,
-    message: [
-      MCP_LSP_LIST_USAGE,
-      MCP_LSP_ADD_USAGE,
-      MCP_LSP_REMOVE_USAGE,
-      MCP_LSP_DOCTOR_USAGE,
-    ].join("\n"),
-  };
-};
-
-const extractMessageBody = (raw: string) => {
-  const [, ...rest] = raw.split("\n");
-  return rest.join("\n").trim();
-};
-
-const buildApprovalMessage = (
-  title: string,
-  item?: PendingReviewItem,
-  extraLines: string[] = []
-) =>
-  [
-    title,
-    ...(item
-      ? [
-          `id: ${item.id}`,
-          `action: ${item.request.action}`,
-          `path: ${item.request.path}`,
-        ]
-      : []),
-    ...extraLines.filter(Boolean),
-  ].join("\n");
-
-const parseToolDetail = (raw: string) => {
-  const [header = ""] = raw.split("\n");
-  const detail = header
-    .replace("[tool result]", "")
-    .replace("[tool error]", "")
-    .trim();
-  const [action = "", path = ""] = detail.split(/\s+/, 2);
-  return {
-    detail,
-    action: action || undefined,
-    path: path || undefined,
-  };
-};
-
-const condensePreview = (text: string, maxLines = 120) => {
-  const lines = text.split("\n");
-  if (lines.length <= maxLines) {
-    return text;
-  }
-  return `${lines.slice(0, maxLines).join("\n")}\n... ${lines.length - maxLines} more lines`;
-};
-
-const getApprovalPreviewText = (
-  item: PendingReviewItem | undefined,
-  mode: ApprovalPreviewMode
-) => {
-  if (!item) {
-    return "";
-  }
-  return mode === "full" ? item.previewFull : item.previewSummary;
-};
-
-const getPendingQueueSignature = (pending: PendingReviewItem[]) =>
-  pending.map(item => item.id).join("|");
-
 const HOTKEY_REPEAT_COOLDOWN_MS = 900;
 const ACTION_REPEAT_COOLDOWN_MS = 400;
 const APPROVAL_BLOCK_RETRY_MS = 1500;
-const AUTH_PANEL_STEPS: AuthPanelStep[] = [
-  "provider",
-  "api_key",
-  "model",
-  "confirm",
-];
 
 const createRuntimeUsageSummary = (model: string): RuntimeUsageSummary => ({
   startedAt: new Date().toISOString(),
@@ -2081,20 +541,9 @@ export const useChatApp = ({
     providerProfileSources: {},
   });
   const [pendingReviews, setPendingReviews] = useState<PendingReviewItem[]>([]);
-  const [approvalPanel, setApprovalPanel] = useState<ApprovalPanelState>({
-    active: false,
-    selectedIndex: 0,
-    previewMode: "summary",
-    previewOffset: 0,
-    lastOpenedAt: null,
-    blockedItemId: null,
-    blockedReason: null,
-    blockedAt: null,
-    lastAction: null,
-    inFlightId: null,
-    actionState: null,
-    resumePending: false,
-  });
+  const [approvalPanel, setApprovalPanel] = useState<ApprovalPanelState>(() =>
+    createInitialApprovalPanelState()
+  );
   const [authPanel, setAuthPanel] = useState<AuthPanelState>({
     active: false,
     mode: "manual_login",
@@ -2205,6 +654,10 @@ export const useChatApp = ({
       if (!cancelled) {
         updateCurrentModelState(transport.getModel());
         updateCurrentProviderState(transport.getProvider());
+        void syncAuthSelection({
+          providerBaseUrl: transport.getProvider(),
+          model: transport.getModel(),
+        });
       }
     };
 
@@ -3046,11 +1499,11 @@ export const useChatApp = ({
     });
   };
 
-  const applySlashSuggestion = (suggestion: CommandSpec | undefined) => {
+  const applySlashSuggestion = (suggestion: CommandSuggestion | undefined) => {
     if (!suggestion) {
       return;
     }
-    const nextValue = getSlashInsertValue(suggestion.command);
+    const nextValue = suggestion.insertValue;
     commitEditorState({
       value: nextValue,
       cursorOffset: nextValue.length,
@@ -3133,11 +1586,28 @@ export const useChatApp = ({
     currentModel && currentModel !== "local-core" ? currentModel : "gpt-4o-mini";
 
   const getSuggestedLoginProvider = () => {
+    if (isUsableHttpProvider(currentProvider)) {
+      return currentProvider;
+    }
     const authProvider = authRef.current?.status.provider;
     if (authProvider && isUsableHttpProvider(authProvider)) {
       return authProvider;
     }
-    return isUsableHttpProvider(currentProvider) ? currentProvider : "";
+    return "";
+  };
+
+  const syncAuthSelection = async (selection?: {
+    providerBaseUrl?: string;
+    model?: string;
+  }) => {
+    if (!authRef.current?.syncSelection) {
+      return;
+    }
+    try {
+      await authRef.current.syncSelection(selection ?? {});
+    } catch {
+      // Transport/auth selection syncing is best-effort only.
+    }
   };
 
   const hydrateAuthPanelRememberedKey = async (
@@ -3155,135 +1625,22 @@ export const useChatApp = ({
     const savedApiKey =
       (await authRef.current.getSavedApiKey(normalizedProviderBaseUrl)) ?? "";
     setAuthPanel(previous => {
-      if (!previous.active || previous.saving) {
-        return previous;
-      }
-      if (previous.providerBaseUrl.trim() !== normalizedProviderBaseUrl) {
-        return previous;
-      }
-      const nextStep =
-        savedApiKey.length > 0
-          ? "model"
-          : (options?.preferredStep ?? previous.step);
-      const infoLines = [
-        options?.infoPrefix?.trim(),
-        savedApiKey
-          ? "Using remembered API key for this provider. Press 4 at confirm to replace it."
-          : "",
-      ].filter(Boolean);
-      return {
-        ...previous,
-        apiKey:
-          savedApiKey.length > 0
-            ? savedApiKey
-            : options?.clearWhenMissing
-              ? ""
-              : previous.apiKey,
-        rememberedKeyAvailable: savedApiKey.length > 0,
-        usingRememberedKey: savedApiKey.length > 0,
-        step: nextStep,
-        cursorOffset:
-          nextStep === "provider"
-            ? previous.providerBaseUrl.length
-            : nextStep === "api_key"
-              ? (savedApiKey.length > 0
-                  ? savedApiKey.length
-                  : options?.clearWhenMissing
-                    ? 0
-                    : previous.apiKey.length)
-              : previous.model.length,
-        error: null,
-        info: infoLines.length > 0 ? infoLines.join(" ") : null,
-      };
+      return applyRememberedKeyToAuthPanel(previous, {
+        normalizedProviderBaseUrl,
+        savedApiKey,
+        infoPrefix: options?.infoPrefix,
+        preferredStep: options?.preferredStep,
+        clearWhenMissing: options?.clearWhenMissing,
+      });
     });
-  };
-
-  const getAuthPanelFieldValue = (panel: AuthPanelState) => {
-    if (panel.step === "provider") {
-      return panel.providerBaseUrl;
-    }
-    if (panel.step === "api_key") {
-      return panel.apiKey;
-    }
-    return panel.model;
-  };
-
-  const updateAuthPanelFieldValue = (
-    panel: AuthPanelState,
-    nextValue: string,
-    nextCursorOffset: number
-  ): AuthPanelState => {
-    const sanitizedValue = nextValue.replace(/\r?\n/g, "");
-    const cursorOffset = clampCursorOffset(sanitizedValue, nextCursorOffset);
-    if (panel.step === "provider") {
-      return {
-        ...panel,
-        providerBaseUrl: sanitizedValue,
-        rememberedKeyAvailable:
-          sanitizedValue === panel.providerBaseUrl
-            ? panel.rememberedKeyAvailable
-            : false,
-        usingRememberedKey:
-          sanitizedValue === panel.providerBaseUrl
-            ? panel.usingRememberedKey
-            : false,
-        cursorOffset,
-        error: null,
-      };
-    }
-    if (panel.step === "api_key") {
-      return {
-        ...panel,
-        apiKey: sanitizedValue,
-        usingRememberedKey:
-          sanitizedValue === panel.apiKey ? panel.usingRememberedKey : false,
-        cursorOffset,
-        error: null,
-      };
-    }
-    return {
-      ...panel,
-      model: sanitizedValue,
-      cursorOffset,
-      error: null,
-    };
   };
 
   const setAuthPanelStep = (step: AuthPanelStep) => {
-    setAuthPanel(previous => ({
-      ...previous,
-      step,
-      cursorOffset:
-        step === "provider"
-          ? previous.providerBaseUrl.length
-          : step === "api_key"
-            ? previous.apiKey.length
-            : previous.model.length,
-      error: null,
-      info: null,
-    }));
+    setAuthPanel(previous => transitionAuthPanelStep(previous, step));
   };
 
   const startRememberedKeyReplacement = () => {
-    setAuthPanel(previous => {
-      if (
-        !previous.active ||
-        previous.saving ||
-        !previous.rememberedKeyAvailable ||
-        !previous.usingRememberedKey
-      ) {
-        return previous;
-      }
-      return {
-        ...previous,
-        step: "api_key",
-        apiKey: "",
-        usingRememberedKey: false,
-        cursorOffset: 0,
-        error: null,
-        info: "Enter a new API key. Saving will replace the remembered key for this provider.",
-      };
-    });
+    setAuthPanel(previous => startRememberedKeyReplacementState(previous));
   };
 
   const applyAuthProviderPreset = (presetKey: keyof typeof AUTH_PROVIDER_PRESETS) => {
@@ -3298,20 +1655,10 @@ export const useChatApp = ({
       // keep alias text as a safe fallback
     }
     setAuthPanel(previous => {
-      if (!previous.active || previous.step !== "provider" || previous.saving) {
-        return previous;
-      }
-      return {
-        ...previous,
+      return applyAuthProviderPresetState(previous, {
         providerBaseUrl,
-        step: "api_key",
-        apiKey: "",
-        rememberedKeyAvailable: false,
-        usingRememberedKey: false,
-        cursorOffset: 0,
-        error: null,
-        info: `Preset selected: ${preset.label} (${providerBaseUrl})`,
-      };
+        presetLabel: preset.label,
+      });
     });
     void hydrateAuthPanelRememberedKey(providerBaseUrl, {
       infoPrefix: `Preset selected: ${preset.label} (${providerBaseUrl})`,
@@ -3466,39 +1813,6 @@ export const useChatApp = ({
     token: string,
     cooldownMs = ACTION_REPEAT_COOLDOWN_MS
   ) => isRepeatedInteraction(lastActionIntentRef, token, cooldownMs);
-
-  const clearApprovalBlock = (
-    state: ApprovalPanelState
-  ): ApprovalPanelState => ({
-    ...state,
-    blockedItemId: null,
-    blockedReason: null,
-    blockedAt: null,
-    lastAction: null,
-  });
-
-  const clearApprovalInFlight = (
-    state: ApprovalPanelState
-  ): ApprovalPanelState => ({
-    ...state,
-    inFlightId: null,
-    actionState: null,
-    resumePending: false,
-  });
-
-  const syncApprovalBlockToQueue = (
-    state: ApprovalPanelState,
-    pending: PendingReviewItem[]
-  ): ApprovalPanelState => {
-    if (
-      !state.blockedItemId ||
-      pending.some(item => item.id === state.blockedItemId)
-    ) {
-      return state;
-    }
-
-    return clearApprovalBlock(state);
-  };
 
   const recordSessionMemories = async (
     sessionId: string | null,
@@ -3815,12 +2129,19 @@ export const useChatApp = ({
       return;
     }
     suspendedTaskRef.current = null;
-    const result = await current.resume(toolResultMessage);
-    await consumeQueryRunResult(
-      current.sessionId,
-      current.assistantBufferRef,
-      result
-    );
+    try {
+      const result = await current.resume(toolResultMessage);
+      await consumeQueryRunResult(
+        current.sessionId,
+        current.assistantBufferRef,
+        result
+      );
+    } catch (error) {
+      clearActiveTurnForAssistantBuffer(current.assistantBufferRef);
+      setSessionState(null);
+      setStatus("idle");
+      throw error;
+    }
   };
 
   const cancelSuspendedTask = async (
@@ -3916,6 +2237,33 @@ export const useChatApp = ({
     }
     updateActiveSessionIdState(created.id);
     return created;
+  };
+
+  const startNewSessionCommand = async () => {
+    const created = await sessionStore.createSession();
+    pendingChoiceRef.current = null;
+    if (draftSessionSkillUsesRef.current.length > 0) {
+      setSessionSkillUseIds(created.id, draftSessionSkillUsesRef.current);
+      draftSessionSkillUsesRef.current = [];
+    }
+    updateActiveSessionIdState(created.id);
+    clearLiveAssistantSegment();
+    setItems([
+      {
+        role: "system",
+        text: defaultSystemText,
+        kind: "system_hint",
+        tone: "neutral",
+        color: "gray",
+      },
+      {
+        role: "system",
+        text: `Started new session: ${created.id}`,
+        kind: "system_hint",
+        tone: "info",
+        color: "cyan",
+      },
+    ]);
   };
 
   const appendToLiveAssistant = (rawAssistantText: string) => {
@@ -4101,6 +2449,66 @@ export const useChatApp = ({
         previewOffset: 0,
       }));
     }
+  };
+
+  const openModelPickerFromCommand = (options: {
+    models: string[];
+    selectedIndex: number;
+  }) => {
+    closeAllOverlayPanels({ keepModelPicker: true });
+    const nextState = {
+      active: true,
+      models: options.models,
+      selectedIndex: options.selectedIndex,
+      pageSize: MODEL_PAGE_SIZE,
+    };
+    modelPickerRef.current = nextState;
+    setModelPicker(nextState);
+  };
+
+  const openProviderPickerFromCommand = (options: {
+    providers: string[];
+    selectedIndex: number;
+    currentKeySource: string;
+    providerProfiles: ProviderPickerState["providerProfiles"];
+    providerProfileSources: ProviderPickerState["providerProfileSources"];
+  }) => {
+    closeAllOverlayPanels({ keepProviderPicker: true });
+    const nextState = {
+      active: true,
+      providers: options.providers,
+      selectedIndex: options.selectedIndex,
+      pageSize: PROVIDER_PAGE_SIZE,
+      currentKeySource: options.currentKeySource,
+      providerProfiles: options.providerProfiles,
+      providerProfileSources: options.providerProfileSources,
+    };
+    providerPickerRef.current = nextState;
+    setProviderPicker(nextState);
+  };
+
+  const openResumePickerFromCommand = (sessions: SessionListItem[]) => {
+    closeAllOverlayPanels({ keepResumePicker: true });
+    const nextState = {
+      active: true,
+      sessions,
+      selectedIndex: 0,
+      pageSize: RESUME_PAGE_SIZE,
+    };
+    resumePickerRef.current = nextState;
+    setResumePicker(nextState);
+  };
+
+  const openSessionsPanelFromCommand = (sessions: SessionListItem[]) => {
+    closeAllOverlayPanels({ keepSessionsPanel: true });
+    const nextState = {
+      active: true,
+      sessions,
+      selectedIndex: 0,
+      pageSize: RESUME_PAGE_SIZE,
+    };
+    sessionsPanelRef.current = nextState;
+    setSessionsPanel(nextState);
   };
 
   const openAuthPanel = (mode: AuthPanelMode) => {
@@ -4306,6 +2714,10 @@ export const useChatApp = ({
       const result = await transport.setModel(selected);
       updateCurrentModelState(transport.getModel());
       if (result.ok) {
+        await syncAuthSelection({
+          providerBaseUrl: transport.getProvider(),
+          model: transport.getModel(),
+        });
         pushSystemMessage(result.message, {
           kind: "system_hint",
           tone: "info",
@@ -4345,6 +2757,10 @@ export const useChatApp = ({
       updateCurrentProviderState(transport.getProvider());
       updateCurrentModelState(transport.getModel());
       if (result.ok) {
+        await syncAuthSelection({
+          providerBaseUrl: transport.getProvider(),
+          model: transport.getModel(),
+        });
         pushSystemMessage(result.message, {
           kind: "system_hint",
           tone: "info",
@@ -4407,119 +2823,19 @@ export const useChatApp = ({
     });
   };
 
-  const createNextApprovalPanelState = (
-    nextPending: PendingReviewItem[],
-    options?: {
-      open?: boolean;
-      focusLatest?: boolean;
-      selectId?: string;
-      selectedIndex?: number;
-      previewMode?: ApprovalPreviewMode;
-      clearBlocked?: boolean;
-      blocked?: {
-        itemId: string;
-        reason: string;
-        at: number;
-        lastAction: ApprovalActionKind;
-      } | null;
-    }
-  ): ApprovalPanelState => {
-    const previous = approvalPanelRef.current;
-
-    if (nextPending.length === 0) {
-      return {
-        active: false,
-        selectedIndex: 0,
-        previewMode: options?.previewMode ?? previous.previewMode,
-        previewOffset: 0,
-        lastOpenedAt: previous.lastOpenedAt,
-        blockedItemId: null,
-        blockedReason: null,
-        blockedAt: null,
-        lastAction: null,
-        inFlightId: null,
-        actionState: null,
-        resumePending: false,
-      };
-    }
-
-    let nextIndex = previous.selectedIndex;
-    if (typeof options?.selectedIndex === "number") {
-      nextIndex = options.selectedIndex;
-    } else if (options?.selectId) {
-      const matchedIndex = nextPending.findIndex(item => item.id === options.selectId);
-      if (matchedIndex >= 0) {
-        nextIndex = matchedIndex;
-      }
-    } else if (options?.focusLatest) {
-      nextIndex = nextPending.length - 1;
-    }
-
-    const boundedIndex = computeNextApprovalSelection(nextIndex, nextPending.length);
-    const nextPreviewMode = options?.previewMode ?? previous.previewMode;
-    const selectedItem = nextPending[boundedIndex];
-    const selectedPreview = getApprovalPreviewText(selectedItem, nextPreviewMode);
-    const previewOffset =
-      options?.previewMode && options.previewMode !== previous.previewMode
-        ? 0
-        : boundedIndex !== previous.selectedIndex
-          ? 0
-          : clampPreviewOffset(selectedPreview, previous.previewOffset);
-    const nextActive = options?.open ?? previous.active;
-    let nextState: ApprovalPanelState = {
-      active: nextActive,
-      selectedIndex: boundedIndex,
-      previewMode: nextPreviewMode,
-      previewOffset,
-      lastOpenedAt: nextActive ? new Date().toISOString() : previous.lastOpenedAt,
-      blockedItemId: previous.blockedItemId,
-      blockedReason: previous.blockedReason,
-      blockedAt: previous.blockedAt,
-      lastAction: previous.lastAction,
-      inFlightId: previous.inFlightId,
-      actionState: previous.actionState,
-      resumePending: previous.resumePending,
-    };
-
-    if (options?.clearBlocked) {
-      nextState = clearApprovalBlock(nextState);
-    } else if (options?.blocked) {
-      nextState = {
-        ...nextState,
-        blockedItemId: options.blocked.itemId,
-        blockedReason: options.blocked.reason,
-        blockedAt: options.blocked.at,
-        lastAction: options.blocked.lastAction,
-      };
-    } else if (boundedIndex !== previous.selectedIndex) {
-      nextState = clearApprovalBlock(nextState);
-    }
-
-    return syncApprovalBlockToQueue(nextState, nextPending);
-  };
-
   const updatePendingState = (
     nextPending: PendingReviewItem[],
-    options?: {
-      open?: boolean;
-      focusLatest?: boolean;
-      selectId?: string;
-      selectedIndex?: number;
-      previewMode?: ApprovalPreviewMode;
-      clearBlocked?: boolean;
-      blocked?: {
-        itemId: string;
-        reason: string;
-        at: number;
-        lastAction: ApprovalActionKind;
-      } | null;
-    }
+    options?: ApprovalStateUpdateOptions
   ) => {
     pendingReviewsRef.current = nextPending;
     if (nextPending.length === 0) {
       dismissedApprovalQueueSignatureRef.current = null;
     }
-    const nextPanelState = createNextApprovalPanelState(nextPending, options);
+    const nextPanelState = createNextApprovalPanelState(
+      approvalPanelRef.current,
+      nextPending,
+      options
+    );
     approvalPanelRef.current = nextPanelState;
     setPendingReviews(nextPending);
     setApprovalPanel(nextPanelState);
@@ -4533,22 +2849,8 @@ export const useChatApp = ({
         pendingReviewsRef.current
       );
     }
-    approvalPanelRef.current = {
-      ...approvalPanelRef.current,
-      active: false,
-      previewOffset: 0,
-      inFlightId: null,
-      actionState: null,
-      resumePending: false,
-    };
-    setApprovalPanel(previous => ({
-      ...previous,
-      active: false,
-      previewOffset: 0,
-      inFlightId: null,
-      actionState: null,
-      resumePending: false,
-    }));
+    approvalPanelRef.current = closeApprovalPanelState(approvalPanelRef.current);
+    setApprovalPanel(previous => closeApprovalPanelState(previous));
   };
 
   const repairSettledReviewState = () => {
@@ -4602,7 +2904,7 @@ export const useChatApp = ({
     }
 
     syncApprovalPanelState(previous => ({
-      ...createNextApprovalPanelState(pendingReviews, {
+      ...createNextApprovalPanelState(previous, pendingReviews, {
         open: true,
         selectedIndex: previous.selectedIndex,
         previewMode: previous.previewMode,
@@ -4642,68 +2944,19 @@ export const useChatApp = ({
     }
     enqueueTask(async () => {
       try {
-        const before = mcpService.listPending();
-        const target = before.find(item => item.id === id);
-        const currentIndex = computeNextApprovalSelection(
-          before.findIndex(item => item.id === id),
-          before.length
-        );
-        const wasOpen = approvalPanelRef.current.active;
-        const optimisticPending = before.filter(item => item.id !== id);
-        if (target) {
-          updatePendingState(optimisticPending, {
-            open: shouldKeepApprovalPanelOpen(optimisticPending.length, wasOpen),
-            selectedIndex: computeNextApprovalSelection(
-              currentIndex,
-              optimisticPending.length
-            ),
-            clearBlocked: true,
-          });
-        }
-        const result = await mcpService.approve(id);
-        const nextPending = mcpService.listPending();
-
-        if (!target) {
-          updatePendingState(nextPending, {
-            open: shouldKeepApprovalPanelOpen(
-              nextPending.length,
-              wasOpen
-            ),
-            selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
-            clearBlocked: true,
-          });
-          pushSystemMessage(buildApprovalMessage("Approval error", undefined, [result.message]), {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          await recordSessionMemory(getMemorySessionId(), {
-            kind: "error",
-            text: buildApprovalMessage("Approval error", undefined, [result.message]),
-            priority: 85,
-            entities: {
-              status: ["error"],
-            },
-          });
-          return;
-        }
-
-        if (!result.ok) {
-          const blockedState = {
-            itemId: target.id,
-            reason: extractMessageBody(result.message) || result.message,
-            at: Date.now(),
-            lastAction: "approve" as const,
-          };
-          updatePendingState(nextPending, {
-            open: shouldKeepApprovalPanelOpen(
-              nextPending.length,
-              wasOpen
-            ),
-            selectedIndex: currentIndex,
-            blocked: blockedState,
-          });
-          if (nextPending.some(item => item.id === target.id)) {
+        await executeApprovePendingReview({
+          id,
+          mcpService,
+          wasOpen: approvalPanelRef.current.active,
+          pushSystemMessage,
+          recordSessionMemory,
+          getMemorySessionId,
+          updatePendingState,
+          syncShellSessionFromMessage,
+          actionColor,
+          resumeSuspendedTask,
+          repairSettledReviewState,
+          onApprovalBlocked: blockedState => {
             syncApprovalPanelState(previous => ({
               ...previous,
               blockedItemId: blockedState.itemId,
@@ -4711,63 +2964,8 @@ export const useChatApp = ({
               blockedAt: blockedState.at,
               lastAction: blockedState.lastAction,
             }));
-          }
-          pushSystemMessage(
-            buildApprovalMessage("Approval error", target, [
-              extractMessageBody(result.message) || result.message,
-            ]),
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          await recordSessionMemory(getMemorySessionId(), {
-            kind: "error",
-            text: buildApprovalMessage("Approval error", target, [
-              extractMessageBody(result.message) || result.message,
-            ]),
-            priority: 90,
-            entities: {
-              path: [target.request.path],
-              action: [target.request.action],
-              status: ["error"],
-            },
-          });
-          return;
-        }
-
-        updatePendingState(nextPending, {
-          open: shouldKeepApprovalPanelOpen(
-            nextPending.length,
-            wasOpen
-          ),
-          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
-          clearBlocked: true,
-        });
-
-        const output = extractMessageBody(result.message);
-        syncShellSessionFromMessage(result.message, target.request.action);
-        pushSystemMessage(
-          buildApprovalMessage("Approved", target, output ? [output] : []),
-          {
-            kind: "review_status",
-            tone: "success",
-            color: actionColor(target.request.action) ?? "green",
-          }
-        );
-        await recordSessionMemory(getMemorySessionId(), {
-          kind: "approval",
-          text: buildApprovalMessage("Approved", target, output ? [output] : []),
-          priority: 80,
-          entities: {
-            path: [target.request.path],
-            action: [target.request.action],
-            status: ["approved"],
           },
         });
-        await resumeSuspendedTask(result.message);
-        repairSettledReviewState();
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
         approvalActionRef.current.release();
@@ -4781,104 +2979,16 @@ export const useChatApp = ({
     }
     enqueueTask(async () => {
       try {
-        const before = mcpService.listPending();
-        const target = before.find(item => item.id === id);
-        const currentIndex = computeNextApprovalSelection(
-          before.findIndex(item => item.id === id),
-          before.length
-        );
-        const wasOpen = approvalPanelRef.current.active;
-        const optimisticPending = before.filter(item => item.id !== id);
-        if (target) {
-          updatePendingState(optimisticPending, {
-            open: shouldKeepApprovalPanelOpen(optimisticPending.length, wasOpen),
-            selectedIndex: computeNextApprovalSelection(
-              currentIndex,
-              optimisticPending.length
-            ),
-            clearBlocked: true,
-          });
-        }
-        const result = mcpService.reject(id);
-        const nextPending = mcpService.listPending();
-
-        if (!target || !result.ok) {
-          updatePendingState(nextPending, {
-            open: shouldKeepApprovalPanelOpen(
-              nextPending.length,
-              wasOpen
-            ),
-            selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
-          });
-          pushSystemMessage(
-            buildApprovalMessage(
-              "Approval error",
-              target,
-              [extractMessageBody(result.message) || result.message]
-            ),
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          await recordSessionMemory(getMemorySessionId(), {
-            kind: "error",
-            text: buildApprovalMessage(
-              "Approval error",
-              target,
-              [extractMessageBody(result.message) || result.message]
-            ),
-            priority: 85,
-            entities: {
-              path: target?.request.path ? [target.request.path] : undefined,
-              action: target?.request.action ? [target.request.action] : undefined,
-              status: ["error"],
-            },
-          });
-          return;
-        }
-
-        updatePendingState(nextPending, {
-          open: shouldKeepApprovalPanelOpen(
-            nextPending.length,
-            wasOpen
-          ),
-          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
-          clearBlocked: true,
-        });
-
-        const cancelledSuspendedTask = Boolean(suspendedTaskRef.current);
-        const rejectionMessage = buildApprovalMessage(
-          "Rejected",
-          target,
-          cancelledSuspendedTask
-            ? [
-                "current suspended task cancelled",
-                "add requirements and send a new prompt when ready",
-              ]
-            : []
-        );
-        if (cancelledSuspendedTask) {
-          await cancelSuspendedTask(rejectionMessage, {
-            suppressApprovalQueue: true,
-          });
-        } else {
-          pushSystemMessage(rejectionMessage, {
-            kind: "review_status",
-            tone: "warning",
-            color: "yellow",
-          });
-        }
-        await recordSessionMemory(getMemorySessionId(), {
-          kind: "approval",
-          text: rejectionMessage,
-          priority: 78,
-          entities: {
-            path: [target.request.path],
-            action: [target.request.action],
-            status: ["rejected"],
-          },
+        await executeRejectPendingReview({
+          id,
+          mcpService,
+          wasOpen: approvalPanelRef.current.active,
+          hasSuspendedTask: Boolean(suspendedTaskRef.current),
+          pushSystemMessage,
+          recordSessionMemory,
+          getMemorySessionId,
+          updatePendingState,
+          cancelSuspendedTask,
         });
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
@@ -4894,112 +3004,30 @@ export const useChatApp = ({
   ) => {
     enqueueTask(async () => {
       try {
-        const before = mcpService.listPending();
-        const targets = before.filter(selector);
-        const wasOpen = approvalPanelRef.current.active;
-        const currentIndex = approvalPanelRef.current.selectedIndex;
-
-        if (targets.length === 0) {
-          pushSystemMessage(
-            `No pending operations matched batch scope: ${scopeLabel}.`,
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          return;
-        }
-
-        syncApprovalPanelState(previous => ({
-          ...previous,
-          inFlightId: `batch:${action}`,
-          actionState: action,
-          resumePending: Boolean(suspendedTaskRef.current),
-        }));
-
-        let success = 0;
-        let failed = 0;
-        let resumeMessage: string | null = null;
-        const failureDetails: string[] = [];
-        const hadSuspendedTask = Boolean(suspendedTaskRef.current);
-
-        for (const target of targets) {
-          const result =
-            action === "approve"
-              ? await mcpService.approve(target.id)
-              : mcpService.reject(target.id);
-          if (result.ok) {
-            success += 1;
-            if (action === "approve" && !resumeMessage) {
-              resumeMessage = result.message;
-            }
-            continue;
-          }
-
-          failed += 1;
-          failureDetails.push(
-            `${target.id}: ${extractMessageBody(result.message) || result.message}`
-          );
-        }
-
-        const nextPending = mcpService.listPending();
-        updatePendingState(nextPending, {
-          open: shouldKeepApprovalPanelOpen(nextPending.length, wasOpen),
-          selectedIndex: computeNextApprovalSelection(currentIndex, nextPending.length),
-          clearBlocked: true,
+        await executePendingBatch({
+          action,
+          selector,
+          scopeLabel,
+          currentIndex: approvalPanelRef.current.selectedIndex,
+          wasOpen: approvalPanelRef.current.active,
+          hasSuspendedTask: Boolean(suspendedTaskRef.current),
+          markInFlight: () =>
+            syncApprovalPanelState(previous => ({
+              ...previous,
+              inFlightId: `batch:${action}`,
+              actionState: action,
+              resumePending: Boolean(suspendedTaskRef.current),
+            })),
+          mcpService,
+          pushSystemMessage,
+          recordSessionMemory,
+          getMemorySessionId,
+          updatePendingState,
+          resumeSuspendedTask,
+          cancelSuspendedTask,
+          repairSettledReviewState,
+          summarizePendingRisk,
         });
-
-        const processedRisk = summarizePendingRisk(targets);
-        const remainingRisk = summarizePendingRisk(nextPending);
-        const title =
-          action === "approve" ? "Batch approved" : "Batch rejected";
-        const tone =
-          failed > 0
-            ? "warning"
-            : action === "approve"
-              ? "success"
-              : "warning";
-        const color = failed > 0 ? "yellow" : action === "approve" ? "green" : "yellow";
-        const lines = [
-          `scope: ${scopeLabel}`,
-          `processed: ${targets.length}`,
-          `success: ${success}`,
-          `failed: ${failed}`,
-          `remaining: ${nextPending.length}`,
-          action === "reject" && hadSuspendedTask && success > 0
-            ? "suspended task: cancelled"
-            : "",
-          `processed_risk: high ${processedRisk.high} | medium ${processedRisk.medium} | low ${processedRisk.low}`,
-          `remaining_risk: high ${remainingRisk.high} | medium ${remainingRisk.medium} | low ${remainingRisk.low}`,
-          ...failureDetails.slice(0, 3).map(detail => `failure: ${detail}`),
-          failureDetails.length > 3
-            ? `failure: ... ${failureDetails.length - 3} more`
-            : "",
-        ].filter(Boolean);
-
-        const summaryMessage = buildApprovalMessage(title, undefined, lines);
-        if (action === "reject" && hadSuspendedTask && success > 0) {
-          await cancelSuspendedTask(summaryMessage, {
-            suppressApprovalQueue: true,
-          });
-        } else {
-          pushSystemMessage(summaryMessage, {
-            kind: "review_status",
-            tone,
-            color,
-          });
-        }
-        await recordSessionMemory(getMemorySessionId(), {
-          kind: failed > 0 ? "error" : "approval",
-          text: summaryMessage,
-          priority: failed > 0 ? 86 : 79,
-          entities: {
-            action: [action],
-            status: [failed > 0 ? "partial" : "ok"],
-          },
-        });
-
-        if (resumeMessage) {
-          await resumeSuspendedTask(resumeMessage);
-        }
-        repairSettledReviewState();
       } finally {
         syncApprovalPanelState(previous => clearApprovalInFlight(previous));
       }
@@ -5007,85 +3035,35 @@ export const useChatApp = ({
   };
 
   const approveCurrentPendingReview = () => {
-    const target =
-      pendingReviewsRef.current[approvalPanelRef.current.selectedIndex];
-    if (!target) {
-      pushSystemMessage("Approval error\nNo pending operation selected.", {
-        kind: "error",
-        tone: "danger",
-        color: "red",
-      });
-      return;
-    }
-    if (approvalActionRef.current.isLocked()) {
-      return;
-    }
-    const now = Date.now();
-    if (
-      !canRetryBlockedApproval(
-        approvalPanelRef.current.blockedItemId,
-        target.id,
-        approvalPanelRef.current.blockedAt,
-        now,
-        APPROVAL_BLOCK_RETRY_MS
-      )
-    ) {
-      return;
-    }
-    if (
-      isRepeatedInteraction(
-        lastApprovalIntentRef,
-        `approve:${target.id}:${approvalPanelRef.current.selectedIndex}`
-      )
-    ) {
-      return;
-    }
-    markApprovalInFlight(
-      target.id,
-      "approve",
-      Boolean(suspendedTaskRef.current)
-    );
-    pushSystemMessage(`Approving ${target.id}...`, {
-      kind: "system_hint",
-      tone: "info",
-      color: "cyan",
+    executeCurrentPendingReviewAction({
+      action: "approve",
+      pendingReviews: pendingReviewsRef.current,
+      approvalPanel: approvalPanelRef.current,
+      blockedRetryMs: APPROVAL_BLOCK_RETRY_MS,
+      isActionLocked: approvalActionRef.current.isLocked(),
+      hasSuspendedTask: Boolean(suspendedTaskRef.current),
+      lastIntentRef: lastApprovalIntentRef,
+      isRepeatedInteraction,
+      pushSystemMessage,
+      markApprovalInFlight,
+      runReviewAction: approvePendingReview,
     });
-    approvePendingReview(target.id);
   };
 
   const rejectCurrentPendingReview = () => {
-    const target =
-      pendingReviewsRef.current[approvalPanelRef.current.selectedIndex];
-    if (!target) {
-      pushSystemMessage("Approval error\nNo pending operation selected.", {
-        kind: "error",
-        tone: "danger",
-        color: "red",
-      });
-      return;
-    }
-    if (approvalActionRef.current.isLocked()) {
-      return;
-    }
-    if (
-      isRepeatedInteraction(
-        lastApprovalIntentRef,
-        `reject:${target.id}:${approvalPanelRef.current.selectedIndex}`
-      )
-    ) {
-      return;
-    }
-    markApprovalInFlight(
-      target.id,
-      "reject",
-      Boolean(suspendedTaskRef.current)
-    );
-    pushSystemMessage(`Rejecting ${target.id}...`, {
-      kind: "system_hint",
-      tone: "info",
-      color: "cyan",
+    executeCurrentPendingReviewAction({
+      action: "reject",
+      pendingReviews: pendingReviewsRef.current,
+      approvalPanel: approvalPanelRef.current,
+      blockedRetryMs: APPROVAL_BLOCK_RETRY_MS,
+      isActionLocked: approvalActionRef.current.isLocked(),
+      hasSuspendedTask: Boolean(suspendedTaskRef.current),
+      lastIntentRef: lastApprovalIntentRef,
+      isRepeatedInteraction,
+      pushSystemMessage,
+      markApprovalInFlight,
+      runReviewAction: rejectPendingReview,
     });
-    rejectPendingReview(target.id);
   };
 
   inputAdapterHook((inputValue, key) => {
@@ -5767,336 +3745,42 @@ export const useChatApp = ({
       return;
     }
 
-    if (query === "/login") {
-      if (!authRef.current) {
-        pushSystemMessage("Auth runtime unavailable. HTTP onboarding is not enabled in this build.", {
-          kind: "error",
-          tone: "danger",
-          color: "red",
-        });
-        clearInput();
-        return;
-      }
-      openAuthPanel("manual_login");
-      clearInput();
+    if (
+      handleAuthCommand({
+        query,
+        authRuntime: authRef.current,
+        transport,
+        pushSystemMessage,
+        clearInput,
+        enqueueTask,
+        openManualLoginPanel: () => openAuthPanel("manual_login"),
+        formatAuthStatusMessage,
+        isUsableHttpProvider,
+      })
+    ) {
       return;
     }
 
-    if (query === "/logout") {
-      enqueueTask(async () => {
-        const authRuntime = authRef.current;
-        if (!authRuntime) {
-          pushSystemMessage("Auth runtime unavailable. Nothing to log out.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          return;
-        }
-        const result = await authRuntime.logout();
-        pushSystemMessage(result.message, {
-          kind: "system_hint",
-          tone:
-            result.status.credentialSource === "process_env" ? "warning" : "info",
-          color:
-            result.status.credentialSource === "process_env" ? "yellow" : "cyan",
-        });
-      });
-      clearInput();
-      return;
-    }
-
-    if (query === "/auth") {
-      enqueueTask(async () => {
-        const nextStatus = authRef.current
-          ? await authRef.current.getStatus()
-          : ({
-              mode: transport.getProvider() === "local-core" ? "local" : "http",
-              credentialSource: "none",
-              provider: transport.getProvider(),
-              model: transport.getModel(),
-              persistenceTarget: null,
-              onboardingAvailable: false,
-              httpReady: transport.getProvider() !== "local-core",
-            } as AuthStatus);
-        const hasRememberedKey =
-          authRef.current?.getSavedApiKey && isUsableHttpProvider(nextStatus.provider)
-            ? Boolean(await authRef.current.getSavedApiKey(nextStatus.provider))
-            : false;
-        pushSystemMessage(formatAuthStatusMessage(nextStatus, { hasRememberedKey }), {
-          kind: "system_hint",
-          tone: "info",
-          color: "cyan",
-        });
-      });
-      clearInput();
-      return;
-    }
-
-    if (query === "/provider") {
-      enqueueTask(async () => {
-        const providers = await transport.listProviders();
-        updateCurrentProviderState(transport.getProvider());
-        if (providers.length === 0) {
-          pushSystemMessage("No providers available. Set CYRENE_BASE_URL or switch with /provider <url|openai|gemini|anthropic>.");
-          return;
-        }
-        const current = transport.getProvider();
-        const selectedIndex = Math.max(0, providers.indexOf(current));
-        const currentKeySource = currentProviderKeySource || resolveProviderKeySource(current);
-        const manualOverrides = listManualProviderProfileOverrides();
-        const providerProfiles = Object.fromEntries(
-          providers.map(provider => [provider, resolveProviderProfile(provider)])
-        ) as ProviderPickerState["providerProfiles"];
-        const providerProfileSources = Object.fromEntries(
-          providers.map(provider => [
-            provider,
-            resolveProviderProfileSource(provider, manualOverrides),
-          ])
-        ) as ProviderPickerState["providerProfileSources"];
-        closeAllOverlayPanels({ keepProviderPicker: true });
-        const nextState = {
-          active: true,
-          providers,
-          selectedIndex,
-          pageSize: PROVIDER_PAGE_SIZE,
-          currentKeySource,
-          providerProfiles,
-          providerProfileSources,
-        };
-        providerPickerRef.current = nextState;
-        setProviderPicker(nextState);
-      });
-      clearInput();
-      return;
-    }
-
-    if (query.startsWith("/provider profile")) {
-      enqueueTask(async () => {
-        if (!transport.setProviderProfile) {
-          pushSystemMessage(
-            "Provider profile override is unavailable in this transport.",
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          return;
-        }
-
-        if (query === "/provider profile list") {
-          const overrides = transport.listProviderProfiles?.() ?? {};
-          const lines = Object.entries(overrides)
-            .sort(([left], [right]) => left.localeCompare(right))
-            .map(([provider, profile]) => `- ${provider} => ${profile}`);
-          pushSystemMessage(
-            lines.length > 0
-              ? ["Manual provider profile overrides:", ...lines].join("\n")
-              : "No manual provider profile overrides."
-          );
-          return;
-        }
-
-        if (query === "/provider profile") {
-          pushSystemMessage(
-            "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list",
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          return;
-        }
-
-        const rawArgs = query
-          .slice("/provider profile".length)
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean);
-        if (rawArgs.length === 0) {
-          pushSystemMessage(
-            "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list",
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          return;
-        }
-
-        const profileToken = rawArgs[0]?.toLowerCase();
-        let normalizedProfile: ProviderProfile | null = null;
-        if (profileToken === "clear") {
-          normalizedProfile = "custom";
-        } else if (
-          profileToken === "openai" ||
-          profileToken === "gemini" ||
-          profileToken === "anthropic" ||
-          profileToken === "custom"
-        ) {
-          normalizedProfile = profileToken;
-        }
-        if (!normalizedProfile) {
-          pushSystemMessage(
-            "Profile must be one of: openai, gemini, anthropic, custom (or clear).",
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          return;
-        }
-
-        const targetProvider = rawArgs.slice(1).join(" ").trim() || transport.getProvider();
-        if (!targetProvider || targetProvider === "none") {
-          pushSystemMessage(
-            "No active provider. Use /provider <url> first, or pass [url] explicitly.",
-            {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            }
-          );
-          return;
-        }
-
-        if (
-          isRepeatedActionInteraction(
-            `command:provider-profile:${targetProvider}:${normalizedProfile}`
-          )
-        ) {
-          return;
-        }
-
-        const result = await transport.setProviderProfile(
-          targetProvider,
-          normalizedProfile
-        );
-        updateCurrentProviderState(transport.getProvider());
-        updateCurrentModelState(transport.getModel());
-        if (result.ok) {
-          pushSystemMessage(result.message, {
-            kind: "system_hint",
-            tone: "info",
-            color: "cyan",
-          });
-        } else {
-          pushSystemMessage(`[provider profile failed] ${result.message}`, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-        }
-      });
-      clearInput();
-      return;
-    }
-
-    if (query === "/provider refresh") {
-      enqueueTask(async () => {
-        const result = await transport.refreshModels();
-        updateCurrentProviderState(transport.getProvider());
-        updateCurrentModelState(transport.getModel());
-        if (result.ok) {
-          pushSystemMessage(
-            `${result.message}\nProvider: ${transport.getProvider()}\nCurrent model: ${transport.getModel()}`
-          );
-        } else {
-          pushSystemMessage(`[provider refresh failed] ${result.message}`);
-        }
-      });
-      clearInput();
-      return;
-    }
-
-    if (query.startsWith("/provider ")) {
-      const nextProvider = query.slice("/provider ".length).trim();
-      enqueueTask(async () => {
-        if (!nextProvider) {
-          pushSystemMessage(
-            "Usage: /provider <base_url|openai|gemini|anthropic> | /provider refresh | /provider profile ..."
-          );
-          return;
-        }
-        if (isRepeatedActionInteraction(`command:provider:${nextProvider}`)) {
-          return;
-        }
-        const result = await transport.setProvider(nextProvider);
-        updateCurrentProviderState(transport.getProvider());
-        updateCurrentModelState(transport.getModel());
-        if (result.ok) {
-          pushSystemMessage(result.message);
-        } else {
-          pushSystemMessage(`[provider switch failed] ${result.message}`);
-        }
-      });
-      clearInput();
-      return;
-    }
-
-    if (query === "/model") {
-      enqueueTask(async () => {
-        const models = await transport.listModels();
-        updateCurrentModelState(transport.getModel());
-      if (models.length === 0) {
-          pushSystemMessage("No models available. Try /model refresh.");
-          return;
-        }
-        const current = transport.getModel();
-        const selectedIndex = Math.max(0, models.indexOf(current));
-        closeAllOverlayPanels({ keepModelPicker: true });
-        const nextState = {
-          active: true,
-          models,
-          selectedIndex,
-          pageSize: MODEL_PAGE_SIZE,
-        };
-        modelPickerRef.current = nextState;
-        setModelPicker(nextState);
-      });
-      clearInput();
-      return;
-    }
-
-    if (query === "/model refresh") {
-      enqueueTask(async () => {
-        const result = await transport.refreshModels();
-        updateCurrentModelState(transport.getModel());
-        if (result.ok) {
-          pushSystemMessage(
-            `${result.message}\nCurrent model: ${transport.getModel()}`
-          );
-        } else {
-          pushSystemMessage(`[model refresh failed] ${result.message}`);
-        }
-      });
-      clearInput();
-      return;
-    }
-
-    if (query.startsWith("/model ")) {
-      const nextModel = query.slice("/model ".length).trim();
-      enqueueTask(async () => {
-        if (!nextModel) {
-          pushSystemMessage("Usage: /model <model_name>");
-          return;
-        }
-        if (isRepeatedActionInteraction(`command:model:${nextModel}`)) {
-          return;
-        }
-        const result = await transport.setModel(nextModel);
-        updateCurrentModelState(transport.getModel());
-        if (result.ok) {
-          pushSystemMessage(result.message);
-        } else {
-          pushSystemMessage(`[model switch failed] ${result.message}`);
-        }
-      });
-      clearInput();
+    if (
+      handleProviderModelCommand({
+        query,
+        transport,
+        currentProviderKeySource,
+        pushSystemMessage,
+        clearInput,
+        enqueueTask,
+        isRepeatedActionInteraction,
+        updateCurrentProviderState,
+        updateCurrentModelState,
+        syncAuthSelection,
+        resolveProviderKeySource,
+        listManualProviderProfileOverrides,
+        resolveProviderProfile,
+        resolveProviderProfileSource,
+        openProviderPicker: openProviderPickerFromCommand,
+        openModelPicker: openModelPickerFromCommand,
+      })
+    ) {
       return;
     }
 
@@ -6110,1207 +3794,80 @@ export const useChatApp = ({
     enqueueTask(async () => {
       let activeSubmitRunId: number | null = null;
       try {
-        if (query === "/new") {
-          const created = await sessionStore.createSession();
-          pendingChoiceRef.current = null;
-          if (draftSessionSkillUsesRef.current.length > 0) {
-            setSessionSkillUseIds(created.id, draftSessionSkillUsesRef.current);
-            draftSessionSkillUsesRef.current = [];
-          }
-          updateActiveSessionIdState(created.id);
-          clearLiveAssistantSegment();
-          setItems([
-            {
-              role: "system",
-              text: defaultSystemText,
-              kind: "system_hint",
-              tone: "neutral",
-              color: "gray",
-            },
-            {
-              role: "system",
-              text: `Started new session: ${created.id}`,
-              kind: "system_hint",
-              tone: "info",
-              color: "cyan",
-            },
-          ]);
-          clearInput();
+        if (
+          await handleSessionCommand({
+            query,
+            sessionStore,
+            activeSessionId,
+            systemPrompt,
+            defaultSystemPrompt,
+            pinMaxCount,
+            pushSystemMessage,
+            clearInput,
+            setSystemPrompt,
+            formatReducerStateMessage,
+            ensureActiveSession,
+            startNewSession: startNewSessionCommand,
+            undoLastMutation: () => mcpService.undoLastMutation(),
+            openSessionsPanel: openSessionsPanelFromCommand,
+            openResumePicker: openResumePickerFromCommand,
+            loadSessionIntoChat,
+          })
+        ) {
           return;
         }
 
-      if (query === "/undo") {
-        const result = await mcpService.undoLastMutation();
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query === "/search-session") {
-        pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/search-session ")) {
-        const raw = query.slice("/search-session ".length).trim();
-        if (!raw) {
-          pushSystemMessage("Usage: /search-session <query> | /search-session #<tag> [query]");
-          clearInput();
+        if (
+          await handleSkillsCommand({
+            query,
+            skillsService,
+            activeSessionId,
+            pushSystemMessage,
+            clearInput,
+            getSkillDefinitionById,
+            getSessionSkillUseIds,
+            setSessionSkillUseIds,
+          })
+        ) {
           return;
         }
 
-        const parts = raw.split(/\s+/).filter(Boolean);
-        const tagToken = parts.find(part => part.startsWith("#"));
-        const tag = tagToken ? tagToken.replace(/^#+/, "").trim() : "";
-        const textQuery = parts
-          .filter(part => !part.startsWith("#"))
-          .join(" ")
-          .trim();
-        const searchQuery = textQuery || (tag ? "" : raw);
-
-        const results = await sessionStore.searchSessions(searchQuery, {
-          tag: tag || undefined,
-          limit: 12,
-        });
-        if (results.length === 0) {
-          pushSystemMessage(
-            `No sessions matched.${tag ? ` (tag: ${tag})` : ""}`
-          );
-          clearInput();
-          return;
-        }
-        pushSystemMessage(
-          [
-            `Found ${results.length} session(s):`,
-            ...results.map((item, index) => {
-              const tagSuffix =
-                item.tags.length > 0 ? ` #${item.tags.join(" #")}` : "";
-              return `${index + 1}. ${item.id} | ${item.title}${tagSuffix}`;
-            }),
-          ].join("\n")
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/tag") {
-        pushSystemMessage("Usage: /tag list | /tag add <tag> | /tag remove <tag>");
-        clearInput();
-        return;
-      }
-
-      if (query === "/tag list") {
-        const session = await ensureActiveSession();
-        if (session.tags.length === 0) {
-          pushSystemMessage("No tags yet. Use /tag add <tag>.");
-        } else {
-          pushSystemMessage(`Session tags:\n${session.tags.map(tag => `#${tag}`).join("\n")}`);
-        }
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/tag add ")) {
-        const tag = query.slice("/tag add ".length).trim();
-        if (!tag) {
-          pushSystemMessage("Usage: /tag add <tag>");
-          clearInput();
-          return;
-        }
-        const session = await ensureActiveSession();
-        const next = await sessionStore.addTag(session.id, tag);
-        pushSystemMessage(
-          next.tags.length > 0
-            ? `Tag added. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`
-            : "Tag was not added."
-        );
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/tag remove ")) {
-        const tag = query.slice("/tag remove ".length).trim();
-        if (!tag) {
-          pushSystemMessage("Usage: /tag remove <tag>");
-          clearInput();
-          return;
-        }
-        const session = await ensureActiveSession();
-        const next = await sessionStore.removeTag(session.id, tag);
-        if (next.tags.length === 0) {
-          pushSystemMessage("Tag removed. No tags remain.");
-        } else {
-          pushSystemMessage(`Tag removed. Current tags: ${next.tags.map(item => `#${item}`).join(" ")}`);
-        }
-        clearInput();
-        return;
-      }
-
-      if (query === "/system") {
-        pushSystemMessage(`Current system prompt:\n${systemPrompt}`);
-        clearInput();
-        return;
-      }
-
-      if (query === "/state") {
-        const activeSession = activeSessionId
-          ? await sessionStore.loadSession(activeSessionId)
-          : null;
-        pushSystemMessage(formatReducerStateMessage(activeSession), {
-          kind: "system_hint",
-          tone: "info",
-          color: "cyan",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query === "/system reset") {
-        setSystemPrompt(defaultSystemPrompt);
-        pushSystemMessage("System prompt reset to default.");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/system ")) {
-        const nextPrompt = query.slice("/system ".length).trim();
-        if (!nextPrompt) {
-          pushSystemMessage("Usage: /system <prompt_text> | /system reset");
-          clearInput();
-          return;
-        }
-        setSystemPrompt(nextPrompt);
-        pushSystemMessage("System prompt updated for current runtime.");
-        clearInput();
-        return;
-      }
-
-      if (query === "/sessions") {
-        const sessions = await sessionStore.listSessions();
-        if (sessions.length === 0) {
-          pushSystemMessage("No sessions yet.");
-        } else {
-          closeAllOverlayPanels({ keepSessionsPanel: true });
-          const nextState = {
-            active: true,
-            sessions,
-            selectedIndex: 0,
-            pageSize: RESUME_PAGE_SIZE,
-          };
-          sessionsPanelRef.current = nextState;
-          setSessionsPanel(nextState);
-        }
-        clearInput();
-        return;
-      }
-
-      if (query === "/skills") {
-        if (!skillsService?.describeRuntime) {
-          pushSystemMessage("Skills runtime is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-        pushSystemMessage(formatSkillsRuntimeSummary(skillsService.describeRuntime()), {
-          kind: "system_hint",
-          tone: "info",
-          color: "cyan",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query === "/skills list") {
-        if (!skillsService) {
-          pushSystemMessage("Skills runtime is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
+        if (
+          await handleMcpCommand({
+            query,
+            mcpService,
+            pushSystemMessage,
+            clearInput,
+            getApprovalRisk,
+          })
+        ) {
           return;
         }
 
-        const skills = skillsService.listSkills();
-        pushSystemMessage(
-          skills.length > 0
-            ? ["Skills", ...skills.map(formatSkillLine)].join("\n")
-            : "No skills available.",
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/skills show ")) {
-        if (!skillsService) {
-          pushSystemMessage("Skills runtime is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
+        if (
+          handleApprovalCommand({
+            query,
+            listPending: () => mcpService.listPending(),
+            pushSystemMessage,
+            clearInput,
+            summarizePendingRisk,
+            openApprovalPanel,
+            approvePendingReview,
+            rejectPendingReview,
+            approveLowBatch: () =>
+              processPendingBatch(
+                "approve",
+                item => getApprovalRisk(item.request.action) !== "high",
+                "low-and-medium"
+              ),
+            approveAllBatch: () =>
+              processPendingBatch("approve", () => true, "all"),
+            rejectAllBatch: () =>
+              processPendingBatch("reject", () => true, "all"),
+          })
+        ) {
           return;
         }
-
-        const skillId = query.slice("/skills show ".length).trim();
-        if (!skillId) {
-          pushSystemMessage("Usage: /skills show <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const skill = skillsService.listSkills().find(item => item.id === skillId);
-        pushSystemMessage(
-          skill ? formatSkillDetail(skill) : `Skill not found: ${skillId}`,
-          {
-            kind: skill ? "system_hint" : "error",
-            tone: skill ? "info" : "danger",
-            color: skill ? "cyan" : "red",
-          }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/skills reload") {
-        if (!skillsService?.reloadConfig) {
-          pushSystemMessage("Skills runtime reload is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await skillsService.reloadConfig();
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/skills enable ")) {
-        if (!skillsService?.setSkillEnabled) {
-          pushSystemMessage("Skills runtime management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-        const skillId = query.slice("/skills enable ".length).trim();
-        if (!skillId) {
-          pushSystemMessage("Usage: /skills enable <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await skillsService.setSkillEnabled(skillId, true);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/skills disable ")) {
-        if (!skillsService?.setSkillEnabled) {
-          pushSystemMessage("Skills runtime management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-        const skillId = query.slice("/skills disable ".length).trim();
-        if (!skillId) {
-          pushSystemMessage("Usage: /skills disable <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await skillsService.setSkillEnabled(skillId, false);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/skills remove ")) {
-        if (!skillsService?.removeSkill) {
-          pushSystemMessage("Skills runtime remove is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-        const skillId = query.slice("/skills remove ".length).trim();
-        if (!skillId) {
-          pushSystemMessage("Usage: /skills remove <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await skillsService.removeSkill(skillId);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/skills use ")) {
-        if (!skillsService) {
-          pushSystemMessage("Skills runtime is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-        const skillId = query.slice("/skills use ".length).trim();
-        if (!skillId) {
-          pushSystemMessage("Usage: /skills use <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const skill = getSkillDefinitionById(skillId);
-        if (!skill) {
-          pushSystemMessage(`Skill not found: ${skillId}`, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const targetSessionId = activeSessionId;
-        const currentSkillIds = getSessionSkillUseIds(targetSessionId);
-        const alreadyActive = currentSkillIds.some(id => id === skill.id);
-        if (alreadyActive) {
-          pushSystemMessage(
-            targetSessionId
-              ? `Session skill already active: ${skill.id} (session ${targetSessionId})`
-              : `Session skill already queued for next session: ${skill.id}`
-          );
-          clearInput();
-          return;
-        }
-
-        setSessionSkillUseIds(targetSessionId, [...currentSkillIds, skill.id]);
-        pushSystemMessage(
-          targetSessionId
-            ? `Session skill activated: ${skill.id} (${skill.label})\nscope: session ${targetSessionId}`
-            : `Session skill activated: ${skill.id} (${skill.label})\nscope: next new session`
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp") {
-        const servers = mcpService.listServers();
-        const pending = mcpService.listPending();
-        pushSystemMessage(
-          formatMcpRuntimeSummary(mcpService.describeRuntime?.(), servers, pending),
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp servers") {
-        const servers = mcpService.listServers();
-        pushSystemMessage(
-          servers.length > 0
-            ? ["MCP servers", ...servers.map(formatMcpServerLine)].join("\n")
-            : "No MCP servers registered.",
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp tools") {
-        const servers = mcpService.listServers();
-        const lines = servers.flatMap(server => {
-          const tools = mcpService.listTools(server.id);
-          return buildMcpToolSectionLines(server, tools);
-        });
-
-        pushSystemMessage(
-          lines.length > 0
-            ? ["MCP tools", ...lines].join("\n")
-            : "No MCP tools registered.",
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp lsp") {
-        pushSystemMessage(
-          [
-            "MCP LSP commands",
-            MCP_LSP_LIST_USAGE,
-            MCP_LSP_ADD_USAGE,
-            MCP_LSP_REMOVE_USAGE,
-            MCP_LSP_DOCTOR_USAGE,
-          ].join("\n"),
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp pending") {
-        const pending = mcpService.listPending();
-        pushSystemMessage(
-          pending.length > 0
-            ? ["MCP pending operations", ...pending.map(formatMcpPendingLine)].join("\n")
-            : "No pending MCP operations.",
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/mcp reload") {
-        if (!mcpService.reloadConfig) {
-          pushSystemMessage("MCP runtime reload is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await mcpService.reloadConfig();
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp add ")) {
-        if (!mcpService.addServer) {
-          pushSystemMessage("MCP server management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const parsed = parseMcpAddCommand(query);
-        if (!parsed.ok) {
-          pushSystemMessage(parsed.message, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await mcpService.addServer(parsed.input);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp lsp ")) {
-        const parsed = parseMcpLspCommand(query);
-        if (!parsed.ok) {
-          pushSystemMessage(parsed.message, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const servers = mcpService.listServers();
-        const resolveTarget = (serverRef: string) => {
-          const resolved = resolveFilesystemMcpServerDescriptor(servers, serverRef);
-          if (!resolved.ok) {
-            pushSystemMessage(resolved.message, {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            });
-            clearInput();
-            return null;
-          }
-          return resolved.server;
-        };
-
-        if (parsed.action === "list") {
-          if (!mcpService.listLspServers) {
-            pushSystemMessage("MCP LSP listing is unavailable in this build.", {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            });
-            clearInput();
-            return;
-          }
-
-          const targetServer = parsed.filesystemServerId
-            ? resolveTarget(parsed.filesystemServerId)
-            : null;
-          if (parsed.filesystemServerId && !targetServer) {
-            return;
-          }
-
-          const filesystemServers = parsed.filesystemServerId
-            ? [targetServer!]
-            : servers.filter(server => server.transport === "filesystem");
-          const lspEntries = mcpService.listLspServers(targetServer?.id);
-          if (filesystemServers.length === 0) {
-            pushSystemMessage("No filesystem MCP servers registered.", {
-              kind: "system_hint",
-              tone: "neutral",
-              color: "white",
-            });
-            clearInput();
-            return;
-          }
-
-          const lines = filesystemServers.flatMap(server => {
-            const entries = lspEntries.filter(entry => entry.filesystemServerId === server.id);
-            return [
-              `[${
-                server.id
-              }] ${server.label} | workspace ${entries[0]?.filesystemWorkspaceRoot ?? "(unknown)"} | ${formatMcpLspSummary(server)}`,
-              ...(entries.length > 0
-                ? entries.map(formatMcpLspListLine)
-                : ["- (no configured lsp_servers)"]),
-            ];
-          });
-
-          pushSystemMessage(["MCP LSP servers", ...lines].join("\n"), {
-            kind: "system_hint",
-            tone: "info",
-            color: "cyan",
-          });
-          clearInput();
-          return;
-        }
-
-        if (parsed.action === "add") {
-          if (!mcpService.addLspServer) {
-            pushSystemMessage("MCP LSP management is unavailable in this build.", {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            });
-            clearInput();
-            return;
-          }
-          const targetServer = resolveTarget(parsed.filesystemServerId);
-          if (!targetServer) {
-            return;
-          }
-          const result = await mcpService.addLspServer(targetServer.id, parsed.input);
-          pushSystemMessage(result.message, {
-            kind: result.ok ? "system_hint" : "error",
-            tone: result.ok ? "info" : "danger",
-            color: result.ok ? "cyan" : "red",
-          });
-          clearInput();
-          return;
-        }
-
-        if (parsed.action === "remove") {
-          if (!mcpService.removeLspServer) {
-            pushSystemMessage("MCP LSP management is unavailable in this build.", {
-              kind: "error",
-              tone: "danger",
-              color: "red",
-            });
-            clearInput();
-            return;
-          }
-          const targetServer = resolveTarget(parsed.filesystemServerId);
-          if (!targetServer) {
-            return;
-          }
-          const result = await mcpService.removeLspServer(targetServer.id, parsed.lspServerId);
-          pushSystemMessage(result.message, {
-            kind: result.ok ? "system_hint" : "error",
-            tone: result.ok ? "info" : "danger",
-            color: result.ok ? "cyan" : "red",
-          });
-          clearInput();
-          return;
-        }
-
-        if (!mcpService.doctorLsp) {
-          pushSystemMessage("MCP LSP doctor is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const targetServer = resolveTarget(parsed.filesystemServerId);
-        if (!targetServer) {
-          return;
-        }
-        const result = await mcpService.doctorLsp(targetServer.id, parsed.path, {
-          lspServerId: parsed.lspServerId,
-        });
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp remove ")) {
-        if (!mcpService.removeServer) {
-          pushSystemMessage("MCP server management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const serverId = query.slice("/mcp remove ".length).trim();
-        if (!serverId) {
-          pushSystemMessage("Usage: /mcp remove <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await mcpService.removeServer(serverId);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp enable ")) {
-        if (!mcpService.setServerEnabled) {
-          pushSystemMessage("MCP server management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const serverId = query.slice("/mcp enable ".length).trim();
-        if (!serverId) {
-          pushSystemMessage("Usage: /mcp enable <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await mcpService.setServerEnabled(serverId, true);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp disable ")) {
-        if (!mcpService.setServerEnabled) {
-          pushSystemMessage("MCP server management is unavailable in this build.", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const serverId = query.slice("/mcp disable ".length).trim();
-        if (!serverId) {
-          pushSystemMessage("Usage: /mcp disable <id>", {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const result = await mcpService.setServerEnabled(serverId, false);
-        pushSystemMessage(result.message, {
-          kind: result.ok ? "system_hint" : "error",
-          tone: result.ok ? "info" : "danger",
-          color: result.ok ? "cyan" : "red",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp server ")) {
-        const serverId = query.slice("/mcp server ".length).trim();
-        if (!serverId) {
-          pushSystemMessage("Usage: /mcp server <id>");
-          clearInput();
-          return;
-        }
-
-        const servers = mcpService.listServers();
-        const server = resolveMcpServerDescriptor(servers, serverId);
-        if (!server) {
-          pushSystemMessage(`MCP server not found: ${serverId}`, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const tools = mcpService.listTools(server.id);
-        pushSystemMessage(
-          [
-            `MCP server ${server.id}`,
-            `label: ${server.label}`,
-            `transport: ${server.transport ?? "unknown"}`,
-            `source: ${server.source}`,
-            `health: ${server.health}`,
-            `enabled: ${server.enabled ? "true" : "false"}`,
-            `aliases: ${formatMcpAliases(server.aliases)}`,
-            `lsp: ${
-              server.transport === "filesystem"
-                ? server.lsp && server.lsp.configuredCount > 0
-                  ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-                  : "none configured"
-                : "n/a"
-            }`,
-            `tools: ${tools.length}`,
-          ].join("\n"),
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/mcp tools ")) {
-        const serverId = query.slice("/mcp tools ".length).trim();
-        if (!serverId) {
-          pushSystemMessage("Usage: /mcp tools <server>");
-          clearInput();
-          return;
-        }
-
-        const servers = mcpService.listServers();
-        const server = resolveMcpServerDescriptor(servers, serverId);
-        if (!server) {
-          pushSystemMessage(`MCP server not found: ${serverId}`, {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        const tools = mcpService.listTools(server.id);
-        pushSystemMessage(
-          [
-            `MCP tools for ${server.id}`,
-            ...(server.transport === "filesystem"
-              ? [
-                  `lsp: ${
-                    server.lsp && server.lsp.configuredCount > 0
-                      ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-                      : "none configured"
-                  }`,
-                  ...((!server.lsp || server.lsp.configuredCount === 0)
-                    ? [
-                        "tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server",
-                      ]
-                    : []),
-                ]
-              : []),
-            ...(tools.length > 0 ? tools.map(formatMcpToolLine) : ["- (no tools registered)"]),
-          ].join("\n"),
-          { kind: "system_hint", tone: "info", color: "cyan" }
-        );
-        clearInput();
-        return;
-      }
-
-        if (query === "/review") {
-          const pending = mcpService.listPending();
-          if (pending.length === 0) {
-            pushSystemMessage(
-              "No pending operations.",
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          } else {
-            const risk = summarizePendingRisk(pending);
-            pushSystemMessage(
-              buildApprovalMessage("Approval required", undefined, [
-                `pending: ${pending.length}`,
-                `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
-                "panel: opened",
-                "keys: ↑/↓ select  Tab preview  a approve  r reject  Esc close",
-                "batch: /approve low | /approve all | /reject all",
-              ]),
-              { kind: "review_status", tone: "warning", color: "yellow" }
-            );
-            openApprovalPanel(pending, {
-              focusLatest: true,
-              previewMode: "summary",
-            });
-          }
-          clearInput();
-          return;
-        }
-
-      if (query.startsWith("/review ")) {
-        const id = query.slice("/review ".length).trim();
-        if (!id) {
-          pushSystemMessage("Usage: /review <id>");
-          clearInput();
-          return;
-        }
-
-        const pending = mcpService.listPending();
-        const target = pending.find(item => item.id === id);
-        if (!target) {
-          pushSystemMessage(buildApprovalMessage("Approval error", undefined, [
-            `pending operation not found: ${id}`,
-          ]), {
-            kind: "error",
-            tone: "danger",
-            color: "red",
-          });
-          clearInput();
-          return;
-        }
-
-        pushSystemMessage(
-          buildApprovalMessage("Approval required", target, [
-            "panel: opened",
-            "preview: full",
-          ]),
-          { kind: "review_status", tone: "warning", color: "yellow" }
-        );
-        openApprovalPanel(pending, {
-          selectId: target.id,
-          previewMode: "full",
-        });
-        clearInput();
-        return;
-      }
-
-      if (query === "/approve") {
-        const pending = mcpService.listPending();
-        if (pending.length === 0) {
-          pushSystemMessage(
-            "No pending operations to approve.",
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          clearInput();
-          return;
-        }
-        if (pending.length > 1) {
-          const risk = summarizePendingRisk(pending);
-          pushSystemMessage(
-            buildApprovalMessage("Approval required", undefined, [
-              `pending: ${pending.length}`,
-              `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
-              "use: /approve <id>, /approve low, /approve all, or the approval panel",
-            ]),
-            { kind: "review_status", tone: "warning", color: "yellow" }
-          );
-          clearInput();
-          return;
-        }
-        const only = pending[0];
-        if (!only) {
-          pushSystemMessage(
-            "No pending operations to approve.",
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          clearInput();
-          return;
-        }
-        approvePendingReview(only.id);
-        clearInput();
-        return;
-      }
-
-      if (query === "/approve low") {
-        processPendingBatch(
-          "approve",
-          item => getApprovalRisk(item.request.action) !== "high",
-          "low-and-medium"
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/approve all") {
-        processPendingBatch("approve", () => true, "all");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/approve ")) {
-        const id = query.slice("/approve ".length).trim();
-        if (!id) {
-          pushSystemMessage("Usage: /approve <id> | /approve low | /approve all");
-          clearInput();
-          return;
-        }
-        approvePendingReview(id);
-        clearInput();
-        return;
-      }
-
-      if (query === "/reject") {
-        const pending = mcpService.listPending();
-        if (pending.length === 0) {
-          pushSystemMessage(
-            "No pending operations to reject.",
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          clearInput();
-          return;
-        }
-        if (pending.length > 1) {
-          const risk = summarizePendingRisk(pending);
-          pushSystemMessage(
-            buildApprovalMessage("Approval required", undefined, [
-              `pending: ${pending.length}`,
-              `risk: high ${risk.high} | medium ${risk.medium} | low ${risk.low}`,
-              "use: /reject <id>, /reject all, or the approval panel",
-            ]),
-            { kind: "review_status", tone: "warning", color: "yellow" }
-          );
-          clearInput();
-          return;
-        }
-        const only = pending[0];
-        if (!only) {
-          pushSystemMessage(
-            "No pending operations to reject.",
-            { kind: "system_hint", tone: "neutral", color: "white" }
-          );
-          clearInput();
-          return;
-        }
-        rejectPendingReview(only.id);
-        clearInput();
-        return;
-      }
-
-      if (query === "/reject all") {
-        processPendingBatch("reject", () => true, "all");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/reject ")) {
-        const id = query.slice("/reject ".length).trim();
-        if (!id) {
-          pushSystemMessage("Usage: /reject <id> | /reject all");
-          clearInput();
-          return;
-        }
-        rejectPendingReview(id);
-        clearInput();
-        return;
-      }
-
-      if (query === "/pins") {
-        const session = await ensureActiveSession();
-        if (session.focus.length === 0) {
-          pushSystemMessage("No pinned focus yet. Use /pin <note>.");
-        } else {
-          pushSystemMessage(
-            `Pinned focus:\n${session.focus
-              .map((item, index) => `${index + 1}. ${item}`)
-              .join("\n")}`
-          );
-        }
-        clearInput();
-        return;
-      }
-
-      if (query === "/pin") {
-        pushSystemMessage("Usage: /pin <important_note>");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/pin ")) {
-        const note = query.slice("/pin ".length).trim();
-        if (!note) {
-          pushSystemMessage("Usage: /pin <important_note>");
-          clearInput();
-          return;
-        }
-        const session = await ensureActiveSession();
-        if (session.focus.length >= pinMaxCount) {
-          pushSystemMessage(
-            `Pin limit reached (${pinMaxCount}). Remove low-value pins with /unpin <index> before adding more.`
-          );
-          clearInput();
-          return;
-        }
-        const next = await sessionStore.addFocus(session.id, note);
-        pushSystemMessage(
-          `Pinned to session focus (${next.focus.length}): ${note}`
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/unpin") {
-        pushSystemMessage("Usage: /unpin <index>");
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/unpin ")) {
-        const raw = query.slice("/unpin ".length).trim();
-        const index = Number(raw);
-        if (!Number.isInteger(index) || index <= 0) {
-          pushSystemMessage("Usage: /unpin <index> (1-based)");
-          clearInput();
-          return;
-        }
-        const session = await ensureActiveSession();
-        if (session.focus.length === 0) {
-          pushSystemMessage("No pinned focus to remove.");
-          clearInput();
-          return;
-        }
-        if (index > session.focus.length) {
-          pushSystemMessage(
-            `Index out of range. Current pin count: ${session.focus.length}`
-          );
-          clearInput();
-          return;
-        }
-        const removed = session.focus[index - 1];
-        const next = await sessionStore.removeFocus(session.id, index - 1);
-        pushSystemMessage(
-          `Unpinned #${index}: ${removed}\nRemaining pins: ${next.focus.length}`
-        );
-        clearInput();
-        return;
-      }
-
-      if (query === "/resume") {
-        const sessions = await sessionStore.listSessions();
-        if (sessions.length === 0) {
-          pushSystemMessage("No sessions to resume.");
-        } else {
-          closeAllOverlayPanels({ keepResumePicker: true });
-          const nextState = {
-            active: true,
-            sessions,
-            selectedIndex: 0,
-            pageSize: RESUME_PAGE_SIZE,
-          };
-          resumePickerRef.current = nextState;
-          setResumePicker(nextState);
-        }
-        clearInput();
-        return;
-      }
-
-      if (query.startsWith("/resume ")) {
-        const targetId = query.slice("/resume ".length).trim();
-        if (!targetId) {
-          pushSystemMessage("Usage: /resume <session_id>");
-          clearInput();
-          return;
-        }
-
-        await loadSessionIntoChat(targetId);
-        clearInput();
-        return;
-      }
 
       if (query.startsWith("/")) {
         pushSystemMessage(

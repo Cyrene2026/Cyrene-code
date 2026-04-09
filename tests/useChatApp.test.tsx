@@ -166,7 +166,10 @@ const createPending = (
                                     newName: "RenamedSymbol",
                                     maxResults: 5,
                                   }
-                              : action === "lsp_hover" || action === "lsp_definition"
+                              : action === "lsp_hover" ||
+                                  action === "lsp_definition" ||
+                                  action === "lsp_implementation" ||
+                                  action === "lsp_type_definition"
                                 ? {
                                     action,
                                     path,
@@ -183,6 +186,14 @@ const createPending = (
                                       serverId: "rust",
                                       maxResults: 5,
                                     }
+                                  : action === "lsp_workspace_symbols"
+                                    ? {
+                                        action,
+                                        path: ".",
+                                        query: "DemoSymbol",
+                                        serverId: "rust",
+                                        maxResults: 5,
+                                      }
                                   : action === "lsp_document_symbols" || action === "lsp_diagnostics"
                                     ? {
                                         action,
@@ -200,6 +211,36 @@ const createPending = (
                                           serverId: "rust",
                                           maxResults: 5,
                                         }
+                                      : action === "lsp_rename"
+                                        ? {
+                                            action,
+                                            path,
+                                            line: 1,
+                                            column: 1,
+                                            newName: "RenamedSymbol",
+                                            serverId: "rust",
+                                            maxResults: 5,
+                                          }
+                                        : action === "lsp_code_actions"
+                                          ? {
+                                              action,
+                                              path,
+                                              line: 1,
+                                              column: 1,
+                                              serverId: "rust",
+                                              kind: "quickfix",
+                                              title: "Fix issue",
+                                              maxResults: 5,
+                                            }
+                                          : action === "lsp_format_document"
+                                            ? {
+                                                action,
+                                                path,
+                                                serverId: "rust",
+                                                tabSize: 2,
+                                                insertSpaces: true,
+                                                maxResults: 5,
+                                              }
           : action === "copy_path" || action === "move_path"
             ? {
                 action,
@@ -890,6 +931,163 @@ describe("useChatApp", () => {
     app.cleanup();
   });
 
+  test("provider switch syncs auth selection and login reuses the remembered key for the new provider", async () => {
+    let currentProvider = "https://api.openai.com/v1";
+    let currentModel = "gpt-4o-mini";
+    const syncSelection = mock(
+      async (input: { providerBaseUrl?: string; model?: string }) => ({
+        mode: "http" as const,
+        credentialSource: "user_env" as const,
+        provider: input.providerBaseUrl ?? currentProvider,
+        model: input.model ?? currentModel,
+        persistenceTarget: null,
+        onboardingAvailable: true,
+        httpReady: true,
+      })
+    );
+    const getSavedApiKey = mock(async (providerBaseUrl: string) =>
+      providerBaseUrl === "https://api.anthropic.com"
+        ? "remembered-anthropic-key"
+        : undefined
+    );
+    const transport: QueryTransport = {
+      getModel: () => currentModel,
+      getProvider: () => currentProvider,
+      describeProvider: provider => {
+        const resolvedProvider = provider?.trim() || currentProvider;
+        const anthropic = resolvedProvider.includes("anthropic");
+        return {
+          provider: resolvedProvider,
+          vendor: anthropic ? "anthropic" : "openai",
+          keySource: anthropic
+            ? "CYRENE_ANTHROPIC_API_KEY"
+            : "CYRENE_OPENAI_API_KEY",
+        };
+      },
+      setModel: async model => {
+        currentModel = model;
+        return { ok: true, message: `model ${model}` };
+      },
+      listModels: async () =>
+        currentProvider.includes("anthropic")
+          ? ["claude-3-7-sonnet-latest"]
+          : ["gpt-4o-mini"],
+      listProviders: async () => [
+        "https://api.openai.com/v1",
+        "https://api.anthropic.com",
+      ],
+      setProvider: async provider => {
+        currentProvider = provider;
+        currentModel = provider.includes("anthropic")
+          ? "claude-3-7-sonnet-latest"
+          : "gpt-4o-mini";
+        return {
+          ok: true,
+          message: `Provider switched to: ${provider}`,
+          currentProvider: provider,
+          providers: [
+            "https://api.openai.com/v1",
+            "https://api.anthropic.com",
+          ],
+          models: [currentModel],
+        };
+      },
+      refreshModels: async () => ({
+        ok: true,
+        message: "Models refreshed",
+        models: await Promise.resolve(
+          currentProvider.includes("anthropic")
+            ? ["claude-3-7-sonnet-latest"]
+            : ["gpt-4o-mini"]
+        ),
+      }),
+      requestStreamUrl: async query => `stream://${query}`,
+      stream: async function* () {},
+    };
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport,
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        auth: {
+          status: {
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: "https://api.openai.com/v1",
+            model: "gpt-4o-mini",
+            persistenceTarget: null,
+            onboardingAvailable: true,
+            httpReady: true,
+          },
+          getStatus: async () => ({
+            mode: "http" as const,
+            credentialSource: "user_env" as const,
+            provider: currentProvider,
+            model: currentModel,
+            persistenceTarget: null,
+            onboardingAvailable: true,
+            httpReady: true,
+          }),
+          getSavedApiKey,
+          syncSelection,
+          saveLogin: async () => ({
+            ok: true,
+            message: "saved",
+            status: {
+              mode: "http" as const,
+              credentialSource: "user_env" as const,
+              provider: currentProvider,
+              model: currentModel,
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: true,
+            },
+          }),
+          logout: async () => ({
+            ok: true,
+            message: "logged out",
+            status: {
+              mode: "local" as const,
+              credentialSource: "none" as const,
+              provider: "none",
+              model: "gpt-4o-mini",
+              persistenceTarget: null,
+              onboardingAvailable: true,
+              httpReady: false,
+            },
+          }),
+        },
+        mcpService: {
+          listPending: () => [],
+        } as any,
+      })
+    );
+
+    await runCommand(app, "/provider https://api.anthropic.com");
+
+    expect(syncSelection).toHaveBeenCalledWith({
+      providerBaseUrl: "https://api.anthropic.com",
+      model: "claude-3-7-sonnet-latest",
+    });
+
+    await runCommand(app, "/login");
+    await flushMicrotasks();
+
+    expect(getSavedApiKey).toHaveBeenCalledWith("https://api.anthropic.com");
+    expect(app.getLatest().authPanel.providerBaseUrl).toBe(
+      "https://api.anthropic.com"
+    );
+    expect(app.getLatest().authPanel.step).toBe("model");
+    expect(app.getLatest().authPanel.apiKey).toBe(
+      "remembered-anthropic-key"
+    );
+
+    app.cleanup();
+  });
+
 type ScriptedTransportEvent =
   | { type: "tool_call"; toolName: string; input: unknown }
   | { type: "text_delta"; text: string };
@@ -1264,13 +1462,24 @@ const createScriptedTransport = (
   test("/mcp lsp commands expose list/add/remove/doctor flows", async () => {
     const addLspServer = mock(async (_serverId: string, _input: unknown) => ({
       ok: true,
-      message:
-        "MCP LSP server added: repo/rust\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+      message: [
+        "MCP LSP server added",
+        "filesystem_server: repo",
+        "lsp_server: rust",
+        "command: rust-analyzer",
+        "patterns: **/*.rs",
+        "config: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+      ].join("\n"),
     }));
     const removeLspServer = mock(async (_serverId: string, _lspServerId: string) => ({
       ok: true,
-      message:
-        "MCP LSP server removed: repo/rust\nconfig: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+      message: [
+        "MCP LSP server removed",
+        "filesystem_server: repo",
+        "lsp_server: rust",
+        "remaining: (none)",
+        "config: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
+      ].join("\n"),
     }));
     const doctorLsp = mock(async (_serverId: string, _path: string, _options?: unknown) => ({
       ok: true,
@@ -1286,6 +1495,7 @@ const createScriptedTransport = (
       message: [
         "MCP LSP doctor",
         "filesystem_server: repo",
+        "requested_lsp: rust",
         "status: ready",
       ].join("\n"),
     }));
@@ -1366,8 +1576,38 @@ const createScriptedTransport = (
 
     const texts = getTexts(app.getLatest().items);
     expect(texts.some(text => text.includes("MCP LSP servers"))).toBe(true);
+    expect(
+      texts.some(text => text.includes("scope: all filesystem servers"))
+    ).toBe(true);
+    expect(
+      texts.some(text => text.includes("configured_lsp_servers: 1"))
+    ).toBe(true);
+    expect(
+      texts.some(text => text.includes("aliases repofs"))
+    ).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("match_hint workspace . (path must stay inside)")
+      )
+    ).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("patterns **/*.rs (any glob match)")
+      )
+    ).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("roots Cargo.toml, .git (nearest marker wins)")
+      )
+    ).toBe(true);
     expect(texts.some(text => text.includes("env_keys RUST_LOG"))).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("tip: /mcp lsp doctor repo <path> --lsp rust")
+      )
+    ).toBe(true);
     expect(texts.some(text => text.includes("MCP LSP doctor"))).toBe(true);
+    expect(texts.some(text => text.includes("requested_lsp: rust"))).toBe(true);
 
     app.cleanup();
   });
@@ -5192,6 +5432,81 @@ const createScriptedTransport = (
       "create one file",
       "draft after approval",
     ]);
+    app.cleanup();
+  });
+
+  test("resume stream error after approval returns to idle and does not freeze later submits", async () => {
+    let pending = [createPending("resume-error")];
+    const sessionStore = createTestSessionStore() as TestSessionStore;
+    let capturedHandlers:
+      | {
+          onState?: (state: any) => void;
+          onTextDelta?: (text: string) => void;
+          onError?: (message: string) => Promise<void> | void;
+        }
+      | null = null;
+    let turn = 0;
+    const resume = mock(async (_toolResultMessage: string) => {
+      capturedHandlers?.onState?.({ status: "streaming" });
+      capturedHandlers?.onTextDelta?.("after approval failure");
+      await capturedHandlers?.onError?.("520 <none>");
+      throw new Error("Stream error: 520 <none>");
+    });
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta, onError }: any) => {
+      turn += 1;
+      if (turn === 1) {
+        capturedHandlers = { onState, onTextDelta, onError };
+        onState({ status: "awaiting_review" });
+        onTextDelta("draft ");
+        return { status: "suspended" as const, resume };
+      }
+
+      onState({ status: "streaming" });
+      onTextDelta("recovered after retry");
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore,
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [...pending],
+          approve: mock(async (id: string) => {
+            pending = [];
+            return { ok: true, message: `[approved] ${id}\nCreated file: ok` };
+          }),
+          reject: mock((id: string) => ({ ok: true, message: `[rejected] ${id}` })),
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await runCommand(app, "create one file");
+    await openApprovalPanelForTest(app, pending);
+
+    await act(async () => {
+      inputHandler?.("a", {});
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(app.getLatest().status).toBe("idle");
+    expect(getTexts(app.getLatest().items).some(text => text.includes("Queued action failed: Stream error: 520 <none>"))).toBe(
+      true
+    );
+
+    await runCommand(app, "retry after resume failure");
+    await flushMicrotasks();
+
+    expect(runQuerySessionImpl).toHaveBeenCalledTimes(2);
+    expect(app.getLatest().status).toBe("idle");
+    expect(getTexts(app.getLatest().items)).toContain("recovered after retry");
     app.cleanup();
   });
 

@@ -14,6 +14,7 @@ import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
 import type {
   ApplyPatchToolRequest,
   CommandToolRequest,
@@ -39,8 +40,14 @@ import type {
   LspDiagnosticsToolRequest,
   LspDocumentSymbolsToolRequest,
   LspHoverToolRequest,
+  LspCodeActionsToolRequest,
+  LspImplementationToolRequest,
+  LspFormatDocumentToolRequest,
   LspPrepareRenameToolRequest,
+  LspRenameToolRequest,
   LspReferencesToolRequest,
+  LspTypeDefinitionToolRequest,
+  LspWorkspaceSymbolsToolRequest,
   TsDefinitionToolRequest,
   TsDiagnosticsToolRequest,
   TsHoverToolRequest,
@@ -67,12 +74,15 @@ import {
 import {
   LspManager,
   pathFromLspUri,
+  type LspCodeAction,
   type LspDiagnostic,
   type LspDocumentSymbol,
   type LspLocation,
   type LspManagerLike,
   type LspRange,
   type LspTextEdit,
+  type LspWorkspaceLike,
+  type LspWorkspaceSymbol,
   type LspWorkspaceEdit,
 } from "./lspClient";
 
@@ -99,6 +109,15 @@ type UndoEntry =
       kind: "move_path";
       from: string;
       to: string;
+      sourceAction: ToolRequest["action"];
+    }
+  | {
+      kind: "restore_workspace";
+      files: Array<{
+        path: string;
+        existedBefore: boolean;
+        content: Uint8Array;
+      }>;
       sourceAction: ToolRequest["action"];
     };
 
@@ -211,6 +230,21 @@ type PathConflict = {
   path: string;
 };
 
+type LspWorkspaceFileEditPlan = {
+  uri: string;
+  filePath: string;
+  workspacePath: string;
+  edits: LspTextEdit[];
+  before: string;
+  after: string;
+};
+
+type LspWorkspaceEditPlan = {
+  files: LspWorkspaceFileEditPlan[];
+  skippedPaths: string[];
+  totalEdits: number;
+};
+
 type ShellFlavor = "pwsh" | "sh";
 
 type ShellAuditResult = {
@@ -249,10 +283,42 @@ const READ_ONLY_ACTIONS: FileAction[] = [
   "ts_prepare_rename",
   "lsp_hover",
   "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
   "lsp_references",
+  "lsp_workspace_symbols",
   "lsp_document_symbols",
   "lsp_diagnostics",
   "lsp_prepare_rename",
+];
+const READ_ONLY_ACTION_SET = new Set<ToolRequest["action"]>(READ_ONLY_ACTIONS);
+const LSP_SYMBOL_KIND_LABELS = [
+  "file",
+  "module",
+  "namespace",
+  "package",
+  "class",
+  "method",
+  "property",
+  "field",
+  "constructor",
+  "enum",
+  "interface",
+  "function",
+  "variable",
+  "constant",
+  "string",
+  "number",
+  "boolean",
+  "array",
+  "object",
+  "key",
+  "null",
+  "enum_member",
+  "struct",
+  "event",
+  "operator",
+  "type_parameter",
 ];
 const TYPESCRIPT_LANGUAGE_EXTENSIONS = /\.(?:d\.)?(?:[cm]?[jt]sx?)$/i;
 const SHELL_MUTATING_COMMANDS = new Set([
@@ -340,6 +406,9 @@ const PENDING_CONFLICT_ACTIONS: FileAction[] = [
   "delete_file",
   "copy_path",
   "move_path",
+  "lsp_rename",
+  "lsp_code_actions",
+  "lsp_format_document",
 ];
 const MAX_PREVIEW_SUMMARY_LINES = 24;
 const lineNoWidth = 4;
@@ -703,8 +772,19 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
       return "lsp_hover";
     case "lsp_definition":
       return "lsp_definition";
+    case "lsp_implementation":
+    case "implementation":
+    case "go_to_implementation":
+      return "lsp_implementation";
+    case "lsp_type_definition":
+    case "type_definition":
+    case "go_to_type_definition":
+      return "lsp_type_definition";
     case "lsp_references":
       return "lsp_references";
+    case "lsp_workspace_symbols":
+    case "workspace_symbols":
+      return "lsp_workspace_symbols";
     case "lsp_document_symbols":
     case "document_symbols":
     case "lsp_symbols":
@@ -714,6 +794,18 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "lsp_prepare_rename":
     case "lsp_rename_preview":
       return "lsp_prepare_rename";
+    case "lsp_rename":
+    case "rename_symbol":
+      return "lsp_rename";
+    case "lsp_code_actions":
+    case "code_actions":
+    case "code_action":
+      return "lsp_code_actions";
+    case "lsp_format_document":
+    case "format_document":
+    case "format_file":
+    case "lsp_format":
+      return "lsp_format_document";
     case "run_shell":
     case "shell_command":
     case "terminal":
@@ -1244,9 +1336,14 @@ const buildNormalizedFileRequest = (
     pickString(record, ["symbol", "name", "identifier"]) ??
     pickString(record, ["query", "needle"]);
   const query = pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
+  const workspaceSymbolQuery =
+    pickString(record, ["query", "needle", "symbol", "name"]) ??
+    pickFirstNonEmptyValue(rawArgs);
   const revision = pickString(record, ["revision", "rev", "commit", "ref"]);
   const newName = pickString(record, ["newName", "new_name", "renameTo", "rename_to"]);
   const serverId = pickString(record, ["serverId", "server_id", "lspServer", "lsp_server"]);
+  const title = pickString(record, ["title", "name", "label"]);
+  const kind = pickString(record, ["kind", "actionKind", "action_kind"]);
   const jsonPath = pickString(record, ["jsonPath", "json_path", "pointer", "key"]);
   const yamlPath = pickString(record, ["yamlPath", "yaml_path", "pointer", "key"]);
   const maxResults = normalizeSearchLimit(
@@ -1273,6 +1370,10 @@ const buildNormalizedFileRequest = (
   const after = normalizeNonNegativeInteger(
     pickNumber(record, ["after", "contextAfter", "context_after"])
   );
+  const tabSize = normalizePositiveInteger(
+    pickNumber(record, ["tabSize", "tab_size"])
+  );
+  const insertSpaces = pickBoolean(record, ["insertSpaces", "insert_spaces"]);
   const hasStartLine = hasRecordValue(record, [
     "startLine",
     "start_line",
@@ -1502,6 +1603,8 @@ const buildNormalizedFileRequest = (
       };
     case "lsp_hover":
     case "lsp_definition":
+    case "lsp_implementation":
+    case "lsp_type_definition":
       if (!path || typeof line !== "number" || typeof column !== "number") {
         return null;
       }
@@ -1521,6 +1624,17 @@ const buildNormalizedFileRequest = (
         path,
         line,
         column,
+        serverId,
+        maxResults,
+      };
+    case "lsp_workspace_symbols":
+      if (!workspaceSymbolQuery) {
+        return null;
+      }
+      return {
+        action,
+        path: path ?? ".",
+        query: workspaceSymbolQuery,
         serverId,
         maxResults,
       };
@@ -1551,6 +1665,50 @@ const buildNormalizedFileRequest = (
         column,
         newName,
         serverId,
+        maxResults,
+      };
+    case "lsp_rename":
+      if (
+        !path ||
+        typeof line !== "number" ||
+        typeof column !== "number" ||
+        !newName
+      ) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        newName,
+        serverId,
+        maxResults,
+      };
+    case "lsp_code_actions":
+      if (!path || typeof line !== "number" || typeof column !== "number") {
+        return null;
+      }
+      return {
+        action,
+        path,
+        line,
+        column,
+        serverId,
+        maxResults,
+        title,
+        kind,
+      };
+    case "lsp_format_document":
+      if (!path) {
+        return null;
+      }
+      return {
+        action,
+        path,
+        serverId,
+        tabSize,
+        insertSpaces,
         maxResults,
       };
     case "copy_path":
@@ -1892,7 +2050,10 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       action === "ts_references" ||
       action === "lsp_hover" ||
       action === "lsp_definition" ||
-      action === "lsp_references"
+      action === "lsp_implementation" ||
+      action === "lsp_type_definition" ||
+      action === "lsp_references" ||
+      action === "lsp_code_actions"
     ) {
       const line = normalizePositiveInteger(
         pickNumber(record, ["line", "lineNumber", "line_number"])
@@ -1905,7 +2066,24 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       }
     }
 
-    if (action === "ts_prepare_rename" || action === "lsp_prepare_rename") {
+    if (action === "lsp_workspace_symbols") {
+      const query =
+        pickString(record, ["query", "symbol", "name"]) ??
+        pickFirstNonEmptyValue(
+          Array.isArray(record.args) && record.args.every(item => typeof item === "string")
+            ? (record.args as string[])
+            : undefined
+        );
+      if (!query) {
+        return "Invalid tool input for lsp_workspace_symbols: lsp_workspace_symbols requires `query`.";
+      }
+    }
+
+    if (
+      action === "ts_prepare_rename" ||
+      action === "lsp_prepare_rename" ||
+      action === "lsp_rename"
+    ) {
       const line = normalizePositiveInteger(
         pickNumber(record, ["line", "lineNumber", "line_number"])
       );
@@ -1918,6 +2096,16 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       }
       if (!newName) {
         return `Invalid tool input for ${action}: ${action} requires \`newName\`.`;
+      }
+    }
+
+    if (action === "lsp_format_document") {
+      const tabSize = pickNumber(record, ["tabSize", "tab_size"]);
+      if (
+        typeof tabSize === "number" &&
+        (!Number.isInteger(tabSize) || tabSize <= 0)
+      ) {
+        return "Invalid tool input for lsp_format_document: lsp_format_document requires `tabSize` to be a positive integer when provided.";
       }
     }
 
@@ -2124,7 +2312,10 @@ const validateRequest = (request: ToolRequest): string | null => {
     case "ts_references":
     case "lsp_hover":
     case "lsp_definition":
+    case "lsp_implementation":
+    case "lsp_type_definition":
     case "lsp_references":
+    case "lsp_code_actions":
       if (!Number.isInteger(request.line) || request.line <= 0) {
         return `${request.action} requires a positive integer \`line\`.`;
       }
@@ -2132,11 +2323,35 @@ const validateRequest = (request: ToolRequest): string | null => {
         return `${request.action} requires a positive integer \`column\`.`;
       }
       if (
-        (request.action === "ts_references" || request.action === "lsp_references") &&
+        (
+          request.action === "ts_references" ||
+          request.action === "lsp_references" ||
+          request.action === "lsp_implementation" ||
+          request.action === "lsp_type_definition" ||
+          request.action === "lsp_code_actions"
+        ) &&
         typeof request.maxResults === "number" &&
         (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
       ) {
         return `${request.action} requires \`maxResults\` to be a positive integer when provided.`;
+      }
+      if (
+        request.action === "lsp_code_actions" &&
+        typeof request.title === "string" &&
+        !request.title.trim()
+      ) {
+        return "lsp_code_actions requires `title` to be non-empty when provided.";
+      }
+      return null;
+    case "lsp_workspace_symbols":
+      if (!request.query.trim()) {
+        return "lsp_workspace_symbols requires `query`.";
+      }
+      if (
+        typeof request.maxResults === "number" &&
+        (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
+      ) {
+        return "lsp_workspace_symbols requires `maxResults` to be a positive integer when provided.";
       }
       return null;
     case "ts_diagnostics":
@@ -2151,6 +2366,7 @@ const validateRequest = (request: ToolRequest): string | null => {
       return null;
     case "ts_prepare_rename":
     case "lsp_prepare_rename":
+    case "lsp_rename":
       if (!Number.isInteger(request.line) || request.line <= 0) {
         return `${request.action} requires a positive integer \`line\`.`;
       }
@@ -2165,6 +2381,20 @@ const validateRequest = (request: ToolRequest): string | null => {
         (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
       ) {
         return `${request.action} requires \`maxResults\` to be a positive integer when provided.`;
+      }
+      return null;
+    case "lsp_format_document":
+      if (
+        typeof request.tabSize === "number" &&
+        (!Number.isInteger(request.tabSize) || request.tabSize <= 0)
+      ) {
+        return "lsp_format_document requires `tabSize` to be a positive integer when provided.";
+      }
+      if (
+        typeof request.maxResults === "number" &&
+        (!Number.isInteger(request.maxResults) || request.maxResults <= 0)
+      ) {
+        return "lsp_format_document requires `maxResults` to be a positive integer when provided.";
       }
       return null;
     case "copy_path":
@@ -2188,6 +2418,22 @@ const clipContextLine = (text: string) =>
   clip(text.replace(/\t/g, "  "), MAX_SEARCH_SNIPPET_CHARS);
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const isLspCodeActionApplyRequest = (
+  request: ToolRequest
+): request is LspCodeActionsToolRequest =>
+  request.action === "lsp_code_actions" &&
+  typeof request.title === "string" &&
+  request.title.trim().length > 0;
+
+const isMutatingLspRequest = (request: ToolRequest) =>
+  request.action === "lsp_rename" ||
+  request.action === "lsp_format_document" ||
+  isLspCodeActionApplyRequest(request);
+
+const isReadOnlyRequest = (request: ToolRequest) =>
+  READ_ONLY_ACTION_SET.has(request.action) ||
+  (request.action === "lsp_code_actions" && !isLspCodeActionApplyRequest(request));
 
 const splitFileLines = (content: string) => {
   if (content.length === 0) {
@@ -2766,6 +3012,47 @@ export class FileMcpService {
       .join(" ");
   }
 
+  private formatLspSymbolKind(kind: number) {
+    return LSP_SYMBOL_KIND_LABELS[kind - 1] ?? `kind_${kind}`;
+  }
+
+  private async formatLspWorkspaceSymbolEntry(symbol: LspWorkspaceSymbol) {
+    const locationText = symbol.location
+      ? await this.formatLspLocation(symbol.location)
+      : symbol.uri
+        ? (() => {
+            const absolutePath = this.getAbsolutePathFromLspUri(symbol.uri);
+            return absolutePath ? this.formatTsWorkspacePath(absolutePath) : symbol.uri;
+          })()
+        : "";
+    return [
+      symbol.name,
+      `(${this.formatLspSymbolKind(symbol.kind)})`,
+      symbol.containerName ? `[${symbol.containerName}]` : "",
+      locationText ? `@ ${locationText}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private async getLspSessionForWorkspaceQuery(
+    path: string,
+    serverId?: string
+  ) {
+    const absolutePath = this.resolvePath(path);
+    const info = await stat(absolutePath).catch(() => null);
+    if (!info) {
+      throw new Error(`LSP workspace query path does not exist: ${path}`);
+    }
+    if (info.isFile()) {
+      return this.getLspManager().getSession(absolutePath, { serverId });
+    }
+    if (info.isDirectory()) {
+      return this.getLspManager().getSessionForServer({ serverId });
+    }
+    throw new Error(`LSP workspace queries only support files or directories: ${path}`);
+  }
+
   private lspPositionToIndex(
     content: string,
     lineStarts: number[],
@@ -2878,6 +3165,241 @@ export class FileMcpService {
     );
   }
 
+  private async buildLspWorkspaceEditPlan(workspaceEdit: LspWorkspaceEdit) {
+    const files: LspWorkspaceFileEditPlan[] = [];
+    const skippedPaths: string[] = [];
+    const groupedEdits = this.collectLspWorkspaceEdits(workspaceEdit);
+    let totalEdits = 0;
+
+    for (const group of groupedEdits) {
+      totalEdits += group.edits.length;
+      const filePath = this.getAbsolutePathFromLspUri(group.uri);
+      if (!filePath) {
+        throw new Error(`LSP workspace edit does not support non-file URI edits: ${group.uri}`);
+      }
+      if (!isPathInsideWorkspaceRoot(filePath, this.rules.workspaceRoot)) {
+        skippedPaths.push(this.formatTsWorkspacePath(filePath));
+        continue;
+      }
+      const before = await readFile(filePath, "utf8");
+      const after = this.applyLspTextEditsToContent(before, group.edits);
+      if (before === after) {
+        continue;
+      }
+      files.push({
+        uri: group.uri,
+        filePath,
+        workspacePath: this.normalizeWorkspacePathFromAbsolute(filePath),
+        edits: group.edits,
+        before,
+        after,
+      });
+    }
+
+    return {
+      files,
+      skippedPaths,
+      totalEdits,
+    } satisfies LspWorkspaceEditPlan;
+  }
+
+  private async applyLspWorkspaceEditPlan(
+    request: ToolRequest,
+    plan: LspWorkspaceEditPlan
+  ) {
+    if (plan.skippedPaths.length > 0) {
+      throw new Error(
+        `LSP workspace edit includes ${plan.skippedPaths.length} path(s) outside the workspace: ${plan.skippedPaths
+          .slice(0, 5)
+          .join(", ")}`
+      );
+    }
+
+    if (plan.files.length === 0) {
+      return 0;
+    }
+
+    const undoFiles = await Promise.all(
+      plan.files.map(async file => ({
+        path: file.workspacePath,
+        existedBefore: true,
+        content: await readFile(file.filePath),
+      }))
+    );
+
+    for (const file of plan.files) {
+      await writeFile(file.filePath, file.after, "utf8");
+    }
+
+    this.pushUndoEntry({
+      kind: "restore_workspace",
+      files: undoFiles,
+      sourceAction: request.action,
+    });
+    this.noteFilesystemMutation();
+    return plan.files.length;
+  }
+
+  private formatLspWorkspaceEditDiffPreview(
+    plan: LspWorkspaceEditPlan,
+    mode: "summary" | "full"
+  ) {
+    if (plan.files.length === 0) {
+      return ["changes: none"];
+    }
+
+    const maxFiles = mode === "summary" ? 2 : plan.files.length;
+    const maxLinesPerFile = mode === "summary" ? 12 : 40;
+    const previewLines: string[] = [];
+
+    for (const file of plan.files.slice(0, maxFiles)) {
+      const diff = summarizeMutationDiff(file.before, file.after);
+      previewLines.push(`[file] ${file.workspacePath}`);
+      previewLines.push(`diff_stats: +${diff.additions} -${diff.deletions}`);
+      const lines = diff.previewLines.slice(0, maxLinesPerFile);
+      if (lines.length > 0) {
+        previewLines.push(...lines);
+      }
+      if (diff.previewLines.length > lines.length) {
+        previewLines.push(`... ${diff.previewLines.length - lines.length} more diff line(s)`);
+      }
+    }
+
+    if (plan.files.length > maxFiles) {
+      previewLines.push(`... ${plan.files.length - maxFiles} more file(s)`);
+    }
+    return previewLines;
+  }
+
+  private formatLspWorkspaceApplyPlanBlocks(plan: LspWorkspaceEditPlan) {
+    return plan.files.map(file =>
+      this.formatApplyPatchPlan(file.workspacePath, file.before, file.after)
+    );
+  }
+
+  private async resolveLspRenamePlan(request: LspPrepareRenameToolRequest | LspRenameToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const prepare = await session.prepareRename(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    if (!prepare) {
+      return {
+        session,
+        prepare: null,
+        workspaceEdit: null,
+        plan: null,
+      };
+    }
+    const workspaceEdit = await session.rename(
+      absolutePath,
+      request.line,
+      request.column,
+      request.newName
+    );
+    if (!workspaceEdit) {
+      return {
+        session,
+        prepare,
+        workspaceEdit: null,
+        plan: null,
+      };
+    }
+    return {
+      session,
+      prepare,
+      workspaceEdit,
+      plan: await this.buildLspWorkspaceEditPlan(workspaceEdit),
+    };
+  }
+
+  private async listLspCodeActions(
+    request: LspCodeActionsToolRequest
+  ): Promise<{
+    session: LspWorkspaceLike;
+    absolutePath: string;
+    actions: LspCodeAction[];
+  }> {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const actions = await session.codeActions(
+      absolutePath,
+      request.line,
+      request.column,
+      request.kind ? { kind: request.kind } : undefined
+    );
+    return {
+      session,
+      absolutePath,
+      actions,
+    };
+  }
+
+  private findLspCodeActionByTitle(actions: LspCodeAction[], title: string) {
+    const normalizedTitle = title.trim().toLowerCase();
+    return (
+      actions.find(action => action.title.trim() === title.trim()) ??
+      actions.find(action => action.title.trim().toLowerCase() === normalizedTitle) ??
+      null
+    );
+  }
+
+  private async resolveLspCodeActionPlan(request: LspCodeActionsToolRequest) {
+    const listed = await this.listLspCodeActions(request);
+    const desiredTitle = request.title?.trim();
+    if (!desiredTitle) {
+      return {
+        ...listed,
+        selectedAction: null,
+        plan: null,
+      };
+    }
+    const selectedAction = this.findLspCodeActionByTitle(listed.actions, desiredTitle);
+    if (!selectedAction) {
+      return {
+        ...listed,
+        selectedAction: null,
+        plan: null,
+      };
+    }
+    return {
+      ...listed,
+      selectedAction,
+      plan: selectedAction.edit
+        ? await this.buildLspWorkspaceEditPlan(selectedAction.edit)
+        : null,
+    };
+  }
+
+  private async resolveLspFormatDocumentPlan(request: LspFormatDocumentToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const edits = await session.formatDocument(absolutePath, {
+      tabSize: request.tabSize,
+      insertSpaces: request.insertSpaces,
+    });
+    const workspaceEdit: LspWorkspaceEdit = {
+      changes: edits.length > 0 ? { [pathToFileURL(absolutePath).href]: edits } : {},
+      documentChanges: [],
+    };
+    return {
+      session,
+      edits,
+      plan: await this.buildLspWorkspaceEditPlan(workspaceEdit),
+    };
+  }
+
   private async pathExists(inputPath: string) {
     try {
       await stat(this.resolvePath(inputPath));
@@ -2896,7 +3418,7 @@ export class FileMcpService {
       request.action === "run_shell" ||
       isPersistentShellAction(request.action) ||
       request.action === "create_dir" ||
-      READ_ONLY_ACTIONS.includes(request.action)
+      isReadOnlyRequest(request)
     ) {
       return [];
     }
@@ -2945,7 +3467,7 @@ export class FileMcpService {
       return null;
     }
 
-    if (READ_ONLY_ACTIONS.includes(request.action)) {
+    if (isReadOnlyRequest(request)) {
       return null;
     }
 
@@ -2989,6 +3511,13 @@ export class FileMcpService {
         }
         return null;
       }
+      case "lsp_rename":
+      case "lsp_code_actions":
+      case "lsp_format_document":
+        if (!(await this.pathExists(request.path))) {
+          return `${request.action} target does not exist: ${normalizedPath}`;
+        }
+        return null;
     }
 
     return null;
@@ -3978,6 +4507,25 @@ export class FileMcpService {
       return `reverted ${entry.sourceAction}: restored ${entry.path}`;
     }
 
+    if (entry.kind === "restore_workspace") {
+      for (const file of entry.files) {
+        const absolute = this.resolvePath(file.path);
+        if (!file.existedBefore) {
+          try {
+            await rm(absolute, { recursive: false, force: false });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+              throw error;
+            }
+          }
+          continue;
+        }
+        await mkdir(dirname(absolute), { recursive: true });
+        await writeFile(absolute, file.content);
+      }
+      return `reverted ${entry.sourceAction}: restored ${entry.files.length} file(s)`;
+    }
+
     if (entry.kind === "delete_path") {
       const absolute = this.resolvePath(entry.path);
       try {
@@ -4109,6 +4657,88 @@ export class FileMcpService {
         `source: ${request.path}`,
         `destination: ${request.destination}`,
       ].join("\n");
+    }
+
+    if (request.action === "lsp_rename") {
+      const resolved = await this.resolveLspRenamePlan(request);
+      const { session, prepare, workspaceEdit, plan } = resolved;
+      return [
+        "[lsp rename preview]",
+        `server: ${session.getInfo().serverId}`,
+        `path: ${request.path}`,
+        `position: ${request.line}:${request.column}`,
+        `symbol: ${prepare?.placeholder ?? "(unavailable)"}`,
+        `rename_to: ${request.newName}`,
+        workspaceEdit ? `workspace_edit: ready` : "workspace_edit: unavailable",
+        ...(plan
+          ? [
+              `files: ${plan.files.length}`,
+              `edits: ${plan.totalEdits}`,
+              ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+              ...(plan.skippedPaths.length > 0
+                ? [
+                    `skipped_outside_workspace: ${plan.skippedPaths.length}`,
+                    ...plan.skippedPaths.slice(0, 5).map(path => `- ${path}`),
+                  ]
+                : []),
+            ]
+          : []),
+      ].join("\n");
+    }
+
+    if (request.action === "lsp_code_actions" && request.title?.trim()) {
+      const resolved = await this.resolveLspCodeActionPlan(request);
+      const { session, actions, selectedAction, plan } = resolved;
+      return [
+        "[lsp code action preview]",
+        `server: ${session.getInfo().serverId}`,
+        `path: ${request.path}`,
+        `position: ${request.line}:${request.column}`,
+        `title: ${request.title}`,
+        request.kind ? `kind_filter: ${request.kind}` : "",
+        selectedAction?.kind ? `kind: ${selectedAction.kind}` : "",
+        selectedAction?.isPreferred ? "preferred: true" : "",
+        selectedAction?.disabledReason
+          ? `disabled: ${selectedAction.disabledReason}`
+          : selectedAction
+            ? "disabled: false"
+            : "",
+        !selectedAction
+          ? `match: not found (${actions.length} available action(s))`
+          : selectedAction.edit
+            ? "workspace_edit: ready"
+            : selectedAction.hasCommand
+              ? "workspace_edit: command-only (not supported yet)"
+              : "workspace_edit: none",
+        ...(plan
+          ? [
+              `files: ${plan.files.length}`,
+              `edits: ${plan.totalEdits}`,
+              ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+            ]
+          : []),
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    if (request.action === "lsp_format_document") {
+      const resolved = await this.resolveLspFormatDocumentPlan(request);
+      const { session, plan } = resolved;
+      return [
+        "[lsp format preview]",
+        `server: ${session.getInfo().serverId}`,
+        `path: ${request.path}`,
+        typeof request.tabSize === "number" ? `tab_size: ${request.tabSize}` : "",
+        typeof request.insertSpaces === "boolean"
+          ? `insert_spaces: ${request.insertSpaces}`
+          : "",
+        `files: ${plan.files.length}`,
+        `edits: ${plan.totalEdits}`,
+        ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+      ]
+        .filter(Boolean)
+        .join("\n");
     }
 
     const abs = this.resolvePath(request.path);
@@ -4279,7 +4909,7 @@ export class FileMcpService {
     if ("query" in request) {
       chunks.push(`query=${clip(request.query, 80)}`);
       chunks.push(`maxResults=${request.maxResults ?? DEFAULT_SEARCH_RESULTS}`);
-      if (typeof request.caseSensitive === "boolean") {
+      if ("caseSensitive" in request && typeof request.caseSensitive === "boolean") {
         chunks.push(`caseSensitive=${request.caseSensitive}`);
       }
     }
@@ -4304,8 +4934,20 @@ export class FileMcpService {
     if ("newName" in request && request.newName) {
       chunks.push(`newName=${request.newName}`);
     }
+    if ("title" in request && request.title) {
+      chunks.push(`title=${clip(request.title, 80)}`);
+    }
+    if ("kind" in request && request.kind) {
+      chunks.push(`kind=${request.kind}`);
+    }
     if ("serverId" in request && request.serverId) {
       chunks.push(`serverId=${request.serverId}`);
+    }
+    if ("tabSize" in request && typeof request.tabSize === "number") {
+      chunks.push(`tabSize=${request.tabSize}`);
+    }
+    if ("insertSpaces" in request && typeof request.insertSpaces === "boolean") {
+      chunks.push(`insertSpaces=${request.insertSpaces}`);
     }
     if ("find" in request && request.find) {
       chunks.push(`find=${request.find}`);
@@ -5834,6 +6476,66 @@ export class FileMcpService {
     ].join("\n");
   }
 
+  private async executeLspImplementation(request: LspImplementationToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const implementations = await session.implementation(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    const limitedImplementations = implementations.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    if (limitedImplementations.length === 0) {
+      return `(no LSP implementations at: ${request.path}:${request.line}:${request.column})`;
+    }
+    const formattedImplementations = await Promise.all(
+      limitedImplementations.map(implementation =>
+        this.formatLspLocation(implementation)
+      )
+    );
+    return [
+      `Found ${formattedImplementations.length} LSP implementation(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...formattedImplementations,
+    ].join("\n");
+  }
+
+  private async executeLspTypeDefinition(request: LspTypeDefinitionToolRequest) {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
+    const session = await this.getLspManager().getSession(absolutePath, {
+      serverId: request.serverId,
+    });
+    const typeDefinitions = await session.typeDefinition(
+      absolutePath,
+      request.line,
+      request.column
+    );
+    const limitedTypeDefinitions = typeDefinitions.slice(
+      0,
+      request.maxResults ?? DEFAULT_SEARCH_RESULTS
+    );
+    if (limitedTypeDefinitions.length === 0) {
+      return `(no LSP type definitions at: ${request.path}:${request.line}:${request.column})`;
+    }
+    const formattedTypeDefinitions = await Promise.all(
+      limitedTypeDefinitions.map(typeDefinition =>
+        this.formatLspLocation(typeDefinition)
+      )
+    );
+    return [
+      `Found ${formattedTypeDefinitions.length} LSP type definition(s):`,
+      `server: ${session.getInfo().serverId}`,
+      ...formattedTypeDefinitions,
+    ].join("\n");
+  }
+
   private async executeLspReferences(request: LspReferencesToolRequest) {
     const absolutePath = this.resolvePath(request.path);
     await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
@@ -5855,6 +6557,27 @@ export class FileMcpService {
       `Found ${formattedReferences.length} LSP reference(s):`,
       `server: ${session.getInfo().serverId}`,
       ...formattedReferences,
+    ].join("\n");
+  }
+
+  private async executeLspWorkspaceSymbols(request: LspWorkspaceSymbolsToolRequest) {
+    const session = await this.getLspSessionForWorkspaceQuery(
+      request.path,
+      request.serverId
+    );
+    const symbols = await session.workspaceSymbols(request.query);
+    const limitedSymbols = symbols.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
+    if (limitedSymbols.length === 0) {
+      return `(no LSP workspace symbols for: ${request.query})`;
+    }
+    const formattedSymbols = await Promise.all(
+      limitedSymbols.map(symbol => this.formatLspWorkspaceSymbolEntry(symbol))
+    );
+    return [
+      `Found ${formattedSymbols.length} LSP workspace symbol(s):`,
+      `server: ${session.getInfo().serverId}`,
+      `query: ${request.query}`,
+      ...formattedSymbols,
     ].join("\n");
   }
 
@@ -5905,25 +6628,11 @@ export class FileMcpService {
   }
 
   private async executeLspPrepareRename(request: LspPrepareRenameToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const prepare = await session.prepareRename(
-      absolutePath,
-      request.line,
-      request.column
-    );
+    const resolved = await this.resolveLspRenamePlan(request);
+    const { session, prepare, workspaceEdit, plan } = resolved;
     if (!prepare) {
       return `(LSP rename preview unavailable at: ${request.path}:${request.line}:${request.column})`;
     }
-    const workspaceEdit = await session.rename(
-      absolutePath,
-      request.line,
-      request.column,
-      request.newName
-    );
     if (!workspaceEdit) {
       return `LSP rename unavailable: no workspace edit was returned.`;
     }
@@ -5940,32 +6649,8 @@ export class FileMcpService {
       limitedLocations.map(entry => this.formatLspRenameEdit(entry.uri, entry.edit))
     );
 
-    const workspacePlanBlocks: string[] = [];
-    const skippedPlanPaths: string[] = [];
-    for (const group of groupedEdits) {
-      const filePath = this.getAbsolutePathFromLspUri(group.uri);
-      if (!filePath) {
-        throw new Error(
-          `LSP rename preview does not support non-file URI edits: ${group.uri}`
-        );
-      }
-      if (!isPathInsideWorkspaceRoot(filePath, this.rules.workspaceRoot)) {
-        skippedPlanPaths.push(this.formatTsWorkspacePath(filePath));
-        continue;
-      }
-      const before = await readFile(filePath, "utf8");
-      const after = this.applyLspTextEditsToContent(before, group.edits);
-      if (before === after) {
-        continue;
-      }
-      workspacePlanBlocks.push(
-        this.formatApplyPatchPlan(
-          this.normalizeWorkspacePathFromAbsolute(filePath),
-          before,
-          after
-        )
-      );
-    }
+    const workspacePlanBlocks = plan ? this.formatLspWorkspaceApplyPlanBlocks(plan) : [];
+    const skippedPlanPaths = plan?.skippedPaths ?? [];
 
     const baseBody = [
       `Prepared LSP rename preview:`,
@@ -6022,6 +6707,159 @@ export class FileMcpService {
       }
     }
     return body;
+  }
+
+  private async executeLspRename(request: LspRenameToolRequest) {
+    const resolved = await this.resolveLspRenamePlan(request);
+    const { session, prepare, workspaceEdit, plan } = resolved;
+    if (!prepare) {
+      throw new Error(
+        `LSP rename unavailable at: ${request.path}:${request.line}:${request.column}`
+      );
+    }
+    if (!workspaceEdit || !plan) {
+      throw new Error("LSP rename unavailable: no workspace edit was returned.");
+    }
+    if (plan.files.length === 0) {
+      return [
+        "Applied LSP rename:",
+        `server: ${session.getInfo().serverId}`,
+        `symbol: ${prepare.placeholder || "(unknown symbol)"}`,
+        `rename_to: ${request.newName}`,
+        "changes: none",
+      ].join("\n");
+    }
+
+    await this.applyLspWorkspaceEditPlan(request, plan);
+    return [
+      "Applied LSP rename:",
+      `server: ${session.getInfo().serverId}`,
+      `symbol: ${prepare.placeholder || "(unknown symbol)"}`,
+      `rename_to: ${request.newName}`,
+      `files: ${plan.files.length}`,
+      `occurrences: ${plan.totalEdits}`,
+      ...plan.files.map(file => {
+        const diff = summarizeMutationDiff(file.before, file.after);
+        return `- ${file.workspacePath} (+${diff.additions} -${diff.deletions})`;
+      }),
+    ].join("\n");
+  }
+
+  private formatLspCodeActionListEntry(action: LspCodeAction) {
+    const details = [
+      action.kind ? `[${action.kind}]` : "",
+      action.isPreferred ? "[preferred]" : "",
+      action.disabledReason ? `[disabled: ${action.disabledReason}]` : "",
+      action.edit ? "[edit]" : "",
+      action.hasCommand ? "[command]" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return `- ${action.title}${details ? ` ${details}` : ""}`;
+  }
+
+  private async executeLspCodeActions(request: LspCodeActionsToolRequest) {
+    if (!request.title?.trim()) {
+      const { session, actions } = await this.listLspCodeActions(request);
+      const limitedActions = actions.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
+      if (limitedActions.length === 0) {
+        return `(no LSP code actions at: ${request.path}:${request.line}:${request.column})`;
+      }
+      return [
+        `Found ${limitedActions.length} LSP code action(s):`,
+        `server: ${session.getInfo().serverId}`,
+        request.kind ? `kind_filter: ${request.kind}` : "",
+        ...limitedActions.map(action => this.formatLspCodeActionListEntry(action)),
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    const resolved = await this.resolveLspCodeActionPlan(request);
+    const { session, actions, selectedAction, plan } = resolved;
+    if (!selectedAction) {
+      const available = actions.slice(0, 8).map(action => `- ${action.title}`);
+      throw new Error(
+        [
+          `LSP code action not found: ${request.title}`,
+          available.length > 0 ? "available_titles:" : "",
+          ...available,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    }
+    if (selectedAction.disabledReason) {
+      throw new Error(
+        `LSP code action is disabled: ${selectedAction.title} (${selectedAction.disabledReason})`
+      );
+    }
+    if (!selectedAction.edit) {
+      if (selectedAction.hasCommand) {
+        throw new Error(
+          `LSP code action requires command execution and is not supported yet: ${selectedAction.title}`
+        );
+      }
+      throw new Error(`LSP code action has no editable workspace changes: ${selectedAction.title}`);
+    }
+    if (!plan || plan.files.length === 0) {
+      return [
+        "Applied LSP code action:",
+        `server: ${session.getInfo().serverId}`,
+        `title: ${selectedAction.title}`,
+        selectedAction.kind ? `kind: ${selectedAction.kind}` : "",
+        "changes: none",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    await this.applyLspWorkspaceEditPlan(request, plan);
+    return [
+      "Applied LSP code action:",
+      `server: ${session.getInfo().serverId}`,
+      `title: ${selectedAction.title}`,
+      selectedAction.kind ? `kind: ${selectedAction.kind}` : "",
+      `files: ${plan.files.length}`,
+      `edits: ${plan.totalEdits}`,
+      ...plan.files.map(file => {
+        const diff = summarizeMutationDiff(file.before, file.after);
+        return `- ${file.workspacePath} (+${diff.additions} -${diff.deletions})`;
+      }),
+      selectedAction.hasCommand ? "note: command side effects were not executed." : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async executeLspFormatDocument(request: LspFormatDocumentToolRequest) {
+    const resolved = await this.resolveLspFormatDocumentPlan(request);
+    const { session, plan } = resolved;
+    if (plan.files.length === 0) {
+      return [
+        "Applied LSP document format:",
+        `server: ${session.getInfo().serverId}`,
+        "changes: none",
+      ].join("\n");
+    }
+
+    await this.applyLspWorkspaceEditPlan(request, plan);
+    return [
+      "Applied LSP document format:",
+      `server: ${session.getInfo().serverId}`,
+      typeof request.tabSize === "number" ? `tab_size: ${request.tabSize}` : "",
+      typeof request.insertSpaces === "boolean"
+        ? `insert_spaces: ${request.insertSpaces}`
+        : "",
+      `files: ${plan.files.length}`,
+      `edits: ${plan.totalEdits}`,
+      ...plan.files.map(file => {
+        const diff = summarizeMutationDiff(file.before, file.after);
+        return `- ${file.workspacePath} (+${diff.additions} -${diff.deletions})`;
+      }),
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   private async findGitRepoRoot(inputPath: string) {
@@ -6445,14 +7283,26 @@ export class FileMcpService {
         return this.executeLspHover(request);
       case "lsp_definition":
         return this.executeLspDefinition(request);
+      case "lsp_implementation":
+        return this.executeLspImplementation(request);
+      case "lsp_type_definition":
+        return this.executeLspTypeDefinition(request);
       case "lsp_references":
         return this.executeLspReferences(request);
+      case "lsp_workspace_symbols":
+        return this.executeLspWorkspaceSymbols(request);
       case "lsp_document_symbols":
         return this.executeLspDocumentSymbols(request);
       case "lsp_diagnostics":
         return this.executeLspDiagnostics(request);
       case "lsp_prepare_rename":
         return this.executeLspPrepareRename(request);
+      case "lsp_rename":
+        return this.executeLspRename(request);
+      case "lsp_code_actions":
+        return this.executeLspCodeActions(request);
+      case "lsp_format_document":
+        return this.executeLspFormatDocument(request);
       case "create_file": {
         const content = request.content ?? "";
         await mkdir(dirname(abs), { recursive: true });
@@ -6607,7 +7457,7 @@ export class FileMcpService {
         ok: false,
         message:
           describeInvalidToolInput(normalizedName, input) ??
-          `Invalid tool input. Expected { action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
+          `Invalid tool input. Expected { action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, title?, kind?, tabSize?, insertSpaces?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }. Received: ${summarizeInput(input)}.`,
       };
     }
     const validationError = validateRequest(request);
@@ -6723,9 +7573,10 @@ export class FileMcpService {
       request.action === "run_command" ||
       request.action === "run_shell" ||
       (request.action === "write_shell" && shellWriteAudit?.policy === "review") ||
+      isMutatingLspRequest(request) ||
       (request.action !== "create_dir" &&
         !isPersistentShellAction(request.action) &&
-        !READ_ONLY_ACTIONS.includes(request.action) &&
+        !isReadOnlyRequest(request) &&
         this.rules.requireReview.includes(request.action))
     ) {
       const id = crypto.randomUUID().slice(0, 8);

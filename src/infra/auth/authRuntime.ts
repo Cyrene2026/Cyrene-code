@@ -56,6 +56,10 @@ export type AuthRuntime = {
   validateLoginInput: (input: AuthLoginInput) => Promise<AuthValidationResult>;
   saveLogin: (input: AuthLoginInput) => Promise<AuthRuntimeMutationResult>;
   logout: () => Promise<AuthRuntimeMutationResult>;
+  syncSelection: (input: {
+    providerBaseUrl?: string;
+    model?: string;
+  }) => Promise<AuthStatus>;
   buildTransport: () => Promise<QueryTransport>;
 };
 
@@ -491,6 +495,33 @@ export const createAuthRuntime = (
     });
   };
 
+  const syncSelection = async (input: {
+    providerBaseUrl?: string;
+    model?: string;
+  }) => {
+    const nextProviderBaseUrl = trimNonEmpty(input.providerBaseUrl);
+    if (
+      !nextProviderBaseUrl ||
+      nextProviderBaseUrl === "none" ||
+      nextProviderBaseUrl === "local-core"
+    ) {
+      runtimeProviderBaseUrlOverride = undefined;
+    } else {
+      try {
+        runtimeProviderBaseUrlOverride = normalizeProviderBaseUrl(nextProviderBaseUrl);
+      } catch {
+        runtimeProviderBaseUrlOverride = nextProviderBaseUrl;
+      }
+    }
+
+    const nextModel = trimNonEmpty(input.model);
+    if (nextModel) {
+      runtimeModelOverride = nextModel;
+    }
+
+    return await getStatus();
+  };
+
   const getSavedApiKey = async (providerBaseUrl: string) => {
     const normalizedProviderBaseUrl = trimNonEmpty(providerBaseUrl);
     if (!normalizedProviderBaseUrl) {
@@ -612,6 +643,7 @@ export const createAuthRuntime = (
     validateLoginInput,
     saveLogin,
     logout,
+    syncSelection,
     buildTransport,
   };
 };

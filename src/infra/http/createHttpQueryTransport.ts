@@ -148,10 +148,16 @@ export const FILE_TOOL = {
             "ts_prepare_rename",
             "lsp_hover",
             "lsp_definition",
+            "lsp_implementation",
+            "lsp_type_definition",
             "lsp_references",
+            "lsp_workspace_symbols",
             "lsp_document_symbols",
             "lsp_diagnostics",
             "lsp_prepare_rename",
+            "lsp_rename",
+            "lsp_code_actions",
+            "lsp_format_document",
             "run_command",
             "run_shell",
             "open_shell",
@@ -187,23 +193,33 @@ export const FILE_TOOL = {
         line: {
           type: "integer",
           description:
-            "1-based line for ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, or lsp_references.",
+            "1-based line for ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, lsp_references, lsp_rename, or lsp_code_actions.",
           minimum: 1,
         },
         column: {
           type: "integer",
           description:
-            "1-based column for ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, or lsp_references.",
+            "1-based column for ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, lsp_references, lsp_rename, or lsp_code_actions.",
           minimum: 1,
         },
         newName: {
           type: "string",
-          description: "Replacement identifier for ts_prepare_rename or lsp_prepare_rename.",
+          description: "Replacement identifier for ts_prepare_rename, lsp_prepare_rename, or lsp_rename.",
         },
         serverId: {
           type: "string",
           description:
             "Optional explicit LSP server id for lsp_* actions when more than one configured LSP server matches the path.",
+        },
+        title: {
+          type: "string",
+          description:
+            "Exact code action title for lsp_code_actions apply mode. Omit to list available actions.",
+        },
+        kind: {
+          type: "string",
+          description:
+            "Optional code action kind filter for lsp_code_actions, such as quickfix or refactor.extract.",
         },
         jsonPath: {
           type: "string",
@@ -225,7 +241,8 @@ export const FILE_TOOL = {
         },
         query: {
           type: "string",
-          description: "Search string for search_text or search_text_context. Omit when unused.",
+          description:
+            "Search string for search_text/search_text_context, or symbol query for lsp_workspace_symbols. Omit when unused.",
         },
         before: {
           type: "integer",
@@ -238,6 +255,15 @@ export const FILE_TOOL = {
           minimum: 0,
         },
         maxResults: { type: "integer", minimum: 1, maximum: 200 },
+        tabSize: {
+          type: "integer",
+          minimum: 1,
+          description: "Optional tab size for lsp_format_document.",
+        },
+        insertSpaces: {
+          type: "boolean",
+          description: "Optional spacing mode for lsp_format_document.",
+        },
         caseSensitive: { type: "boolean" },
         findInComments: {
           type: "boolean",
@@ -274,10 +300,10 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "You are operating inside a workspace through exactly one function: `file`.",
   "Whenever you need filesystem or shell work, you MUST call `file` instead of describing the action abstractly.",
   "Function arguments must be valid JSON and include required fields:",
-  "{ action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }.",
+  "{ action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, title?, kind?, tabSize?, insertSpaces?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }.",
   "Never call the file tool with empty arguments, placeholder values, or guessed fields you do not need.",
   "Available actions are:",
-  "read_file, read_files, read_range, read_json, read_yaml, list_dir, create_dir, create_file, write_file, edit_file, apply_patch, delete_file, stat_path, stat_paths, outline_file, find_files, find_symbol, find_references, search_text, search_text_context, copy_path, move_path, git_status, git_diff, git_log, git_show, git_blame, ts_hover, ts_definition, ts_references, ts_diagnostics, ts_prepare_rename, lsp_hover, lsp_definition, lsp_references, lsp_document_symbols, lsp_diagnostics, lsp_prepare_rename, run_command, run_shell, open_shell, write_shell, read_shell, shell_status, interrupt_shell, close_shell.",
+  "read_file, read_files, read_range, read_json, read_yaml, list_dir, create_dir, create_file, write_file, edit_file, apply_patch, delete_file, stat_path, stat_paths, outline_file, find_files, find_symbol, find_references, search_text, search_text_context, copy_path, move_path, git_status, git_diff, git_log, git_show, git_blame, ts_hover, ts_definition, ts_references, ts_diagnostics, ts_prepare_rename, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, lsp_references, lsp_workspace_symbols, lsp_document_symbols, lsp_diagnostics, lsp_prepare_rename, lsp_rename, lsp_code_actions, lsp_format_document, run_command, run_shell, open_shell, write_shell, read_shell, shell_status, interrupt_shell, close_shell.",
   "Choose the narrowest action that answers the question. Prefer precise search or metadata actions over broad exploratory reads.",
   "Tool selection rules:",
   "- Use read_files when you already know multiple exact file paths and need to inspect them together.",
@@ -297,10 +323,16 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Use ts_prepare_rename to preview a semantic TypeScript/JavaScript rename before any file mutation.",
   "- Use lsp_hover for generic language-server hover info when TS-specific tools do not apply.",
   "- Use lsp_definition for generic language-server definition lookup.",
+  "- Use lsp_implementation for generic language-server implementation lookup.",
+  "- Use lsp_type_definition for generic language-server type-definition lookup.",
   "- Use lsp_references for generic language-server references.",
+  "- Use lsp_workspace_symbols for generic language-server workspace symbol search.",
   "- Use lsp_document_symbols for generic language-server document symbols or outline.",
   "- Use lsp_diagnostics for generic language-server diagnostics on one file.",
   "- Use lsp_prepare_rename to preview a generic language-server rename before any file mutation.",
+  "- Use lsp_rename to apply a reviewed generic language-server rename.",
+  "- Use lsp_code_actions to list available generic language-server code actions, or provide `title` to apply one reviewed edit-based action.",
+  "- Use lsp_format_document to apply reviewed generic language-server formatting edits.",
   "- Use search_text for content discovery inside files.",
   "- Use search_text_context when surrounding lines around each match matter.",
   "- Use git_status to inspect the repository worktree without going through a reviewed shell command.",
@@ -319,11 +351,15 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- For read_yaml, provide `yamlPath` only when you want one nested field instead of the whole document.",
   "- For find_symbol, provide the exact symbol name in `symbol`.",
   "- For find_references, provide the exact symbol name in `symbol`.",
-  "- For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, and lsp_references, provide exact 1-based `line` and `column`.",
+  "- For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, and lsp_references, provide exact 1-based `line` and `column`.",
   "- For ts_diagnostics, provide a TS/JS file path and optional `maxResults` when you need fewer entries.",
   "- For ts_prepare_rename, provide exact 1-based `line`, `column`, and a non-empty `newName`.",
+  "- For lsp_workspace_symbols, provide a non-empty `query`, a relevant `path` such as `.` or a matching file, and optional `serverId` when multiple configured LSP servers exist.",
   "- For lsp_document_symbols and lsp_diagnostics, provide a file path and optional `serverId` when multiple configured LSP servers could match.",
   "- For lsp_prepare_rename, provide exact 1-based `line`, `column`, a non-empty `newName`, and optional `serverId`.",
+  "- For lsp_rename, provide exact 1-based `line`, `column`, a non-empty `newName`, and optional `serverId`.",
+  "- For lsp_code_actions, provide exact 1-based `line` and `column`, optional `kind`, and optional `title` only when you want to apply one matching action.",
+  "- For lsp_format_document, provide a file path and optional `serverId`, `tabSize`, or `insertSpaces`.",
   "- For search_text_context, use `before` and `after` only when you need surrounding context lines.",
   "- For git_log, use `maxResults` to limit how many commits you need.",
   "- For git_show, use `revision` and an optional scoped `path`.",

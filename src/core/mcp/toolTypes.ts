@@ -33,10 +33,16 @@ export type FileAction =
   | "ts_prepare_rename"
   | "lsp_hover"
   | "lsp_definition"
+  | "lsp_implementation"
+  | "lsp_type_definition"
   | "lsp_references"
+  | "lsp_workspace_symbols"
   | "lsp_document_symbols"
   | "lsp_diagnostics"
-  | "lsp_prepare_rename";
+  | "lsp_prepare_rename"
+  | "lsp_rename"
+  | "lsp_code_actions"
+  | "lsp_format_document";
 
 export type ShellSessionAction =
   | "open_shell"
@@ -275,11 +281,37 @@ export type LspDefinitionToolRequest = {
   serverId?: string;
 };
 
+export type LspImplementationToolRequest = {
+  action: "lsp_implementation";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspTypeDefinitionToolRequest = {
+  action: "lsp_type_definition";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+  maxResults?: number;
+};
+
 export type LspReferencesToolRequest = {
   action: "lsp_references";
   path: string;
   line: number;
   column: number;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspWorkspaceSymbolsToolRequest = {
+  action: "lsp_workspace_symbols";
+  path: string;
+  query: string;
   serverId?: string;
   maxResults?: number;
 };
@@ -305,6 +337,36 @@ export type LspPrepareRenameToolRequest = {
   column: number;
   newName: string;
   serverId?: string;
+  maxResults?: number;
+};
+
+export type LspRenameToolRequest = {
+  action: "lsp_rename";
+  path: string;
+  line: number;
+  column: number;
+  newName: string;
+  serverId?: string;
+  maxResults?: number;
+};
+
+export type LspCodeActionsToolRequest = {
+  action: "lsp_code_actions";
+  path: string;
+  line: number;
+  column: number;
+  serverId?: string;
+  maxResults?: number;
+  title?: string;
+  kind?: string;
+};
+
+export type LspFormatDocumentToolRequest = {
+  action: "lsp_format_document";
+  path: string;
+  serverId?: string;
+  tabSize?: number;
+  insertSpaces?: boolean;
   maxResults?: number;
 };
 
@@ -343,10 +405,16 @@ export type FileToolRequest =
   | TsPrepareRenameToolRequest
   | LspHoverToolRequest
   | LspDefinitionToolRequest
+  | LspImplementationToolRequest
+  | LspTypeDefinitionToolRequest
   | LspReferencesToolRequest
+  | LspWorkspaceSymbolsToolRequest
   | LspDocumentSymbolsToolRequest
   | LspDiagnosticsToolRequest
-  | LspPrepareRenameToolRequest;
+  | LspPrepareRenameToolRequest
+  | LspRenameToolRequest
+  | LspCodeActionsToolRequest
+  | LspFormatDocumentToolRequest;
 
 export type CommandToolRequest = {
   action: "run_command";

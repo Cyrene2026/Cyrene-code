@@ -99,10 +99,16 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(actionEnum).toContain("ts_prepare_rename");
     expect(actionEnum).toContain("lsp_hover");
     expect(actionEnum).toContain("lsp_definition");
+    expect(actionEnum).toContain("lsp_implementation");
+    expect(actionEnum).toContain("lsp_type_definition");
     expect(actionEnum).toContain("lsp_references");
+    expect(actionEnum).toContain("lsp_workspace_symbols");
     expect(actionEnum).toContain("lsp_document_symbols");
     expect(actionEnum).toContain("lsp_diagnostics");
     expect(actionEnum).toContain("lsp_prepare_rename");
+    expect(actionEnum).toContain("lsp_rename");
+    expect(actionEnum).toContain("lsp_code_actions");
+    expect(actionEnum).toContain("lsp_format_document");
     expect(actionEnum).toContain("apply_patch");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("paths");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("startLine");
@@ -111,6 +117,10 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("column");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("newName");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("serverId");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("title");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("kind");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("tabSize");
+    expect(FILE_TOOL.function.parameters.properties).toHaveProperty("insertSpaces");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("jsonPath");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("yamlPath");
     expect(FILE_TOOL.function.parameters.properties).toHaveProperty("pattern");
@@ -149,10 +159,16 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("ts_prepare_rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_hover");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_definition");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_implementation");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_type_definition");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_workspace_symbols");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_document_symbols");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_diagnostics");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_prepare_rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_code_actions");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("lsp_format_document");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("apply_patch");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("run_command");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("run_shell");
@@ -177,10 +193,16 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_prepare_rename to preview a semantic TypeScript/JavaScript rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_hover for generic language-server hover info");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_definition for generic language-server definition lookup");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_implementation for generic language-server implementation lookup");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_type_definition for generic language-server type-definition lookup");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_references for generic language-server references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_workspace_symbols for generic language-server workspace symbol search");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_document_symbols for generic language-server document symbols");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_diagnostics for generic language-server diagnostics");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_prepare_rename to preview a generic language-server rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_rename to apply a reviewed generic language-server rename");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_code_actions to list available generic language-server code actions");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_format_document to apply reviewed generic language-server formatting edits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use search_text_context when surrounding lines around each match matter");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_log to inspect recent commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_show to inspect one revision in detail");
@@ -193,7 +215,10 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_symbol, provide the exact symbol name in `symbol`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_references, provide the exact symbol name in `symbol`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
-      "For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, and lsp_references, provide exact 1-based `line` and `column`"
+      "For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, and lsp_references, provide exact 1-based `line` and `column`"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_workspace_symbols, provide a non-empty `query`, a relevant `path` such as `.` or a matching file, and optional `serverId`"
     );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For ts_diagnostics, provide a TS/JS file path");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For ts_prepare_rename, provide exact 1-based `line`, `column`, and a non-empty `newName`");
@@ -202,6 +227,15 @@ describe("createHttpQueryTransport tool exposure", () => {
     );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
       "For lsp_prepare_rename, provide exact 1-based `line`, `column`, a non-empty `newName`, and optional `serverId`"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_rename, provide exact 1-based `line`, `column`, a non-empty `newName`, and optional `serverId`"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_code_actions, provide exact 1-based `line` and `column`, optional `kind`, and optional `title` only when you want to apply one matching action"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For lsp_format_document, provide a file path and optional `serverId`, `tabSize`, or `insertSpaces`"
     );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_log, use `maxResults` to limit how many commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_show, use `revision`");

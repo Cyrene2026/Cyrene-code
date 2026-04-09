@@ -22,8 +22,23 @@ describe("McpPolicy", () => {
     expect(getMcpToolCapabilities("lsp_references")).toEqual(
       expect.arrayContaining(["read", "search"])
     );
+    expect(getMcpToolCapabilities("lsp_implementation")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_type_definition")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_workspace_symbols")).toEqual(
+      expect.arrayContaining(["read", "search"])
+    );
     expect(getMcpToolCapabilities("lsp_prepare_rename")).toEqual(
       expect.arrayContaining(["read", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_rename")).toEqual(
+      expect.arrayContaining(["write", "review", "search"])
+    );
+    expect(getMcpToolCapabilities("lsp_code_actions")).toEqual(
+      expect.arrayContaining(["read", "write", "review", "search"])
     );
   });
 
@@ -32,6 +47,7 @@ describe("McpPolicy", () => {
       expect.arrayContaining(["write", "review"])
     );
     expect(getMcpToolRisk("write_file")).toBe("medium");
+    expect(getMcpToolRisk("lsp_format_document")).toBe("medium");
     expect(getMcpToolRisk("run_shell")).toBe("high");
     expect(getMcpToolRisk("read_file")).toBe("low");
   });

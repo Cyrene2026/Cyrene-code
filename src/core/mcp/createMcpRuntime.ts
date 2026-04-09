@@ -4,6 +4,7 @@ import {
   FileMcpService,
   LspManager,
   createLspServerConfig,
+  isLspConfigError,
 } from "./adapters/filesystem";
 import { HttpMcpAdapter } from "./adapters/http";
 import { StdioMcpAdapter } from "./adapters/stdio";
@@ -333,8 +334,78 @@ const toRuntimeLspServerDescriptor = (
   filePatterns: [...lsp.filePatterns],
   rootMarkers: [...lsp.rootMarkers],
   workspaceRoot: lsp.workspaceRoot,
-  envKeys: Object.keys(lsp.env ?? {}),
+  envKeys: Object.keys(lsp.env ?? {}).sort((left, right) =>
+    left.localeCompare(right)
+  ),
 });
+
+type LspDoctorFailureReason = NonNullable<McpRuntimeLspDoctorResult["reason"]>;
+
+const classifyLspDoctorFailure = (
+  message: string,
+  startupFailed: boolean,
+  requestFailed: boolean
+): {
+  reason: LspDoctorFailureReason;
+  hint: string;
+} => {
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes("method not found")) {
+    return {
+      reason: "unsupported_request",
+      hint: "the server started but rejected this LSP method; verify capability support or try a different lsp_* tool",
+    };
+  }
+  if (normalized.includes("permission denied") || normalized.includes("eacces")) {
+    return {
+      reason: "permission_denied",
+      hint: "the configured command is not executable; fix file permissions or point --command to a runnable binary",
+    };
+  }
+  if (
+    normalized.includes("invalid lsp frame") ||
+    normalized.includes("invalid lsp json")
+  ) {
+    return {
+      reason: "invalid_protocol_output",
+      hint: "the process did not speak stdio LSP JSON-RPC; confirm the command/args use the server's --stdio mode",
+    };
+  }
+  if (normalized.includes("exited before request completed")) {
+    return {
+      reason: "process_exited_early",
+      hint: "the language server exited during initialize; run the command manually to inspect stderr or missing runtime dependencies",
+    };
+  }
+  if (
+    normalized.includes("failed to launch") &&
+    (normalized.includes("enoent") ||
+      normalized.includes("not found") ||
+      normalized.includes("command not found"))
+  ) {
+    return {
+      reason: "command_not_found",
+      hint: "the configured command was not found in PATH; install the language server or set --command to an executable path",
+    };
+  }
+  if (startupFailed) {
+    return {
+      reason: "startup_failed",
+      hint: "install the language server binary or fix the configured command/args/env",
+    };
+  }
+  if (requestFailed) {
+    return {
+      reason: "request_failed",
+      hint: "the server started but the request failed; verify project roots/settings or try a simpler lsp_* probe first",
+    };
+  }
+  return {
+    reason: "unknown",
+    hint: "adjust file_patterns/root_markers/workspace_root or re-run with --lsp <id>",
+  };
+};
 
 const buildMutationMessage = (
   action: string,
@@ -561,9 +632,15 @@ class ManagedMcpRuntime implements McpRuntime {
       ? servers.filter(server => server.id === filesystemServerId.trim())
       : servers;
 
-    return filtered.flatMap(server =>
-      (server.lspServers ?? []).map(lsp => toRuntimeLspServerDescriptor(server, lsp))
-    );
+    return filtered
+      .flatMap(server =>
+        (server.lspServers ?? []).map(lsp => toRuntimeLspServerDescriptor(server, lsp))
+      )
+      .sort((left, right) =>
+        left.filesystemServerId === right.filesystemServerId
+          ? left.id.localeCompare(right.id)
+          : left.filesystemServerId.localeCompare(right.filesystemServerId)
+      );
   }
 
   async addLspServer(
@@ -594,8 +671,25 @@ class ManagedMcpRuntime implements McpRuntime {
     return {
       ok: true,
       message: [
-        `MCP LSP server added: ${editable.normalizedId}/${nextLsp.id}`,
+        "MCP LSP server added",
+        `filesystem_server: ${editable.normalizedId}`,
+        `lsp_server: ${nextLsp.id}`,
+        `command: ${nextLsp.command}`,
+        `args: ${nextLsp.args.length > 0 ? nextLsp.args.join(" ") : "(none)"}`,
+        `patterns: ${nextLsp.filePatterns.join(", ")}`,
+        `roots: ${
+          nextLsp.rootMarkers.length > 0
+            ? nextLsp.rootMarkers.join(", ")
+            : "(none)"
+        }`,
+        `workspace: ${nextLsp.workspaceRoot ?? "(filesystem workspace)"}`,
+        `env_keys: ${
+          Object.keys(nextLsp.env ?? {}).sort((left, right) =>
+            left.localeCompare(right)
+          ).join(", ") || "(none)"
+        }`,
         `config: ${saved.path}`,
+        `hint: run /mcp lsp doctor ${editable.normalizedId} <path> --lsp ${nextLsp.id} to verify startup`,
       ].join("\n"),
       serverId: editable.normalizedId,
       configPath: saved.path,
@@ -644,8 +738,16 @@ class ManagedMcpRuntime implements McpRuntime {
     return {
       ok: true,
       message: [
-        `MCP LSP server removed: ${editable.normalizedId}/${normalizedLspId}`,
+        "MCP LSP server removed",
+        `filesystem_server: ${editable.normalizedId}`,
+        `lsp_server: ${normalizedLspId}`,
+        `remaining: ${
+          nextPatchServer.lspServers && nextPatchServer.lspServers.length > 0
+            ? nextPatchServer.lspServers.map(server => server.id).join(", ")
+            : "(none)"
+        }`,
         `config: ${saved.path}`,
+        `hint: run /mcp lsp list ${editable.normalizedId} to confirm the remaining configuration`,
       ].join("\n"),
       serverId: editable.normalizedId,
       configPath: saved.path,
@@ -684,6 +786,7 @@ class ManagedMcpRuntime implements McpRuntime {
     const baseLines = [
       "MCP LSP doctor",
       `filesystem_server: ${resolved.server.id}`,
+      `requested_lsp: ${options?.lspServerId?.trim() || "(auto)"}`,
       `workspace_root: ${workspaceRoot}`,
       `input_path: ${path}`,
       `resolved_path: ${resolvedPath}`,
@@ -696,6 +799,7 @@ class ManagedMcpRuntime implements McpRuntime {
         return {
           ok: false,
           status: "config_error",
+          reason: "path_not_file",
           filesystemServerId: resolved.server.id,
           workspaceRoot,
           inputPath: path,
@@ -705,7 +809,8 @@ class ManagedMcpRuntime implements McpRuntime {
           message: [
             ...baseLines,
             "status: config_error",
-            "hint: the requested path must point to an existing file inside the filesystem workspace",
+            "reason: path_not_file",
+            "hint: the requested path must point to an existing readable file inside the filesystem workspace",
           ].join("\n"),
         };
       }
@@ -713,6 +818,7 @@ class ManagedMcpRuntime implements McpRuntime {
       return {
         ok: false,
         status: "config_error",
+        reason: "path_not_readable",
         filesystemServerId: resolved.server.id,
         workspaceRoot,
         inputPath: path,
@@ -722,6 +828,7 @@ class ManagedMcpRuntime implements McpRuntime {
         message: [
           ...baseLines,
           "status: config_error",
+          "reason: path_not_readable",
           "hint: the requested path does not exist or is not readable from the filesystem workspace",
         ].join("\n"),
       };
@@ -739,6 +846,7 @@ class ManagedMcpRuntime implements McpRuntime {
       return {
         ok: true,
         status: "ready",
+        reason: undefined,
         filesystemServerId: resolved.server.id,
         workspaceRoot,
         inputPath: path,
@@ -758,13 +866,29 @@ class ManagedMcpRuntime implements McpRuntime {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const requestFailed = message.startsWith("LSP request failed:");
+      const startupFailed = message.startsWith("LSP startup error:");
       const status =
-        message.startsWith("LSP startup error:") || message.startsWith("LSP request failed:")
-          ? "startup_error"
-          : "config_error";
+        startupFailed || requestFailed ? "startup_error" : "config_error";
+      const classifiedFailure = classifyLspDoctorFailure(
+        message,
+        startupFailed,
+        requestFailed
+      );
+      const reason = isLspConfigError(error)
+        ? error.code
+        : classifiedFailure.reason;
+      const hintLine = isLspConfigError(error)
+        ? undefined
+        : status === "startup_error"
+          ? `hint: ${classifiedFailure.hint}`
+          : configuredServerIds.length === 0
+            ? `hint: add an lsp server with /mcp lsp add ${resolved.server.id} <lsp-id> --command <cmd> --pattern <glob>`
+            : "hint: adjust file_patterns/root_markers/workspace_root or re-run with --lsp <id>";
       return {
         ok: false,
         status,
+        reason,
         filesystemServerId: resolved.server.id,
         workspaceRoot,
         inputPath: path,
@@ -774,10 +898,10 @@ class ManagedMcpRuntime implements McpRuntime {
         message: [
           ...baseLines,
           `status: ${status}`,
-          `error: ${message}`,
-          status === "startup_error"
-            ? "hint: install the language server binary or fix the configured command/args/env"
-            : "hint: adjust file_patterns/root_markers or re-run with --lsp <id>",
+          ...(isLspConfigError(error)
+            ? error.detailLines
+            : [`reason: ${reason}`, `error: ${message}`]),
+          ...(hintLine ? [hintLine] : []),
         ].join("\n"),
       };
     } finally {

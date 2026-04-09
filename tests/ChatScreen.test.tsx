@@ -330,6 +330,26 @@ describe("ChatScreen", () => {
     ]);
   });
 
+  test("parses markdown tables into dedicated table blocks", () => {
+    expect(
+      parseMarkdownBlocks([
+        "| 文件 | 说明 |",
+        "| --- | --- |",
+        "| transportation.py | 运输问题求解器 |",
+        "| main.py | 单纯形法求解器 |",
+      ].join("\n"))
+    ).toEqual([
+      {
+        kind: "table",
+        headers: ["文件", "说明"],
+        rows: [
+          ["transportation.py", "运输问题求解器"],
+          ["main.py", "单纯形法求解器"],
+        ],
+      },
+    ]);
+  });
+
   test("renders multiline assistant prose and unicode bullets without collapsing them", () => {
     const tree = renderScreen({
       items: [
@@ -712,7 +732,7 @@ describe("ChatScreen", () => {
     expect(output).toContain("prompt");
     expect(output).toContain("cached");
     expect(output).toContain("completion");
-    expect(output).toContain("128");
+    expect(output).toContain("32");
     expect(output).toContain("96");
     expect(output).toContain("64");
     expect(output).toContain("192");
@@ -843,6 +863,33 @@ describe("ChatScreen", () => {
     expect(output).toContain("OAuth2PasswordBearer");
     expect(output).toContain("Token");
     expect(output).toContain("─────────────────────────");
+  });
+
+  test("renders markdown tables with bordered cells instead of raw pipes", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "assistant",
+          text: [
+            "| 文件 | 说明 |",
+            "| --- | --- |",
+            "| transportation.py | 运输问题求解器 |",
+            "| main.py | 单纯形法求解器 |",
+          ].join("\n"),
+          kind: "transcript",
+          tone: "neutral",
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("┌");
+    expect(output).toContain("┬");
+    expect(output).toContain("文件");
+    expect(output).toContain("说明");
+    expect(output).toContain("transportation.py");
+    expect(output).toContain("单纯形法求解器");
+    expect(output).not.toContain("| 文件 | 说明 |");
   });
 
   test("renders compact approval summary, diff preview and code block text", () => {

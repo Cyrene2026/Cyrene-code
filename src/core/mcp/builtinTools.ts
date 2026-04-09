@@ -37,10 +37,16 @@ export const BUILTIN_FILE_TOOL_ACTIONS: ToolRequest["action"][] = [
   "ts_prepare_rename",
   "lsp_hover",
   "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
   "lsp_references",
+  "lsp_workspace_symbols",
   "lsp_document_symbols",
   "lsp_diagnostics",
   "lsp_prepare_rename",
+  "lsp_rename",
+  "lsp_code_actions",
+  "lsp_format_document",
   "run_command",
   "run_shell",
   "open_shell",
@@ -67,14 +73,26 @@ const BUILTIN_TOOL_DESCRIPTIONS: Partial<Record<ToolRequest["action"], string>> 
     "Generic language-server hover info. Requires configured `lsp_servers` on the filesystem MCP server.",
   lsp_definition:
     "Generic language-server definition lookup. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_implementation:
+    "Generic language-server implementation lookup. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_type_definition:
+    "Generic language-server type-definition lookup. Requires configured `lsp_servers` on the filesystem MCP server.",
   lsp_references:
     "Generic language-server references. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_workspace_symbols:
+    "Generic language-server workspace symbol search. Requires configured `lsp_servers` on the filesystem MCP server.",
   lsp_document_symbols:
     "Generic language-server document symbols for one file. Requires configured `lsp_servers` on the filesystem MCP server.",
   lsp_diagnostics:
     "Generic language-server diagnostics for one file. Requires configured `lsp_servers` on the filesystem MCP server.",
   lsp_prepare_rename:
     "Preview a generic language-server rename before any file mutation. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_rename:
+    "Apply a reviewed generic language-server rename. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_code_actions:
+    "List or apply generic language-server code actions at an exact file position. Applying edits requires review. Requires configured `lsp_servers` on the filesystem MCP server.",
+  lsp_format_document:
+    "Apply reviewed generic language-server document formatting edits. Requires configured `lsp_servers` on the filesystem MCP server.",
 };
 
 export const buildBuiltinToolDescriptors = (

@@ -32,10 +32,16 @@ const READ_ACTIONS = new Set<ToolRequest["action"]>([
   "ts_prepare_rename",
   "lsp_hover",
   "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
   "lsp_references",
+  "lsp_workspace_symbols",
   "lsp_document_symbols",
   "lsp_diagnostics",
   "lsp_prepare_rename",
+  "lsp_rename",
+  "lsp_code_actions",
+  "lsp_format_document",
   "read_shell",
   "shell_status",
 ]);
@@ -49,6 +55,9 @@ const WRITE_ACTIONS = new Set<ToolRequest["action"]>([
   "delete_file",
   "copy_path",
   "move_path",
+  "lsp_rename",
+  "lsp_code_actions",
+  "lsp_format_document",
 ]);
 
 const SHELL_ACTIONS = new Set<ToolRequest["action"]>([
@@ -90,8 +99,13 @@ export const getMcpToolCapabilities = (
     action === "ts_references" ||
     action === "ts_prepare_rename" ||
     action === "lsp_definition" ||
+    action === "lsp_implementation" ||
+    action === "lsp_type_definition" ||
     action === "lsp_references" ||
+    action === "lsp_workspace_symbols" ||
     action === "lsp_prepare_rename" ||
+    action === "lsp_rename" ||
+    action === "lsp_code_actions" ||
     action === "search_text_context"
   ) {
     capabilities.add("search");
@@ -126,6 +140,9 @@ export const getMcpToolRisk = (action: ToolRequest["action"]): McpToolRisk => {
     action === "edit_file" ||
     action === "apply_patch" ||
     action === "copy_path" ||
+    action === "lsp_rename" ||
+    action === "lsp_code_actions" ||
+    action === "lsp_format_document" ||
     action === "run_command" ||
     action === "open_shell" ||
     action === "interrupt_shell" ||

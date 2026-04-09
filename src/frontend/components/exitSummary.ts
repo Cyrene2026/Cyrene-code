@@ -1,3 +1,5 @@
+import { getUncachedPromptTokenCount } from "../../core/query/tokenUsage";
+
 const ANSI_CLEAR_SCREEN = "\x1b[2J\x1b[H";
 const ANSI_RESET = "\x1b[0m";
 const ANSI_BOLD = "\x1b[1m";
@@ -100,13 +102,14 @@ export const buildExitScreen = (
   const sessionLabel = summary.activeSessionId ?? "-";
   const modelLabel = summary.currentModel.trim() || "-";
   const runtimeLabel = formatDuration(summary.startedAt, options.now);
+  const uncachedPromptTokens = getUncachedPromptTokenCount(summary);
   const rows = [
     ["session", sessionLabel],
     ["model", modelLabel],
     ["runtime", runtimeLabel],
     ["requests", String(summary.requestCount)],
     ["state updates", String(summary.stateUpdateCount)],
-    ["prompt", String(summary.promptTokens)],
+    ["prompt uncached", String(uncachedPromptTokens)],
     ["cached", String(summary.cachedTokens)],
     ["completion", String(summary.completionTokens)],
     ["total", String(summary.totalTokens)],

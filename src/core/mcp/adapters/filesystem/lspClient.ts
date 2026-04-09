@@ -81,16 +81,38 @@ export type LspWorkspaceEdit = {
   documentChanges: LspWorkspaceEditDocumentChange[];
 };
 
+export type LspCodeAction = {
+  title: string;
+  kind?: string;
+  isPreferred?: boolean;
+  disabledReason?: string;
+  edit?: LspWorkspaceEdit;
+  hasCommand?: boolean;
+};
+
 export type LspPrepareRenameResult = {
   range: LspRange;
   placeholder: string;
 };
 
+export type LspWorkspaceSymbol = {
+  name: string;
+  kind: number;
+  containerName?: string;
+  location?: LspLocation;
+  uri?: string;
+};
+
 type LspServerCapabilities = {
   hoverProvider?: unknown;
   definitionProvider?: unknown;
+  implementationProvider?: unknown;
+  typeDefinitionProvider?: unknown;
   referencesProvider?: unknown;
   documentSymbolProvider?: unknown;
+  workspaceSymbolProvider?: unknown;
+  codeActionProvider?: unknown;
+  documentFormattingProvider?: unknown;
   renameProvider?: unknown;
   diagnosticProvider?: unknown;
   textDocumentSync?: unknown;
@@ -101,9 +123,22 @@ export interface LspWorkspaceLike {
   probe(filePath: string): Promise<{ serverId: string; rootPath: string }>;
   hover(filePath: string, line: number, column: number): Promise<LspHoverResult | null>;
   definition(filePath: string, line: number, column: number): Promise<LspLocation[]>;
+  implementation(filePath: string, line: number, column: number): Promise<LspLocation[]>;
+  typeDefinition(filePath: string, line: number, column: number): Promise<LspLocation[]>;
   references(filePath: string, line: number, column: number): Promise<LspLocation[]>;
+  workspaceSymbols(query: string): Promise<LspWorkspaceSymbol[]>;
+  codeActions(
+    filePath: string,
+    line: number,
+    column: number,
+    options?: { kind?: string }
+  ): Promise<LspCodeAction[]>;
   documentSymbols(filePath: string): Promise<LspDocumentSymbol[]>;
   diagnostics(filePath: string): Promise<LspDiagnostic[]>;
+  formatDocument(
+    filePath: string,
+    options?: { tabSize?: number; insertSpaces?: boolean }
+  ): Promise<LspTextEdit[]>;
   prepareRename(
     filePath: string,
     line: number,
@@ -128,11 +163,33 @@ export type LspPathInspection = {
   resolvedRoot?: string;
 };
 
+export type LspConfigErrorCode =
+  | "no_configured_servers"
+  | "server_not_configured"
+  | "server_id_required"
+  | "path_mismatch"
+  | "no_matching_server"
+  | "multiple_matching_servers";
+
+export class LspConfigError extends Error {
+  constructor(
+    readonly code: LspConfigErrorCode,
+    readonly detailLines: string[]
+  ) {
+    super(detailLines.join("\n"));
+    this.name = "LspConfigError";
+  }
+}
+
+export const isLspConfigError = (error: unknown): error is LspConfigError =>
+  error instanceof LspConfigError;
+
 export interface LspManagerLike {
   getSession(
     filePath: string,
     options?: { serverId?: string }
   ): Promise<LspWorkspaceLike>;
+  getSessionForServer(options?: { serverId?: string }): Promise<LspWorkspaceLike>;
   inspectPath(
     filePath: string,
     options?: { serverId?: string }
@@ -370,6 +427,37 @@ const normalizeDocumentSymbol = (value: unknown): LspDocumentSymbol | null => {
   };
 };
 
+const normalizeWorkspaceSymbol = (value: unknown): LspWorkspaceSymbol | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const name = normalizeString((value as { name?: unknown }).name);
+  const kind = normalizeNumber((value as { kind?: unknown }).kind);
+  if (!name || typeof kind !== "number") {
+    return null;
+  }
+  const rawLocation = (value as { location?: unknown }).location;
+  const normalizedLocation =
+    normalizeLocation(rawLocation) ?? normalizeLocationLink(rawLocation);
+  const uri =
+    normalizedLocation?.uri ??
+    normalizeString((rawLocation as { uri?: unknown } | undefined)?.uri);
+  return {
+    name,
+    kind,
+    ...(normalizeString((value as { containerName?: unknown }).containerName)
+      ? { containerName: normalizeString((value as { containerName?: unknown }).containerName) }
+      : {}),
+    ...(normalizedLocation ? { location: normalizedLocation } : {}),
+    ...(uri ? { uri } : {}),
+  };
+};
+
+const normalizeWorkspaceSymbolArray = (value: unknown): LspWorkspaceSymbol[] =>
+  (Array.isArray(value) ? value : value == null ? [] : [value])
+    .map(item => normalizeWorkspaceSymbol(item))
+    .filter((item): item is LspWorkspaceSymbol => item !== null);
+
 const normalizeDiagnostic = (value: unknown): LspDiagnostic | null => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -407,6 +495,11 @@ const normalizeTextEdit = (value: unknown): LspTextEdit | null => {
   }
   return { range, newText };
 };
+
+const normalizeTextEditArray = (value: unknown): LspTextEdit[] =>
+  (Array.isArray(value) ? value : value == null ? [] : [value])
+    .map(item => normalizeTextEdit(item))
+    .filter((item): item is LspTextEdit => item !== null);
 
 const normalizeWorkspaceEdit = (value: unknown): LspWorkspaceEdit | null => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -474,6 +567,42 @@ const normalizeWorkspaceEdit = (value: unknown): LspWorkspaceEdit | null => {
     documentChanges,
   };
 };
+
+const normalizeCodeAction = (value: unknown): LspCodeAction | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const title = normalizeString((value as { title?: unknown }).title);
+  if (!title) {
+    return null;
+  }
+  const edit = normalizeWorkspaceEdit((value as { edit?: unknown }).edit);
+  const disabled =
+    (value as { disabled?: unknown }).disabled &&
+    typeof (value as { disabled: unknown }).disabled === "object" &&
+    !Array.isArray((value as { disabled: unknown }).disabled)
+      ? normalizeString(
+          ((value as { disabled: { reason?: unknown } }).disabled ?? {}).reason
+        )
+      : undefined;
+  return {
+    title,
+    ...(normalizeString((value as { kind?: unknown }).kind)
+      ? { kind: normalizeString((value as { kind?: unknown }).kind) }
+      : {}),
+    ...(typeof (value as { isPreferred?: unknown }).isPreferred === "boolean"
+      ? { isPreferred: (value as { isPreferred: boolean }).isPreferred }
+      : {}),
+    ...(disabled ? { disabledReason: disabled } : {}),
+    ...(edit ? { edit } : {}),
+    ...(Boolean((value as { command?: unknown }).command) ? { hasCommand: true } : {}),
+  };
+};
+
+const normalizeCodeActionArray = (value: unknown): LspCodeAction[] =>
+  (Array.isArray(value) ? value : value == null ? [] : [value])
+    .map(item => normalizeCodeAction(item))
+    .filter((item): item is LspCodeAction => item !== null);
 
 const hasPrepareRenameProvider = (capabilities: LspServerCapabilities) => {
   const renameProvider = capabilities.renameProvider;
@@ -630,6 +759,15 @@ const findIdentifierRangeAt = (content: string, line: number, column: number): L
     end: { line, character: end },
   };
 };
+
+const compareLspPositions = (left: LspPosition, right: LspPosition) =>
+  left.line === right.line
+    ? left.character - right.character
+    : left.line - right.line;
+
+const rangesOverlap = (left: LspRange, right: LspRange) =>
+  compareLspPositions(left.start, right.end) <= 0 &&
+  compareLspPositions(right.start, left.end) <= 0;
 
 class LspClient {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -933,16 +1071,40 @@ class LspClient {
           workspace: {
             configuration: true,
             workspaceFolders: true,
+            symbol: {
+              dynamicRegistration: false,
+            },
           },
           textDocument: {
             hover: {
               contentFormat: ["markdown", "plaintext"],
             },
+            implementation: {},
+            typeDefinition: {},
             definition: {},
             references: {},
+            codeAction: {
+              codeActionLiteralSupport: {
+                codeActionKind: {
+                  valueSet: [
+                    "",
+                    "quickfix",
+                    "refactor",
+                    "refactor.extract",
+                    "refactor.inline",
+                    "refactor.move",
+                    "refactor.rewrite",
+                    "source",
+                    "source.fixAll",
+                    "source.organizeImports",
+                  ],
+                },
+              },
+            },
             documentSymbol: {
               hierarchicalDocumentSymbolSupport: true,
             },
+            formatting: {},
             rename: {
               prepareSupport: true,
             },
@@ -1003,6 +1165,26 @@ class LspClient {
     );
   }
 
+  async implementation(uri: string, position: LspPosition) {
+    await this.initialize();
+    return normalizeLocationArray(
+      await this.request("textDocument/implementation", {
+        textDocument: { uri },
+        position,
+      })
+    );
+  }
+
+  async typeDefinition(uri: string, position: LspPosition) {
+    await this.initialize();
+    return normalizeLocationArray(
+      await this.request("textDocument/typeDefinition", {
+        textDocument: { uri },
+        position,
+      })
+    );
+  }
+
   async references(uri: string, position: LspPosition) {
     await this.initialize();
     return normalizeLocationArray(
@@ -1011,6 +1193,34 @@ class LspClient {
         position,
         context: {
           includeDeclaration: true,
+        },
+      })
+    );
+  }
+
+  async workspaceSymbols(query: string) {
+    await this.initialize();
+    return normalizeWorkspaceSymbolArray(
+      await this.request("workspace/symbol", {
+        query,
+      })
+    );
+  }
+
+  async codeActions(
+    uri: string,
+    range: LspRange,
+    diagnostics: LspDiagnostic[],
+    options?: { kind?: string }
+  ) {
+    await this.initialize();
+    return normalizeCodeActionArray(
+      await this.request("textDocument/codeAction", {
+        textDocument: { uri },
+        range,
+        context: {
+          diagnostics,
+          ...(options?.kind ? { only: [options.kind] } : {}),
         },
       })
     );
@@ -1062,6 +1272,25 @@ class LspClient {
 
     const timeout = delay(timeoutMs).then(() => cached ?? []);
     return Promise.race([next, timeout]);
+  }
+
+  async formatDocument(
+    uri: string,
+    options?: { tabSize?: number; insertSpaces?: boolean }
+  ) {
+    await this.initialize();
+    return normalizeTextEditArray(
+      await this.request("textDocument/formatting", {
+        textDocument: { uri },
+        options: {
+          tabSize: options?.tabSize ?? 2,
+          insertSpaces: options?.insertSpaces ?? true,
+          trimTrailingWhitespace: true,
+          insertFinalNewline: true,
+          trimFinalNewlines: true,
+        },
+      })
+    );
   }
 
   async prepareRename(uri: string, position: LspPosition) {
@@ -1239,12 +1468,59 @@ class LspWorkspaceSession implements LspWorkspaceLike {
     });
   }
 
+  async implementation(filePath: string, line: number, column: number) {
+    await this.ensureSynced(filePath);
+    return this.client.implementation(toUri(filePath), {
+      line: line - 1,
+      character: column - 1,
+    });
+  }
+
+  async typeDefinition(filePath: string, line: number, column: number) {
+    await this.ensureSynced(filePath);
+    return this.client.typeDefinition(toUri(filePath), {
+      line: line - 1,
+      character: column - 1,
+    });
+  }
+
   async references(filePath: string, line: number, column: number) {
     await this.ensureSynced(filePath);
     return this.client.references(toUri(filePath), {
       line: line - 1,
       character: column - 1,
     });
+  }
+
+  async workspaceSymbols(query: string) {
+    await this.client.initialize();
+    return this.client.workspaceSymbols(query);
+  }
+
+  async codeActions(
+    filePath: string,
+    line: number,
+    column: number,
+    options?: { kind?: string }
+  ) {
+    await this.ensureSynced(filePath);
+    const uri = toUri(filePath);
+    let diagnostics: LspDiagnostic[] = [];
+    try {
+      diagnostics = await this.diagnostics(filePath);
+    } catch {
+      diagnostics = [];
+    }
+    const cursorRange = {
+      start: { line: line - 1, character: column - 1 },
+      end: { line: line - 1, character: column - 1 },
+    } satisfies LspRange;
+    return this.client.codeActions(
+      uri,
+      cursorRange,
+      diagnostics.filter(diagnostic => rangesOverlap(diagnostic.range, cursorRange)),
+      options
+    );
   }
 
   async documentSymbols(filePath: string) {
@@ -1264,6 +1540,14 @@ class LspWorkspaceSession implements LspWorkspaceLike {
       // Fall back to publishDiagnostics.
     }
     return this.client.waitForPublishedDiagnostics(uri);
+  }
+
+  async formatDocument(
+    filePath: string,
+    options?: { tabSize?: number; insertSpaces?: boolean }
+  ) {
+    await this.ensureSynced(filePath);
+    return this.client.formatDocument(toUri(filePath), options);
   }
 
   async prepareRename(filePath: string, line: number, column: number) {
@@ -1403,6 +1687,43 @@ const formatRelativeWorkspacePath = (workspaceRoot: string, filePath: string) =>
   return relativePath;
 };
 
+const formatLspServerWorkspaceScope = (
+  workspaceRoot: string,
+  config: LspServerConfig
+) => {
+  const serverWorkspaceRoot = resolve(workspaceRoot, config.workspaceRoot ?? ".");
+  const relativeScope = normalizePathForGlob(
+    relative(workspaceRoot, serverWorkspaceRoot)
+  );
+  if (!relativeScope || relativeScope === "") {
+    return ".";
+  }
+  return relativeScope.startsWith("..") ? serverWorkspaceRoot : relativeScope;
+};
+
+const formatLspServerSelectionHint = (
+  workspaceRoot: string,
+  config: LspServerConfig
+) =>
+  [
+    `workspace ${formatLspServerWorkspaceScope(workspaceRoot, config)} (path must stay inside)`,
+    `patterns ${
+      config.filePatterns.length > 0
+        ? `${config.filePatterns.join(", ")} (any glob match)`
+        : "(all files; no pattern filter)"
+    }`,
+    `roots ${
+      config.rootMarkers.length > 0
+        ? `${config.rootMarkers.join(", ")} (nearest marker wins)`
+        : "(workspace root fallback)"
+    }`,
+  ].join(" | ");
+
+const formatLspSelectionHints = (
+  workspaceRoot: string,
+  configs: LspServerConfig[]
+) => configs.map(config => `- ${config.id}: ${formatLspServerSelectionHint(workspaceRoot, config)}`);
+
 export class LspManager implements LspManagerLike {
   private readonly sessions = new Map<string, LspWorkspaceLike>();
 
@@ -1417,55 +1738,70 @@ export class LspManager implements LspManagerLike {
   }
 
   private buildNoConfiguredServersError() {
-    return new Error(
-      [
-        "LSP config error: no lsp_servers are configured for this filesystem workspace.",
-        `workspace: ${this.workspaceRoot}`,
-        "hint: add `lsp_servers` under the filesystem server in .cyrene/mcp.yaml or use `/mcp lsp add ...`",
-      ].join("\n")
-    );
+    return new LspConfigError("no_configured_servers", [
+      "LSP config error: no lsp_servers are configured for this filesystem workspace.",
+      "reason: no_configured_servers",
+      `workspace: ${this.workspaceRoot}`,
+      "configured: (none)",
+      "hint: add `lsp_servers` under the filesystem server in .cyrene/mcp.yaml or use `/mcp lsp add ...`",
+    ]);
   }
 
   private buildServerNotFoundError(serverId: string) {
-    return new Error(
-      [
-        `LSP config error: serverId '${serverId}' is not configured.`,
-        `configured: ${formatConfiguredServerIds(this.configs)}`,
-        "hint: re-run with a configured serverId or add the missing lsp_servers entry",
-      ].join("\n")
-    );
+    return new LspConfigError("server_not_configured", [
+      `LSP config error: serverId '${serverId}' is not configured.`,
+      "reason: server_not_configured",
+      `configured: ${formatConfiguredServerIds(this.configs)}`,
+      ...(this.configs.length > 0
+        ? ["match_hints:", ...formatLspSelectionHints(this.workspaceRoot, this.configs)]
+        : []),
+      "hint: re-run with a configured serverId or add the missing lsp_servers entry",
+    ]);
+  }
+
+  private buildServerSelectionRequiredError() {
+    return new LspConfigError("server_id_required", [
+      "LSP config error: workspace-wide LSP requests need an explicit serverId when multiple lsp_servers are configured.",
+      "reason: server_id_required",
+      `configured: ${formatConfiguredServerIds(this.configs)}`,
+      "match_hints:",
+      ...formatLspSelectionHints(this.workspaceRoot, this.configs),
+      "hint: re-run with serverId to select the intended LSP server",
+    ]);
   }
 
   private buildPathMismatchError(config: LspServerConfig, filePath: string) {
-    return new Error(
-      [
-        `LSP config error: serverId '${config.id}' does not match path '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
-        `workspace: ${this.workspaceRoot}`,
-        `file_patterns: ${config.filePatterns.join(", ")}`,
-        `server_workspace: ${resolve(this.workspaceRoot, config.workspaceRoot ?? ".")}`,
-        "hint: use a different serverId or adjust file_patterns/workspace_root",
-      ].join("\n")
-    );
+    return new LspConfigError("path_mismatch", [
+      `LSP config error: serverId '${config.id}' does not match path '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
+      "reason: path_mismatch",
+      `workspace: ${this.workspaceRoot}`,
+      `relative_path: ${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}`,
+      `match_hint: ${formatLspServerSelectionHint(this.workspaceRoot, config)}`,
+      `server_workspace: ${resolve(this.workspaceRoot, config.workspaceRoot ?? ".")}`,
+      "hint: use a different serverId or adjust file_patterns/workspace_root",
+    ]);
   }
 
   private buildNoMatchError(filePath: string) {
-    return new Error(
-      [
-        `LSP config error: no configured LSP server matches '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
-        `configured: ${formatConfiguredServerIds(this.configs)}`,
-        "hint: add a matching file_patterns entry or re-run with a specific serverId if you expected one match",
-      ].join("\n")
-    );
+    return new LspConfigError("no_matching_server", [
+      `LSP config error: no configured LSP server matches '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
+      "reason: no_matching_server",
+      `configured: ${formatConfiguredServerIds(this.configs)}`,
+      "match_hints:",
+      ...formatLspSelectionHints(this.workspaceRoot, this.configs),
+      "hint: add a matching file_patterns entry or re-run with a specific serverId if you expected one match",
+    ]);
   }
 
   private buildMultipleMatchError(filePath: string, matches: LspServerConfig[]) {
-    return new Error(
-      [
-        `LSP config error: multiple LSP servers match '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
-        `matched: ${matches.map(config => config.id).join(", ")}`,
-        "hint: re-run with serverId to disambiguate",
-      ].join("\n")
-    );
+    return new LspConfigError("multiple_matching_servers", [
+      `LSP config error: multiple LSP servers match '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
+      "reason: multiple_matching_servers",
+      `matched: ${matches.map(config => config.id).join(", ")}`,
+      "match_hints:",
+      ...matches.map(config => `- ${config.id}: ${formatLspServerSelectionHint(this.workspaceRoot, config)}`),
+      "hint: re-run with serverId to disambiguate",
+    ]);
   }
 
   private async createSession(config: LspServerConfig, rootPath: string) {
@@ -1481,6 +1817,17 @@ export class LspManager implements LspManagerLike {
         spawnProcess: this.options.spawnProcess,
       })
     );
+  }
+
+  private async getOrCreateSession(config: LspServerConfig, rootPath: string) {
+    const key = `${config.id}:${rootPath}`;
+    const cached = this.sessions.get(key);
+    if (cached) {
+      return cached;
+    }
+    const created = await this.createSession(config, rootPath);
+    this.sessions.set(key, created);
+    return created;
   }
 
   async inspectPath(filePath: string, options?: { serverId?: string }) {
@@ -1539,15 +1886,27 @@ export class LspManager implements LspManagerLike {
     if (!config || !inspection.resolvedRoot) {
       throw new Error("LSP config error: failed to resolve a matching session.");
     }
-    const rootPath = inspection.resolvedRoot;
-    const key = `${config.id}:${rootPath}`;
-    const cached = this.sessions.get(key);
-    if (cached) {
-      return cached;
+    return this.getOrCreateSession(config, inspection.resolvedRoot);
+  }
+
+  async getSessionForServer(options?: { serverId?: string }) {
+    if (this.configs.length === 0) {
+      throw this.buildNoConfiguredServersError();
     }
-    const created = await this.createSession(config, rootPath);
-    this.sessions.set(key, created);
-    return created;
+    const explicitServerId = options?.serverId?.trim();
+    const config = explicitServerId
+      ? this.getServerConfigForId(explicitServerId)
+      : this.configs.length === 1
+        ? this.configs[0]
+        : null;
+    if (explicitServerId && !config) {
+      throw this.buildServerNotFoundError(explicitServerId);
+    }
+    if (!config) {
+      throw this.buildServerSelectionRequiredError();
+    }
+    const rootPath = resolve(this.workspaceRoot, config.workspaceRoot ?? ".");
+    return this.getOrCreateSession(config, rootPath);
   }
 
   invalidate(filePath?: string) {

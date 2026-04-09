@@ -11,7 +11,11 @@ import {
   getInputLines,
 } from "../../application/chat/multilineInput";
 import type { PendingReviewItem } from "../../core/mcp";
-import type { TokenUsage } from "../../core/query/tokenUsage";
+import {
+  getCachedTokenCount,
+  getUncachedPromptTokenCount,
+  type TokenUsage,
+} from "../../core/query/tokenUsage";
 import type { SessionListItem } from "../../core/session/types";
 import type { ChatItem, ChatStatus } from "../../shared/types/chat";
 import type { AuthStatus } from "../../infra/auth/types";
@@ -221,6 +225,11 @@ type MarkdownBlock =
         text: string;
         marker?: string;
       }>;
+    }
+  | {
+      kind: "table";
+      headers: string[];
+      rows: string[][];
     }
   | { kind: "code"; language?: string; content: string }
   | { kind: "diff"; lines: string[] }
@@ -1339,6 +1348,60 @@ export const parseInlineCodeSegments = (line: string) =>
     isCode: segment.kind === "code",
   }));
 
+const renderInlineMarkdownSegments = (
+  text: string,
+  keyPrefix: string,
+  color: ChatItem["color"],
+  options?: { bold?: boolean }
+) => {
+  const segments = parseInlineMarkdownSegments(text);
+  if (segments.length === 0) {
+    return (
+      <Text
+        key={`${keyPrefix}-text`}
+        color={color}
+        bold={options?.bold}
+      >
+        {text || " "}
+      </Text>
+    );
+  }
+
+  return segments.map((segment, index) =>
+    segment.kind === "code" ? (
+      <Text
+        key={`${keyPrefix}-code-${index}`}
+        color="cyan"
+        bold
+      >
+        {segment.text}
+      </Text>
+    ) : segment.kind === "strong" ? (
+      <Text
+        key={`${keyPrefix}-strong-${index}`}
+        color={color}
+        bold
+      >
+        {segment.text}
+      </Text>
+    ) : (
+      <Text
+        key={`${keyPrefix}-plain-${index}`}
+        color={color}
+        bold={options?.bold}
+      >
+        {segment.text}
+      </Text>
+    )
+  );
+};
+
+const getInlineMarkdownDisplayWidth = (text: string) =>
+  parseInlineMarkdownSegments(text).reduce(
+    (total, segment) => total + stringWidth(segment.text),
+    0
+  );
+
 const renderSegments = (
   segments: CodeSegment[],
   keyPrefix: string,
@@ -1376,25 +1439,7 @@ const renderInlineMarkdownLine = (
   return (
     <Text key={key} color={color}>
       {prefix ?? ""}
-      {segments.map((segment, index) =>
-        segment.kind === "code" ? (
-          <Text
-            key={`${key}-code-${index}`}
-            color="cyan"
-            bold
-          >
-            {segment.text}
-          </Text>
-        ) : segment.kind === "strong" ? (
-          <Text key={`${key}-strong-${index}`} color={color} bold>
-            {segment.text}
-          </Text>
-        ) : (
-          <Text key={`${key}-text-${index}`} color={color}>
-            {segment.text}
-          </Text>
-        )
-      )}
+      {renderInlineMarkdownSegments(line, key, color)}
     </Text>
   );
 };
@@ -1503,7 +1548,25 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
     codeLanguage = "";
   };
 
-  lines.forEach((line, index) => {
+  const parseMarkdownTableCells = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.includes("|")) {
+      return [];
+    }
+    const withoutOuterPipes = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+    return withoutOuterPipes.split("|").map(cell => cell.trim());
+  };
+
+  const isMarkdownTableDelimiter = (line: string) => {
+    const cells = parseMarkdownTableCells(line);
+    return (
+      cells.length >= 2 &&
+      cells.every(cell => /^:?-{3,}:?$/.test(cell))
+    );
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     const trimmed = line.trim();
     const prev = index > 0 ? lines[index - 1] : undefined;
     const next = index < lines.length - 1 ? lines[index + 1] : undefined;
@@ -1519,19 +1582,19 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
         inCode = true;
         codeLanguage = trimmed.slice(3).trim();
       }
-      return;
+      continue;
     }
 
     if (inCode) {
       codeLines.push(line);
-      return;
+      continue;
     }
 
     if (!trimmed) {
       flushParagraph();
       flushList();
       flushDiff();
-      return;
+      continue;
     }
 
     if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
@@ -1539,7 +1602,7 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
       flushList();
       flushDiff();
       blocks.push({ kind: "rule" });
-      return;
+      continue;
     }
 
     const headingMatch = /^(#{1,6})\s+(.+)$/.exec(trimmed);
@@ -1554,14 +1617,46 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
         level: headingLevel.length,
         text: headingText,
       });
-      return;
+      continue;
+    }
+
+    const headerCells = parseMarkdownTableCells(line);
+    if (
+      headerCells.length >= 2 &&
+      next &&
+      isMarkdownTableDelimiter(next)
+    ) {
+      flushParagraph();
+      flushList();
+      flushDiff();
+      const rows: string[][] = [];
+      let tableIndex = index + 2;
+      while (tableIndex < lines.length) {
+        const rowLine = lines[tableIndex] ?? "";
+        if (!rowLine.trim()) {
+          break;
+        }
+        const rowCells = parseMarkdownTableCells(rowLine);
+        if (rowCells.length < 2) {
+          break;
+        }
+        rows.push(rowCells);
+        tableIndex += 1;
+      }
+      blocks.push({
+        kind: "table",
+        headers: headerCells,
+        rows,
+      });
+      index = tableIndex - 1;
+      continue;
     }
 
     if (isTranscriptDiffLine(line, { prev, next })) {
       flushParagraph();
       flushList();
       diffLines.push(line);
-      return;
+      continue;
     }
 
     const unorderedMatch = /^[-*•]\s+(.+)$/.exec(trimmed);
@@ -1574,7 +1669,7 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
         listState = { ordered: false, items: [] };
       }
       listState.items.push({ text: itemText });
-      return;
+      continue;
     }
 
     const orderedMatch = /^(\d+)\.\s+(.+)$/.exec(trimmed);
@@ -1591,13 +1686,13 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
         text: itemText,
         marker: markerNumber ? `${markerNumber}. ` : undefined,
       });
-      return;
+      continue;
     }
 
     flushList();
     flushDiff();
     paragraphLines.push(line);
-  });
+  }
 
   if (inCode) {
     flushCode();
@@ -1606,6 +1701,73 @@ export const parseMarkdownBlocks = (text: string): MarkdownBlock[] => {
   flushList();
   flushDiff();
   return blocks;
+};
+
+const renderMarkdownTable = (
+  block: Extract<MarkdownBlock, { kind: "table" }>,
+  itemIndex: number
+) => {
+  const columnCount = Math.max(
+    block.headers.length,
+    ...block.rows.map(row => row.length),
+    0
+  );
+  const normalizedHeaders = Array.from({ length: columnCount }, (_, index) =>
+    block.headers[index] ?? ""
+  );
+  const normalizedRows = block.rows.map(row =>
+    Array.from({ length: columnCount }, (_, index) => row[index] ?? "")
+  );
+  const widths = Array.from({ length: columnCount }, (_, index) =>
+    Math.max(
+      getInlineMarkdownDisplayWidth(normalizedHeaders[index] ?? ""),
+      ...normalizedRows.map(row => getInlineMarkdownDisplayWidth(row[index] ?? "")),
+      1
+    )
+  );
+
+  const buildBorder = (left: string, middle: string, right: string) =>
+    `  ${left}${widths.map(width => "─".repeat(width + 2)).join(middle)}${right}`;
+
+  const renderRow = (
+    cells: string[],
+    key: string,
+    options?: { header?: boolean }
+  ) => (
+    <Text key={key}>
+      {"  │ "}
+      {cells.map((cell, index) => {
+        const width = widths[index] ?? 1;
+        const padding = " ".repeat(
+          Math.max(0, width - getInlineMarkdownDisplayWidth(cell))
+        );
+        return (
+          <React.Fragment key={`${key}-cell-${index}`}>
+            {renderInlineMarkdownSegments(
+              cell,
+              `${key}-cell-${index}`,
+              options?.header ? "cyan" : "white",
+              { bold: options?.header }
+            )}
+            <Text>{padding}</Text>
+            <Text>{index === cells.length - 1 ? " │" : " │ "}</Text>
+          </React.Fragment>
+        );
+      })}
+    </Text>
+  );
+
+  return (
+    <Box key={`table-${itemIndex}`} flexDirection="column" marginTop={1}>
+      <Text dimColor>{buildBorder("┌", "┬", "┐")}</Text>
+      {renderRow(normalizedHeaders, `table-header-${itemIndex}`, { header: true })}
+      <Text dimColor>{buildBorder("├", "┼", "┤")}</Text>
+      {normalizedRows.map((row, rowIndex) =>
+        renderRow(row, `table-row-${itemIndex}-${rowIndex}`)
+      )}
+      <Text dimColor>{buildBorder("└", "┴", "┘")}</Text>
+    </Box>
+  );
 };
 
 const TERMINAL_ACTIONS = new Set([
@@ -2164,6 +2326,11 @@ const renderMessageItem = (
       return;
     }
 
+    if (block.kind === "table") {
+      nodes.push(renderMarkdownTable(block, itemIndex * 1000 + blockIndex));
+      return;
+    }
+
     if (block.kind === "diff") {
       block.lines.forEach((line, lineIndex) => {
         nodes.push(
@@ -2219,10 +2386,12 @@ const renderStatusLine = (
 ) => {
   const statusBadge = getStatusBadge(status, spinner);
   const queueColor = pendingCount > 0 ? "yellow" : "green";
+  const cachedTokens = getCachedTokenCount(usage);
+  const uncachedPromptTokens = getUncachedPromptTokenCount(usage);
   const tokenSummary = usage
     ? `tokens ${String(usage.totalTokens)}  |  prompt ${String(
-        usage.promptTokens
-      )}  |  cached ${String(usage.cachedTokens ?? 0)}  |  completion ${String(
+        uncachedPromptTokens
+      )}  |  cached ${String(cachedTokens)}  |  completion ${String(
         usage.completionTokens
       )}`
     : "tokens -";

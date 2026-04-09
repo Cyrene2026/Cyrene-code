@@ -5,6 +5,7 @@ import { join, posix, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   FileMcpService,
+  type LspCodeAction,
   isPathInsideWorkspaceRoot,
   type LspDiagnostic,
   type LspDocumentSymbol,
@@ -12,6 +13,7 @@ import {
   type LspLocation,
   type LspManagerLike,
   type LspPrepareRenameResult,
+  type LspWorkspaceSymbol,
   type LspWorkspaceEdit,
   type LspWorkspaceLike,
   type TsServerClientLike,
@@ -445,6 +447,53 @@ const createFakeLspManager = (
     },
   ];
 
+  const implementationResult = (filePath: string): LspLocation[] => [
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 0, character: 3 },
+        end: { line: 0, character: 8 },
+      },
+    },
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 4, character: 3 },
+        end: { line: 4, character: 7 },
+      },
+    },
+  ];
+
+  const typeDefinitionResult = (filePath: string): LspLocation[] => [
+    {
+      uri: toUri(filePath),
+      range: {
+        start: { line: 0, character: 16 },
+        end: { line: 0, character: 20 },
+      },
+    },
+  ];
+
+  const workspaceSymbolsResult = (filePath: string): LspWorkspaceSymbol[] => [
+    {
+      name: "greet",
+      kind: 12,
+      containerName: "demo",
+      location: {
+        uri: toUri(filePath),
+        range: {
+          start: { line: 0, character: 3 },
+          end: { line: 0, character: 8 },
+        },
+      },
+    },
+    {
+      name: "Greeter",
+      kind: 5,
+      uri: toUri(filePath),
+    },
+  ];
+
   const documentSymbolsResult: LspDocumentSymbol[] = [
     {
       name: "greet",
@@ -544,6 +593,48 @@ const createFakeLspManager = (
     documentChanges: [],
   });
 
+  const codeActionsResult = (filePath: string): LspCodeAction[] => [
+    {
+      title: "Extract to helper",
+      kind: "refactor.extract",
+      isPreferred: true,
+      edit: {
+        changes: {
+          [toUri(filePath)]: [
+            {
+              range: {
+                start: { line: 0, character: 0 },
+                end: { line: 0, character: 2 },
+              },
+              newText: "pub fn",
+            },
+          ],
+        },
+        documentChanges: [],
+      },
+    },
+    {
+      title: "Run organize imports",
+      kind: "source.organizeImports",
+      hasCommand: true,
+    },
+    {
+      title: "Disabled fix",
+      kind: "quickfix",
+      disabledReason: "not available here",
+    },
+  ];
+
+  const formatDocumentResult = () => [
+    {
+      range: {
+        start: { line: 1, character: 0 },
+        end: { line: 1, character: 27 },
+      },
+      newText: '    format!("hello {}", name)',
+    },
+  ];
+
   const workspace: LspWorkspaceLike = {
     getInfo() {
       return { serverId, rootPath };
@@ -560,9 +651,27 @@ const createFakeLspManager = (
       calls.push({ method: "definition", args: [filePath, line, column] });
       return definitionResult(filePath);
     },
+    async implementation(filePath: string, line: number, column: number) {
+      calls.push({ method: "implementation", args: [filePath, line, column] });
+      return implementationResult(filePath);
+    },
+    async typeDefinition(filePath: string, line: number, column: number) {
+      calls.push({ method: "typeDefinition", args: [filePath, line, column] });
+      return typeDefinitionResult(filePath);
+    },
     async references(filePath: string, line: number, column: number) {
       calls.push({ method: "references", args: [filePath, line, column] });
       return referencesResult(filePath);
+    },
+    async workspaceSymbols(query: string) {
+      calls.push({ method: "workspaceSymbols", args: [query] });
+      return workspaceSymbolsResult(join(rootPath, "src", "demo.rs"));
+    },
+    async codeActions(filePath: string, line: number, column: number, options?: { kind?: string }) {
+      calls.push({ method: "codeActions", args: [filePath, line, column, options] });
+      const actions = codeActionsResult(filePath);
+      const kind = options?.kind;
+      return kind ? actions.filter(action => action.kind?.startsWith(kind)) : actions;
     },
     async documentSymbols(filePath: string) {
       calls.push({ method: "documentSymbols", args: [filePath] });
@@ -571,6 +680,10 @@ const createFakeLspManager = (
     async diagnostics(filePath: string) {
       calls.push({ method: "diagnostics", args: [filePath] });
       return diagnosticsResult;
+    },
+    async formatDocument(filePath: string, options?: { tabSize?: number; insertSpaces?: boolean }) {
+      calls.push({ method: "formatDocument", args: [filePath, options] });
+      return formatDocumentResult();
     },
     async prepareRename(filePath: string, line: number, column: number) {
       calls.push({ method: "prepareRename", args: [filePath, line, column] });
@@ -594,6 +707,10 @@ const createFakeLspManager = (
     sessionRequests,
     async getSession(filePath: string, options?: { serverId?: string }) {
       sessionRequests.push({ filePath, options });
+      return workspace;
+    },
+    async getSessionForServer(options?: { serverId?: string }) {
+      sessionRequests.push({ filePath: rootPath, options });
       return workspace;
     },
     async inspectPath(filePath: string, options?: { serverId?: string }) {
@@ -1853,6 +1970,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("LSP config error: no lsp_servers are configured");
+    expect(result.message).toContain("reason: no_configured_servers");
+    expect(result.message).toContain("configured: (none)");
     expect(result.message).toContain("/mcp lsp add");
   });
 
@@ -1899,6 +2018,90 @@ describe("FileMcpService", () => {
     expect(referencesResult.message).toContain("Found 2 LSP reference(s):");
     expect(referencesResult.message).toContain("src/demo.rs:1:4-1:9");
     expect(referencesResult.message).toContain("src/demo.rs:6:17-6:22");
+  });
+
+  test("lsp_implementation and lsp_type_definition delegate to the LSP manager", async () => {
+    const { root, service, lspManager } = await createLspService("rust-analyzer");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      [
+        "trait Greeter {",
+        "  fn greet(&self) -> String;",
+        "}",
+        "",
+        "impl Greeter for Demo {",
+        "  fn greet(&self) -> String {",
+        '    "hi".to_string()',
+        "  }",
+        "}",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const implementationResult = await service.handleToolCall("file", {
+      action: "lsp_implementation",
+      path: "src/demo.rs",
+      line: 2,
+      column: 6,
+      maxResults: 2,
+    });
+    const typeDefinitionResult = await service.handleToolCall("file", {
+      action: "lsp_type_definition",
+      path: "src/demo.rs",
+      line: 5,
+      column: 18,
+      maxResults: 1,
+    });
+
+    expect(implementationResult.ok).toBe(true);
+    expect(implementationResult.message).toContain("[tool result] lsp_implementation src/demo.rs");
+    expect(implementationResult.message).toContain("Found 2 LSP implementation(s):");
+    expect(implementationResult.message).toContain("server: rust-analyzer");
+    expect(implementationResult.message).toContain("src/demo.rs:1:4-1:9");
+    expect(implementationResult.message).toContain("src/demo.rs:5:4-5:8");
+
+    expect(typeDefinitionResult.ok).toBe(true);
+    expect(typeDefinitionResult.message).toContain("[tool result] lsp_type_definition src/demo.rs");
+    expect(typeDefinitionResult.message).toContain("Found 1 LSP type definition(s):");
+    expect(typeDefinitionResult.message).toContain("server: rust-analyzer");
+    expect(typeDefinitionResult.message).toContain("src/demo.rs:1:17-1:21");
+
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "implementation" }),
+        expect.objectContaining({ method: "typeDefinition" }),
+      ])
+    );
+  });
+
+  test("lsp_workspace_symbols uses workspace-scoped LSP search", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn greet() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_workspace_symbols",
+      path: ".",
+      query: "greet",
+      serverId: "rust",
+      maxResults: 2,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] lsp_workspace_symbols .");
+    expect(result.message).toContain("Found 2 LSP workspace symbol(s):");
+    expect(result.message).toContain("server: rust");
+    expect(result.message).toContain("query: greet");
+    expect(result.message).toContain("greet (function) [demo] @ src/demo.rs:1:4-1:9");
+    expect(result.message).toContain("Greeter (class) @ src/demo.rs");
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "workspaceSymbols", args: ["greet"] }),
+      ])
+    );
   });
 
   test("lsp_document_symbols formats a flattened document outline", async () => {
@@ -2008,6 +2211,173 @@ describe("FileMcpService", () => {
       expect.arrayContaining([
         expect.objectContaining({ method: "prepareRename" }),
         expect.objectContaining({ method: "rename" }),
+      ])
+    );
+  });
+
+  test("lsp_rename enters review and applies workspace edits after approval", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    const originalContent = [
+      "fn greet(name: &str) -> String {",
+      '  format!("hello {}", name)',
+      "}",
+      "",
+      "fn main() {",
+      '  let message = greet("Cyrene");',
+      '  println!("{}", message);',
+      "}",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), originalContent, "utf8");
+
+    const pendingResult = await service.handleToolCall("file", {
+      action: "lsp_rename",
+      path: "src/demo.rs",
+      line: 6,
+      column: 17,
+      newName: "welcome",
+      serverId: "rust",
+    });
+
+    expect(pendingResult.ok).toBe(true);
+    expect(pendingResult.pending).toBeDefined();
+    expect(pendingResult.message).toContain("[review required]");
+    expect(pendingResult.message).toContain("action=lsp_rename");
+    expect(pendingResult.message).toContain("[lsp rename preview]");
+    expect(pendingResult.message).toContain("rename_to: welcome");
+
+    const approveResult = await service.approve(pendingResult.pending?.id ?? "");
+    expect(approveResult.ok).toBe(true);
+    expect(approveResult.message).toContain("Applied LSP rename:");
+    expect(approveResult.message).toContain("server: rust");
+    expect(approveResult.message).toContain("rename_to: welcome");
+    expect(await readFile(join(root, "src", "demo.rs"), "utf8")).toBe(
+      [
+        "fn welcome(name: &str) -> String {",
+        '  format!("hello {}", name)',
+        "}",
+        "",
+        "fn main() {",
+        '  let message = welcome("Cyrene");',
+        '  println!("{}", message);',
+        "}",
+      ].join("\n")
+    );
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "prepareRename" }),
+        expect.objectContaining({ method: "rename" }),
+      ])
+    );
+  });
+
+  test("lsp_code_actions lists available actions with metadata", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), "fn greet() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "lsp_code_actions",
+      path: "src/demo.rs",
+      line: 1,
+      column: 4,
+      kind: "refactor",
+      serverId: "rust",
+      maxResults: 5,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] lsp_code_actions src/demo.rs");
+    expect(result.message).toContain("Found 1 LSP code action(s):");
+    expect(result.message).toContain("server: rust");
+    expect(result.message).toContain("kind_filter: refactor");
+    expect(result.message).toContain("Extract to helper [refactor.extract] [preferred] [edit]");
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "codeActions" }),
+      ])
+    );
+  });
+
+  test("lsp_code_actions apply mode enters review and applies edit-based actions", async () => {
+    const { root, service } = await createLspService("rust");
+
+    const originalContent = [
+      "fn greet(name: &str) -> String {",
+      '  format!("hello {}", name)',
+      "}",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), originalContent, "utf8");
+
+    const pendingResult = await service.handleToolCall("file", {
+      action: "lsp_code_actions",
+      path: "src/demo.rs",
+      line: 1,
+      column: 1,
+      title: "Extract to helper",
+      serverId: "rust",
+    });
+
+    expect(pendingResult.ok).toBe(true);
+    expect(pendingResult.pending).toBeDefined();
+    expect(pendingResult.message).toContain("action=lsp_code_actions");
+    expect(pendingResult.message).toContain("[lsp code action preview]");
+    expect(pendingResult.message).toContain("title: Extract to helper");
+
+    const approveResult = await service.approve(pendingResult.pending?.id ?? "");
+    expect(approveResult.ok).toBe(true);
+    expect(approveResult.message).toContain("Applied LSP code action:");
+    expect(approveResult.message).toContain("title: Extract to helper");
+    expect(await readFile(join(root, "src", "demo.rs"), "utf8")).toBe(
+      [
+        "pub fn greet(name: &str) -> String {",
+        '  format!("hello {}", name)',
+        "}",
+      ].join("\n")
+    );
+  });
+
+  test("lsp_format_document enters review and writes formatted content on approval", async () => {
+    const { root, service, lspManager } = await createLspService("rust");
+
+    const originalContent = [
+      "fn greet(name: &str) -> String {",
+      '  format!("hello {}", name)',
+      "}",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), originalContent, "utf8");
+
+    const pendingResult = await service.handleToolCall("file", {
+      action: "lsp_format_document",
+      path: "src/demo.rs",
+      serverId: "rust",
+      tabSize: 4,
+      insertSpaces: true,
+    });
+
+    expect(pendingResult.ok).toBe(true);
+    expect(pendingResult.pending).toBeDefined();
+    expect(pendingResult.message).toContain("action=lsp_format_document");
+    expect(pendingResult.message).toContain("[lsp format preview]");
+
+    const approveResult = await service.approve(pendingResult.pending?.id ?? "");
+    expect(approveResult.ok).toBe(true);
+    expect(approveResult.message).toContain("Applied LSP document format:");
+    expect(approveResult.message).toContain("tab_size: 4");
+    expect(await readFile(join(root, "src", "demo.rs"), "utf8")).toBe(
+      [
+        "fn greet(name: &str) -> String {",
+        '    format!("hello {}", name)',
+        "}",
+      ].join("\n")
+    );
+    expect(lspManager.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "formatDocument" }),
       ])
     );
   });

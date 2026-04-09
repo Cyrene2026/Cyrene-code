@@ -286,12 +286,18 @@ describe("createMcpRuntime", () => {
       },
     });
     expect(addResult?.ok).toBe(true);
+    expect(addResult?.message).toContain("MCP LSP server added");
+    expect(addResult?.message).toContain("filesystem_server: repo");
+    expect(addResult?.message).toContain("lsp_server: python");
+    expect(addResult?.message).toContain("env_keys: PYRIGHT_PYTHON_FORCE_VERSION");
     expect(
       runtime.listLspServers?.("repo").map(entry => entry.id).sort()
     ).toEqual(["python", "rust"]);
 
     const removeRust = await runtime.removeLspServer?.("repo", "rust");
     expect(removeRust?.ok).toBe(true);
+    expect(removeRust?.message).toContain("MCP LSP server removed");
+    expect(removeRust?.message).toContain("remaining: python");
     expect(runtime.listLspServers?.("repo").map(entry => entry.id)).toEqual(["python"]);
 
     const removePython = await runtime.removeLspServer?.("repo", "python");
@@ -335,9 +341,96 @@ describe("createMcpRuntime", () => {
 
     expect(result?.ok).toBe(false);
     expect(result?.status).toBe("startup_error");
+    expect(result?.reason).toBe("command_not_found");
     expect(result?.message).toContain("MCP LSP doctor");
+    expect(result?.message).toContain("requested_lsp: (auto)");
     expect(result?.message).toContain("status: startup_error");
+    expect(result?.message).toContain("reason: command_not_found");
     expect(result?.message).toContain("definitely-not-a-real-lsp-binary");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp classifies unmatched files and prints match hints", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.py"), "print('hi')\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: rust-analyzer",
+        "        file_patterns: [\"**/*.rs\"]",
+        "        root_markers: [\"Cargo.toml\", \".git\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "src/demo.py");
+
+    expect(result?.ok).toBe(false);
+    expect(result?.status).toBe("config_error");
+    expect(result?.reason).toBe("no_matching_server");
+    expect(result?.message).toContain("reason: no_matching_server");
+    expect(result?.message).toContain("match_hints:");
+    expect(result?.message).toContain("workspace . (path must stay inside)");
+    expect(result?.message).toContain("patterns **/*.rs (any glob match)");
+    expect(result?.message).toContain("roots Cargo.toml, .git (nearest marker wins)");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp reports multiple matching servers with disambiguation hints", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.ts"), "export const demo = 1;\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: ts",
+        "        command: typescript-language-server",
+        "        args: [\"--stdio\"]",
+        "        file_patterns: [\"**/*.ts\"]",
+        "      - id: deno",
+        "        command: deno",
+        "        args: [\"lsp\"]",
+        "        file_patterns: [\"src/**/*.ts\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "src/demo.ts");
+
+    expect(result?.ok).toBe(false);
+    expect(result?.status).toBe("config_error");
+    expect(result?.reason).toBe("multiple_matching_servers");
+    expect(result?.message).toContain("reason: multiple_matching_servers");
+    expect(result?.message).toContain("matched: ts, deno");
+    expect(result?.message).toContain("hint: re-run with serverId to disambiguate");
 
     runtime.dispose();
   });

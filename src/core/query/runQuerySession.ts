@@ -579,12 +579,17 @@ const buildToolStatusMessage = (toolName: string, input: unknown) => {
     const symbol =
       pickTrimmedString(record, "symbol") ?? pickTrimmedString(record, "query");
     detail = symbol ? `symbol ${formatQuotedPreview(symbol)}` : undefined;
+  } else if (action === "lsp_workspace_symbols") {
+    const query = pickTrimmedString(record, "query");
+    detail = query ? `query ${formatQuotedPreview(query)}` : undefined;
   } else if (
     action === "ts_hover" ||
     action === "ts_definition" ||
     action === "ts_references" ||
     action === "lsp_hover" ||
     action === "lsp_definition" ||
+    action === "lsp_implementation" ||
+    action === "lsp_type_definition" ||
     action === "lsp_references"
   ) {
     const line = pickFiniteNumber(record, "line");
@@ -593,7 +598,11 @@ const buildToolStatusMessage = (toolName: string, input: unknown) => {
       typeof line === "number" && typeof column === "number"
         ? `at ${line}:${column}`
         : undefined;
-  } else if (action === "ts_prepare_rename" || action === "lsp_prepare_rename") {
+  } else if (
+    action === "ts_prepare_rename" ||
+    action === "lsp_prepare_rename" ||
+    action === "lsp_rename"
+  ) {
     const line = pickFiniteNumber(record, "line");
     const column = pickFiniteNumber(record, "column");
     const newName = pickTrimmedString(record, "newName");
@@ -601,6 +610,29 @@ const buildToolStatusMessage = (toolName: string, input: unknown) => {
       typeof line === "number" && typeof column === "number"
         ? `at ${line}:${column}`
         : undefined]
+      .filter(Boolean)
+      .join(" ");
+  } else if (action === "lsp_code_actions") {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    const title = pickTrimmedString(record, "title");
+    const kind = pickTrimmedString(record, "kind");
+    detail = [
+      title ? `title ${formatQuotedPreview(title)}` : "list",
+      kind ? `kind ${formatQuotedPreview(kind)}` : undefined,
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  } else if (action === "lsp_format_document") {
+    const tabSize = pickFiniteNumber(record, "tabSize");
+    const insertSpaces = pickBoolean(record, "insertSpaces");
+    detail = [
+      typeof tabSize === "number" ? `tabSize ${tabSize}` : undefined,
+      typeof insertSpaces === "boolean" ? `insertSpaces ${insertSpaces}` : undefined,
+    ]
       .filter(Boolean)
       .join(" ");
   } else if (action === "git_show") {
@@ -736,6 +768,8 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
     case "ts_definition":
     case "lsp_hover":
     case "lsp_definition":
+    case "lsp_implementation":
+    case "lsp_type_definition":
       return {
         action,
         path,
@@ -753,6 +787,14 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         maxResults: pickFiniteNumber(record, "maxResults"),
         serverId: pickTrimmedString(record, "serverId"),
       };
+    case "lsp_workspace_symbols":
+      return {
+        action,
+        path: path ?? ".",
+        query: pickTrimmedString(record, "query"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
+      };
     case "ts_diagnostics":
     case "lsp_document_symbols":
     case "lsp_diagnostics":
@@ -764,6 +806,7 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
       };
     case "ts_prepare_rename":
     case "lsp_prepare_rename":
+    case "lsp_rename":
       return {
         action,
         path,
@@ -774,6 +817,26 @@ const getNormalizedLoopInput = (toolName: string, input: unknown): unknown => {
         findInStrings: pickBoolean(record, "findInStrings"),
         maxResults: pickFiniteNumber(record, "maxResults"),
         serverId: pickTrimmedString(record, "serverId"),
+      };
+    case "lsp_code_actions":
+      return {
+        action,
+        path,
+        line: pickFiniteNumber(record, "line"),
+        column: pickFiniteNumber(record, "column"),
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
+        title: pickTrimmedString(record, "title"),
+        kind: pickTrimmedString(record, "kind"),
+      };
+    case "lsp_format_document":
+      return {
+        action,
+        path,
+        maxResults: pickFiniteNumber(record, "maxResults"),
+        serverId: pickTrimmedString(record, "serverId"),
+        tabSize: pickFiniteNumber(record, "tabSize"),
+        insertSpaces: pickBoolean(record, "insertSpaces"),
       };
     case "copy_path":
     case "move_path":
@@ -1227,8 +1290,12 @@ const buildHeuristicNudges = (
     recentResults.includes("[tool result] find_symbol ") ||
     recentResults.includes("[tool result] find_references ") ||
     recentResults.includes("[tool result] lsp_definition ") ||
+    recentResults.includes("[tool result] lsp_implementation ") ||
+    recentResults.includes("[tool result] lsp_type_definition ") ||
     recentResults.includes("[tool result] lsp_references ") ||
+    recentResults.includes("[tool result] lsp_workspace_symbols ") ||
     recentResults.includes("[tool result] lsp_document_symbols ") ||
+    recentResults.includes("[tool result] lsp_code_actions ") ||
     recentResults.includes("[tool result] search_text ") ||
     recentResults.includes("[tool result] search_text_context ") ||
     recentResults.includes("[tool result] stat_path ")

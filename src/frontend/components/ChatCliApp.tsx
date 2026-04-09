@@ -85,6 +85,14 @@ export const ChatCliApp = ({
       },
       getSavedApiKey: async (providerBaseUrl: string) =>
         await runtimeAuthRuntime.getSavedApiKey(providerBaseUrl),
+      syncSelection: async (input: {
+        providerBaseUrl?: string;
+        model?: string;
+      }) => {
+        const nextStatus = await runtimeAuthRuntime.syncSelection(input);
+        setAuthStatus(nextStatus);
+        return nextStatus;
+      },
       saveLogin: async (input: {
         providerBaseUrl: string;
         apiKey: string;

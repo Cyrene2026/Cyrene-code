@@ -400,6 +400,62 @@ describe("createAuthRuntime", () => {
     );
   });
 
+  test("syncSelection keeps auth status and rebuilt transports aligned with provider/model switches", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    await store.save("openai-user-key", "CYRENE_OPENAI_API_KEY");
+    await store.save("anthropic-user-key", "CYRENE_ANTHROPIC_API_KEY");
+    const createHttpTransport = mock((options?: { env?: NodeJS.ProcessEnv }) =>
+      createStubTransport(
+        options?.env?.CYRENE_MODEL ?? "claude-3-7-sonnet-latest",
+        options?.env?.CYRENE_BASE_URL ?? "https://api.anthropic.com"
+      )
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      createHttpTransport: createHttpTransport as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["gpt-4o-mini", "claude-3-7-sonnet-latest"],
+        defaultModel: "gpt-4o-mini",
+        lastUsedModel: "gpt-4o-mini",
+        providerBaseUrl: "https://api.openai.com/v1",
+        providers: ["https://api.openai.com/v1", "https://api.anthropic.com"],
+        providerProfiles: {},
+      })),
+    });
+
+    expect(await runtime.getStatus()).toMatchObject({
+      provider: "https://api.openai.com/v1",
+      model: "gpt-4o-mini",
+      credentialSource: "user_env",
+    });
+
+    const nextStatus = await runtime.syncSelection({
+      providerBaseUrl: "https://api.anthropic.com",
+      model: "claude-3-7-sonnet-latest",
+    });
+
+    expect(nextStatus).toMatchObject({
+      provider: "https://api.anthropic.com",
+      model: "claude-3-7-sonnet-latest",
+      credentialSource: "user_env",
+    });
+
+    await runtime.buildTransport();
+    expect(createHttpTransport).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CYRENE_BASE_URL: "https://api.anthropic.com",
+          CYRENE_MODEL: "claude-3-7-sonnet-latest",
+          CYRENE_ANTHROPIC_API_KEY: "anthropic-user-key",
+        }),
+      })
+    );
+  });
+
   test("buildTransport includes remembered provider-specific keys so provider switching can reuse them", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();

@@ -5,6 +5,7 @@ import type {
   McpToolDescriptor,
   PendingReviewItem,
 } from "../../core/mcp";
+import { formatLspPresetCatalog } from "../../core/mcp";
 import type { SkillDefinition, SkillsRuntime } from "../../core/skills";
 
 export const formatMcpAliases = (aliases?: string[]) =>
@@ -30,7 +31,8 @@ export const formatMcpLspListHeader = (options: {
     `scope: ${options.scopeLabel}`,
     `filesystem_servers: ${options.filesystemServerCount}`,
     `configured_lsp_servers: ${options.configuredLspCount}`,
-    "commands: /mcp lsp add ... | /mcp lsp list [filesystem-server] | /mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]",
+    "commands: /mcp lsp add <filesystem-server> <preset> [lsp-id] | /mcp lsp add ...custom-flags... | /mcp lsp bootstrap <filesystem-server> | /mcp lsp list [filesystem-server] | /mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]",
+    `presets: ${formatLspPresetCatalog()}`,
   ].join("\n");
 
 export const formatMcpLspServerHeader = (

@@ -2,6 +2,7 @@ import type { McpRuntime, McpServerDescriptor, MpcAction } from "../../core/mcp"
 import type { ChatItem } from "../../shared/types/chat";
 import {
   MCP_LSP_ADD_USAGE,
+  MCP_LSP_BOOTSTRAP_USAGE,
   MCP_LSP_DOCTOR_USAGE,
   MCP_LSP_LIST_USAGE,
   MCP_LSP_REMOVE_USAGE,
@@ -334,6 +335,25 @@ export const handleMcpCommand = async ({
         return true;
       }
       const result = await mcpService.addLspServer(targetServer.id, parsed.input);
+      pushMutationResult(pushSystemMessage, result);
+      clearInput();
+      return true;
+    }
+
+    if (parsed.action === "bootstrap") {
+      if (!mcpService.bootstrapLsp) {
+        pushSystemMessage(
+          "MCP LSP bootstrap is unavailable in this build.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        clearInput();
+        return true;
+      }
+      const targetServer = resolveTarget(parsed.filesystemServerId);
+      if (!targetServer) {
+        return true;
+      }
+      const result = await mcpService.bootstrapLsp(targetServer.id);
       pushMutationResult(pushSystemMessage, result);
       clearInput();
       return true;

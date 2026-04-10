@@ -7,6 +7,13 @@ mock.module("ink", () => ({
   Box: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Text: ({ children }: { children?: React.ReactNode }) => <span>{children}</span>,
   useInput: () => {},
+  useStdout: () => ({
+    stdout: {
+      columns: 120,
+      rows: 40,
+    },
+    write: () => {},
+  }),
   useStdin: () => ({
     stdin: {
       on: () => {},
@@ -462,6 +469,25 @@ describe("ChatScreen", () => {
       "Enter send  |  Ctrl+J newline  |  Shift+Enter if terminal supports it"
     );
     expect(output).not.toContain("Conversation");
+  });
+
+  test("composer stays docked at the bottom during both streaming and idle states", () => {
+    const streamingOutput = JSON.stringify(
+      renderScreen({
+        status: "streaming",
+        liveAssistantText: "working through the latest change",
+      })
+    );
+    expect(streamingOutput.indexOf("working  |  model streaming")).toBeGreaterThanOrEqual(0);
+    expect(streamingOutput.indexOf("[tool]")).toBeGreaterThanOrEqual(0);
+    expect(streamingOutput.indexOf("[tool]")).toBeLessThan(
+      streamingOutput.indexOf("working  |  model streaming")
+    );
+
+    const idleOutput = JSON.stringify(renderScreen());
+    expect(idleOutput.indexOf("[tool]")).toBeGreaterThanOrEqual(0);
+    expect(idleOutput.indexOf("ready  |  prompt ready")).toBeGreaterThanOrEqual(0);
+    expect(idleOutput.indexOf("[tool]")).toBeLessThan(idleOutput.indexOf("ready  |  prompt ready"));
   });
 
   test("renders file mutation tool diffs as separate colored rows instead of one collapsed line", () => {
@@ -1056,6 +1082,42 @@ describe("ChatScreen", () => {
     expect(output).not.toContain("terminal  run_command");
     expect(output).not.toContain("Tool result: run_command .");
     expect(output).not.toContain("\"tool\"");
+  });
+
+  test("renders full terminal output lines instead of hiding the tail behind a compact summary", () => {
+    const tree = renderScreen({
+      items: [
+        {
+          role: "system",
+          kind: "tool_status",
+          tone: "info",
+          text: [
+            "Tool result: run_command .",
+            "status: completed",
+            "command: npm",
+            "args: run build",
+            "cwd: .",
+            "exit: 0",
+            "output:",
+            "> vite-react-2048@0.1.0 build",
+            "vite v5.4.0 building for production...",
+            "transforming...",
+            "✓ 42 modules transformed.",
+            "rendering chunks...",
+            "computing gzip size...",
+          ].join("\n"),
+        },
+      ],
+    });
+    const output = JSON.stringify(tree);
+
+    expect(output).toContain("vite-react-2048@0.1.0 build");
+    expect(output).toContain("vite v5.4.0 building for production...");
+    expect(output).toContain("transforming...");
+    expect(output).toContain("✓ 42 modules transformed.");
+    expect(output).toContain("rendering chunks...");
+    expect(output).toContain("computing gzip size...");
+    expect(output).not.toContain("more lines hidden");
   });
 
   test("renders terminal-style transcript for approved shell input", () => {

@@ -99,9 +99,15 @@ export class HttpMcpAdapter implements McpServerAdapter {
     }
 
     const requestId = notification ? undefined : this.nextRequestId++;
+    const normalizedHeaders = this.server.headers
+      ? Object.fromEntries(
+          Object.entries(this.server.headers).map(([key, value]) => [key, value])
+        )
+      : {};
     const response = await fetch(this.server.url, {
       method: "POST",
       headers: {
+        ...normalizedHeaders,
         "content-type": "application/json",
         accept: "application/json",
         ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),

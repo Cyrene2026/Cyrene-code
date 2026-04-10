@@ -49,6 +49,9 @@ const resolveCommandPath = (appRoot: string, command: string) => {
   return command;
 };
 
+const resolveServerCwd = (appRoot: string, cwd?: string) =>
+  cwd ? resolve(appRoot, cwd) : appRoot;
+
 const normalizeToolArray = (value: unknown): RemoteMcpTool[] => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return [];
@@ -211,10 +214,11 @@ export class StdioMcpAdapter implements McpServerAdapter {
       resolveCommandPath(this.context.appRoot, this.server.command),
       this.server.args ?? [],
       {
-        cwd: this.context.appRoot,
+        cwd: resolveServerCwd(this.context.appRoot, this.server.cwd),
         env: {
           ...process.env,
           ...this.context.env,
+          ...this.server.env,
         },
         stdio: "pipe",
       }

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, extname, resolve } from "node:path";
@@ -79,6 +79,7 @@ export type TsServerDiagnosticsResult = {
   syntactic: TsServerDiagnostic[];
   semantic: TsServerDiagnostic[];
   suggestion: TsServerDiagnostic[];
+  warnings?: string[];
 };
 
 export type TsServerRenameInfo =
@@ -151,8 +152,13 @@ export type TsServerClientOptions = {
   nodeExecutable?: string;
   tsserverPath?: string;
   args?: string[];
+  requestTimeoutMs?: number;
+  stderrRingBufferSize?: number;
   spawnProcess?: typeof spawn;
 };
+
+const DEFAULT_TSSERVER_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_TSSERVER_STDERR_RING_SIZE = 40;
 
 const detectScriptKindName = (filePath: string) => {
   const ext = extname(filePath).toLowerCase();
@@ -540,20 +546,66 @@ const getDefaultNodeExecutable = () => {
   return executable.startsWith("node") ? process.execPath : "node";
 };
 
+const getTsServerArgs = (args: string[] | undefined) => {
+  const normalized = [...(args ?? [])];
+  if (!normalized.includes("--useNodeIpc")) {
+    normalized.unshift("--useNodeIpc");
+  }
+  return normalized;
+};
+
 export class TsServerClient implements TsServerClientLike {
-  private process: ChildProcessWithoutNullStreams | null = null;
+  private process: ReturnType<typeof spawn> | null = null;
   private stdoutBuffer = Buffer.alloc(0);
+  private stderrPartialLine = "";
+  private readonly stderrRingBuffer: string[] = [];
   private readonly pendingRequests = new Map<
     number,
     {
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
+      cleanup: () => void;
     }
   >();
   private nextSeq = 1;
   private readonly openedFiles = new Map<string, string>();
 
   constructor(private readonly options: TsServerClientOptions) {}
+
+  getRecentStderr() {
+    return [...this.stderrRingBuffer];
+  }
+
+  private appendStderr(chunk: Buffer | string) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    if (!text) {
+      return;
+    }
+
+    const combined = `${this.stderrPartialLine}${text}`;
+    const lines = combined.split(/\r?\n/);
+    this.stderrPartialLine = lines.pop() ?? "";
+    const limit = Math.max(1, this.options.stderrRingBufferSize ?? DEFAULT_TSSERVER_STDERR_RING_SIZE);
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      this.stderrRingBuffer.push(line);
+      if (this.stderrRingBuffer.length > limit) {
+        this.stderrRingBuffer.splice(0, this.stderrRingBuffer.length - limit);
+      }
+    }
+  }
+
+  private buildRecentStderrSuffix() {
+    const lines = this.getRecentStderr();
+    if (lines.length === 0) {
+      return "";
+    }
+    return ` Recent tsserver stderr:\n${lines.map(line => `- ${line}`).join("\n")}`;
+  }
 
   private resolveTsServerPath() {
     if (this.options.tsserverPath) {
@@ -576,9 +628,26 @@ export class TsServerClient implements TsServerClientLike {
 
   private rejectAllPending(error: Error) {
     for (const pending of this.pendingRequests.values()) {
+      pending.cleanup();
       pending.reject(error);
     }
     this.pendingRequests.clear();
+  }
+
+  private resetProcess(error: Error) {
+    const child = this.process;
+    this.process = null;
+    this.stdoutBuffer = Buffer.alloc(0);
+    this.stderrPartialLine = "";
+    this.openedFiles.clear();
+    this.rejectAllPending(error);
+    if (child) {
+      try {
+        child.kill();
+      } catch {
+        // Best effort cleanup.
+      }
+    }
   }
 
   private handleResponseMessage(message: TsServerResponseMessage) {
@@ -590,6 +659,7 @@ export class TsServerClient implements TsServerClientLike {
       return;
     }
     this.pendingRequests.delete(message.request_seq);
+    pending.cleanup();
     if (!message.success) {
       pending.reject(new Error(message.message ?? `tsserver ${message.command ?? "request"} failed`));
       return;
@@ -644,22 +714,28 @@ export class TsServerClient implements TsServerClientLike {
 
     const child = (this.options.spawnProcess ?? spawn)(
       this.options.nodeExecutable ?? getDefaultNodeExecutable(),
-      [this.resolveTsServerPath(), ...(this.options.args ?? [])],
+      [this.resolveTsServerPath(), ...getTsServerArgs(this.options.args)],
       {
         cwd: this.options.workspaceRoot,
         env: {
           ...process.env,
           ...this.options.env,
         },
-        stdio: "pipe",
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
       }
     );
 
-    child.stdout.on("data", chunk => {
+    child.stdout?.on("data", chunk => {
       this.consumeStdout(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
-    child.stderr.on("data", () => {
-      // tsserver can log on stderr; ignore for now and surface request failures instead.
+    child.stderr?.on("data", chunk => {
+      this.appendStderr(chunk);
+    });
+    child.on("message", message => {
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        return;
+      }
+      this.handleResponseMessage(message as TsServerResponseMessage);
     });
     child.on("error", error => {
       this.process = null;
@@ -684,18 +760,32 @@ export class TsServerClient implements TsServerClientLike {
       throw new Error("tsserver is not running.");
     }
 
-    const payload = JSON.stringify(message);
-    const frame = `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
-    this.process.stdin.write(frame, "utf8");
+    if (typeof this.process.send === "function" && this.process.connected) {
+      this.process.send(message);
+      return;
+    }
+
+    const payload = `${JSON.stringify(message)}\n`;
+    this.process.stdin?.write(payload, "utf8");
   }
 
   private request(command: string, args?: Record<string, unknown>) {
     const seq = this.nextSeq++;
+    const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_TSSERVER_REQUEST_TIMEOUT_MS;
 
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
+      const timer = setTimeout(() => {
+        this.resetProcess(
+          new Error(
+            `tsserver request '${command}' timed out after ${timeoutMs}ms.${this.buildRecentStderrSuffix()}`
+          )
+        );
+      }, timeoutMs);
+
       this.pendingRequests.set(seq, {
         resolve: resolveRequest,
         reject: rejectRequest,
+        cleanup: () => clearTimeout(timer),
       });
 
       void this.ensureProcess()
@@ -708,6 +798,8 @@ export class TsServerClient implements TsServerClientLike {
           });
         })
         .catch(error => {
+          const pending = this.pendingRequests.get(seq);
+          pending?.cleanup();
           this.pendingRequests.delete(seq);
           rejectRequest(error instanceof Error ? error : new Error(String(error)));
         });
@@ -813,26 +905,40 @@ export class TsServerClient implements TsServerClientLike {
   }
 
   async diagnostics(filePath: string) {
-    await this.syncFile(filePath, false);
-    const [syntactic, semantic, suggestion] = await Promise.all([
-      this.request("syntacticDiagnosticsSync", {
-        file: filePath,
-        includeLinePosition: true,
-      }),
-      this.request("semanticDiagnosticsSync", {
-        file: filePath,
-        includeLinePosition: true,
-      }),
-      this.request("suggestionDiagnosticsSync", {
-        file: filePath,
-        includeLinePosition: true,
-      }),
-    ]);
+    const warnings: string[] = [];
+    const runDiagnosticsPhase = async (
+      phase: "syntactic" | "semantic" | "suggestion",
+      command:
+        | "syntacticDiagnosticsSync"
+        | "semanticDiagnosticsSync"
+        | "suggestionDiagnosticsSync"
+    ) => {
+      try {
+        await this.syncFile(filePath, false);
+        const result = await this.request(command, {
+          file: filePath,
+          includeLinePosition: true,
+        });
+        return normalizeDiagnostics(result, filePath);
+      } catch (error) {
+        warnings.push(
+          `${phase} diagnostics unavailable: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        return [];
+      }
+    };
+
+    const syntactic = await runDiagnosticsPhase("syntactic", "syntacticDiagnosticsSync");
+    const semantic = await runDiagnosticsPhase("semantic", "semanticDiagnosticsSync");
+    const suggestion = await runDiagnosticsPhase("suggestion", "suggestionDiagnosticsSync");
 
     return {
-      syntactic: normalizeDiagnostics(syntactic, filePath),
-      semantic: normalizeDiagnostics(semantic, filePath),
-      suggestion: normalizeDiagnostics(suggestion, filePath),
+      syntactic,
+      semantic,
+      suggestion,
+      ...(warnings.length > 0 ? { warnings } : {}),
     } satisfies TsServerDiagnosticsResult;
   }
 

@@ -38,11 +38,14 @@ export type McpConfiguredServer = {
   enabled: boolean;
   aliases: string[];
   workspaceRoot?: string;
+  cwd?: string;
   maxReadBytes?: number;
   requireReview?: MpcAction[];
   command?: string;
   args?: string[];
   url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   lspServers?: LspServerConfig[];
   tools: McpConfiguredTool[];
 };
@@ -314,6 +317,7 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     enabled: normalizeBoolean(value.enabled, true),
     aliases,
     workspaceRoot: normalizeString(value.workspace_root ?? value.workspaceRoot),
+    cwd: normalizeString(value.cwd),
     maxReadBytes:
       typeof value.max_read_bytes === "number"
         ? Math.max(1, Math.floor(value.max_read_bytes))
@@ -324,6 +328,10 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     command: normalizeString(value.command),
     args: normalizeStringArray(value.args),
     url: normalizeString(value.url),
+    ...(normalizeStringRecord(value.env) ? { env: normalizeStringRecord(value.env) } : {}),
+    ...(normalizeStringRecord(value.headers)
+      ? { headers: normalizeStringRecord(value.headers) }
+      : {}),
     ...(lspServers !== undefined ? { lspServers } : {}),
     tools,
   };
@@ -380,6 +388,7 @@ const mergeServer = (
   enabled: patch.enabled ?? base?.enabled ?? true,
   aliases: Array.from(new Set([...(base?.aliases ?? []), ...patch.aliases])),
   workspaceRoot: patch.workspaceRoot ?? base?.workspaceRoot,
+  cwd: patch.cwd ?? base?.cwd,
   maxReadBytes: patch.maxReadBytes ?? base?.maxReadBytes,
   requireReview:
     patch.requireReview && patch.requireReview.length > 0
@@ -393,6 +402,9 @@ const mergeServer = (
       ? [...patch.args]
       : [...(base?.args ?? [])],
   url: patch.url ?? base?.url,
+  env: patch.env ? { ...patch.env } : base?.env ? { ...base.env } : undefined,
+  headers:
+    patch.headers ? { ...patch.headers } : base?.headers ? { ...base.headers } : undefined,
   ...(patch.lspServers !== undefined
     ? {
         lspServers: patch.lspServers.map(server => ({
@@ -547,6 +559,7 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
     : {}),
   ...(server.aliases.length > 0 ? { aliases: [...server.aliases] } : {}),
   ...(server.workspaceRoot ? { workspace_root: server.workspaceRoot } : {}),
+  ...(server.cwd ? { cwd: server.cwd } : {}),
   ...(typeof server.maxReadBytes === "number"
     ? { max_read_bytes: server.maxReadBytes }
     : {}),
@@ -556,6 +569,10 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   ...(server.command ? { command: server.command } : {}),
   ...(server.args && server.args.length > 0 ? { args: [...server.args] } : {}),
   ...(server.url ? { url: server.url } : {}),
+  ...(server.env && Object.keys(server.env).length > 0 ? { env: { ...server.env } } : {}),
+  ...(server.headers && Object.keys(server.headers).length > 0
+    ? { headers: { ...server.headers } }
+    : {}),
   ...(server.lspServers !== undefined
     ? { lsp_servers: server.lspServers.map(entry => serializeConfiguredLspServer(entry)) }
     : {}),

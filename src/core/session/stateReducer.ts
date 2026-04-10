@@ -214,7 +214,7 @@ const STABLE_FACT_SIGNAL =
   /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态)/iu;
 
 const STRICT_FACT_PREDICATE_SIGNAL =
-  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证)/iu;
+  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|does not exist|doesn't exist|not present|absent|missing from)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|不存在|未找到|项目中没有|仓库中没有)/iu;
 
 const COMPLETED_SECTION_SIGNAL =
   /\b(?:done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved|answered|added|removed|renamed|stored|persisted|recorded|marked|recovered|handled|captured|merged|rebuilt|synced)\b|(?:完成|已写|已创建|已更新|已实现|已修复|已批准|已解决|已回答|已添加|已删除|已重命名|已存储|已记录|已标记|已恢复|已处理|已合并|已重建|已同步|已确认|已[^，,。；;\s]{0,6}(?:实现|完成|创建|更新|确认|修复)|(?:创建|完成|实现|配置|确认|更新|修复|回答|编写)了|标记为)/iu;
@@ -279,6 +279,9 @@ const ENDPOINT_LABEL_SIGNAL =
 
 const ENTRYPOINT_LABEL_SIGNAL =
   /^(?:(?:启动)?入口(?:文件)?|主入口)\s*[：:]\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)$/u;
+
+const PATH_ABSENCE_FACT_SIGNAL =
+  /^`?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`?\s*(?:[：:]\s*)?(?:不存在|未找到|does not exist|doesn't exist|is missing|missing|not found|is not present)$/iu;
 
 const trimLeadingSeparators = (value: string) =>
   value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
@@ -426,6 +429,11 @@ const isConstraintCandidate = (line: string) =>
     (CONSTRAINT_MODAL_SIGNAL.test(line) && !isExecutableTaskLine(line)));
 
 const isSafeFactFragment = (line: string) => {
+  const pathAbsenceMatch = line.match(PATH_ABSENCE_FACT_SIGNAL);
+  if (pathAbsenceMatch?.[1]) {
+    return `项目中不存在 \`${pathAbsenceMatch[1]}\``;
+  }
+
   const endpointMatch = line.match(ENDPOINT_LABEL_SIGNAL);
   if (endpointMatch) {
     const [, method, route, description] = endpointMatch;
@@ -1139,6 +1147,7 @@ export const buildStateReducerPrompt = ({
     "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
     "Hard rules: never copy the user's raw request into CONFIRMED FACTS. CONFIRMED FACTS only stores stable, durable facts.",
     "Hard rules: CONFIRMED FACTS must be complete factual statements. Do not emit bare identifiers, headings, search metadata, or incomplete conditional fragments.",
+    "Hard rules: CONFIRMED FACTS may include confirmed negative facts such as missing files, absent entrypoints, or disproven default project structure guesses when they reduce future hallucinated paths.",
     "Hard rules: OBJECTIVE must be one executable task sentence, not narration or a bare topic fragment.",
     "Hard rules: CONSTRAINTS stores only actual requirements/prohibitions. Drop explanatory preambles and keep the concrete rule clause.",
     "Hard rules: RECENT FAILURES only stores real failures, conflicts, or blockers. Explanations about error handling do not belong there.",

@@ -56,6 +56,7 @@ describe("createMcpRuntime", () => {
   test("loads configured http server, discovers tools and calls remote tool", async () => {
     const { root, cyreneHome } = await createWorkspace();
     const port = await getAvailablePort();
+    const seenHeaders: string[] = [];
     const server = Bun.serve({
       port,
       fetch: async request => {
@@ -76,6 +77,7 @@ describe("createMcpRuntime", () => {
           "content-type": "application/json",
           "mcp-session-id": "session-1",
         };
+        seenHeaders.push(request.headers.get("authorization") ?? "");
 
         if (payload.method === "notifications/initialized") {
           return new Response(null, {
@@ -158,6 +160,8 @@ describe("createMcpRuntime", () => {
         "  - id: webdocs",
         "    transport: http",
         `    url: "http://127.0.0.1:${port}/mcp"`,
+        "    headers:",
+        '      Authorization: "Bearer runtime-token"',
       ].join("\n"),
       "utf8"
     );
@@ -183,6 +187,7 @@ describe("createMcpRuntime", () => {
 
     expect(result.ok).toBe(true);
     expect(result.message).toContain("http docs: routing");
+    expect(seenHeaders.every(value => value === "Bearer runtime-token")).toBe(true);
 
     runtime.dispose();
   });
@@ -200,9 +205,27 @@ describe("createMcpRuntime", () => {
       id: "docs",
       transport: "http",
       url: "http://127.0.0.1:9100/mcp",
+      headers: {
+        Authorization: "Bearer docs-token",
+      },
     });
     expect(addResult?.ok).toBe(true);
     expect(runtime.listServers().some(server => server.id === "docs")).toBe(true);
+    let configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(configText).toContain('Authorization: "Bearer docs-token"');
+
+    const addStdioResult = await runtime.addServer?.({
+      id: "time",
+      transport: "stdio",
+      enabled: false,
+      command: "node",
+      args: ["scripts/time-mcp-server.mjs"],
+      cwd: "./scripts",
+      env: {
+        TIMEZONE: "Asia/Shanghai",
+      },
+    });
+    expect(addStdioResult?.ok).toBe(true);
 
     const disableResult = await runtime.setServerEnabled?.("docs", false);
     expect(disableResult?.ok).toBe(true);
@@ -216,9 +239,11 @@ describe("createMcpRuntime", () => {
     expect(removeResult?.ok).toBe(true);
     expect(runtime.listServers().some(server => server.id === "docs")).toBe(false);
 
-    const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
     expect(configText).toContain("remove_servers");
     expect(configText).toContain("- docs");
+    expect(configText).toContain("cwd: ./scripts");
+    expect(configText).toContain("TIMEZONE: Asia/Shanghai");
 
     runtime.dispose();
   });
@@ -307,6 +332,44 @@ describe("createMcpRuntime", () => {
     const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
     expect(configText).toContain("lsp_servers:");
     expect(configText).toContain("[]");
+
+    runtime.dispose();
+  });
+
+  test("bootstrapLsp adds detected mainstream-language presets for the workspace", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "package.json"), '{ "name": "demo" }\n', "utf8");
+    await writeFile(join(root, "tsconfig.json"), '{ "compilerOptions": {} }\n', "utf8");
+    await writeFile(join(root, "src", "main.tsx"), "export const App = () => null;\n", "utf8");
+    await writeFile(join(root, "scripts.sh"), "echo hi\n", "utf8");
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.bootstrapLsp?.("filesystem");
+    expect(result?.ok).toBe(true);
+    expect(result?.message).toContain("MCP LSP bootstrap");
+    expect(result?.message).toContain("detected: typescript, json, bash");
+    expect(result?.message).toContain("added: typescript, json, bash");
+    expect(result?.message).toContain(
+      "- typescript: npm install -g typescript-language-server typescript"
+    );
+    expect(result?.message).toContain(
+      "- json: npm install -g vscode-langservers-extracted"
+    );
+    expect(result?.message).toContain(
+      "- bash: npm install -g bash-language-server"
+    );
+    expect(runtime.listLspServers?.("filesystem").map(entry => entry.id)).toEqual([
+      "bash",
+      "json",
+      "typescript",
+    ]);
 
     runtime.dispose();
   });

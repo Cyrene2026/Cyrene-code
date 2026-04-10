@@ -77,11 +77,14 @@ export type McpRuntimeServerInput = {
   enabled?: boolean;
   aliases?: string[];
   workspaceRoot?: string;
+  cwd?: string;
   maxReadBytes?: number;
   requireReview?: MpcAction[];
   command?: string;
   args?: string[];
   url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   tools?: McpRuntimeToolInput[];
 };
 
@@ -176,6 +179,7 @@ export interface McpRuntime {
     filesystemServerId: string,
     input: McpRuntimeLspServerInput
   ): Promise<McpRuntimeMutationResult>;
+  bootstrapLsp?(filesystemServerId: string): Promise<McpRuntimeMutationResult>;
   removeLspServer?(
     filesystemServerId: string,
     lspServerId: string

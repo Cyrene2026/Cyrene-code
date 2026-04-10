@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text } from "ink";
+import { Box, Text, useStdout } from "ink";
 import stringWidth from "string-width";
 import {
   getComposerHint,
@@ -336,7 +336,6 @@ const MAX_RENDER_TEXT_CHARS = 24000;
 const MAX_STREAMING_RENDER_TEXT_LINES = 48;
 const MAX_STREAMING_RENDER_TEXT_CHARS = 4000;
 const MAX_RENDERED_TERMINAL_OUTPUT_LINES = 220;
-const MAX_COMPACT_TERMINAL_OUTPUT_LINES = 2;
 const CODE_KEYWORDS = new Set([
   "const",
   "let",
@@ -2002,10 +2001,7 @@ const renderTerminalTranscript = (
   const activityColor = activityLabel === "shell" ? "yellow" : "cyan";
   const summary = getTerminalTranscriptSummary(transcript);
   const meaningfulOutputLines = getTerminalMeaningfulOutputLines(transcript.outputLines);
-  const visibleOutputLines = meaningfulOutputLines.slice(
-    0,
-    Math.min(MAX_RENDERED_TERMINAL_OUTPUT_LINES, MAX_COMPACT_TERMINAL_OUTPUT_LINES)
-  );
+  const visibleOutputLines = meaningfulOutputLines.slice(0, MAX_RENDERED_TERMINAL_OUTPUT_LINES);
   const hiddenOutputLines = Math.max(
     0,
     meaningfulOutputLines.length - visibleOutputLines.length
@@ -2065,7 +2061,7 @@ const renderTerminalTranscript = (
             })()
           )}
           {hiddenOutputLines > 0 ? (
-            <Text dimColor>{`[+${hiddenOutputLines} more lines hidden]`}</Text>
+            <Text dimColor>{`[render clipped] omitted ${hiddenOutputLines} lines to keep terminal stable`}</Text>
           ) : null}
         </Box>
       ) : null}
@@ -4339,6 +4335,7 @@ export const ChatScreen = ({
   onInputChange,
   onSubmit,
 }: ChatScreenProps) => {
+  const { stdout } = useStdout();
   const [spinnerIndex, setSpinnerIndex] = React.useState(0);
   const [shellClock, setShellClock] = React.useState(() => Date.now());
   const approvalModeActive = approvalPanel.active;
@@ -4529,22 +4526,22 @@ export const ChatScreen = ({
       status,
     ]
   );
-
-  return (
-    <Box flexDirection="column">
-      <Box marginBottom={SECTION_GAP} flexDirection="column">
-        {showStartupView
-          ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
-          : null}
-        {showTranscriptWindowNotice ? (
-          <Text dimColor>
-            {`[render window] showing latest ${transcriptWindow.items.length} of ${renderedTranscriptItems.length} messages`}
-          </Text>
-        ) : null}
-        {transcriptNodes}
-        {liveAssistantNode}
-      </Box>
-
+  const transcriptSection = (
+    <Box marginBottom={SECTION_GAP} flexDirection="column">
+      {showStartupView
+        ? renderStartupView(appRoot, currentModel, currentProvider, activeSessionId, authStatus)
+        : null}
+      {showTranscriptWindowNotice ? (
+        <Text dimColor>
+          {`[render window] showing latest ${transcriptWindow.items.length} of ${renderedTranscriptItems.length} messages`}
+        </Text>
+      ) : null}
+      {transcriptNodes}
+      {liveAssistantNode}
+    </Box>
+  );
+  const supplementalPanels = (
+    <>
       {authPanel.active ? renderAuthWizardPanel(authPanel, authStatus) : null}
 
       {sessionsPanel.active &&
@@ -4672,9 +4669,19 @@ export const ChatScreen = ({
             appRoot
           )
         : null}
+    </>
+  );
+  const terminalRows =
+    typeof stdout?.rows === "number" && stdout.rows > 0 ? stdout.rows : undefined;
 
-      {composerNode}
+  return (
+    <Box flexDirection="column" height={terminalRows}>
+      <Box flexDirection="column" flexGrow={1}>
+        {transcriptSection}
+        {supplementalPanels}
+      </Box>
       {statusLineNode}
+      {composerNode}
     </Box>
   );
 };

@@ -70,6 +70,9 @@ describe("buildPromptWithContext", () => {
       "Hard rules: CONFIRMED FACTS must be complete factual statements."
     );
     expect(prompt).toContain(
+      "Hard rules: CONFIRMED FACTS may include confirmed negative facts such as missing files"
+    );
+    expect(prompt).toContain(
       "Hard rules: COMPLETED and REMAINING must stay mutually exclusive."
     );
     expect(prompt.indexOf("Working state (durable reducer):")).toBeLessThan(
@@ -81,7 +84,13 @@ describe("buildPromptWithContext", () => {
     const prompt = buildPromptWithContext("continue", "system", "project", {
       pins: [],
       relevantMemories: [],
-      recent: [],
+      recent: [
+        {
+          role: "assistant",
+          text: "latest unresolved branch is docs polish",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      ],
       durableSummary: "",
       pendingDigest: "",
       summaryFallback: [
@@ -103,6 +112,9 @@ describe("buildPromptWithContext", () => {
 
     expect(prompt).toContain("Working state (durable reducer):\n(missing)");
     expect(prompt).toContain("Pending turn digest (last completed turn not yet merged):\n(none)");
+    expect(prompt).toContain(
+      "The current user query is low-information. Continue from the most recent unresolved context first"
+    );
     expect(prompt).toContain("Local fallback state estimate (non-durable recovery aid):");
     expect(prompt).toContain("OBJECTIVE:\n- continue oauth work");
     expect(prompt).toContain("Interrupted prior turn snapshot:");
@@ -111,6 +123,50 @@ describe("buildPromptWithContext", () => {
     expect(prompt).toContain("- status: interrupted before reducer finalized");
     expect(prompt).toContain(
       "Current reducer mode: full_rebuild_and_digest. Rebuild the durable summary from prior evidence before the current user turn, then produce nextPendingDigest for the current turn."
+    );
+  });
+
+  test("low-information continuation queries prioritize pending digest and recent context ahead of durable summary", () => {
+    const prompt = buildPromptWithContext("继续", "system", "project", {
+      pins: [],
+      relevantMemories: [],
+      recent: [
+        {
+          role: "assistant",
+          text: "latest active thread is the LSP rename flow, not the earlier billing cleanup",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+      durableSummary: [
+        "OBJECTIVE:",
+        "- finish billing cleanup",
+        "",
+        "REMAINING:",
+        "- verify usage totals",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- continue the LSP rename flow",
+        "",
+        "REMAINING:",
+        "- verify rename preview",
+      ].join("\n"),
+      summaryFallback: "",
+      reducerMode: "merge_and_digest",
+      summaryRecoveryNeeded: false,
+      interruptedTurn: null,
+    });
+
+    expect(prompt).toContain(
+      "The current user query is low-information. Continue from the most recent unresolved context first"
+    );
+    expect(prompt).toContain("OBJECTIVE:\n- continue the LSP rename flow");
+    expect(prompt).toContain("latest active thread is the LSP rename flow");
+    expect(prompt.indexOf("Pending turn digest (last completed turn not yet merged):")).toBeLessThan(
+      prompt.indexOf("Working state (durable reducer):")
+    );
+    expect(prompt.indexOf("Short transcript tail (immediate recency only):")).toBeLessThan(
+      prompt.indexOf("Working state (durable reducer):")
     );
   });
 });

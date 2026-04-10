@@ -49,6 +49,49 @@ describe("chatMcpCommandParsers", () => {
     });
   });
 
+  test("parses /mcp lsp add preset shorthand for mainstream languages", () => {
+    expect(parseMcpLspCommand("/mcp lsp add repo typescript")).toEqual({
+      ok: true,
+      action: "add",
+      filesystemServerId: "repo",
+      input: {
+        id: "typescript",
+        command: "typescript-language-server",
+        args: ["--stdio"],
+        filePatterns: [
+          "**/*.ts",
+          "**/*.tsx",
+          "**/*.js",
+          "**/*.jsx",
+          "**/*.mts",
+          "**/*.cts",
+          "**/*.mjs",
+          "**/*.cjs",
+        ],
+        rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json", ".git"],
+      },
+    });
+
+    expect(parseMcpLspCommand("/mcp lsp add repo python pyright")).toEqual({
+      ok: true,
+      action: "add",
+      filesystemServerId: "repo",
+      input: {
+        id: "pyright",
+        command: "pyright-langserver",
+        args: ["--stdio"],
+        filePatterns: ["**/*.py", "**/*.pyi"],
+        rootMarkers: [
+          "pyproject.toml",
+          "setup.py",
+          "setup.cfg",
+          "requirements.txt",
+          ".git",
+        ],
+      },
+    });
+  });
+
   test("validates /mcp lsp doctor and bad env input", () => {
     expect(
       parseMcpLspCommand("/mcp lsp doctor repo src/index.ts --lsp tsserver")
@@ -60,6 +103,12 @@ describe("chatMcpCommandParsers", () => {
       lspServerId: "tsserver",
     });
 
+    expect(parseMcpLspCommand("/mcp lsp bootstrap repo")).toEqual({
+      ok: true,
+      action: "bootstrap",
+      filesystemServerId: "repo",
+    });
+
     expect(
       parseMcpLspCommand(
         "/mcp lsp add repo ts --command tsserver --pattern '**/*.ts' --env BAD"
@@ -67,7 +116,12 @@ describe("chatMcpCommandParsers", () => {
     ).toEqual({
       ok: false,
       message:
-        "Usage: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...\ninvalid --env: expected KEY=VALUE",
+        [
+          "Usage: /mcp lsp add <filesystem-server> <preset> [lsp-id]",
+          "   or: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...",
+          "presets: typescript (ts, tsx, javascript, js), python (py), rust (rs), go (golang), cpp (c, cxx, cc, c++), java (jdt), csharp (cs, c#), php, ruby (rb), lua, html (htm), css (scss, less), json (jsonc), yaml (yml), bash (sh, shell, zsh)",
+          "invalid --env: expected KEY=VALUE",
+        ].join("\n"),
     });
   });
 });

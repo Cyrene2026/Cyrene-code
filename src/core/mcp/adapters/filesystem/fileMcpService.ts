@@ -138,6 +138,7 @@ type FileMcpServiceOptions = {
   ptyFactory?: PtyFactory;
   shellSettleMs?: number;
   tsServerClient?: TsServerClientLike;
+  tsToolTimeoutMs?: number;
   lspManager?: LspManagerLike;
 };
 
@@ -370,6 +371,7 @@ const SHELL_SESSION_DIRECT_LITERAL_COMMANDS = new Set([
   "where",
 ]);
 const COMMAND_TIMEOUT_MS = 20_000;
+const INSTALL_COMMAND_TIMEOUT_MS = 180_000;
 const MAX_COMMAND_OUTPUT_CHARS = 24_000;
 const DEFAULT_SEARCH_RESULTS = 50;
 const MAX_SEARCH_RESULTS = 200;
@@ -416,6 +418,64 @@ const MAX_MUTATION_DIFF_MATRIX_CELLS = 40_000;
 
 const clip = (text: string, max = 320) =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
+
+const INSTALL_SUBCOMMANDS = new Set([
+  "install",
+  "add",
+  "i",
+  "sync",
+]);
+
+const normalizeToken = (value: string) => value.trim().toLowerCase();
+
+const isPackageInstallInvocation = (command: string, args: string[] = []) => {
+  const normalizedCommand = normalizeToken(command);
+  const normalizedArgs = args.map(normalizeToken).filter(Boolean);
+  const firstArg = normalizedArgs[0] ?? "";
+
+  if (["npm", "pnpm", "yarn", "bun"].includes(normalizedCommand)) {
+    return INSTALL_SUBCOMMANDS.has(firstArg);
+  }
+
+  if (["pip", "pip3", "uv"].includes(normalizedCommand)) {
+    return firstArg === "install" || (normalizedCommand === "uv" && firstArg === "sync");
+  }
+
+  if (["cargo", "go", "gem"].includes(normalizedCommand)) {
+    return firstArg === "install";
+  }
+
+  return false;
+};
+
+const extractShellCommandTokens = (command: string) =>
+  command
+    .trim()
+    .split(/\s+/)
+    .map(token => token.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+
+export const getCommandTimeoutMs = (
+  request: Pick<CommandToolRequest | ShellToolRequest, "action" | "command"> & {
+    args?: string[];
+  }
+) => {
+  if (request.action === "run_command") {
+    return isPackageInstallInvocation(request.command, request.args ?? [])
+      ? INSTALL_COMMAND_TIMEOUT_MS
+      : COMMAND_TIMEOUT_MS;
+  }
+
+  const tokens = extractShellCommandTokens(request.command);
+  if (tokens.length === 0) {
+    return COMMAND_TIMEOUT_MS;
+  }
+
+  const [command = "", ...args] = tokens;
+  return isPackageInstallInvocation(command, args)
+    ? INSTALL_COMMAND_TIMEOUT_MS
+    : COMMAND_TIMEOUT_MS;
+};
 
 const countTextLines = (text: string) => {
   if (text.length === 0) {
@@ -2660,6 +2720,7 @@ export class FileMcpService {
     if (!this.tsServerClient) {
       this.tsServerClient = new TsServerClient({
         workspaceRoot: this.rules.workspaceRoot,
+        requestTimeoutMs: this.options.tsToolTimeoutMs,
       });
     }
     return this.tsServerClient;
@@ -5073,6 +5134,8 @@ export class FileMcpService {
       }
     }
 
+    const timeoutMs = getCommandTimeoutMs(request);
+
     return await new Promise<string>(resolvePromise => {
       let child: ReturnType<typeof spawn>;
       try {
@@ -5107,12 +5170,12 @@ export class FileMcpService {
           this.formatExecutionResult(request, {
             status: "timed_out",
             exitCode: null,
-            stderr: `Command timed out after ${COMMAND_TIMEOUT_MS}ms.`,
+            stderr: `Command timed out after ${timeoutMs}ms.`,
             stdout,
             truncated: outputTruncated,
           })
         );
-      }, COMMAND_TIMEOUT_MS);
+      }, timeoutMs);
 
       const appendChunk = (target: "stdout" | "stderr", chunk: Buffer | string) => {
         const text = chunk.toString();
@@ -5194,6 +5257,8 @@ export class FileMcpService {
         ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", request.command]
         : ["-lc", request.command];
 
+    const timeoutMs = getCommandTimeoutMs(request);
+
     return await new Promise<string>(resolvePromise => {
       let child: ReturnType<typeof spawn>;
       try {
@@ -5228,12 +5293,12 @@ export class FileMcpService {
           this.formatExecutionResult(request, {
             status: "timed_out",
             exitCode: null,
-            stderr: `Command timed out after ${COMMAND_TIMEOUT_MS}ms.`,
+            stderr: `Command timed out after ${timeoutMs}ms.`,
             stdout,
             truncated: outputTruncated,
           }, audit.shell)
         );
-      }, COMMAND_TIMEOUT_MS);
+      }, timeoutMs);
 
       const appendChunk = (target: "stdout" | "stderr", chunk: Buffer | string) => {
         const text = chunk.toString();
@@ -6311,11 +6376,19 @@ export class FileMcpService {
     ];
     const limitedEntries = entries.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
     if (limitedEntries.length === 0) {
-      return `(no TypeScript diagnostics for: ${request.path})`;
+      return [
+        `(no TypeScript diagnostics for: ${request.path})`,
+        ...((result.warnings ?? []).length > 0
+          ? ["notes:", ...(result.warnings ?? []).map(warning => `- ${warning}`)]
+          : []),
+      ].join("\n");
     }
 
     return [
       `Found ${limitedEntries.length} TypeScript diagnostic(s):`,
+      ...((result.warnings ?? []).length > 0
+        ? ["notes:", ...(result.warnings ?? []).map(warning => `- ${warning}`)]
+        : []),
       ...limitedEntries,
     ].join("\n");
   }

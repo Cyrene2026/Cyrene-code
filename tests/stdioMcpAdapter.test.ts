@@ -168,4 +168,56 @@ describe("StdioMcpAdapter", () => {
 
     adapter.dispose();
   });
+
+  test("passes server cwd and env to spawned stdio process", async () => {
+    const fakeProcess = createFakeSpawnProcess();
+    const capture: {
+      current:
+        | {
+            cwd?: string;
+            env?: NodeJS.ProcessEnv;
+          }
+        | null;
+    } = { current: null };
+    const adapter = new StdioMcpAdapter(
+      {
+        id: "docs",
+        transport: "stdio",
+        label: "Docs",
+        enabled: true,
+        aliases: ["docs"],
+        command: "node",
+        args: ["fake-server.mjs"],
+        cwd: "./tools/docs",
+        env: {
+          DOCS_API_KEY: "demo-key",
+        },
+        tools: [],
+      } as any,
+      {
+        appRoot: "/workspace/project",
+        spawnProcess: ((_command: string, _args: string[], options?: {
+          cwd?: string;
+          env?: NodeJS.ProcessEnv;
+        }) => {
+          capture.current = options ?? null;
+          return fakeProcess.child as any;
+        }) as any,
+      }
+    );
+
+    await adapter.initialize();
+
+    expect(capture.current).not.toBeNull();
+    if (!capture.current) {
+      throw new Error("spawn options were not captured");
+    }
+    const spawnOptions = capture.current;
+    expect(spawnOptions.cwd).toBe("/workspace/project/tools/docs");
+    expect((spawnOptions.env as Record<string, string> | undefined)?.DOCS_API_KEY).toBe(
+      "demo-key"
+    );
+
+    adapter.dispose();
+  });
 });

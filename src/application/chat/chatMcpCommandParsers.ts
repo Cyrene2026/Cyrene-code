@@ -2,6 +2,11 @@ import type {
   McpRuntimeLspServerInput,
   McpRuntimeServerInput,
 } from "../../core/mcp";
+import {
+  createLspInputFromPreset,
+  formatLspPresetCatalog,
+  resolveLspPreset,
+} from "../../core/mcp";
 
 const tokenizeInlineCommand = (raw: string) =>
   [...raw.matchAll(/"([^"]*)"|'([^']*)'|[^\s]+/g)].map(
@@ -113,17 +118,28 @@ export type ParsedMcpLspCommand =
       lspServerId?: string;
     }
   | {
+      ok: true;
+      action: "bootstrap";
+      filesystemServerId: string;
+    }
+  | {
       ok: false;
       message: string;
     };
 
 export const MCP_LSP_LIST_USAGE = "Usage: /mcp lsp list [filesystem-server]";
 export const MCP_LSP_ADD_USAGE =
-  "Usage: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...";
+  [
+    "Usage: /mcp lsp add <filesystem-server> <preset> [lsp-id]",
+    "   or: /mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...",
+    `presets: ${formatLspPresetCatalog()}`,
+  ].join("\n");
 export const MCP_LSP_REMOVE_USAGE =
   "Usage: /mcp lsp remove <filesystem-server> <lsp-id>";
 export const MCP_LSP_DOCTOR_USAGE =
   "Usage: /mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]";
+export const MCP_LSP_BOOTSTRAP_USAGE =
+  "Usage: /mcp lsp bootstrap <filesystem-server>";
 
 export const parseMcpLspCommand = (query: string): ParsedMcpLspCommand => {
   const raw = query.slice("/mcp lsp ".length).trim();
@@ -183,11 +199,37 @@ export const parseMcpLspCommand = (query: string): ParsedMcpLspCommand => {
     };
   }
 
+  if (action === "bootstrap") {
+    const filesystemServerId = tokens[1]?.trim();
+    if (!filesystemServerId || tokens.length !== 2) {
+      return { ok: false, message: MCP_LSP_BOOTSTRAP_USAGE };
+    }
+    return {
+      ok: true,
+      action: "bootstrap",
+      filesystemServerId,
+    };
+  }
+
   if (action === "add") {
     const filesystemServerId = tokens[1]?.trim();
     const lspServerId = tokens[2]?.trim();
     if (!filesystemServerId || !lspServerId) {
       return { ok: false, message: MCP_LSP_ADD_USAGE };
+    }
+
+    const firstOptionIndex = tokens.findIndex((token, index) => index >= 3 && token.startsWith("--"));
+    if (firstOptionIndex === -1) {
+      const preset = resolveLspPreset(lspServerId);
+      if (!preset || tokens.length > 4) {
+        return { ok: false, message: MCP_LSP_ADD_USAGE };
+      }
+      return {
+        ok: true,
+        action: "add",
+        filesystemServerId,
+        input: createLspInputFromPreset(preset, tokens[3]?.trim()),
+      };
     }
 
     let command = "";
@@ -273,6 +315,7 @@ export const parseMcpLspCommand = (query: string): ParsedMcpLspCommand => {
       MCP_LSP_ADD_USAGE,
       MCP_LSP_REMOVE_USAGE,
       MCP_LSP_DOCTOR_USAGE,
+      MCP_LSP_BOOTSTRAP_USAGE,
     ].join("\n"),
   };
 };

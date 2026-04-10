@@ -1460,14 +1460,17 @@ const createScriptedTransport = (
   });
 
   test("/mcp lsp commands expose list/add/remove/doctor flows", async () => {
-    const addLspServer = mock(async (_serverId: string, _input: unknown) => ({
+    const addLspServer = mock(async (_serverId: string, input: any) => ({
       ok: true,
       message: [
         "MCP LSP server added",
         "filesystem_server: repo",
-        "lsp_server: rust",
-        "command: rust-analyzer",
-        "patterns: **/*.rs",
+        `lsp_server: ${input.id}`,
+        `command: ${input.command}`,
+        `patterns: ${input.filePatterns.join(", ")}`,
+        ...(input.id === "typescript"
+          ? ["install_hint: npm install -g typescript-language-server typescript"]
+          : []),
         "config: D:/Projects/js_projects/Cyrene-code/.cyrene/mcp.yaml",
       ].join("\n"),
     }));
@@ -1497,6 +1500,20 @@ const createScriptedTransport = (
         "filesystem_server: repo",
         "requested_lsp: rust",
         "status: ready",
+      ].join("\n"),
+    }));
+    const bootstrapLsp = mock(async (_serverId: string) => ({
+      ok: true,
+      message: [
+        "MCP LSP bootstrap",
+        "filesystem_server: repo",
+        "workspace: D:/Projects/js_projects/Cyrene-code",
+        "detected: typescript, json",
+        "added: typescript, json",
+        "skipped_existing: (none)",
+        "install_hints:",
+        "- typescript: npm install -g typescript-language-server typescript",
+        "- json: npm install -g vscode-langservers-extracted",
       ].join("\n"),
     }));
     const listLspServers = mock((serverId?: string) =>
@@ -1544,6 +1561,7 @@ const createScriptedTransport = (
           listTools: () => [],
           listLspServers,
           addLspServer,
+          bootstrapLsp,
           removeLspServer,
           doctorLsp,
         } as any,
@@ -1555,6 +1573,8 @@ const createScriptedTransport = (
       app,
       '/mcp lsp add repofs rust --command rust-analyzer --pattern "**/*.rs" --root Cargo.toml --root .git --env RUST_LOG=info'
     );
+    await runCommand(app, "/mcp lsp add repofs typescript");
+    await runCommand(app, "/mcp lsp bootstrap repofs");
     await runCommand(app, "/mcp lsp doctor repofs src/demo.rs --lsp rust");
     await runCommand(app, "/mcp lsp remove repofs rust");
 
@@ -1569,9 +1589,26 @@ const createScriptedTransport = (
         RUST_LOG: "info",
       },
     });
+    expect(addLspServer).toHaveBeenCalledWith("repo", {
+      id: "typescript",
+      command: "typescript-language-server",
+      args: ["--stdio"],
+      filePatterns: [
+        "**/*.ts",
+        "**/*.tsx",
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.mts",
+        "**/*.cts",
+        "**/*.mjs",
+        "**/*.cjs",
+      ],
+      rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json", ".git"],
+    });
     expect(doctorLsp).toHaveBeenCalledWith("repo", "src/demo.rs", {
       lspServerId: "rust",
     });
+    expect(bootstrapLsp).toHaveBeenCalledWith("repo");
     expect(removeLspServer).toHaveBeenCalledWith("repo", "rust");
 
     const texts = getTexts(app.getLatest().items);
@@ -1604,6 +1641,22 @@ const createScriptedTransport = (
     expect(
       texts.some(text =>
         text.includes("tip: /mcp lsp doctor repo <path> --lsp rust")
+      )
+    ).toBe(true);
+    expect(
+      texts.some(text => text.includes("presets: typescript (ts, tsx, javascript, js)"))
+    ).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("install_hint: npm install -g typescript-language-server typescript")
+      )
+    ).toBe(true);
+    expect(
+      texts.some(text => text.includes("MCP LSP bootstrap"))
+    ).toBe(true);
+    expect(
+      texts.some(text =>
+        text.includes("npm install -g typescript-language-server typescript")
       )
     ).toBe(true);
     expect(texts.some(text => text.includes("MCP LSP doctor"))).toBe(true);
@@ -3997,6 +4050,130 @@ const createScriptedTransport = (
 
     expect(app.getLatest().liveAssistantText).toBe("");
     expect(getTexts(app.getLatest().items)).toContain("draft reply");
+    app.cleanup();
+  });
+
+  test("long streaming paragraphs wait for a steadier batch before repainting tiny suffix deltas", async () => {
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+    const longDraft = "段落".repeat(900);
+
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta(longDraft);
+      onTextDelta("补");
+      await streamGate;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("stream long paragraph");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe(longDraft);
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe(longDraft);
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe(`${longDraft}补`);
+
+    await act(async () => {
+      releaseStream();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(app.getLatest().liveAssistantText).toBe("");
+    expect(getTexts(app.getLatest().items)).toContain(`${longDraft}补`);
+    app.cleanup();
+  });
+
+  test("tool status in the middle of streaming does not replay the already committed assistant prefix", async () => {
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+
+    const runQuerySessionImpl = mock(async ({ onState, onTextDelta, onToolStatus }: any) => {
+      onState({ status: "streaming" });
+      onTextDelta("先看动画样式相关实现。");
+      onToolStatus("Tool: read_file src/frontend/components/ChatScreen.tsx | ok");
+      onTextDelta("再看一下顶部类型定义。");
+      await streamGate;
+      onState({ status: "idle" });
+      return { status: "completed" as const };
+    });
+
+    const app = renderHookHarness(() =>
+      useChatAppWithTestInput({
+        transport: createTestTransport(),
+        sessionStore: createTestSessionStore(),
+        defaultSystemPrompt: "system",
+        projectPrompt: "project",
+        pinMaxCount: 3,
+        mcpService: {
+          listPending: () => [],
+        } as any,
+        runQuerySessionImpl,
+      })
+    );
+
+    await act(async () => {
+      app.getLatest().setInput("inspect files");
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      app.getLatest().submit();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(getTexts(app.getLatest().items)).toContain("先看动画样式相关实现。");
+    expect(app.getLatest().liveAssistantText).toBe("再看一下顶部类型定义。");
+
+    await act(async () => {
+      releaseStream();
+      await Promise.resolve();
+    });
+    await flushMicrotasks();
+
+    expect(getTexts(app.getLatest().items)).not.toContain(
+      "先看动画样式相关实现。再看一下顶部类型定义。"
+    );
     app.cleanup();
   });
 

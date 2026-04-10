@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -178,6 +178,9 @@ describe("config loaders", () => {
         "  - id: docs",
         "    transport: stdio",
         '    label: "Docs Search"',
+        "    cwd: ./tools/docs",
+        "    env:",
+        "      DOCS_API_KEY: local-docs-key",
         "    aliases:",
         "      - knowledge",
         "    tools:",
@@ -229,7 +232,11 @@ describe("config loaders", () => {
     expect(config.servers.find(server => server.id === "docs")).toEqual(
       expect.objectContaining({
         transport: "stdio",
+        cwd: "./tools/docs",
         aliases: ["knowledge"],
+        env: {
+          DOCS_API_KEY: "local-docs-key",
+        },
       })
     );
     expect(config.servers.find(server => server.id === "repo")).toEqual(
@@ -271,6 +278,8 @@ describe("config loaders", () => {
         "  - id: docs",
         "    transport: http",
         '    url: "http://127.0.0.1:9000/mcp"',
+        "    headers:",
+        "      Authorization: Bearer demo-token",
       ].join("\n"),
       "utf8"
     );
@@ -293,6 +302,55 @@ describe("config loaders", () => {
 
     expect(config.servers.some(server => server.id === "docs")).toBe(false);
     expect(config.editableConfigPath).toBe(join(root, ".cyrene", "mcp.yaml"));
+
+    const saved = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(saved).toContain("remove_servers");
+  });
+
+  test("loadMcpConfig parses generic stdio env/cwd and http headers", async () => {
+    const root = await createWorkspace("");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: time",
+        "    transport: stdio",
+        "    command: node",
+        "    args: [scripts/time-mcp-server.mjs]",
+        "    cwd: ./scripts",
+        "    env:",
+        "      TZ: Asia/Shanghai",
+        "  - id: docs",
+        "    transport: http",
+        '    url: "https://example.com/mcp"',
+        "    headers:",
+        "      Authorization: Bearer test-token",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = await loadMcpConfig(undefined, {
+      cwd: root,
+      env: { CYRENE_HOME: join(root, "user-home") },
+    });
+
+    expect(config.servers.find(server => server.id === "time")).toEqual(
+      expect.objectContaining({
+        transport: "stdio",
+        cwd: "./scripts",
+        env: {
+          TZ: "Asia/Shanghai",
+        },
+      })
+    );
+    expect(config.servers.find(server => server.id === "docs")).toEqual(
+      expect.objectContaining({
+        transport: "http",
+        headers: {
+          Authorization: "Bearer test-token",
+        },
+      })
+    );
   });
 
   test("loadMcpConfig treats explicit empty lsp_servers as clearing inherited LSP config", async () => {

@@ -5,6 +5,7 @@ import { join, posix, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   FileMcpService,
+  getCommandTimeoutMs,
   type LspCodeAction,
   isPathInsideWorkspaceRoot,
   type LspDiagnostic,
@@ -1854,6 +1855,50 @@ describe("FileMcpService", () => {
     expect(tsServerClient.invalidations.length).toBeGreaterThan(0);
   });
 
+  test("ts_diagnostics surfaces partial diagnostics warnings without failing the whole tool", async () => {
+    const tsServerClient: TsServerClientLike = {
+      open: async () => {},
+      reload: async () => {},
+      hover: async () => null,
+      definition: async () => null,
+      references: async () => null,
+      rename: async () => null,
+      diagnostics: async filePath => ({
+        syntactic: [],
+        semantic: [],
+        suggestion: [
+          {
+            file: filePath,
+            start: { line: 1, offset: 1 },
+            end: { line: 1, offset: 6 },
+            code: 80001,
+            category: "suggestion",
+            text: "CommonJS module can be converted to ES module.",
+          },
+        ],
+        warnings: ["semantic diagnostics unavailable: tsserver request 'semanticDiagnosticsSync' timed out"],
+      }),
+      invalidate: () => {},
+      dispose: () => {},
+    };
+    const { root, service } = await createService({
+      tsServerClient,
+    });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.ts"), "export const value = 1;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "ts_diagnostics",
+      path: "src/demo.ts",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] ts_diagnostics src/demo.ts");
+    expect(result.message).toContain("notes:");
+    expect(result.message).toContain("semantic diagnostics unavailable");
+    expect(result.message).toContain("CommonJS module can be converted to ES module.");
+  });
+
   test("ts_prepare_rename returns a semantic rename preview without mutating files", async () => {
     const tsServerClient = createFakeTsServerClient();
     const { root, service } = await createService({ tsServerClient });
@@ -3036,6 +3081,36 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("status: timed_out");
     expect(approved.message).toContain("exit: timeout");
     expect(approved.message).toContain("Command timed out");
+  });
+
+  test("extends timeout budget for dependency install commands", () => {
+    expect(
+      getCommandTimeoutMs({
+        action: "run_command",
+        command: "bun",
+        args: ["add", "zod"],
+      })
+    ).toBe(180_000);
+    expect(
+      getCommandTimeoutMs({
+        action: "run_command",
+        command: "npm",
+        args: ["install"],
+      })
+    ).toBe(180_000);
+    expect(
+      getCommandTimeoutMs({
+        action: "run_shell",
+        command: "pnpm install",
+      })
+    ).toBe(180_000);
+    expect(
+      getCommandTimeoutMs({
+        action: "run_command",
+        command: "node",
+        args: ["slow.js"],
+      })
+    ).toBe(20_000);
   });
 
   test("run_shell enters review queue and executes through platform shell on approve", async () => {

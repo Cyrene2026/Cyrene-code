@@ -283,8 +283,10 @@ const MODEL_PAGE_SIZE = 8;
 const PROVIDER_PAGE_SIZE = 8;
 const INPUT_HISTORY_LIMIT = 100;
 const STREAMING_RENDER_BATCH_MS = 60;
-const STREAMING_RENDER_BATCH_MS_MEDIUM = 110;
-const STREAMING_RENDER_BATCH_MS_LARGE = 180;
+const STREAMING_RENDER_BATCH_MS_MEDIUM = 130;
+const STREAMING_RENDER_BATCH_MS_LARGE = 220;
+const STREAMING_RENDER_MIN_DELTA_MEDIUM = 120;
+const STREAMING_RENDER_MIN_DELTA_LARGE = 240;
 const TURN_CANCELLED_ERROR = "__CYRENE_TURN_CANCELLED__";
 const EMPTY_FILE_MENTION_PREVIEW: FileMentionPreviewState = {
   path: null,
@@ -418,6 +420,16 @@ const getStreamingRenderBatchMs = (textLength: number) => {
     return STREAMING_RENDER_BATCH_MS_MEDIUM;
   }
   return STREAMING_RENDER_BATCH_MS;
+};
+
+const getStreamingRenderMinDelta = (textLength: number) => {
+  if (textLength >= 4_000) {
+    return STREAMING_RENDER_MIN_DELTA_LARGE;
+  }
+  if (textLength >= 1_500) {
+    return STREAMING_RENDER_MIN_DELTA_MEDIUM;
+  }
+  return 0;
 };
 
 const isUsableHttpProvider = (provider: string) =>
@@ -606,6 +618,7 @@ export const useChatApp = ({
   } | null>(null);
   const liveAssistantRawTextRef = useRef("");
   const liveAssistantTextRef = useRef("");
+  const liveAssistantCommittedPrefixRef = useRef("");
   const liveAssistantRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveAssistantRenderedTextRef = useRef("");
   const liveAssistantLastFlushAtRef = useRef(0);
@@ -1760,12 +1773,27 @@ export const useChatApp = ({
     }, waitMs);
   };
 
-  const clearLiveAssistantSegment = () => {
+  const getUncommittedAssistantText = (visibleText: string) => {
+    const committedPrefix = liveAssistantCommittedPrefixRef.current;
+    if (!committedPrefix) {
+      return visibleText;
+    }
+    if (visibleText.startsWith(committedPrefix)) {
+      return visibleText.slice(committedPrefix.length);
+    }
+    liveAssistantCommittedPrefixRef.current = "";
+    return visibleText;
+  };
+
+  const clearLiveAssistantSegment = (options?: { preserveCommittedPrefix?: boolean }) => {
     cancelLiveAssistantRender();
     liveAssistantRawTextRef.current = "";
     liveAssistantTextRef.current = "";
     liveAssistantRenderedTextRef.current = "";
     liveAssistantLastFlushAtRef.current = 0;
+    if (!options?.preserveCommittedPrefix) {
+      liveAssistantCommittedPrefixRef.current = "";
+    }
     setLiveAssistantText(previous => (previous ? "" : previous));
   };
 
@@ -1776,6 +1804,7 @@ export const useChatApp = ({
     setItems(previous => {
       const next = [...previous];
       if (liveAssistantTextRef.current) {
+        liveAssistantCommittedPrefixRef.current += liveAssistantTextRef.current;
         next.push({
           role: "assistant",
           text: liveAssistantTextRef.current,
@@ -1792,7 +1821,7 @@ export const useChatApp = ({
       });
       return next;
     });
-    clearLiveAssistantSegment();
+    clearLiveAssistantSegment({ preserveCommittedPrefix: true });
   };
 
   const isRepeatedInteraction = (
@@ -2271,19 +2300,37 @@ export const useChatApp = ({
       return;
     }
     liveAssistantRawTextRef.current = rawAssistantText;
-    const nextVisible = parseAssistantStateUpdate(rawAssistantText).visibleText;
+    const nextVisible = getUncommittedAssistantText(
+      parseAssistantStateUpdate(rawAssistantText).visibleText
+    );
     if (nextVisible === liveAssistantTextRef.current) {
       return;
     }
     liveAssistantTextRef.current = nextVisible;
 
-    if (!liveAssistantRenderedTextRef.current) {
+    const lastRendered = liveAssistantRenderedTextRef.current;
+    if (!lastRendered) {
+      flushLiveAssistantSegment(nextVisible);
+      return;
+    }
+
+    const appendedSlice = nextVisible.startsWith(lastRendered)
+      ? nextVisible.slice(lastRendered.length)
+      : nextVisible;
+    const appendedLength = Math.max(0, nextVisible.length - lastRendered.length);
+    const hasAppendedLineBreak = appendedSlice.includes("\n");
+    const minDelta = getStreamingRenderMinDelta(nextVisible.length);
+
+    if (hasAppendedLineBreak) {
       flushLiveAssistantSegment(nextVisible);
       return;
     }
 
     const elapsed = Date.now() - liveAssistantLastFlushAtRef.current;
-    if (elapsed >= getStreamingRenderBatchMs(nextVisible.length)) {
+    if (
+      elapsed >= getStreamingRenderBatchMs(nextVisible.length) &&
+      (minDelta === 0 || appendedLength >= minDelta)
+    ) {
       flushLiveAssistantSegment(nextVisible);
       return;
     }

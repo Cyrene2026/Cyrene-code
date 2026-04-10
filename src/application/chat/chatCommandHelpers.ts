@@ -119,9 +119,9 @@ export const COMMAND_SPECS: CommandSpec[] = [
   },
   {
     command:
-      "/mcp lsp add <filesystem-server> <lsp-id> --command <cmd> [--arg <arg>]... --pattern <glob> [--pattern <glob>]... [--root <marker>]... [--workspace <path>] [--env KEY=VALUE]...",
+      "/mcp lsp add <filesystem-server> <preset>|<lsp-id> ...",
     description:
-      "add or update one LSP server config on a filesystem MCP server",
+      "add one mainstream-language LSP preset or a custom LSP server config",
   },
   {
     command: "/mcp lsp remove <filesystem-server> <lsp-id>",
@@ -130,6 +130,10 @@ export const COMMAND_SPECS: CommandSpec[] = [
   {
     command: "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]",
     description: "inspect LSP matching and startup for one file path",
+  },
+  {
+    command: "/mcp lsp bootstrap <filesystem-server>",
+    description: "auto-add mainstream-language LSP presets detected in the workspace",
   },
   { command: "/mcp remove <id>", description: "remove one MCP server from active project config" },
   { command: "/mcp enable <id>", description: "enable one MCP server in project config" },

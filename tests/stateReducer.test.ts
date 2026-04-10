@@ -50,6 +50,7 @@ describe("stateReducer", () => {
               "请你读一下这个项目，分析项目结构",
               "这是一个 Bun CLI 项目",
               "入口",
+              "src/frontend/main.tsx：不存在",
             ],
           },
           COMPLETED: {
@@ -77,6 +78,7 @@ describe("stateReducer", () => {
           "CONFIRMED FACTS": [
             "请你读一下这个项目",
             "项目使用 Bun 作为包管理器",
+            "src/frontend/styles.css 不存在",
           ],
           COMPLETED: ["wrote reducer tests"],
           REMAINING: ["wrote reducer tests", "检查 stateReducer prompt"],
@@ -91,6 +93,7 @@ describe("stateReducer", () => {
 
     expect(applied.summary).toContain("OBJECTIVE:\n- 分析项目结构");
     expect(applied.summary).toContain("CONFIRMED FACTS:\n- 这是一个 Bun CLI 项目");
+    expect(applied.summary).toContain("- 项目中不存在 `src/frontend/main.tsx`");
     expect(applied.summary).toContain("COMPLETED:\n- implemented reducer sanitizer");
     expect(applied.summary).toContain("REMAINING:\n- 检查 query 如何把 memory 注入 prompt");
     expect(applied.summary).toContain("KNOWN PATHS:\n- src/query.ts");
@@ -106,6 +109,7 @@ describe("stateReducer", () => {
     expect(applied.pendingDigest).toContain(
       "CONFIRMED FACTS:\n- 项目使用 Bun 作为包管理器"
     );
+    expect(applied.pendingDigest).toContain("- 项目中不存在 `src/frontend/styles.css`");
     expect(applied.pendingDigest).toContain("COMPLETED:\n- wrote reducer tests");
     expect(applied.pendingDigest).toContain(
       "REMAINING:\n- 检查 stateReducer prompt"

@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import {
   FileMcpService,
@@ -6,6 +6,13 @@ import {
   createLspServerConfig,
   isLspConfigError,
 } from "./adapters/filesystem";
+import {
+  createLspInputFromPreset,
+  findLspPresetByInput,
+  listLspPresets,
+  type LspPreset,
+  matchesLspPresetPath,
+} from "./lspPresets";
 import { HttpMcpAdapter } from "./adapters/http";
 import { StdioMcpAdapter } from "./adapters/stdio";
 import type { LspServerConfig, RuleConfig } from "./toolTypes";
@@ -178,6 +185,8 @@ const cloneConfiguredServer = (server: McpConfiguredServer): McpConfiguredServer
   aliases: [...server.aliases],
   requireReview: server.requireReview ? [...server.requireReview] : undefined,
   args: server.args ? [...server.args] : undefined,
+  env: server.env ? { ...server.env } : undefined,
+  headers: server.headers ? { ...server.headers } : undefined,
   ...(server.lspServers ? { lspServers: server.lspServers.map(entry => cloneLspServerConfig(entry)) } : {}),
   tools: server.tools.map(tool => cloneConfiguredTool(tool)),
 });
@@ -258,6 +267,7 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
       input.transport === "filesystem"
         ? input.workspaceRoot?.trim() || "."
         : input.workspaceRoot?.trim(),
+    cwd: input.cwd?.trim() || undefined,
     maxReadBytes:
       typeof input.maxReadBytes === "number"
         ? Math.max(1, Math.floor(input.maxReadBytes))
@@ -266,6 +276,8 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
     command: input.command?.trim(),
     args: input.args ? [...input.args] : undefined,
     url: input.url?.trim(),
+    env: normalizeEnvRecord(input.env),
+    headers: normalizeEnvRecord(input.headers),
     lspServers: [],
     tools: (input.tools ?? []).map(tool => ({
       name: tool.name.trim(),
@@ -338,6 +350,79 @@ const toRuntimeLspServerDescriptor = (
     left.localeCompare(right)
   ),
 });
+
+const BOOTSTRAP_IGNORED_DIRS = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".turbo",
+  ".cache",
+  "target",
+  "vendor",
+]);
+const BOOTSTRAP_MAX_FILES = 4_000;
+
+const collectWorkspacePathsForLspBootstrap = async (workspaceRoot: string) => {
+  const collected: string[] = [];
+  const queue = [resolve(workspaceRoot)];
+
+  while (queue.length > 0 && collected.length < BOOTSTRAP_MAX_FILES) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    try {
+      const entries = await readdir(current, {
+        withFileTypes: true,
+        encoding: "utf8",
+      });
+
+      for (const entry of entries) {
+        const absolute = resolve(current, entry.name);
+        const relativePath = relative(workspaceRoot, absolute).replace(/\\/g, "/");
+        if (!relativePath || relativePath.startsWith("..")) {
+          continue;
+        }
+
+        if (entry.isDirectory()) {
+          if (!BOOTSTRAP_IGNORED_DIRS.has(entry.name)) {
+            queue.push(absolute);
+          }
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        collected.push(relativePath);
+        if (collected.length >= BOOTSTRAP_MAX_FILES) {
+          break;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return collected;
+};
+
+const detectRelevantLspPresets = async (workspaceRoot: string): Promise<LspPreset[]> => {
+  const paths = await collectWorkspacePathsForLspBootstrap(workspaceRoot);
+  if (paths.length === 0) {
+    return [];
+  }
+  return listLspPresets().filter(preset =>
+    paths.some(path => matchesLspPresetPath(preset, path))
+  );
+};
 
 type LspDoctorFailureReason = NonNullable<McpRuntimeLspDoctorResult["reason"]>;
 
@@ -667,6 +752,7 @@ class ManagedMcpRuntime implements McpRuntime {
 
     const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);
     await this.load();
+    const matchedPreset = findLspPresetByInput(input);
 
     return {
       ok: true,
@@ -689,7 +775,92 @@ class ManagedMcpRuntime implements McpRuntime {
           ).join(", ") || "(none)"
         }`,
         `config: ${saved.path}`,
+        ...(matchedPreset?.installHint ? [`install_hint: ${matchedPreset.installHint}`] : []),
         `hint: run /mcp lsp doctor ${editable.normalizedId} <path> --lsp ${nextLsp.id} to verify startup`,
+      ].join("\n"),
+      serverId: editable.normalizedId,
+      configPath: saved.path,
+    };
+  }
+
+  async bootstrapLsp(filesystemServerId: string): Promise<McpRuntimeMutationResult> {
+    const editable = this.getEditableFilesystemPatchServer(filesystemServerId);
+    if (!editable.ok) {
+      return {
+        ok: false,
+        message: editable.message,
+      };
+    }
+
+    const workspaceRoot = resolve(editable.server.workspaceRoot ?? this.appRoot);
+    const detectedPresets = await detectRelevantLspPresets(workspaceRoot);
+    if (detectedPresets.length === 0) {
+      return {
+        ok: true,
+        message: [
+          "MCP LSP bootstrap",
+          `filesystem_server: ${editable.normalizedId}`,
+          `workspace: ${workspaceRoot}`,
+          "detected: (none)",
+          "added: (none)",
+          "skipped_existing: (none)",
+          "hint: no known mainstream-language files were detected in this workspace",
+        ].join("\n"),
+        serverId: editable.normalizedId,
+      };
+    }
+
+    const existing = editable.server.lspServers ?? [];
+    const existingIds = new Set(existing.map(server => server.id.toLowerCase()));
+    const existingCommands = new Set(existing.map(server => server.command.toLowerCase()));
+    const presetsToAdd = detectedPresets.filter(
+      preset =>
+        !existingIds.has(preset.id.toLowerCase()) &&
+        !existingCommands.has(preset.command.toLowerCase())
+    );
+    const skipped = detectedPresets.filter(preset => !presetsToAdd.includes(preset));
+
+    if (presetsToAdd.length === 0) {
+      return {
+        ok: true,
+        message: [
+          "MCP LSP bootstrap",
+          `filesystem_server: ${editable.normalizedId}`,
+          `workspace: ${workspaceRoot}`,
+          `detected: ${detectedPresets.map(preset => preset.id).join(", ")}`,
+          "added: (none)",
+          `skipped_existing: ${skipped.map(preset => preset.id).join(", ") || "(none)"}`,
+          "hint: the detected mainstream-language presets are already configured",
+        ].join("\n"),
+        serverId: editable.normalizedId,
+      };
+    }
+
+    const patch = cloneConfigPatch(this.getConfig().projectPatch);
+    patch.removeServerIds = patch.removeServerIds.filter(id => id !== editable.normalizedId);
+    const nextPatchServer = cloneConfiguredServer(editable.patchServer);
+    nextPatchServer.lspServers = [
+      ...existing.map(server => cloneLspServerConfig(server)),
+      ...presetsToAdd.map(preset => normalizeLspServerInput(createLspInputFromPreset(preset))),
+    ];
+    upsertPatchServer(patch, nextPatchServer);
+
+    const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: [
+        "MCP LSP bootstrap",
+        `filesystem_server: ${editable.normalizedId}`,
+        `workspace: ${workspaceRoot}`,
+        `detected: ${detectedPresets.map(preset => preset.id).join(", ")}`,
+        `added: ${presetsToAdd.map(preset => preset.id).join(", ")}`,
+        `skipped_existing: ${skipped.map(preset => preset.id).join(", ") || "(none)"}`,
+        `config: ${saved.path}`,
+        "install_hints:",
+        ...presetsToAdd.map(preset => `- ${preset.id}: ${preset.installHint ?? "install the matching language server and ensure it is in PATH"}`),
+        `hint: run /mcp lsp list ${editable.normalizedId} to review all configured language servers`,
       ].join("\n"),
       serverId: editable.normalizedId,
       configPath: saved.path,

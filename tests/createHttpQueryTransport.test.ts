@@ -189,6 +189,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_hover for TypeScript/JavaScript quick info");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_definition for TypeScript/JavaScript definition lookup");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_references for semantic TypeScript/JavaScript references");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Prefer lsp_diagnostics for TypeScript/JavaScript diagnostics when a matching LSP server is configured"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_diagnostics for TypeScript/JavaScript diagnostics");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_prepare_rename to preview a semantic TypeScript/JavaScript rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_hover for generic language-server hover info");

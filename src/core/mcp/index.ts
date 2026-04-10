@@ -7,6 +7,7 @@ export * from "./McpServerRegistry";
 export * from "./McpToolRouter";
 export * from "./loadMcpConfig";
 export * from "./createMcpRuntime";
+export * from "./lspPresets";
 export * from "./adapters/filesystem";
 export * from "./adapters/stdio";
 export * from "./adapters/http";

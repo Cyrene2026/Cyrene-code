@@ -90,6 +90,11 @@ export const buildPromptWithContext = (
           : ""
       }\n- status: interrupted before reducer finalized`
     : "Interrupted prior turn snapshot:\n(none)";
+  const latestActionableUserRequestSection = promptContext.latestActionableUserMessage.trim()
+    ? `Latest actionable user request before this continuation:\n${clipPromptLine(
+        promptContext.latestActionableUserMessage
+      )}`
+    : "Latest actionable user request before this continuation:\n(none)";
   const recentTranscriptSection = recentLines
     ? `Short transcript tail (immediate recency only):\n${recentLines}`
     : "Short transcript tail (immediate recency only):\n(none)";
@@ -99,6 +104,7 @@ export const buildPromptWithContext = (
         recencyGuardLine,
         pendingDigestSection,
         interruptedTurnSection,
+        latestActionableUserRequestSection,
         recentTranscriptSection,
         durableSummarySection,
       ].filter(Boolean)

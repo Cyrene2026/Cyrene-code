@@ -12,6 +12,7 @@ import {
 
 type HttpMcpAdapterContext = {
   appRoot: string;
+  validateRequestUrl?: () => Promise<string | null>;
 };
 
 type JsonRpcErrorShape = {
@@ -97,6 +98,10 @@ export class HttpMcpAdapter implements McpServerAdapter {
     if (!this.server.url) {
       throw new Error(`MCP http server missing url: ${this.server.id}`);
     }
+    const requestUrlError = await this._context.validateRequestUrl?.();
+    if (requestUrlError) {
+      throw new Error(requestUrlError);
+    }
 
     const requestId = notification ? undefined : this.nextRequestId++;
     const normalizedHeaders = this.server.headers
@@ -106,6 +111,7 @@ export class HttpMcpAdapter implements McpServerAdapter {
       : {};
     const response = await fetch(this.server.url, {
       method: "POST",
+      redirect: "manual",
       headers: {
         ...normalizedHeaders,
         "content-type": "application/json",
@@ -123,6 +129,21 @@ export class HttpMcpAdapter implements McpServerAdapter {
     const sessionId = response.headers.get("mcp-session-id");
     if (sessionId) {
       this.sessionId = sessionId;
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error(
+        [
+          `MCP http ${method} blocked: redirects are not allowed`,
+          `server: ${this.server.id}`,
+          `url: ${this.server.url}`,
+          response.headers.get("location")
+            ? `location: ${response.headers.get("location")}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
     }
 
     if (!response.ok) {

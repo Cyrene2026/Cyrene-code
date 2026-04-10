@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, extname, resolve } from "node:path";
+import { buildRestrictedSubprocessEnv } from "./subprocessEnv";
 
 const require = createRequire(import.meta.url);
 
@@ -717,10 +718,7 @@ export class TsServerClient implements TsServerClientLike {
       [this.resolveTsServerPath(), ...getTsServerArgs(this.options.args)],
       {
         cwd: this.options.workspaceRoot,
-        env: {
-          ...process.env,
-          ...this.options.env,
-        },
+        env: buildRestrictedSubprocessEnv(this.options.env),
         stdio: ["pipe", "pipe", "pipe", "ipc"],
       }
     );

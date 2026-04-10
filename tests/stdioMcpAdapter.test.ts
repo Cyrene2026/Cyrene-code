@@ -170,6 +170,11 @@ describe("StdioMcpAdapter", () => {
   });
 
   test("passes server cwd and env to spawned stdio process", async () => {
+    const previousApiKey = process.env.CYRENE_API_KEY;
+    const previousPath = process.env.PATH;
+    process.env.CYRENE_API_KEY = "should-not-leak";
+    process.env.PATH = process.env.PATH ?? "/usr/bin";
+
     const fakeProcess = createFakeSpawnProcess();
     const capture: {
       current:
@@ -206,18 +211,34 @@ describe("StdioMcpAdapter", () => {
       }
     );
 
-    await adapter.initialize();
+    try {
+      await adapter.initialize();
 
-    expect(capture.current).not.toBeNull();
-    if (!capture.current) {
-      throw new Error("spawn options were not captured");
+      expect(capture.current).not.toBeNull();
+      if (!capture.current) {
+        throw new Error("spawn options were not captured");
+      }
+      const spawnOptions = capture.current;
+      expect(spawnOptions.cwd).toBe("/workspace/project/tools/docs");
+      expect((spawnOptions.env as Record<string, string> | undefined)?.DOCS_API_KEY).toBe(
+        "demo-key"
+      );
+      expect((spawnOptions.env as Record<string, string> | undefined)?.CYRENE_API_KEY).toBeUndefined();
+      expect((spawnOptions.env as Record<string, string> | undefined)?.PATH).toBe(
+        process.env.PATH
+      );
+    } finally {
+      adapter.dispose();
+      if (previousApiKey === undefined) {
+        delete process.env.CYRENE_API_KEY;
+      } else {
+        process.env.CYRENE_API_KEY = previousApiKey;
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
     }
-    const spawnOptions = capture.current;
-    expect(spawnOptions.cwd).toBe("/workspace/project/tools/docs");
-    expect((spawnOptions.env as Record<string, string> | undefined)?.DOCS_API_KEY).toBe(
-      "demo-key"
-    );
-
-    adapter.dispose();
   });
 });

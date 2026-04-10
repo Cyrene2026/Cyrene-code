@@ -1,4 +1,6 @@
+import { lookup as dnsLookup } from "node:dns/promises";
 import { readdir, stat } from "node:fs/promises";
+import { isIP } from "node:net";
 import { isAbsolute, relative, resolve } from "node:path";
 import {
   FileMcpService,
@@ -41,11 +43,24 @@ import type {
 type CreateMcpRuntimeContext = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  dnsLookup?: DnsLookupFn;
 };
 
 type InitializableMcpAdapter = McpServerAdapter & {
   initialize?: () => Promise<void>;
 };
+
+type McpServerOrigin = LoadedMcpConfig["serverOrigins"][string];
+
+type DnsLookupAddress = {
+  address: string;
+  family: number;
+};
+
+type DnsLookupFn = (
+  hostname: string,
+  options: { all: true; verbatim?: boolean }
+) => Promise<DnsLookupAddress[]>;
 
 const FILE_ALIAS_NAMES = ["file", "fs", "mcp.file"];
 
@@ -64,6 +79,202 @@ const buildFilesystemLspSummary = (lspServers?: LspServerConfig[]) =>
         serverIds: lspServers.map(entry => entry.id),
       }
     : undefined;
+
+const createBlockedRemoteAdapter = (
+  descriptor: McpServerDescriptor,
+  serverId: string,
+  message: string
+): InitializableMcpAdapter => ({
+  descriptor: {
+    ...descriptor,
+    enabled: false,
+    health: "offline",
+  },
+  async handleToolCall() {
+    return {
+      ok: false,
+      message,
+    };
+  },
+  listPending() {
+    return [];
+  },
+  async approve(id: string) {
+    return {
+      ok: false,
+      message: `Pending operation not found: ${id}`,
+    };
+  },
+  reject(id: string) {
+    return {
+      ok: false,
+      message: `Pending operation not found: ${id}`,
+    };
+  },
+  async undoLastMutation() {
+    return {
+      ok: false,
+      message: `Undo is not supported for MCP server: ${serverId}`,
+    };
+  },
+});
+
+const isBlockedPrivateIpv4Host = (hostname: string) => {
+  const octets = hostname.split(".").map(part => Number(part));
+  if (
+    octets.length !== 4 ||
+    octets.some(octet => !Number.isInteger(octet) || octet < 0 || octet > 255)
+  ) {
+    return false;
+  }
+
+  const [first, second = 0] = octets;
+  return (
+    first === 0 ||
+    first === 10 ||
+    first === 127 ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  );
+};
+
+const isBlockedPrivateIpv6Host = (hostname: string) => {
+  const normalized = hostname.toLowerCase();
+  const mappedIpv4 = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (mappedIpv4 && isBlockedPrivateIpv4Host(mappedIpv4)) {
+    return true;
+  }
+  return (
+    normalized === "::" ||
+    normalized === "::1" ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb")
+  );
+};
+
+const isBlockedPrivateHttpHost = (hostname: string) => {
+  const normalized = hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1").replace(/\.$/, "");
+  if (!normalized) {
+    return true;
+  }
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized === "host.docker.internal" ||
+    normalized === "gateway.docker.internal" ||
+    normalized === "kubernetes.docker.internal"
+  ) {
+    return true;
+  }
+
+  const ipVersion = isIP(normalized);
+  if (ipVersion === 4) {
+    return isBlockedPrivateIpv4Host(normalized);
+  }
+  if (ipVersion === 6) {
+    return isBlockedPrivateIpv6Host(normalized);
+  }
+  return false;
+};
+
+const defaultDnsLookupAll: DnsLookupFn = async (hostname, options) =>
+  (await dnsLookup(hostname, options)) as DnsLookupAddress[];
+
+const resolveHttpHostnameAddresses = async (
+  hostname: string,
+  lookupFn: DnsLookupFn
+) => {
+  try {
+    const resolved = await lookupFn(hostname, {
+      all: true,
+      verbatim: true,
+    });
+    const addresses = Array.from(
+      new Set(
+        resolved
+          .map(entry => entry.address.trim())
+          .filter(Boolean)
+      )
+    );
+    return addresses.length > 0 ? addresses : null;
+  } catch {
+    return null;
+  }
+};
+
+const getRemoteHttpBlockMessage = async (
+  server: McpConfiguredServer,
+  origin: McpServerOrigin | undefined,
+  context?: CreateMcpRuntimeContext
+) => {
+  if (!server.url) {
+    return `MCP http server missing url: ${server.id}`;
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(server.url);
+  } catch {
+    return `MCP http server blocked: invalid url: ${server.url}`;
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    return `MCP http server blocked: unsupported url scheme: ${server.url}`;
+  }
+  if (server.allowPrivateNetwork === true) {
+    return null;
+  }
+  if (isBlockedPrivateHttpHost(parsedUrl.hostname)) {
+    return [
+      `MCP http server blocked: private or loopback addresses require allow_private_network: true`,
+      `server: ${server.id}`,
+      `url: ${server.url}`,
+      origin?.configPath ? `config: ${origin.configPath}` : "",
+      "hint: only enable allow_private_network for intentionally trusted local/private MCP endpoints",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  const normalizedHostname = parsedUrl.hostname
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1")
+    .replace(/\.$/, "");
+  if (isIP(normalizedHostname) !== 0) {
+    return null;
+  }
+
+  const resolvedAddresses = await resolveHttpHostnameAddresses(
+    normalizedHostname,
+    context?.dnsLookup ?? defaultDnsLookupAll
+  );
+  if (!resolvedAddresses) {
+    return null;
+  }
+  const blockedResolvedAddresses = resolvedAddresses.filter(address =>
+    isBlockedPrivateHttpHost(address)
+  );
+  if (blockedResolvedAddresses.length === 0) {
+    return null;
+  }
+
+  return [
+    `MCP http server blocked: hostname resolved to private or loopback address(es)`,
+    `server: ${server.id}`,
+    `url: ${server.url}`,
+    `hostname: ${normalizedHostname}`,
+    `resolved_addresses: ${blockedResolvedAddresses.join(", ")}`,
+    origin?.configPath ? `config: ${origin.configPath}` : "",
+    "hint: only enable allow_private_network for intentionally trusted local/private MCP endpoints",
+  ]
+    .filter(Boolean)
+    .join("\n");
+};
 
 const createRuleConfigFromServer = (
   appRoot: string,
@@ -132,25 +343,50 @@ const createFilesystemServerAdapter = (
   };
 };
 
-const createRemoteServerAdapter = (
+const createRemoteServerAdapter = async (
   appRoot: string,
   server: McpConfiguredServer,
+  origin: McpServerOrigin | undefined,
   context?: CreateMcpRuntimeContext
-): InitializableMcpAdapter => {
-  if (server.transport === "stdio") {
-    return new StdioMcpAdapter(server, {
-      appRoot,
-      env: context?.env,
-    });
+): Promise<InitializableMcpAdapter> => {
+  const adapter =
+    server.transport === "stdio"
+      ? new StdioMcpAdapter(server, {
+          appRoot,
+          env: context?.env,
+        })
+      : server.transport === "http"
+        ? new HttpMcpAdapter(server, {
+            appRoot,
+            validateRequestUrl: () =>
+              getRemoteHttpBlockMessage(server, origin, context),
+          })
+        : null;
+
+  if (!adapter) {
+    throw new Error(`Unsupported MCP transport: ${server.transport}`);
   }
 
   if (server.transport === "http") {
-    return new HttpMcpAdapter(server, {
-      appRoot,
-    });
+    const httpBlockMessage = await getRemoteHttpBlockMessage(server, origin, context);
+    if (httpBlockMessage) {
+      return createBlockedRemoteAdapter(adapter.descriptor, server.id, httpBlockMessage);
+    }
   }
 
-  throw new Error(`Unsupported MCP transport: ${server.transport}`);
+  if (origin?.scope === "project" && server.trusted !== true) {
+    const trustMessage = [
+      `Project MCP server is blocked until trusted: ${server.id}`,
+      `transport: ${server.transport}`,
+      origin.configPath ? `config: ${origin.configPath}` : "",
+      "hint: set `trusted: true` in .cyrene/mcp.yaml or re-enable the server via /mcp enable <id>",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return createBlockedRemoteAdapter(adapter.descriptor, server.id, trustMessage);
+  }
+
+  return adapter;
 };
 
 const buildAliasMap = (config: LoadedMcpConfig) =>
@@ -262,6 +498,10 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
     transport: input.transport,
     label: input.label?.trim() || id,
     enabled: input.enabled ?? true,
+    trusted:
+      input.transport === "filesystem"
+        ? undefined
+        : true,
     aliases: normalizeAliases(id, input.aliases),
     workspaceRoot:
       input.transport === "filesystem"
@@ -276,6 +516,10 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
     command: input.command?.trim(),
     args: input.args ? [...input.args] : undefined,
     url: input.url?.trim(),
+    allowPrivateNetwork:
+      typeof input.allowPrivateNetwork === "boolean"
+        ? input.allowPrivateNetwork
+        : undefined,
     env: normalizeEnvRecord(input.env),
     headers: normalizeEnvRecord(input.headers),
     lspServers: [],
@@ -509,7 +753,12 @@ const buildManagerFromConfig = async (
     const adapter =
       server.transport === "filesystem"
         ? createFilesystemServerAdapter(appRoot, server)
-        : createRemoteServerAdapter(appRoot, server, context);
+        : await createRemoteServerAdapter(
+            appRoot,
+            server,
+            config.serverOrigins[server.id],
+            context
+          );
     if ("initialize" in adapter && typeof adapter.initialize === "function") {
       await adapter.initialize().catch(() => undefined);
     }
@@ -694,6 +943,7 @@ class ManagedMcpRuntime implements McpRuntime {
     upsertPatchServer(patch, {
       ...existingPatchServer,
       enabled,
+      ...(current.transport !== "filesystem" && enabled ? { trusted: true } : {}),
     });
 
     const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);

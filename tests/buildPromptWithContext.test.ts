@@ -39,6 +39,7 @@ describe("buildPromptWithContext", () => {
         "REMAINING:",
         "- verify approval flow",
       ].join("\n"),
+      latestActionableUserMessage: "finish the oauth follow-up without reopening old files",
       summaryFallback: "",
       reducerMode: "merge_and_digest",
       summaryRecoveryNeeded: false,
@@ -91,6 +92,7 @@ describe("buildPromptWithContext", () => {
           createdAt: "2026-01-01T00:00:01.000Z",
         },
       ],
+      latestActionableUserMessage: "continue oauth",
       durableSummary: "",
       pendingDigest: "",
       summaryFallback: [
@@ -137,6 +139,8 @@ describe("buildPromptWithContext", () => {
           createdAt: "2026-01-01T00:00:01.000Z",
         },
       ],
+      latestActionableUserMessage:
+        "完善下 lsp doctor/list 的一致性和可诊断性，再继续补 rename 相关能力",
       durableSummary: [
         "OBJECTIVE:",
         "- finish billing cleanup",
@@ -168,5 +172,7 @@ describe("buildPromptWithContext", () => {
     expect(prompt.indexOf("Short transcript tail (immediate recency only):")).toBeLessThan(
       prompt.indexOf("Working state (durable reducer):")
     );
+    expect(prompt).toContain("Latest actionable user request before this continuation:");
+    expect(prompt).toContain("完善下 lsp doctor/list 的一致性和可诊断性");
   });
 });

@@ -34,6 +34,31 @@ type SessionStoreContext = {
   env?: NodeJS.ProcessEnv;
 };
 
+const LOW_SIGNAL_CONTINUATION_PATTERN =
+  /^(?:ok(?:ay)?|sure|yes|yep|go|go on|continue|continue please|resume|proceed|thanks?|thank you|cool|nice|good|done|start|start now|sounds good|来吧?|继续(?:吧|一下)?|开始吧?|接着|继续搞|继续做|好(?:的)?|行|可以|收到|嗯|搞吧|上吧|来|冲)$/iu;
+
+const isLowSignalContinuationText = (text: string) => {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return false;
+  }
+  if (LOW_SIGNAL_CONTINUATION_PATTERN.test(normalized)) {
+    return true;
+  }
+  return normalized.length <= 24 && !/[\p{L}\p{N}]/u.test(normalized);
+};
+
+const findLatestActionableUserMessage = (messages: SessionMessage[]) => {
+  const userMessages = messages.filter(message => message.role === "user");
+  for (let index = userMessages.length - 1; index >= 0; index -= 1) {
+    const candidate = userMessages[index]?.text.replace(/\s+/g, " ").trim() ?? "";
+    if (candidate && !isLowSignalContinuationText(candidate)) {
+      return candidate;
+    }
+  }
+  return userMessages.at(-1)?.text.replace(/\s+/g, " ").trim() ?? "";
+};
+
 const messageSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
   text: z.string(),
@@ -690,6 +715,9 @@ export const createFileSessionStore = (
       const priorAssistantMessages = priorMessages.filter(
         message => message.role === "assistant"
       );
+      const latestActionableUserMessage = findLatestActionableUserMessage(
+        loaded.session.messages
+      );
       return getPromptContextFromMemoryIndex(
         loaded.index,
         query,
@@ -698,6 +726,7 @@ export const createFileSessionStore = (
           durableSummary,
           summaryFallback,
           pendingDigest,
+          latestActionableUserMessage,
           reducerMode: deriveReducerMode({
             enabled: true,
             durableSummary,

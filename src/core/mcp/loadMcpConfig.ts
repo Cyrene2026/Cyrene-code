@@ -36,6 +36,7 @@ export type McpConfiguredServer = {
   transport: McpServerTransport;
   label: string;
   enabled: boolean;
+  trusted?: boolean;
   aliases: string[];
   workspaceRoot?: string;
   cwd?: string;
@@ -44,6 +45,7 @@ export type McpConfiguredServer = {
   command?: string;
   args?: string[];
   url?: string;
+  allowPrivateNetwork?: boolean;
   env?: Record<string, string>;
   headers?: Record<string, string>;
   lspServers?: LspServerConfig[];
@@ -315,6 +317,12 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     transport,
     label: normalizeString(value.label) ?? id,
     enabled: normalizeBoolean(value.enabled, true),
+    trusted:
+      typeof value.trusted === "boolean"
+        ? value.trusted
+        : typeof value.trust === "boolean"
+          ? value.trust
+          : undefined,
     aliases,
     workspaceRoot: normalizeString(value.workspace_root ?? value.workspaceRoot),
     cwd: normalizeString(value.cwd),
@@ -328,6 +336,12 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     command: normalizeString(value.command),
     args: normalizeStringArray(value.args),
     url: normalizeString(value.url),
+    allowPrivateNetwork:
+      typeof value.allow_private_network === "boolean"
+        ? value.allow_private_network
+        : typeof value.allowPrivateNetwork === "boolean"
+          ? value.allowPrivateNetwork
+          : undefined,
     ...(normalizeStringRecord(value.env) ? { env: normalizeStringRecord(value.env) } : {}),
     ...(normalizeStringRecord(value.headers)
       ? { headers: normalizeStringRecord(value.headers) }
@@ -386,6 +400,7 @@ const mergeServer = (
   transport: patch.transport ?? base?.transport ?? "filesystem",
   label: patch.label || base?.label || patch.id,
   enabled: patch.enabled ?? base?.enabled ?? true,
+  trusted: patch.trusted ?? base?.trusted,
   aliases: Array.from(new Set([...(base?.aliases ?? []), ...patch.aliases])),
   workspaceRoot: patch.workspaceRoot ?? base?.workspaceRoot,
   cwd: patch.cwd ?? base?.cwd,
@@ -402,6 +417,7 @@ const mergeServer = (
       ? [...patch.args]
       : [...(base?.args ?? [])],
   url: patch.url ?? base?.url,
+  allowPrivateNetwork: patch.allowPrivateNetwork ?? base?.allowPrivateNetwork,
   env: patch.env ? { ...patch.env } : base?.env ? { ...base.env } : undefined,
   headers:
     patch.headers ? { ...patch.headers } : base?.headers ? { ...base.headers } : undefined,
@@ -436,7 +452,11 @@ const mergeConfigPatches = (
   const serverMap = new Map<string, McpConfiguredServer>();
 
   for (const server of base.servers) {
-    serverMap.set(server.id, { ...server, aliases: [...server.aliases], tools: [...server.tools] });
+    serverMap.set(server.id, {
+      ...server,
+      aliases: [...server.aliases],
+      tools: [...server.tools],
+    });
   }
 
   for (const server of patch.servers) {
@@ -557,6 +577,7 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   ...(typeof server.enabled === "boolean" && !server.enabled
     ? { enabled: server.enabled }
     : {}),
+  ...(typeof server.trusted === "boolean" ? { trusted: server.trusted } : {}),
   ...(server.aliases.length > 0 ? { aliases: [...server.aliases] } : {}),
   ...(server.workspaceRoot ? { workspace_root: server.workspaceRoot } : {}),
   ...(server.cwd ? { cwd: server.cwd } : {}),
@@ -569,6 +590,9 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   ...(server.command ? { command: server.command } : {}),
   ...(server.args && server.args.length > 0 ? { args: [...server.args] } : {}),
   ...(server.url ? { url: server.url } : {}),
+  ...(typeof server.allowPrivateNetwork === "boolean"
+    ? { allow_private_network: server.allowPrivateNetwork }
+    : {}),
   ...(server.env && Object.keys(server.env).length > 0 ? { env: { ...server.env } } : {}),
   ...(server.headers && Object.keys(server.headers).length > 0
     ? { headers: { ...server.headers } }

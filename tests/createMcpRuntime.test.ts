@@ -159,6 +159,8 @@ describe("createMcpRuntime", () => {
         "servers:",
         "  - id: webdocs",
         "    transport: http",
+        "    trusted: true",
+        "    allow_private_network: true",
         `    url: "http://127.0.0.1:${port}/mcp"`,
         "    headers:",
         '      Authorization: "Bearer runtime-token"',
@@ -192,6 +194,205 @@ describe("createMcpRuntime", () => {
     runtime.dispose();
   });
 
+  test("project-scoped remote MCP servers stay blocked until explicitly trusted", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const port = await getAvailablePort();
+    const server = Bun.serve({
+      port,
+      fetch: async request => {
+        const payload = (await request.json()) as {
+          id?: number;
+          method?: string;
+        };
+        const headers = {
+          "content-type": "application/json",
+          "mcp-session-id": "session-1",
+        };
+
+        if (payload.method === "notifications/initialized") {
+          return new Response(null, {
+            status: 204,
+            headers,
+          });
+        }
+        if (payload.method === "initialize") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "fake-http", version: "1.0.0" },
+              },
+            },
+            { headers }
+          );
+        }
+        if (payload.method === "tools/list") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                tools: [{ name: "fetch_docs", description: "Fetch docs" }],
+              },
+            },
+            { headers }
+          );
+        }
+        if (payload.method === "tools/call") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                content: [{ type: "text", text: "trusted call ok" }],
+              },
+            },
+            { headers }
+          );
+        }
+
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: payload.id,
+            error: { message: `unknown method: ${payload.method}` },
+          },
+          {
+            status: 400,
+            headers,
+          }
+        );
+      },
+    });
+    cleanupTasks.push(async () => {
+      server.stop(true);
+    });
+
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "primary_server: filesystem",
+        "servers:",
+        "  - id: webdocs",
+        "    transport: http",
+        "    allow_private_network: true",
+        `    url: "http://127.0.0.1:${port}/mcp"`,
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    expect(runtime.listServers().find(server => server.id === "webdocs")?.enabled).toBe(false);
+
+    const blocked = await runtime.handleToolCall("webdocs.fetch_docs", {
+      topic: "routing",
+    });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.message).toContain("Project MCP server is blocked until trusted: webdocs");
+
+    const enabled = await runtime.setServerEnabled?.("webdocs", true);
+    expect(enabled?.ok).toBe(true);
+
+    const result = await runtime.handleToolCall("webdocs.fetch_docs", {
+      topic: "routing",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("trusted call ok");
+
+    const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(configText).toContain("trusted: true");
+
+    runtime.dispose();
+  });
+
+  test("http MCP stays blocked for loopback targets unless allow_private_network is enabled", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const port = await getAvailablePort();
+
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "primary_server: filesystem",
+        "servers:",
+        "  - id: webdocs",
+        "    transport: http",
+        "    trusted: true",
+        `    url: "http://127.0.0.1:${port}/mcp"`,
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    expect(runtime.listServers().find(server => server.id === "webdocs")?.enabled).toBe(false);
+
+    const blocked = await runtime.handleToolCall("webdocs.fetch_docs", {
+      topic: "routing",
+    });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.message).toContain("private or loopback addresses require allow_private_network: true");
+
+    runtime.dispose();
+  });
+
+  test("http MCP blocks hostnames whose DNS resolves to private addresses", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const lookedUpHosts: string[] = [];
+
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "primary_server: filesystem",
+        "servers:",
+        "  - id: webdocs",
+        "    transport: http",
+        "    trusted: true",
+        '    url: "https://docs.example.test/mcp"',
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+      dnsLookup: async (hostname, options) => {
+        lookedUpHosts.push(`${hostname}:${options.all ? "all" : "single"}`);
+        return [
+          { address: "10.0.0.8", family: 4 },
+          { address: "203.0.113.20", family: 4 },
+        ];
+      },
+    });
+
+    expect(lookedUpHosts).toEqual(["docs.example.test:all"]);
+    expect(runtime.listServers().find(server => server.id === "webdocs")?.enabled).toBe(false);
+
+    const blocked = await runtime.handleToolCall("webdocs.fetch_docs", {
+      topic: "routing",
+    });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.message).toContain("hostname resolved to private or loopback address(es)");
+    expect(blocked.message).toContain("resolved_addresses: 10.0.0.8");
+
+    runtime.dispose();
+  });
+
   test("runtime mutations persist project mcp config and refresh active servers", async () => {
     const { root, cyreneHome } = await createWorkspace();
     const runtime = await createMcpRuntime(root, {
@@ -205,6 +406,7 @@ describe("createMcpRuntime", () => {
       id: "docs",
       transport: "http",
       url: "http://127.0.0.1:9100/mcp",
+      allowPrivateNetwork: true,
       headers: {
         Authorization: "Bearer docs-token",
       },
@@ -213,6 +415,7 @@ describe("createMcpRuntime", () => {
     expect(runtime.listServers().some(server => server.id === "docs")).toBe(true);
     let configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
     expect(configText).toContain('Authorization: "Bearer docs-token"');
+    expect(configText).toContain("allow_private_network: true");
 
     const addStdioResult = await runtime.addServer?.({
       id: "time",
@@ -244,6 +447,7 @@ describe("createMcpRuntime", () => {
     expect(configText).toContain("- docs");
     expect(configText).toContain("cwd: ./scripts");
     expect(configText).toContain("TIMEZONE: Asia/Shanghai");
+    expect(configText).toContain("trusted: true");
 
     runtime.dispose();
   });

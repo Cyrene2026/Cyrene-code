@@ -11,6 +11,7 @@ import {
   formatRemoteToolCallResult,
   type RemoteMcpTool,
 } from "../remote/mcpRemoteProtocol";
+import { buildRestrictedSubprocessEnvFromBase } from "../filesystem/subprocessEnv";
 
 type StdioMcpAdapterContext = {
   appRoot: string;
@@ -215,11 +216,10 @@ export class StdioMcpAdapter implements McpServerAdapter {
       this.server.args ?? [],
       {
         cwd: resolveServerCwd(this.context.appRoot, this.server.cwd),
-        env: {
-          ...process.env,
-          ...this.context.env,
-          ...this.server.env,
-        },
+        env: buildRestrictedSubprocessEnvFromBase(
+          this.context.env,
+          this.server.env
+        ),
         stdio: "pipe",
       }
     );

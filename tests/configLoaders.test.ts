@@ -323,6 +323,7 @@ describe("config loaders", () => {
         "  - id: docs",
         "    transport: http",
         '    url: "https://example.com/mcp"',
+        "    allow_private_network: true",
         "    headers:",
         "      Authorization: Bearer test-token",
       ].join("\n"),
@@ -346,6 +347,7 @@ describe("config loaders", () => {
     expect(config.servers.find(server => server.id === "docs")).toEqual(
       expect.objectContaining({
         transport: "http",
+        allowPrivateNetwork: true,
         headers: {
           Authorization: "Bearer test-token",
         },

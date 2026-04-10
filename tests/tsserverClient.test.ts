@@ -14,6 +14,11 @@ type FakeTsChildProcess = EventEmitter & {
   kill: () => boolean;
 };
 
+type SpawnOptionsSnapshot = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
 const tempRoots: string[] = [];
 
 const sendTsFrame = (child: FakeTsChildProcess, message: Record<string, unknown>) => {
@@ -39,9 +44,11 @@ const createFakeTsServerSpawn = (handlers: {
   ) => void;
 }) => {
   let spawnCount = 0;
+  let lastOptions: SpawnOptionsSnapshot | undefined;
 
-  const spawnProcess = () => {
+  const spawnProcess = (_command?: string, _args?: string[], options?: SpawnOptionsSnapshot) => {
     const spawnIndex = spawnCount++;
+    lastOptions = options;
     const child = new EventEmitter() as FakeTsChildProcess;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
@@ -82,6 +89,7 @@ const createFakeTsServerSpawn = (handlers: {
   return {
     spawnProcess,
     getSpawnCount: () => spawnCount,
+    getLastOptions: () => lastOptions,
   };
 };
 
@@ -195,5 +203,72 @@ describe("TsServerClient", () => {
     expect(fake.getSpawnCount()).toBeGreaterThanOrEqual(2);
 
     client.dispose();
+  });
+
+  test("spawns tsserver with a restricted environment and preserves explicit overrides", async () => {
+    const previousApiKey = process.env.CYRENE_API_KEY;
+    const previousPath = process.env.PATH;
+    process.env.CYRENE_API_KEY = "should-not-leak";
+    process.env.PATH = process.env.PATH ?? "/usr/bin";
+
+    const root = await mkdtemp(join(tmpdir(), "cyrene-tsserver-test-"));
+    tempRoots.push(root);
+    const filePath = join(root, "demo.ts");
+    await writeFile(filePath, "export const value = 1;\n", "utf8");
+
+    const fake = createFakeTsServerSpawn({
+      onRequest: (request, child) => {
+        if (request.command === "open") {
+          sendTsFrame(child, {
+            request_seq: request.seq,
+            body: true,
+          });
+          return;
+        }
+        if (request.command === "quickinfo") {
+          sendTsFrame(child, {
+            request_seq: request.seq,
+            body: {
+              kind: "const",
+              kindModifiers: "",
+              start: { line: 1, offset: 14 },
+              end: { line: 1, offset: 19 },
+              displayString: "const value: 1",
+              documentation: "",
+              tags: [],
+            },
+          });
+        }
+      },
+    });
+
+    const client = new TsServerClient({
+      workspaceRoot: root,
+      spawnProcess: fake.spawnProcess as any,
+      tsserverPath: "./fake-tsserver.js",
+      env: {
+        CUSTOM_TOOL_FLAG: "enabled",
+      },
+    });
+
+    try {
+      await client.hover(filePath, 1, 14);
+      const env = fake.getLastOptions()?.env ?? {};
+      expect(env.CYRENE_API_KEY).toBeUndefined();
+      expect(env.PATH).toBe(process.env.PATH);
+      expect(env.CUSTOM_TOOL_FLAG).toBe("enabled");
+    } finally {
+      client.dispose();
+      if (previousApiKey === undefined) {
+        delete process.env.CYRENE_API_KEY;
+      } else {
+        process.env.CYRENE_API_KEY = previousApiKey;
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+    }
   });
 });

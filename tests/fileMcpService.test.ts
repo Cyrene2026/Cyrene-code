@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix, relative } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -117,6 +117,17 @@ const createRelaxedReviewService = async (
   }, options);
   services.push(service);
   return { root, service };
+};
+
+const createWorkspaceEscapeSymlink = async (root: string) => {
+  const outsideRoot = await mkdtemp(join(tmpdir(), "cyrene-mcp-outside-"));
+  tempRoots.push(outsideRoot);
+  await writeFile(join(outsideRoot, "outside.txt"), "secret-from-outside-workspace\n", "utf8");
+  await symlink(
+    outsideRoot,
+    join(root, ".audit-link"),
+    process.platform === "win32" ? "junction" : "dir"
+  );
 };
 
 const createFakePersistentShellFactory = () => {
@@ -1187,6 +1198,26 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Path escapes workspace root");
+  });
+
+  test("blocks symlinked paths that escape the workspace root", async () => {
+    const { root, service } = await createService();
+    await createWorkspaceEscapeSymlink(root);
+
+    const readResult = await service.handleToolCall("file", {
+      action: "read_file",
+      path: ".audit-link/outside.txt",
+    });
+    expect(readResult.ok).toBe(false);
+    expect(readResult.message).toContain("Path escapes workspace root");
+
+    const writeResult = await service.handleToolCall("file", {
+      action: "write_file",
+      path: ".audit-link/outside.txt",
+      content: "mutated\n",
+    });
+    expect(writeResult.ok).toBe(false);
+    expect(writeResult.message).toContain("Path escapes workspace root");
   });
 
   test("allows workspace root paths and subpaths under posix semantics", () => {
@@ -2317,6 +2348,45 @@ describe("FileMcpService", () => {
     );
   });
 
+  test("lsp_rename approval fails when reviewed file content changed after preview", async () => {
+    const { root, service } = await createLspService("rust");
+
+    const originalContent = [
+      "fn greet(name: &str) -> String {",
+      '  format!("hello {}", name)',
+      "}",
+      "",
+      "fn main() {",
+      '  let message = greet("Cyrene");',
+      '  println!("{}", message);',
+      "}",
+    ].join("\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.rs"), originalContent, "utf8");
+
+    const pendingResult = await service.handleToolCall("file", {
+      action: "lsp_rename",
+      path: "src/demo.rs",
+      line: 6,
+      column: 17,
+      newName: "welcome",
+      serverId: "rust",
+    });
+
+    expect(pendingResult.ok).toBe(true);
+    expect(pendingResult.pending).toBeDefined();
+
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      `${originalContent}\n// drifted after preview\n`,
+      "utf8"
+    );
+
+    const approveResult = await service.approve(pendingResult.pending?.id ?? "");
+    expect(approveResult.ok).toBe(false);
+    expect(approveResult.message).toContain("LSP review is stale");
+  });
+
   test("lsp_code_actions lists available actions with metadata", async () => {
     const { root, service, lspManager } = await createLspService("rust");
 
@@ -3182,6 +3252,21 @@ describe("FileMcpService", () => {
     expect(service.listPending()).toHaveLength(0);
   });
 
+  test("run_shell blocks symlinked read targets that resolve outside the workspace root", async () => {
+    const { root, service } = await createService();
+    await createWorkspaceEscapeSymlink(root);
+
+    const result = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "cat .audit-link/outside.txt",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("outside the workspace root");
+    expect(service.listPending()).toHaveLength(0);
+  });
+
   test("open_shell executes directly and opens a single persistent shell", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { service, cleanup } = await createIsolatedService({
@@ -3217,7 +3302,64 @@ describe("FileMcpService", () => {
     }
   });
 
-  test("low-risk write_shell inputs execute directly and preserve cwd and environment", async () => {
+  test("open_shell spawns the persistent shell with a restricted environment", async () => {
+    const previousApiKey = process.env.CYRENE_API_KEY;
+    const previousPath = process.env.PATH;
+    process.env.CYRENE_API_KEY = "should-not-leak";
+    process.env.PATH = process.env.PATH ?? "/usr/bin";
+
+    const fakePty = createFakePersistentShellFactory();
+    const { service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      const opened = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+
+      expect(opened.ok).toBe(true);
+      expect(fakePty.state.env.CYRENE_API_KEY).toBeUndefined();
+      expect(fakePty.state.env.PATH).toBe(process.env.PATH);
+    } finally {
+      await cleanup();
+      if (previousApiKey === undefined) {
+        delete process.env.CYRENE_API_KEY;
+      } else {
+        process.env.CYRENE_API_KEY = previousApiKey;
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+    }
+  });
+
+  test("open_shell blocks symlinked cwd values that resolve outside the workspace root", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      await createWorkspaceEscapeSymlink(root);
+
+      const result = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+        cwd: ".audit-link",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("Path escapes workspace root");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("low-risk write_shell inputs execute directly and preserve cwd", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { root, service, cleanup } = await createIsolatedService({
       ptyFactory: fakePty.factory,
@@ -3225,7 +3367,6 @@ describe("FileMcpService", () => {
     });
     try {
       await mkdir(join(root, "subdir"), { recursive: true });
-      await mkdir(join(root, ".venv"), { recursive: true });
 
       const opened = await service.handleToolCall("file", {
         action: "open_shell",
@@ -3233,19 +3374,6 @@ describe("FileMcpService", () => {
       });
       expect(opened.ok).toBe(true);
       expect(opened.pending).toBeUndefined();
-
-      const activateResult = await service.handleToolCall("file", {
-        action: "write_shell",
-        path: ".",
-        input:
-          process.platform === "win32"
-            ? ".\\.venv\\Scripts\\Activate.ps1"
-            : ". .venv/bin/activate",
-      });
-      expect(activateResult.ok).toBe(true);
-      expect(activateResult.pending).toBeUndefined();
-      expect(activateResult.message).toContain("status: completed");
-      expect(activateResult.message).toContain("venv activated");
 
       const cdResult = await service.handleToolCall("file", {
         action: "write_shell",
@@ -3263,7 +3391,7 @@ describe("FileMcpService", () => {
       });
       expect(pythonResult.ok).toBe(true);
       expect(pythonResult.pending).toBeUndefined();
-      expect(pythonResult.message).toContain("Python 3.12.0 (venv)");
+      expect(pythonResult.message).toContain("Python 3.12.0 (system)");
 
       const pipListResult = await service.handleToolCall("file", {
         action: "write_shell",
@@ -3290,6 +3418,94 @@ describe("FileMcpService", () => {
       expect(status.ok).toBe(true);
       expect(status.message).toContain("status: idle");
       expect(status.message).toContain("cwd: subdir");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("write_shell source and venv activation now require review", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      await mkdir(join(root, ".venv"), { recursive: true });
+
+      await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+
+      const queued = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input:
+          process.platform === "win32"
+            ? ".\\.venv\\Scripts\\Activate.ps1"
+            : ". .venv/bin/activate",
+      });
+
+      expect(queued.ok).toBe(true);
+      expect(queued.pending?.request.action).toBe("write_shell");
+      expect(queued.pending?.previewSummary).toContain("policy: review");
+      expect(queued.pending?.previewSummary).toContain("risk: medium");
+
+      const approved = await service.approve(queued.pending?.id ?? "");
+      expect(approved.ok).toBe(true);
+      expect(approved.message).toContain("venv activated");
+
+      const pythonResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "python --version",
+      });
+      expect(pythonResult.ok).toBe(true);
+      expect(pythonResult.pending).toBeUndefined();
+      expect(pythonResult.message).toContain("Python 3.12.0 (venv)");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("write_shell approval fails if the reviewed shell session cwd changed before approval", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      await mkdir(join(root, "subdir"), { recursive: true });
+      await mkdir(join(root, ".venv"), { recursive: true });
+
+      const opened = await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+      expect(opened.ok).toBe(true);
+
+      const queued = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input:
+          process.platform === "win32"
+            ? ".\\.venv\\Scripts\\Activate.ps1"
+            : ". .venv/bin/activate",
+      });
+      expect(queued.ok).toBe(true);
+      expect(queued.pending).toBeDefined();
+
+      const cdResult = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "cd subdir",
+      });
+      expect(cdResult.ok).toBe(true);
+      expect(cdResult.pending).toBeUndefined();
+
+      const approved = await service.approve(queued.pending?.id ?? "");
+      expect(approved.ok).toBe(false);
+      expect(approved.message).toContain("write_shell review is stale");
     } finally {
       await cleanup();
     }
@@ -3360,6 +3576,34 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toContain("outside the workspace root");
     expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("write_shell blocks symlinked read targets that resolve outside the workspace root", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      await createWorkspaceEscapeSymlink(root);
+
+      await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+
+      const result = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: "cat .audit-link/outside.txt",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("outside the workspace root");
+      expect(service.listPending()).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
   });
 
   test("medium-risk and unknown write_shell inputs still enter review", async () => {

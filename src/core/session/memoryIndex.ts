@@ -74,6 +74,7 @@ export type SessionPromptContext = {
   relevantMemories: string[];
   archiveSections?: WorkingStateSectionMap;
   recent: SessionMessage[];
+  latestActionableUserMessage: string;
   durableSummary: string;
   pendingDigest: string;
   summaryFallback: string;
@@ -1130,6 +1131,7 @@ export const getPromptContextFromMemoryIndex = (
     durableSummary: string;
     summaryFallback: string;
     pendingDigest: string;
+    latestActionableUserMessage?: string;
     reducerMode?: ReducerMode;
     summaryRecoveryNeeded?: boolean;
     interruptedTurn?: SessionInFlightTurn | null;
@@ -1199,6 +1201,7 @@ export const getPromptContextFromMemoryIndex = (
     relevantMemories,
     archiveSections,
     recent,
+    latestActionableUserMessage: options.latestActionableUserMessage ?? "",
     durableSummary: options.durableSummary,
     pendingDigest: options.pendingDigest,
     summaryFallback: options.summaryFallback,

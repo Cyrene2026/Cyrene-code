@@ -83,6 +83,7 @@ export type McpRuntimeServerInput = {
   command?: string;
   args?: string[];
   url?: string;
+  allowPrivateNetwork?: boolean;
   env?: Record<string, string>;
   headers?: Record<string, string>;
   tools?: McpRuntimeToolInput[];

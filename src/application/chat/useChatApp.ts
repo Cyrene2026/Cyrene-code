@@ -2341,7 +2341,22 @@ export const useChatApp = ({
   const applyLoadedSession = (loaded: SessionRecord) => {
     const shouldShowLegacyHint = hasLegacyCompressedMarkdown(loaded);
     clearLiveAssistantSegment();
+    activeTurnRef.current = null;
+    suspendedTaskRef.current = null;
+    dismissedApprovalQueueSignatureRef.current = null;
     pendingChoiceRef.current = loaded.pendingChoice;
+    clearPendingReviewState();
+    setSessionState(null);
+    setStatus("idle");
+    clearInput();
+    setInputCursorOffset(0);
+    preferredInputColumnRef.current = null;
+    setRecentLocalCommand(null);
+    const nextApprovalPanelState = createInitialApprovalPanelState(
+      approvalPanelRef.current.previewMode
+    );
+    approvalPanelRef.current = nextApprovalPanelState;
+    setApprovalPanel(nextApprovalPanelState);
     updateActiveSessionIdState(loaded.id);
     setItems([
       {

@@ -3,6 +3,7 @@ import { access, readFile, stat } from "node:fs/promises";
 import { basename, dirname, extname, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { LspServerConfig } from "../../toolTypes";
+import { buildRestrictedSubprocessEnv } from "./subprocessEnv";
 
 type JsonRpcResponseMessage = {
   jsonrpc?: string;
@@ -980,11 +981,7 @@ class LspClient {
       this.options.config.args ?? [],
       {
         cwd: rootPath,
-        env: {
-          ...process.env,
-          ...this.options.env,
-          ...(this.options.config.env ?? {}),
-        },
+        env: buildRestrictedSubprocessEnv(this.options.env, this.options.config.env),
         stdio: "pipe",
       }
     );

@@ -10,7 +10,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -79,12 +79,14 @@ import {
   type LspDocumentSymbol,
   type LspLocation,
   type LspManagerLike,
+  type LspPrepareRenameResult,
   type LspRange,
   type LspTextEdit,
   type LspWorkspaceLike,
   type LspWorkspaceSymbol,
   type LspWorkspaceEdit,
 } from "./lspClient";
+import { buildRestrictedSubprocessEnvFromBase } from "./subprocessEnv";
 
 type HandleResult = {
   ok: boolean;
@@ -244,6 +246,52 @@ type LspWorkspaceEditPlan = {
   files: LspWorkspaceFileEditPlan[];
   skippedPaths: string[];
   totalEdits: number;
+};
+
+type ResolvedLspRenamePlan = {
+  session: LspWorkspaceLike;
+  prepare: LspPrepareRenameResult | null;
+  workspaceEdit: LspWorkspaceEdit | null;
+  plan: LspWorkspaceEditPlan | null;
+};
+
+type ResolvedLspCodeActionPlan = {
+  session: LspWorkspaceLike;
+  absolutePath: string;
+  actions: LspCodeAction[];
+  selectedAction: LspCodeAction | null;
+  plan: LspWorkspaceEditPlan | null;
+};
+
+type ResolvedLspFormatDocumentPlan = {
+  session: LspWorkspaceLike;
+  edits: LspTextEdit[];
+  plan: LspWorkspaceEditPlan;
+};
+
+type PendingApprovalGuard =
+  | {
+      kind: "write_shell";
+      sessionCreatedAt: string;
+      cwd: string;
+    }
+  | {
+      kind: "lsp_rename";
+      resolved: ResolvedLspRenamePlan;
+    }
+  | {
+      kind: "lsp_code_actions";
+      resolved: ResolvedLspCodeActionPlan;
+    }
+  | {
+      kind: "lsp_format_document";
+      resolved: ResolvedLspFormatDocumentPlan;
+    };
+
+type PreparedPendingReview = {
+  previewSummary: string;
+  previewFull: string;
+  guard?: PendingApprovalGuard;
 };
 
 type ShellFlavor = "pwsh" | "sh";
@@ -2655,8 +2703,52 @@ export const isPathInsideWorkspaceRoot = (
   return !/^\.\.(?:[\\/]|$)/.test(relativePath) && !pathApi.isAbsolute(relativePath);
 };
 
+const realpathNative = (targetPath: string) =>
+  typeof realpathSync.native === "function"
+    ? realpathSync.native(targetPath)
+    : realpathSync(targetPath);
+
+const resolvePathThroughRealAncestors = (targetPath: string) => {
+  const absolutePath = resolve(targetPath);
+  let ancestor = absolutePath;
+
+  while (true) {
+    try {
+      lstatSync(ancestor);
+      break;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "ENOENT") {
+        throw error;
+      }
+      const parent = dirname(ancestor);
+      if (parent === ancestor) {
+        throw error;
+      }
+      ancestor = parent;
+    }
+  }
+
+  let realAncestor: string;
+  try {
+    realAncestor = realpathNative(ancestor);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error(`Path traverses a broken symbolic link: ${absolutePath}`);
+    }
+    throw error;
+  }
+
+  const remainder = relative(ancestor, absolutePath);
+  return remainder && remainder !== "."
+    ? resolve(realAncestor, remainder)
+    : realAncestor;
+};
+
 export class FileMcpService {
   private pending = new Map<string, PendingReviewItem>();
+  private pendingApprovalGuards = new Map<string, PendingApprovalGuard>();
   private recentListDir = new Map<
     string,
     { output: string; listedAt: number; mutationVersion: number }
@@ -2667,11 +2759,17 @@ export class FileMcpService {
   private shellSession: ActiveShellSession | null = null;
   private tsServerClient: TsServerClientLike | null;
   private lspManager: LspManagerLike | null;
+  private readonly workspaceRootAbsolute: string;
+  private readonly workspaceRootRealpath: string;
 
   constructor(
     private readonly rules: RuleConfig,
     private readonly options: FileMcpServiceOptions = {}
   ) {
+    this.workspaceRootAbsolute = resolve(this.rules.workspaceRoot);
+    this.workspaceRootRealpath = resolvePathThroughRealAncestors(
+      this.workspaceRootAbsolute
+    );
     this.tsServerClient = options.tsServerClient ?? null;
     this.lspManager = options.lspManager ?? null;
   }
@@ -2689,11 +2787,51 @@ export class FileMcpService {
     return raw;
   }
 
+  private resolveAbsolutePathForContainment(absolutePath: string) {
+    return resolvePathThroughRealAncestors(absolutePath);
+  }
+
+  private canAccessAbsolutePathInsideWorkspaceRoot(absolutePath: string) {
+    try {
+      return isPathInsideWorkspaceRoot(
+        this.resolveAbsolutePathForContainment(absolutePath),
+        this.workspaceRootRealpath
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private formatAbsolutePathForDisplay(absolutePath: string) {
+    const normalizedAbsolute = resolve(absolutePath);
+    if (this.canAccessAbsolutePathInsideWorkspaceRoot(normalizedAbsolute)) {
+      const normalized = relative(this.workspaceRootAbsolute, normalizedAbsolute)
+        .replace(/\\/g, "/")
+        .replace(/^\.\/+/, "");
+      return normalized || ".";
+    }
+
+    try {
+      return this.resolveAbsolutePathForContainment(normalizedAbsolute).replace(/\\/g, "/");
+    } catch {
+      return normalizedAbsolute.replace(/\\/g, "/");
+    }
+  }
+
+  private isShellTargetInsideWorkspace(cwd: string, token: string) {
+    if (!token || token === "-") {
+      return false;
+    }
+    if (isShellNonFileSystemTarget(token)) {
+      return false;
+    }
+    return this.canAccessAbsolutePathInsideWorkspaceRoot(resolve(cwd, token));
+  }
+
   private resolvePath(inputPath: string) {
     const normalized = this.toWorkspaceRelativePath(inputPath);
-    const absolute = resolve(this.rules.workspaceRoot, normalized);
-    const root = resolve(this.rules.workspaceRoot);
-    if (!isPathInsideWorkspaceRoot(absolute, root)) {
+    const absolute = resolve(this.workspaceRootAbsolute, normalized);
+    if (!this.canAccessAbsolutePathInsideWorkspaceRoot(absolute)) {
       throw new Error(
         `Path escapes workspace root: ${inputPath}. Use workspace-relative paths such as "test_files/...".`
       );
@@ -2703,14 +2841,14 @@ export class FileMcpService {
 
   private normalizeWorkspacePath(inputPath: string) {
     const absolute = this.resolvePath(inputPath);
-    const normalized = relative(resolve(this.rules.workspaceRoot), absolute)
+    const normalized = relative(this.workspaceRootAbsolute, absolute)
       .replace(/\\/g, "/")
       .replace(/^\.\/+/, "");
     return normalized || ".";
   }
 
   private normalizeWorkspacePathFromAbsolute(absolutePath: string) {
-    const normalized = relative(resolve(this.rules.workspaceRoot), absolutePath)
+    const normalized = relative(this.workspaceRootAbsolute, absolutePath)
       .replace(/\\/g, "/")
       .replace(/^\.\/+/, "");
     return normalized || ".";
@@ -2758,12 +2896,13 @@ export class FileMcpService {
   }
 
   private formatTsWorkspacePath(absolutePath: string) {
-    return isPathInsideWorkspaceRoot(absolutePath, this.rules.workspaceRoot)
-      ? this.normalizeWorkspacePathFromAbsolute(absolutePath)
-      : absolutePath.replace(/\\/g, "/");
+    return this.formatAbsolutePathForDisplay(absolutePath);
   }
 
   private async getFileLineSnippet(absolutePath: string, lineNumber: number) {
+    if (!this.canAccessAbsolutePathInsideWorkspaceRoot(absolutePath)) {
+      throw new Error(`Path escapes workspace root: ${absolutePath}`);
+    }
     const content = await readFile(absolutePath, "utf8");
     const line = splitFileLines(content)[lineNumber - 1] ?? "";
     const trimmed = line.trim();
@@ -3238,7 +3377,7 @@ export class FileMcpService {
       if (!filePath) {
         throw new Error(`LSP workspace edit does not support non-file URI edits: ${group.uri}`);
       }
-      if (!isPathInsideWorkspaceRoot(filePath, this.rules.workspaceRoot)) {
+      if (!this.canAccessAbsolutePathInsideWorkspaceRoot(filePath)) {
         skippedPaths.push(this.formatTsWorkspacePath(filePath));
         continue;
       }
@@ -3299,6 +3438,141 @@ export class FileMcpService {
     });
     this.noteFilesystemMutation();
     return plan.files.length;
+  }
+
+  private async ensureLspWorkspaceEditPlanFresh(plan: LspWorkspaceEditPlan) {
+    const driftedPaths: string[] = [];
+
+    for (const file of plan.files) {
+      const current = await readFile(file.filePath, "utf8").catch(error => {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === "ENOENT") {
+          return null;
+        }
+        throw error;
+      });
+      if (current !== file.before) {
+        driftedPaths.push(file.workspacePath);
+      }
+    }
+
+    if (driftedPaths.length > 0) {
+      throw new Error(
+        [
+          `LSP review is stale: ${driftedPaths.length} file(s) changed after preview.`,
+          ...driftedPaths.slice(0, 5).map(path => `- ${path}`),
+          driftedPaths.length > 5
+            ? `- ... ${driftedPaths.length - 5} more file(s)`
+            : "",
+          "Re-run the LSP action to refresh the preview before approving.",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    }
+  }
+
+  private formatResolvedLspRenameReviewDetails(
+    request: LspRenameToolRequest,
+    resolved: ResolvedLspRenamePlan,
+    mode: "summary" | "full"
+  ) {
+    const { session, prepare, workspaceEdit, plan } = resolved;
+    return [
+      "[lsp rename preview]",
+      `server: ${session.getInfo().serverId}`,
+      `path: ${request.path}`,
+      `position: ${request.line}:${request.column}`,
+      `symbol: ${prepare?.placeholder ?? "(unavailable)"}`,
+      `rename_to: ${request.newName}`,
+      workspaceEdit ? "workspace_edit: ready" : "workspace_edit: unavailable",
+      ...(plan
+        ? [
+            `files: ${plan.files.length}`,
+            `edits: ${plan.totalEdits}`,
+            ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+            ...(plan.skippedPaths.length > 0
+              ? [
+                  `skipped_outside_workspace: ${plan.skippedPaths.length}`,
+                  ...plan.skippedPaths.slice(0, 5).map(path => `- ${path}`),
+                ]
+              : []),
+          ]
+        : []),
+    ].join("\n");
+  }
+
+  private formatResolvedLspCodeActionReviewDetails(
+    request: LspCodeActionsToolRequest,
+    resolved: ResolvedLspCodeActionPlan,
+    mode: "summary" | "full"
+  ) {
+    const { session, actions, selectedAction, plan } = resolved;
+    return [
+      "[lsp code action preview]",
+      `server: ${session.getInfo().serverId}`,
+      `path: ${request.path}`,
+      `position: ${request.line}:${request.column}`,
+      `title: ${request.title}`,
+      request.kind ? `kind_filter: ${request.kind}` : "",
+      selectedAction?.kind ? `kind: ${selectedAction.kind}` : "",
+      selectedAction?.isPreferred ? "preferred: true" : "",
+      selectedAction?.disabledReason
+        ? `disabled: ${selectedAction.disabledReason}`
+        : selectedAction
+          ? "disabled: false"
+          : "",
+      !selectedAction
+        ? `match: not found (${actions.length} available action(s))`
+        : selectedAction.edit
+          ? "workspace_edit: ready"
+          : selectedAction.hasCommand
+            ? "workspace_edit: command-only (not supported yet)"
+            : "workspace_edit: none",
+      ...(plan
+        ? [
+            `files: ${plan.files.length}`,
+            `edits: ${plan.totalEdits}`,
+            ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+            ...(plan.skippedPaths.length > 0
+              ? [
+                  `skipped_outside_workspace: ${plan.skippedPaths.length}`,
+                  ...plan.skippedPaths.slice(0, 5).map(path => `- ${path}`),
+                ]
+              : []),
+          ]
+        : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private formatResolvedLspFormatDocumentReviewDetails(
+    request: LspFormatDocumentToolRequest,
+    resolved: ResolvedLspFormatDocumentPlan,
+    mode: "summary" | "full"
+  ) {
+    const { session, plan } = resolved;
+    return [
+      "[lsp format preview]",
+      `server: ${session.getInfo().serverId}`,
+      `path: ${request.path}`,
+      typeof request.tabSize === "number" ? `tab_size: ${request.tabSize}` : "",
+      typeof request.insertSpaces === "boolean"
+        ? `insert_spaces: ${request.insertSpaces}`
+        : "",
+      `files: ${plan.files.length}`,
+      `edits: ${plan.totalEdits}`,
+      ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
+      ...(plan.skippedPaths.length > 0
+        ? [
+            `skipped_outside_workspace: ${plan.skippedPaths.length}`,
+            ...plan.skippedPaths.slice(0, 5).map(path => `- ${path}`),
+          ]
+        : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   private formatLspWorkspaceEditDiffPreview(
@@ -3602,7 +3876,7 @@ export class FileMcpService {
     const commandName = (tokens[0] ?? "").toLowerCase();
     const cwd = request.cwd
       ? this.resolvePath(request.cwd)
-      : resolve(this.rules.workspaceRoot);
+      : this.workspaceRootAbsolute;
     const targetTokens = getShellTargetOperands(commandName, tokens);
 
     if (["sudo", "su", "doas", "runas"].includes(commandName)) {
@@ -3656,13 +3930,11 @@ export class FileMcpService {
     }
 
     if (
-      SHELL_MUTATING_COMMANDS.has(commandName) &&
       targetTokens.some(token => {
-        if (!looksLikePathToken(token)) {
+        if (!looksLikePathToken(token) || isShellNonFileSystemTarget(token)) {
           return false;
         }
-        const resolvedTarget = resolve(cwd, token);
-        return !isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot);
+        return !this.isShellTargetInsideWorkspace(cwd, token);
       })
     ) {
       return {
@@ -3670,8 +3942,10 @@ export class FileMcpService {
         shell,
         tokens,
         risk: "high",
-        reason: "run_shell blocked a write or delete target outside the workspace root.",
-        notes: ["Shell mutations must stay inside the workspace root."],
+        reason: SHELL_MUTATING_COMMANDS.has(commandName)
+          ? "run_shell blocked a write or delete target outside the workspace root."
+          : "run_shell blocked a file target outside the workspace root.",
+        notes: ["Shell command targets must stay inside the workspace root."],
       };
     }
 
@@ -3708,8 +3982,21 @@ export class FileMcpService {
 
     const tokens = tokenized.tokens;
     const commandName = (tokens[0] ?? "").toLowerCase();
-    const cwd = session?.cwd ?? resolve(this.rules.workspaceRoot);
+    const cwd = session?.cwd ?? this.workspaceRootAbsolute;
     const targetTokens = getShellTargetOperands(commandName, tokens);
+
+    if (session && !this.canAccessAbsolutePathInsideWorkspaceRoot(cwd)) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        policy: "blocked",
+        risk: "high",
+        reason:
+          "write_shell blocked because the persistent shell cwd escaped the workspace root. Use close_shell and open_shell again.",
+        notes: ["Persistent shell state must stay inside the workspace root."],
+      };
+    }
 
     if (["sudo", "su", "doas", "runas"].includes(commandName)) {
       return {
@@ -3775,17 +4062,29 @@ export class FileMcpService {
       };
     }
 
+    if (
+      targetTokens.some(token => {
+        if (!looksLikePathToken(token) || isShellNonFileSystemTarget(token)) {
+          return false;
+        }
+        return !this.isShellTargetInsideWorkspace(cwd, token);
+      })
+    ) {
+      return {
+        ok: false,
+        shell,
+        tokens,
+        policy: "blocked",
+        risk: "high",
+        reason: SHELL_MUTATING_COMMANDS.has(commandName)
+          ? "write_shell blocked a write or delete target outside the workspace root."
+          : "write_shell blocked a file target outside the workspace root.",
+        notes: ["Shell command targets must stay inside the workspace root."],
+      };
+    }
+
     const targetsStayInWorkspace = (targets: string[]) =>
-      targets.every(token => {
-        if (!token || token === "-") {
-          return false;
-        }
-        if (isShellNonFileSystemTarget(token)) {
-          return false;
-        }
-        const resolvedTarget = resolve(cwd, token);
-        return isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot);
-      });
+      targets.every(token => this.isShellTargetInsideWorkspace(cwd, token));
 
     if (commandName === "cd") {
       if (targetTokens.length !== 1) {
@@ -3849,10 +4148,10 @@ export class FileMcpService {
         ok: true,
         shell,
         tokens,
-        policy: "direct",
-        risk: "low",
+        policy: "review",
+        risk: "medium",
         notes: [
-          "Workspace-local source commands are allowlisted for direct execution.",
+          "Sourcing a script executes arbitrary shell code, so it always requires review.",
         ],
       };
     }
@@ -3873,10 +4172,10 @@ export class FileMcpService {
         ok: true,
         shell,
         tokens,
-        policy: "direct",
-        risk: "low",
+        policy: "review",
+        risk: "medium",
         notes: [
-          "Workspace-local virtual-environment activation is allowlisted for direct execution.",
+          "Virtual-environment activation executes shell script content, so it always requires review.",
         ],
       };
     }
@@ -3973,11 +4272,10 @@ export class FileMcpService {
     if (
       SHELL_MUTATING_COMMANDS.has(commandName) &&
       targetTokens.some(token => {
-        if (!looksLikePathToken(token)) {
+        if (!looksLikePathToken(token) || isShellNonFileSystemTarget(token)) {
           return false;
         }
-        const resolvedTarget = resolve(cwd, token);
-        return !isPathInsideWorkspaceRoot(resolvedTarget, this.rules.workspaceRoot);
+        return !this.isShellTargetInsideWorkspace(cwd, token);
       })
     ) {
       return {
@@ -4074,13 +4372,16 @@ export class FileMcpService {
       return ".";
     }
 
-    const workspaceRoot = resolve(this.rules.workspaceRoot);
     if (isAbsolute(trimmed)) {
       const absolute = resolve(trimmed);
-      if (!isPathInsideWorkspaceRoot(absolute, workspaceRoot)) {
-        return trimmed.replace(/\\/g, "/");
+      if (!this.canAccessAbsolutePathInsideWorkspaceRoot(absolute)) {
+        try {
+          return this.resolveAbsolutePathForContainment(absolute).replace(/\\/g, "/");
+        } catch {
+          return absolute.replace(/\\/g, "/");
+        }
       }
-      const normalized = relative(workspaceRoot, absolute)
+      const normalized = relative(this.workspaceRootAbsolute, absolute)
         .replace(/\\/g, "/")
         .replace(/^\.\/+/, "");
       return normalized || ".";
@@ -4241,6 +4542,7 @@ export class FileMcpService {
   }
 
   dispose() {
+    this.pendingApprovalGuards.clear();
     const session = this.shellSession;
     if (!session) {
       this.tsServerClient?.dispose();
@@ -4274,11 +4576,7 @@ export class FileMcpService {
   }
 
   private buildPtyEnvironment() {
-    return Object.fromEntries(
-      Object.entries(process.env).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string"
-      )
-    );
+    return buildRestrictedSubprocessEnvFromBase();
   }
 
   private async openPersistentShell(request: OpenShellToolRequest) {
@@ -4722,84 +5020,17 @@ export class FileMcpService {
 
     if (request.action === "lsp_rename") {
       const resolved = await this.resolveLspRenamePlan(request);
-      const { session, prepare, workspaceEdit, plan } = resolved;
-      return [
-        "[lsp rename preview]",
-        `server: ${session.getInfo().serverId}`,
-        `path: ${request.path}`,
-        `position: ${request.line}:${request.column}`,
-        `symbol: ${prepare?.placeholder ?? "(unavailable)"}`,
-        `rename_to: ${request.newName}`,
-        workspaceEdit ? `workspace_edit: ready` : "workspace_edit: unavailable",
-        ...(plan
-          ? [
-              `files: ${plan.files.length}`,
-              `edits: ${plan.totalEdits}`,
-              ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
-              ...(plan.skippedPaths.length > 0
-                ? [
-                    `skipped_outside_workspace: ${plan.skippedPaths.length}`,
-                    ...plan.skippedPaths.slice(0, 5).map(path => `- ${path}`),
-                  ]
-                : []),
-            ]
-          : []),
-      ].join("\n");
+      return this.formatResolvedLspRenameReviewDetails(request, resolved, mode);
     }
 
     if (request.action === "lsp_code_actions" && request.title?.trim()) {
       const resolved = await this.resolveLspCodeActionPlan(request);
-      const { session, actions, selectedAction, plan } = resolved;
-      return [
-        "[lsp code action preview]",
-        `server: ${session.getInfo().serverId}`,
-        `path: ${request.path}`,
-        `position: ${request.line}:${request.column}`,
-        `title: ${request.title}`,
-        request.kind ? `kind_filter: ${request.kind}` : "",
-        selectedAction?.kind ? `kind: ${selectedAction.kind}` : "",
-        selectedAction?.isPreferred ? "preferred: true" : "",
-        selectedAction?.disabledReason
-          ? `disabled: ${selectedAction.disabledReason}`
-          : selectedAction
-            ? "disabled: false"
-            : "",
-        !selectedAction
-          ? `match: not found (${actions.length} available action(s))`
-          : selectedAction.edit
-            ? "workspace_edit: ready"
-            : selectedAction.hasCommand
-              ? "workspace_edit: command-only (not supported yet)"
-              : "workspace_edit: none",
-        ...(plan
-          ? [
-              `files: ${plan.files.length}`,
-              `edits: ${plan.totalEdits}`,
-              ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
-            ]
-          : []),
-      ]
-        .filter(Boolean)
-        .join("\n");
+      return this.formatResolvedLspCodeActionReviewDetails(request, resolved, mode);
     }
 
     if (request.action === "lsp_format_document") {
       const resolved = await this.resolveLspFormatDocumentPlan(request);
-      const { session, plan } = resolved;
-      return [
-        "[lsp format preview]",
-        `server: ${session.getInfo().serverId}`,
-        `path: ${request.path}`,
-        typeof request.tabSize === "number" ? `tab_size: ${request.tabSize}` : "",
-        typeof request.insertSpaces === "boolean"
-          ? `insert_spaces: ${request.insertSpaces}`
-          : "",
-        `files: ${plan.files.length}`,
-        `edits: ${plan.totalEdits}`,
-        ...this.formatLspWorkspaceEditDiffPreview(plan, mode),
-      ]
-        .filter(Boolean)
-        .join("\n");
+      return this.formatResolvedLspFormatDocumentReviewDetails(request, resolved, mode);
     }
 
     const abs = this.resolvePath(request.path);
@@ -4906,6 +5137,90 @@ export class FileMcpService {
           maxLines
         ),
       ].join("\n");
+    }
+  }
+
+  private buildPreparedPendingReview(
+    request: ToolRequest,
+    detailsSummary: string,
+    detailsFull: string,
+    guard?: PendingApprovalGuard
+  ): PreparedPendingReview {
+    return {
+      previewSummary: [this.formatPreview(request), detailsSummary]
+        .filter(Boolean)
+        .join("\n"),
+      previewFull: [this.formatPreview(request), detailsFull]
+        .filter(Boolean)
+        .join("\n"),
+      ...(guard ? { guard } : {}),
+    };
+  }
+
+  private async preparePendingReview(request: ToolRequest): Promise<PreparedPendingReview> {
+    if (request.action === "write_shell") {
+      const detailsSummary = await this.buildReviewDetails(request, "summary");
+      const detailsFull = await this.buildReviewDetails(request, "full");
+      const session = this.getActiveShellSession();
+      return this.buildPreparedPendingReview(request, detailsSummary, detailsFull, {
+        kind: "write_shell",
+        sessionCreatedAt: session.createdAt,
+        cwd: session.cwd,
+      });
+    }
+
+    if (request.action === "lsp_rename") {
+      const resolved = await this.resolveLspRenamePlan(request);
+      return this.buildPreparedPendingReview(
+        request,
+        this.formatResolvedLspRenameReviewDetails(request, resolved, "summary"),
+        this.formatResolvedLspRenameReviewDetails(request, resolved, "full"),
+        {
+          kind: "lsp_rename",
+          resolved,
+        }
+      );
+    }
+
+    if (isLspCodeActionApplyRequest(request)) {
+      const resolved = await this.resolveLspCodeActionPlan(request);
+      return this.buildPreparedPendingReview(
+        request,
+        this.formatResolvedLspCodeActionReviewDetails(request, resolved, "summary"),
+        this.formatResolvedLspCodeActionReviewDetails(request, resolved, "full"),
+        {
+          kind: "lsp_code_actions",
+          resolved,
+        }
+      );
+    }
+
+    if (request.action === "lsp_format_document") {
+      const resolved = await this.resolveLspFormatDocumentPlan(request);
+      return this.buildPreparedPendingReview(
+        request,
+        this.formatResolvedLspFormatDocumentReviewDetails(request, resolved, "summary"),
+        this.formatResolvedLspFormatDocumentReviewDetails(request, resolved, "full"),
+        {
+          kind: "lsp_format_document",
+          resolved,
+        }
+      );
+    }
+
+    const detailsSummary = await this.buildReviewDetails(request, "summary");
+    const detailsFull = await this.buildReviewDetails(request, "full");
+    return this.buildPreparedPendingReview(request, detailsSummary, detailsFull);
+  }
+
+  private ensureWriteShellApprovalGuardFresh(
+    guard: Extract<PendingApprovalGuard, { kind: "write_shell" }>
+  ) {
+    const session = this.getActiveShellSession();
+    if (session.createdAt !== guard.sessionCreatedAt || session.cwd !== guard.cwd) {
+      throw new Error(
+        "write_shell review is stale: shell cwd/session changed after preview. Reject this pending item and re-run the command before approving."
+      );
     }
   }
 
@@ -6341,12 +6656,7 @@ export class FileMcpService {
           ? [`symbol: ${result.symbolName}`]
           : []),
       ...limitedRefs.map(reference => {
-        const workspacePath = isPathInsideWorkspaceRoot(
-          reference.file,
-          this.rules.workspaceRoot
-        )
-          ? this.normalizeWorkspacePathFromAbsolute(reference.file)
-          : reference.file.replace(/\\/g, "/");
+        const workspacePath = this.formatTsWorkspacePath(reference.file);
         return [
           `${workspacePath}:${this.formatTsLocation(reference.start)}-${this.formatTsLocation(reference.end)}`,
           reference.isDefinition ? "[definition]" : "",
@@ -6429,7 +6739,7 @@ export class FileMcpService {
     const skippedPlanPaths: string[] = [];
     for (const group of result.locs) {
       const groupAbsolutePath = resolve(group.file);
-      if (!isPathInsideWorkspaceRoot(groupAbsolutePath, this.rules.workspaceRoot)) {
+      if (!this.canAccessAbsolutePathInsideWorkspaceRoot(groupAbsolutePath)) {
         skippedPlanPaths.push(this.formatTsWorkspacePath(groupAbsolutePath));
         continue;
       }
@@ -6782,8 +7092,11 @@ export class FileMcpService {
     return body;
   }
 
-  private async executeLspRename(request: LspRenameToolRequest) {
-    const resolved = await this.resolveLspRenamePlan(request);
+  private async executeResolvedLspRename(
+    request: LspRenameToolRequest,
+    resolved: ResolvedLspRenamePlan,
+    options?: { ensureFresh?: boolean }
+  ) {
     const { session, prepare, workspaceEdit, plan } = resolved;
     if (!prepare) {
       throw new Error(
@@ -6792,6 +7105,12 @@ export class FileMcpService {
     }
     if (!workspaceEdit || !plan) {
       throw new Error("LSP rename unavailable: no workspace edit was returned.");
+    }
+    if (options?.ensureFresh) {
+      await this.ensureLspWorkspaceEditPlanFresh(plan);
+    }
+    if (plan.skippedPaths.length > 0) {
+      await this.applyLspWorkspaceEditPlan(request, plan);
     }
     if (plan.files.length === 0) {
       return [
@@ -6818,6 +7137,13 @@ export class FileMcpService {
     ].join("\n");
   }
 
+  private async executeLspRename(request: LspRenameToolRequest) {
+    return this.executeResolvedLspRename(
+      request,
+      await this.resolveLspRenamePlan(request)
+    );
+  }
+
   private formatLspCodeActionListEntry(action: LspCodeAction) {
     const details = [
       action.kind ? `[${action.kind}]` : "",
@@ -6831,24 +7157,11 @@ export class FileMcpService {
     return `- ${action.title}${details ? ` ${details}` : ""}`;
   }
 
-  private async executeLspCodeActions(request: LspCodeActionsToolRequest) {
-    if (!request.title?.trim()) {
-      const { session, actions } = await this.listLspCodeActions(request);
-      const limitedActions = actions.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
-      if (limitedActions.length === 0) {
-        return `(no LSP code actions at: ${request.path}:${request.line}:${request.column})`;
-      }
-      return [
-        `Found ${limitedActions.length} LSP code action(s):`,
-        `server: ${session.getInfo().serverId}`,
-        request.kind ? `kind_filter: ${request.kind}` : "",
-        ...limitedActions.map(action => this.formatLspCodeActionListEntry(action)),
-      ]
-        .filter(Boolean)
-        .join("\n");
-    }
-
-    const resolved = await this.resolveLspCodeActionPlan(request);
+  private async executeResolvedLspCodeAction(
+    request: LspCodeActionsToolRequest,
+    resolved: ResolvedLspCodeActionPlan,
+    options?: { ensureFresh?: boolean }
+  ) {
     const { session, actions, selectedAction, plan } = resolved;
     if (!selectedAction) {
       const available = actions.slice(0, 8).map(action => `- ${action.title}`);
@@ -6875,7 +7188,16 @@ export class FileMcpService {
       }
       throw new Error(`LSP code action has no editable workspace changes: ${selectedAction.title}`);
     }
-    if (!plan || plan.files.length === 0) {
+    if (!plan) {
+      throw new Error(`LSP code action has no editable workspace changes: ${selectedAction.title}`);
+    }
+    if (options?.ensureFresh) {
+      await this.ensureLspWorkspaceEditPlanFresh(plan);
+    }
+    if (plan.skippedPaths.length > 0) {
+      await this.applyLspWorkspaceEditPlan(request, plan);
+    }
+    if (plan.files.length === 0) {
       return [
         "Applied LSP code action:",
         `server: ${session.getInfo().serverId}`,
@@ -6905,9 +7227,41 @@ export class FileMcpService {
       .join("\n");
   }
 
-  private async executeLspFormatDocument(request: LspFormatDocumentToolRequest) {
-    const resolved = await this.resolveLspFormatDocumentPlan(request);
+  private async executeLspCodeActions(request: LspCodeActionsToolRequest) {
+    if (!request.title?.trim()) {
+      const { session, actions } = await this.listLspCodeActions(request);
+      const limitedActions = actions.slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS);
+      if (limitedActions.length === 0) {
+        return `(no LSP code actions at: ${request.path}:${request.line}:${request.column})`;
+      }
+      return [
+        `Found ${limitedActions.length} LSP code action(s):`,
+        `server: ${session.getInfo().serverId}`,
+        request.kind ? `kind_filter: ${request.kind}` : "",
+        ...limitedActions.map(action => this.formatLspCodeActionListEntry(action)),
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    return this.executeResolvedLspCodeAction(
+      request,
+      await this.resolveLspCodeActionPlan(request)
+    );
+  }
+
+  private async executeResolvedLspFormatDocument(
+    request: LspFormatDocumentToolRequest,
+    resolved: ResolvedLspFormatDocumentPlan,
+    options?: { ensureFresh?: boolean }
+  ) {
     const { session, plan } = resolved;
+    if (options?.ensureFresh) {
+      await this.ensureLspWorkspaceEditPlanFresh(plan);
+    }
+    if (plan.skippedPaths.length > 0) {
+      await this.applyLspWorkspaceEditPlan(request, plan);
+    }
     if (plan.files.length === 0) {
       return [
         "Applied LSP document format:",
@@ -6933,6 +7287,13 @@ export class FileMcpService {
     ]
       .filter(Boolean)
       .join("\n");
+  }
+
+  private async executeLspFormatDocument(request: LspFormatDocumentToolRequest) {
+    return this.executeResolvedLspFormatDocument(
+      request,
+      await this.resolveLspFormatDocumentPlan(request)
+    );
   }
 
   private async findGitRepoRoot(inputPath: string) {
@@ -7509,6 +7870,41 @@ export class FileMcpService {
     }
   }
 
+  private async executePendingApproval(
+    request: ToolRequest,
+    guard?: PendingApprovalGuard
+  ): Promise<string> {
+    if (!guard) {
+      return this.execute(request);
+    }
+
+    switch (guard.kind) {
+      case "write_shell":
+        this.ensureWriteShellApprovalGuardFresh(guard);
+        return this.execute(request);
+      case "lsp_rename":
+        return this.executeResolvedLspRename(request as LspRenameToolRequest, guard.resolved, {
+          ensureFresh: true,
+        });
+      case "lsp_code_actions":
+        return this.executeResolvedLspCodeAction(
+          request as LspCodeActionsToolRequest,
+          guard.resolved,
+          {
+            ensureFresh: true,
+          }
+        );
+      case "lsp_format_document":
+        return this.executeResolvedLspFormatDocument(
+          request as LspFormatDocumentToolRequest,
+          guard.resolved,
+          {
+            ensureFresh: true,
+          }
+        );
+    }
+  }
+
   async handleToolCall(toolName: string, input: unknown): Promise<HandleResult> {
     const normalizedName = toolName.trim().toLowerCase();
     if (
@@ -7653,23 +8049,19 @@ export class FileMcpService {
         this.rules.requireReview.includes(request.action))
     ) {
       const id = crypto.randomUUID().slice(0, 8);
-      const detailsSummary = await this.buildReviewDetails(request, "summary");
-      const detailsFull = await this.buildReviewDetails(request, "full");
-      const previewSummary = [this.formatPreview(request), detailsSummary]
-        .filter(Boolean)
-        .join("\n");
-      const previewFull = [this.formatPreview(request), detailsFull]
-        .filter(Boolean)
-        .join("\n");
+      const prepared = await this.preparePendingReview(request);
       const pending: PendingReviewItem = {
         id,
         request,
-        preview: previewSummary,
-        previewSummary,
-        previewFull,
+        preview: prepared.previewSummary,
+        previewSummary: prepared.previewSummary,
+        previewFull: prepared.previewFull,
         createdAt: new Date().toISOString(),
       };
       this.pending.set(id, pending);
+      if (prepared.guard) {
+        this.pendingApprovalGuards.set(id, prepared.guard);
+      }
       return {
         ok: true,
         message: `[review required] ${id}\n${pending.previewSummary}`,
@@ -7774,8 +8166,12 @@ export class FileMcpService {
       };
     }
     try {
-      const output = await this.execute(pending.request);
+      const output = await this.executePendingApproval(
+        pending.request,
+        this.pendingApprovalGuards.get(id)
+      );
       this.pending.delete(id);
+      this.pendingApprovalGuards.delete(id);
       return {
         ok: true,
         message: `[approved] ${id}\n${output}`,
@@ -7799,6 +8195,7 @@ export class FileMcpService {
       };
     }
     this.pending.delete(id);
+    this.pendingApprovalGuards.delete(id);
     return {
       ok: true,
       message: `[rejected] ${id}`,

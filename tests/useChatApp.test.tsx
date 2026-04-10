@@ -3551,6 +3551,7 @@ const createScriptedTransport = (
 
     await runCommand(app, "/resume session-a");
     expect(app.getLatest().activeSessionId).toBe("session-a");
+    expect(app.getLatest().recentLocalCommand).toBeNull();
     expect(getTexts(app.getLatest().items).some(text => text.includes("Resumed session: session-a"))).toBe(true);
     expect(getTexts(app.getLatest().items)).toContain(markdownReply);
     expect(

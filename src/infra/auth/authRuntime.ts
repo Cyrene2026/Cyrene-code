@@ -68,6 +68,48 @@ const trimNonEmpty = (value: string | undefined | null) => {
   return trimmed ? trimmed : undefined;
 };
 
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
+const INTERNAL_WHITESPACE_PATTERN = /\s/;
+
+const validateApiKeyShape = (rawValue: string | undefined | null) => {
+  const trimmed = trimNonEmpty(rawValue);
+  if (!trimmed) {
+    return {
+      ok: false as const,
+      message: "API key is required.",
+    };
+  }
+
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return {
+      ok: false as const,
+      message: "API key must not include surrounding quotes.",
+    };
+  }
+
+  if (CONTROL_CHAR_PATTERN.test(trimmed)) {
+    return {
+      ok: false as const,
+      message: "API key contains control characters. Remove hidden newlines or other non-printable characters.",
+    };
+  }
+
+  if (INTERNAL_WHITESPACE_PATTERN.test(trimmed)) {
+    return {
+      ok: false as const,
+      message: "API key must not contain spaces or embedded line breaks.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    value: trimmed,
+  };
+};
+
 const GENERIC_API_KEY_ENV_NAME = "CYRENE_API_KEY" as const;
 const PROVIDER_API_KEY_ENV_BY_FAMILY = {
   openai: "CYRENE_OPENAI_API_KEY",
@@ -440,14 +482,15 @@ export const createAuthRuntime = (
       };
     }
 
-    const apiKey = trimNonEmpty(input.apiKey);
-    if (!apiKey) {
+    const apiKeyValidation = validateApiKeyShape(input.apiKey);
+    if (!apiKeyValidation.ok) {
       return {
         ok: false,
-        message: "API key is required.",
+        message: apiKeyValidation.message,
         persistenceTarget,
       };
     }
+    const apiKey = apiKeyValidation.value;
 
     const preferredModel = trimNonEmpty(input.model);
     try {
@@ -470,6 +513,7 @@ export const createAuthRuntime = (
         message: `Validated provider. Loaded ${catalog.models.length} model(s). Initial model: ${catalog.selectedModel}`,
         persistenceTarget,
         normalizedProviderBaseUrl: catalog.providerBaseUrl,
+        normalizedApiKey: apiKey,
         selectedModel: catalog.selectedModel,
         availableModels: catalog.models,
       };
@@ -553,6 +597,7 @@ export const createAuthRuntime = (
     if (
       !validation.ok ||
       !validation.normalizedProviderBaseUrl ||
+      !validation.normalizedApiKey ||
       !validation.selectedModel ||
       !validation.availableModels
     ) {
@@ -593,10 +638,10 @@ export const createAuthRuntime = (
         env: effectiveEnv,
       }
     );
-    await apiKeyStore.save(input.apiKey, providerEnvName);
+    await apiKeyStore.save(validation.normalizedApiKey, providerEnvName);
     runtimeApiKeyOverrides = {
       ...runtimeApiKeyOverrides,
-      [providerEnvName]: trimNonEmpty(input.apiKey),
+      [providerEnvName]: validation.normalizedApiKey,
     };
     runtimeProviderBaseUrlOverride = validation.normalizedProviderBaseUrl;
     runtimeModelOverride = validation.selectedModel;

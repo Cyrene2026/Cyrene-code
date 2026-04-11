@@ -81,6 +81,25 @@ describe("createUserScopedApiKeyStore", () => {
     expect(partiallyCleared).toContain("CYRENE_GEMINI_API_KEY");
   });
 
+  test("round-trips a long api key exactly through the managed shell block parser", async () => {
+    const home = await createTempHome();
+    const targetFile = join(home, ".zshrc");
+    const expectedKey =
+      "k-ant-oat01-NZFmUq4NVsEctq_wdz7-x7nm2IHEPrVgkJEVMIWZ9ahKJVBPxO9lXyN-xF5n";
+
+    const store = createUserScopedApiKeyStore({
+      platform: "linux",
+      env: { SHELL: "/bin/zsh" } as NodeJS.ProcessEnv,
+      homeDir: home,
+    });
+
+    await store.save(expectedKey, "CYRENE_ANTHROPIC_API_KEY");
+
+    expect(await store.read("CYRENE_ANTHROPIC_API_KEY")).toBe(expectedKey);
+    expect((await store.readAll?.())?.CYRENE_ANTHROPIC_API_KEY).toBe(expectedKey);
+    expect(await readFile(targetFile, "utf8")).toContain(expectedKey);
+  });
+
   test("chooses expected bash, fish, and posix targets", async () => {
     const bashHome = await createTempHome();
     await writeFile(join(bashHome, ".bash_profile"), "# bash profile\n", "utf8");

@@ -211,6 +211,29 @@ describe("createAuthRuntime", () => {
     expect(result.normalizedProviderBaseUrl).toBe("https://api.anthropic.com");
   });
 
+  test("validateLoginInput rejects quoted api keys and hidden whitespace", async () => {
+    const appRoot = await createTempRoot();
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: createMemoryApiKeyStore(),
+    });
+
+    const quoted = await runtime.validateLoginInput({
+      providerBaseUrl: "https://provider.test/v1",
+      apiKey: `"sk-test"`,
+    });
+    expect(quoted.ok).toBe(false);
+    expect(quoted.message).toContain("surrounding quotes");
+
+    const spaced = await runtime.validateLoginInput({
+      providerBaseUrl: "https://provider.test/v1",
+      apiKey: "sk-test \n next",
+    });
+    expect(spaced.ok).toBe(false);
+    expect(spaced.message).toContain("control characters");
+  });
+
   test("saveLogin persists provider metadata, saves the key, and switches to HTTP immediately", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();
@@ -290,6 +313,53 @@ describe("createAuthRuntime", () => {
       }),
       appRoot,
       expect.any(Object)
+    );
+  });
+
+  test("saveLogin persists the normalized api key, matching the validated value", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    const fetchProviderModelCatalogImpl = mock(
+      async (options: { apiKey: string }) => {
+        expect(options.apiKey).toBe("k-ant-oat01-demo_key-XYZ123");
+        return {
+          providerBaseUrl: "https://api.anthropic.com",
+          models: ["claude-3-7-sonnet-latest"],
+          selectedModel: "claude-3-7-sonnet-latest",
+        };
+      }
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      fetchProviderModelCatalogImpl: fetchProviderModelCatalogImpl as any,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("claude-3-7-sonnet-latest", "https://api.anthropic.com")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["claude-3-7-sonnet-latest"],
+        defaultModel: "claude-3-7-sonnet-latest",
+        lastUsedModel: "claude-3-7-sonnet-latest",
+        providerBaseUrl: "https://api.anthropic.com",
+        providers: ["https://api.anthropic.com"],
+        providerProfiles: {},
+      })),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "anthropic",
+      apiKey: "  k-ant-oat01-demo_key-XYZ123  ",
+      model: "claude-3-7-sonnet-latest",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.current("CYRENE_ANTHROPIC_API_KEY")).toBe(
+      "k-ant-oat01-demo_key-XYZ123"
+    );
+    expect(await runtime.getSavedApiKey("https://api.anthropic.com")).toBe(
+      "k-ant-oat01-demo_key-XYZ123"
     );
   });
 

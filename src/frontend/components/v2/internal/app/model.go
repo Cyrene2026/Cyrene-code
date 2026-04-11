@@ -327,6 +327,16 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.AuthProvider = []rune(strings.TrimSpace(event.ProviderBaseURL))
 		m.AuthModel = []rune(strings.TrimSpace(event.Model))
 		m.AuthAPIKey = []rune(event.APIKey)
+		if m.ActivePanel == PanelAuth && m.AuthStep == AuthStepProvider {
+			switch {
+			case len(m.AuthProvider) > 0 && len(m.AuthAPIKey) == 0:
+				m.AuthStep = AuthStepAPIKey
+			case len(m.AuthProvider) > 0 && len(m.AuthAPIKey) > 0 && len(m.AuthModel) > 0:
+				m.AuthStep = AuthStepConfirm
+			case len(m.AuthProvider) > 0 && len(m.AuthModel) > 0:
+				m.AuthStep = AuthStepAPIKey
+			}
+		}
 		switch m.AuthStep {
 		case AuthStepProvider:
 			m.AuthCursor = len(m.AuthProvider)
@@ -334,6 +344,8 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 			m.AuthCursor = len(m.AuthAPIKey)
 		case AuthStepModel:
 			m.AuthCursor = len(m.AuthModel)
+		default:
+			m.AuthCursor = 0
 		}
 	case "error":
 		m.Status = StatusError
@@ -940,7 +952,7 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				Model:           model,
 			})
 		}
-		m.moveAuthStep(1)
+		m.advanceAuthStepOnEnter()
 		return m, nil
 	case tea.KeyBackspace:
 		m.deleteAuthBackward()
@@ -1327,6 +1339,37 @@ func (m *Model) moveAuthStep(delta int) {
 	nextIndex := clampInt(currentIndex+delta, 0, len(steps)-1)
 	m.AuthStep = steps[nextIndex]
 	m.AuthCursor = m.currentAuthFieldLength()
+}
+
+func (m *Model) advanceAuthStepOnEnter() {
+	switch m.AuthStep {
+	case AuthStepProvider:
+		if len(m.AuthAPIKey) > 0 {
+			if len(m.AuthModel) > 0 {
+				m.AuthStep = AuthStepConfirm
+				m.AuthCursor = 0
+				return
+			}
+			m.AuthStep = AuthStepModel
+			m.AuthCursor = len(m.AuthModel)
+			return
+		}
+		m.AuthStep = AuthStepAPIKey
+		m.AuthCursor = len(m.AuthAPIKey)
+	case AuthStepAPIKey:
+		if len(m.AuthModel) > 0 {
+			m.AuthStep = AuthStepConfirm
+			m.AuthCursor = 0
+			return
+		}
+		m.AuthStep = AuthStepModel
+		m.AuthCursor = len(m.AuthModel)
+	case AuthStepModel:
+		m.AuthStep = AuthStepConfirm
+		m.AuthCursor = 0
+	default:
+		m.moveAuthStep(1)
+	}
 }
 
 func (m *Model) currentAuthFieldLength() int {

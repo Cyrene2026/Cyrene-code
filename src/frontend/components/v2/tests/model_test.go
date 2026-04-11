@@ -212,6 +212,24 @@ func TestAuthAltDigitStillSwitchesField(t *testing.T) {
 	}
 }
 
+func TestAuthEnterFromAPIKeySkipsPrefilledModelToConfirm(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+	model.AuthAPIKey = []rune("sk-live")
+	model.AuthModel = []rune("gpt-5.4")
+	model.AuthCursor = len(model.AuthAPIKey)
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if model.AuthStep != app.AuthStepConfirm {
+		t.Fatalf("expected auth enter to jump to confirm, got %q", model.AuthStep)
+	}
+	if model.AuthCursor != 0 {
+		t.Fatalf("expected confirm cursor reset, got %d", model.AuthCursor)
+	}
+}
+
 func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 	model := app.NewModel()
 
@@ -332,7 +350,6 @@ func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 func TestSetAuthDefaultsHydratesLoginPanelFields(t *testing.T) {
 	model := app.NewModel()
 	model.ActivePanel = app.PanelAuth
-	model.AuthStep = app.AuthStepAPIKey
 
 	err := model.ApplyBridgeEventJSONForTest(`{
 		"type":"set_auth_defaults",
@@ -353,7 +370,32 @@ func TestSetAuthDefaultsHydratesLoginPanelFields(t *testing.T) {
 	if got := string(model.AuthAPIKey); got != "sk-live" {
 		t.Fatalf("expected auth api key hydrated, got %q", got)
 	}
-	if model.AuthCursor != len([]rune("sk-live")) {
-		t.Fatalf("expected auth cursor at API key tail, got %d", model.AuthCursor)
+	if model.AuthStep != app.AuthStepConfirm {
+		t.Fatalf("expected auth panel to jump to confirm for prefilled login, got %q", model.AuthStep)
+	}
+	if model.AuthCursor != 0 {
+		t.Fatalf("expected confirm cursor reset, got %d", model.AuthCursor)
+	}
+}
+
+func TestSetAuthDefaultsFocusesAPIKeyWhenProviderAndModelKnownButKeyMissing(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_auth_defaults",
+		"providerBaseUrl":"https://api.example.com/v1",
+		"model":"gpt-5.4",
+		"apiKey":""
+	}`)
+	if err != nil {
+		t.Fatalf("ApplyBridgeEventJSONForTest returned error: %v", err)
+	}
+
+	if model.AuthStep != app.AuthStepAPIKey {
+		t.Fatalf("expected auth panel to focus api key, got %q", model.AuthStep)
+	}
+	if model.AuthCursor != 0 {
+		t.Fatalf("expected api key cursor at start, got %d", model.AuthCursor)
 	}
 }

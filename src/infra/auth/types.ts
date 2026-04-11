@@ -43,6 +43,7 @@ export type AuthValidationResult = {
   message: string;
   persistenceTarget: AuthPersistenceTarget | null;
   normalizedProviderBaseUrl?: string;
+  normalizedApiKey?: string;
   selectedModel?: string;
   availableModels?: string[];
 };

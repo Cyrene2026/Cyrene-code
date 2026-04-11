@@ -60,11 +60,11 @@ describe("app root resolver", () => {
 
     expect(parseRootArg(["--root", "./repo"])).toBe("./repo");
     expect(
-      resolveUserHomeDir({
+      normalizeSlashes(resolveUserHomeDir({
         cwd,
         env: userHomeEnv,
-      })
-    ).toBe(resolve(userHome));
+      }))
+    ).toBe(normalizeSlashes(resolve(userHome)));
     expect(
       normalizeSlashes(getCyreneConfigDir({
         cwd,
@@ -72,15 +72,15 @@ describe("app root resolver", () => {
       }))
     ).toBe(normalizeSlashes(join(resolve(userHome), ".cyrene")));
     expect(
-      getCyreneConfigDir({
+      normalizeSlashes(getCyreneConfigDir({
         cwd,
         env: {
           CYRENE_HOME: "./global-cyrene",
         },
-      })
-    ).toBe(resolve(cwd, "global-cyrene"));
-    expect(getLegacyProjectCyreneDir(cwd)).toBe(
-      join(cwd, ".cyrene")
+      }))
+    ).toBe(normalizeSlashes(resolve(cwd, "global-cyrene")));
+    expect(normalizeSlashes(getLegacyProjectCyreneDir(cwd))).toBe(
+      normalizeSlashes(join(cwd, ".cyrene"))
     );
   });
 

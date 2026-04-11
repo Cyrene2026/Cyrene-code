@@ -863,7 +863,7 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.insertAuthRunes([]rune{' '})
 		return m, nil
 	case tea.KeyRunes:
-		if len(msg.Runes) == 1 {
+		if msg.Alt && len(msg.Runes) == 1 {
 			switch msg.Runes[0] {
 			case '1':
 				m.AuthStep = AuthStepProvider

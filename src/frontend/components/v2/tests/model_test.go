@@ -178,3 +178,36 @@ func TestReviewCommandByIDOpensFullPreview(t *testing.T) {
 		t.Fatalf("expected full preview mode, got %q", model.ApprovalPreview)
 	}
 }
+
+func TestAuthDigitsInsertIntoFieldWithoutAlt(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+	model.AuthCursor = 0
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("abc123xyz")})
+
+	if got := string(model.AuthAPIKey); got != "abc123xyz" {
+		t.Fatalf("expected API key field to receive pasted digits, got %q", got)
+	}
+	if model.AuthStep != app.AuthStepAPIKey {
+		t.Fatalf("expected auth step to stay on api key, got %q", model.AuthStep)
+	}
+}
+
+func TestAuthAltDigitStillSwitchesField(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+	model.AuthModel = []rune("deepseek-reasoner")
+	model.AuthCursor = 0
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}, Alt: true})
+
+	if model.AuthStep != app.AuthStepModel {
+		t.Fatalf("expected alt+3 to switch to model field, got %q", model.AuthStep)
+	}
+	if model.AuthCursor != len(model.AuthModel) {
+		t.Fatalf("expected cursor at model field end, got %d", model.AuthCursor)
+	}
+}

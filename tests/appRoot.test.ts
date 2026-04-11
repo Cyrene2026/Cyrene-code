@@ -10,6 +10,8 @@ import {
   resolveUserHomeDir,
 } from "../src/infra/config/appRoot";
 
+const normalizeSlashes = (value: string) => value.replace(/\\/g, "/");
+
 afterEach(() => {
   resetConfiguredAppRoot();
 });
@@ -64,11 +66,11 @@ describe("app root resolver", () => {
       })
     ).toBe(resolve(userHome));
     expect(
-      getCyreneConfigDir({
+      normalizeSlashes(getCyreneConfigDir({
         cwd,
         env: userHomeEnv,
-      })
-    ).toBe(join(resolve(userHome), ".cyrene"));
+      }))
+    ).toBe(normalizeSlashes(join(resolve(userHome), ".cyrene")));
     expect(
       getCyreneConfigDir({
         cwd,

@@ -133,19 +133,23 @@ type Message struct {
 }
 
 type Model struct {
-	Width            int
-	Height           int
-	Status           Status
-	Items            []Message
-	LiveText         string
-	Input            []rune
-	Cursor           int
-	TranscriptOffset int
-	ShouldQuit       bool
-	BridgeReady      bool
-	Notice           string
-	NoticeIsError    bool
-	MouseCapture     bool
+	Width                  int
+	Height                 int
+	Status                 Status
+	Items                  []Message
+	LiveText               string
+	Input                  []rune
+	Cursor                 int
+	TranscriptOffset       int
+	ShouldQuit             bool
+	BridgeReady            bool
+	Notice                 string
+	NoticeIsError          bool
+	MouseCapture           bool
+	transcriptCacheWidth   int
+	transcriptCacheVersion int
+	transcriptCacheLines   []string
+	transcriptVersion      int
 
 	ActivePanel Panel
 
@@ -249,6 +253,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.Width = value.Width
 		m.Height = value.Height
+		m.invalidateTranscriptCache()
 		m.clampTranscriptOffset()
 		return m, nil
 	case tea.MouseMsg:
@@ -294,6 +299,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.CurrentProviderKeySource = event.Snapshot.CurrentProviderKeySource
 		m.Auth = event.Snapshot.Auth
 		m.AppRoot = event.Snapshot.AppRoot
+		m.invalidateTranscriptCache()
 		if m.ProviderProfiles == nil {
 			m.ProviderProfiles = map[string]string{}
 		}
@@ -936,6 +942,7 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 			Kind: "system_hint",
 			Text: slashHelpText(),
 		})
+		m.invalidateTranscriptCache()
 		m.setNotice("Command reference appended to transcript.", false)
 		return true, nil
 	case query == "/cancel":
@@ -944,6 +951,7 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 	case query == "/clear":
 		m.Items = []Message{}
 		m.LiveText = ""
+		m.invalidateTranscriptCache()
 		m.TranscriptOffset = 0
 		m.setNotice("Transcript cleared.", false)
 		return true, nil
@@ -1138,6 +1146,7 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "logout"})
 	case query == "/auth":
 		m.Items = append(m.Items, Message{Role: "system", Kind: "system_hint", Text: m.formatAuthSummary()})
+		m.invalidateTranscriptCache()
 		m.setNotice("Auth status appended to transcript.", false)
 		return true, nil
 	case strings.HasPrefix(query, "/load "):
@@ -1286,6 +1295,13 @@ func (m *Model) deleteAuthBackward() {
 func (m *Model) setNotice(text string, isError bool) {
 	m.Notice = strings.TrimSpace(text)
 	m.NoticeIsError = isError
+}
+
+func (m *Model) invalidateTranscriptCache() {
+	m.transcriptVersion++
+	m.transcriptCacheWidth = 0
+	m.transcriptCacheVersion = 0
+	m.transcriptCacheLines = nil
 }
 
 func (m *Model) insertRunes(values []rune) {

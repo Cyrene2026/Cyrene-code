@@ -164,8 +164,16 @@ func (m *Model) renderTranscript(width, height int) string {
 }
 
 func (m *Model) renderTranscriptLines(width int) []string {
+	if m.transcriptCacheWidth == width && m.transcriptCacheVersion == m.transcriptVersion && m.transcriptCacheLines != nil {
+		return m.transcriptCacheLines
+	}
+
 	if m.shouldShowStartupView() {
-		return m.renderStartupLines(width)
+		lines := m.renderStartupLines(width)
+		m.transcriptCacheWidth = width
+		m.transcriptCacheVersion = m.transcriptVersion
+		m.transcriptCacheLines = lines
+		return lines
 	}
 
 	items := make([]Message, 0, len(m.Items)+1)
@@ -184,6 +192,10 @@ func (m *Model) renderTranscriptLines(width int) []string {
 	if len(lines) == 0 {
 		lines = append(lines, dimStyle.Render("No transcript yet."))
 	}
+
+	m.transcriptCacheWidth = width
+	m.transcriptCacheVersion = m.transcriptVersion
+	m.transcriptCacheLines = lines
 	return lines
 }
 

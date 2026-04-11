@@ -821,24 +821,23 @@ class BubbleTeaBridge {
 
   private async loadSession(sessionId: string, options?: { emit?: boolean }) {
     await this.ensureRuntime();
-    const loaded = await this.sessionStore?.loadSession(sessionId);
-    if (!loaded) {
+    let record = await this.sessionStore?.loadSession(sessionId);
+    if (!record) {
       this.emitError(`Session not found: ${sessionId}`);
       return;
     }
 
-    if (loaded.projectRoot?.trim()) {
-      const normalizedProjectRoot = resolve(loaded.projectRoot);
+    if (record.projectRoot?.trim()) {
+      const normalizedProjectRoot = resolve(record.projectRoot);
       if (normalizedProjectRoot !== this.appRoot) {
         await this.loadRuntime(normalizedProjectRoot);
         await this.refreshSessions();
+        record = await this.sessionStore?.loadSession(sessionId);
+        if (!record) {
+          this.emitError(`Session not found after runtime switch: ${sessionId}`);
+          return;
+        }
       }
-    }
-
-    const record = await this.sessionStore?.loadSession(sessionId);
-    if (!record) {
-      this.emitError(`Session not found after runtime switch: ${sessionId}`);
-      return;
     }
 
     this.activeSessionId = record.id;

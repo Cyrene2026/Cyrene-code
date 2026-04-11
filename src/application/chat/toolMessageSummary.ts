@@ -163,6 +163,19 @@ const parseListDirBody = (body: string) => {
   };
 };
 
+const summarizeReadFilesBody = (body: string) => {
+  const files = body
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => line.startsWith("[file] "));
+  if (files.length === 0) {
+    return "(no files)";
+  }
+  const visible = files.slice(0, 3).join(", ");
+  const more = files.length - Math.min(files.length, 3);
+  return `${visible} (${files.length} files${more > 0 ? `, +${more} more` : ""})`;
+};
+
 const FILE_MUTATION_ACTIONS = new Set([
   "create_file",
   "write_file",
@@ -240,6 +253,12 @@ export const summarizeToolMessage = (raw: string): {
       return {
         ...normalized,
         text: `Tool: ${detail} | ${bodyLine}`,
+      };
+    }
+    if (detail.startsWith("read_files ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeReadFilesBody(body)}`,
       };
     }
     const fileMutationSummary = summarizeFileMutationToolMessage(detail, body);

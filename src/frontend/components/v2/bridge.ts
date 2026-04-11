@@ -231,6 +231,7 @@ const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text">
     const action = detail.split(/\s+/, 1)[0] ?? "";
     if (
       detail.startsWith("read_file ") ||
+      detail.startsWith("read_files ") ||
       detail.startsWith("read_range ") ||
       detail.startsWith("read_json ") ||
       detail.startsWith("read_yaml ") ||

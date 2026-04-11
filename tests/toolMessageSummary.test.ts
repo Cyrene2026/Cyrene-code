@@ -87,6 +87,26 @@ describe("toolMessageSummary", () => {
     expect(result.text).toBe("Tool: read_file test_files/u5.py | (empty file)");
   });
 
+  test("summarizes read_files without leaking raw multi-file body structure", () => {
+    const result = summarizeToolMessage(
+      [
+        "[tool result] read_files a.txt",
+        "[file] a.txt",
+        "alpha",
+        "",
+        "[file] b.txt",
+        "beta",
+      ].join("\n")
+    );
+
+    expect(result.text).toContain("Tool: read_files a.txt |");
+    expect(result.text).toContain("[file] a.txt");
+    expect(result.text).toContain("[file] b.txt");
+    expect(result.text).toContain("2 files");
+    expect(result.text).not.toContain("alpha");
+    expect(result.text).not.toContain("beta");
+  });
+
   test("preserves approved terminal transcript bodies for shell actions", () => {
     const raw = [
       "[approved] shell-1",

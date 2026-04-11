@@ -301,7 +301,7 @@ class BubbleTeaBridge {
   private commandChain: Promise<void> = Promise.resolve();
   private runtimeMetadataDirty = true;
   private pendingAppendItems: BridgeItem[] = [];
-  private appendFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private appendFlushScheduled = false;
 
   enqueue(command: BridgeCommand) {
     this.commandChain = this.commandChain
@@ -558,26 +558,19 @@ class BubbleTeaBridge {
     process.stdout.write(`${JSON.stringify(event)}\n`);
   }
 
-  private cancelAppendFlush() {
-    if (this.appendFlushTimer) {
-      clearTimeout(this.appendFlushTimer);
-      this.appendFlushTimer = null;
-    }
-  }
-
   private discardPendingAppendItems() {
     this.pendingAppendItems = [];
-    this.cancelAppendFlush();
+    this.appendFlushScheduled = false;
   }
 
   private flushPendingAppendItems() {
     if (this.pendingAppendItems.length === 0) {
-      this.cancelAppendFlush();
+      this.appendFlushScheduled = false;
       return;
     }
     const items = this.pendingAppendItems;
     this.pendingAppendItems = [];
-    this.cancelAppendFlush();
+    this.appendFlushScheduled = false;
     this.writeEvent({
       type: "append_items",
       items,
@@ -585,12 +578,13 @@ class BubbleTeaBridge {
   }
 
   private scheduleAppendFlush() {
-    if (this.appendFlushTimer) {
+    if (this.appendFlushScheduled) {
       return;
     }
-    this.appendFlushTimer = setTimeout(() => {
+    this.appendFlushScheduled = true;
+    queueMicrotask(() => {
       this.flushPendingAppendItems();
-    }, 12);
+    });
   }
 
   private emit(event: BridgeEvent) {

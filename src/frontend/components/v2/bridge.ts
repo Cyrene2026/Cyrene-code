@@ -101,6 +101,7 @@ type BridgeSession = {
   id: string;
   title: string;
   updatedAt: string;
+  projectRoot?: string | null;
   tags: string[];
 };
 
@@ -125,6 +126,14 @@ type BridgeProviderProfile =
 
 type BridgeProviderProfileSource = "manual" | "inferred" | "local" | "none";
 
+type BridgeUsageSummary = {
+  requests: number;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
 type BridgeSnapshot = {
   appRoot: string;
   status: BridgeStatus;
@@ -141,6 +150,7 @@ type BridgeSnapshot = {
   providerProfiles: Record<string, BridgeProviderProfile>;
   providerProfileSources: Record<string, BridgeProviderProfileSource>;
   providerNames: Record<string, string>;
+  usageSummary: BridgeUsageSummary;
   auth: BridgeAuthStatus;
 };
 
@@ -165,6 +175,7 @@ type BridgeEvent =
       providerNames: Record<string, string>;
       appRoot: string;
     }
+  | { type: "set_usage_summary"; usageSummary: BridgeUsageSummary }
   | {
       type: "set_auth_defaults";
       providerBaseUrl: string;
@@ -185,6 +196,14 @@ const DEFAULT_EMPTY_STATE: BridgeItem = {
   role: "system",
   kind: "system_hint",
   text: "No messages in the current session. Start typing.",
+};
+
+const EMPTY_USAGE_SUMMARY: BridgeUsageSummary = {
+  requests: 0,
+  promptTokens: 0,
+  cachedTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
 };
 
 const isHighRiskReviewAction = (action: string) =>
@@ -385,6 +404,7 @@ class BubbleTeaBridge {
   private providerProfiles: Record<string, BridgeProviderProfile> = {};
   private providerProfileSources: Record<string, BridgeProviderProfileSource> = {};
   private providerNames: Record<string, string> = {};
+  private usageBySession: Record<string, BridgeUsageSummary> = {};
   private stateUpdateCount = 0;
   private sessionSkillUseIds = new Map<string, string[]>();
   private suspended: SuspendedRun | null = null;
@@ -596,6 +616,7 @@ class BubbleTeaBridge {
     this.providerProfiles = {};
     this.providerProfileSources = {};
     this.providerNames = {};
+    this.usageBySession = {};
 
     try {
       this.availableModels = (await this.transport?.listModels()) ?? [];
@@ -655,6 +676,7 @@ class BubbleTeaBridge {
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
       providerNames: this.providerNames,
+      usageSummary: this.currentUsageSummary(),
       auth: toBridgeAuthStatus(this.authStatus),
     };
   }
@@ -758,6 +780,43 @@ class BubbleTeaBridge {
       providerNames: this.providerNames,
       appRoot: this.appRoot,
     });
+  }
+
+  private emitUsageSummary() {
+    this.emit({
+      type: "set_usage_summary",
+      usageSummary: this.currentUsageSummary(),
+    });
+  }
+
+  private currentUsageSummary(): BridgeUsageSummary {
+    if (!this.activeSessionId) {
+      return { ...EMPTY_USAGE_SUMMARY };
+    }
+    return {
+      ...EMPTY_USAGE_SUMMARY,
+      ...(this.usageBySession[this.activeSessionId] ?? {}),
+    };
+  }
+
+  private recordUsage(sessionId: string, usage: {
+    promptTokens: number;
+    cachedTokens?: number;
+    completionTokens: number;
+    totalTokens: number;
+  }) {
+    const current = this.usageBySession[sessionId] ?? EMPTY_USAGE_SUMMARY;
+    this.usageBySession[sessionId] = {
+      requests: current.requests + 1,
+      promptTokens: current.promptTokens + Math.max(0, Math.floor(usage.promptTokens)),
+      cachedTokens: current.cachedTokens + Math.max(0, Math.floor(usage.cachedTokens ?? 0)),
+      completionTokens:
+        current.completionTokens + Math.max(0, Math.floor(usage.completionTokens)),
+      totalTokens: current.totalTokens + Math.max(0, Math.floor(usage.totalTokens)),
+    };
+    if (this.activeSessionId === sessionId) {
+      this.emitUsageSummary();
+    }
   }
 
   private async emitAuthDefaults() {
@@ -951,6 +1010,7 @@ class BubbleTeaBridge {
       id: item.id,
       title: item.title,
       updatedAt: item.updatedAt,
+      projectRoot: item.projectRoot ?? null,
       tags: [...item.tags],
     }));
     this.emitSessions();
@@ -1091,6 +1151,7 @@ class BubbleTeaBridge {
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     this.hydrateTranscript(record);
     await this.refreshRuntimeMetadata();
+    this.emitUsageSummary();
     if (options?.emit !== false) {
       this.emitInit();
     }
@@ -1136,6 +1197,7 @@ class BubbleTeaBridge {
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
+    this.emitUsageSummary();
     this.emitInit();
   }
 
@@ -1211,6 +1273,9 @@ class BubbleTeaBridge {
           this.status = "streaming";
           this.emitStatus();
           this.emitLiveText();
+        },
+        onUsage: usage => {
+          this.recordUsage(session.id, usage);
         },
         onToolStatus: message => {
           this.pushItem({

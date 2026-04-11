@@ -179,6 +179,10 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("interrupt_shell");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("close_shell");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_files when you already know multiple exact file paths");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("output exactly one valid `file` tool call and nothing else");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not output XML tags");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not guess missing required arguments");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("correct the exact schema error");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_range when you need a specific line window");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_json for JSON configuration files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_yaml for YAML configuration files");
@@ -211,7 +215,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_show to inspect one revision in detail");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_blame to inspect who last changed specific lines");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_files, set `path` to the first file");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_file, provide `path` only. Do not send `paths`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For stat_paths, set `path` to the first target");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For stat_path, provide `path` only. Do not send `paths`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_range, provide 1-based inclusive `startLine` and `endLine`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_json, provide `jsonPath` only when you want one nested field");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_yaml, provide `yamlPath` only when you want one nested field");
@@ -255,6 +261,7 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive list_dir/read_file probing");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("confirmed directory state");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not repeat the same tool call with the same input");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not send read_file together with `paths`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Choose the narrowest action");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If the user asked to create files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Stop exploring once you have enough information to act");

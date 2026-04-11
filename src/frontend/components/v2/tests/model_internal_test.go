@@ -3,6 +3,7 @@ package tests
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -152,6 +153,54 @@ func TestRenderMarkdownBodyLinesHandlesListsQuotesAndEmphasis(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "1. ") || !strings.Contains(rendered, "• ") || !strings.Contains(rendered, "│ ") {
 		t.Fatalf("expected list and quote prefixes rendered, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownBodyLinesRendersTables(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest(
+		"| Name | Value |\n| --- | --- |\n| Alpha | 123 |\n| Beta | 456 |",
+		48,
+		lipgloss.NewStyle(),
+	)
+	rendered := strings.Join(lines, "\n")
+
+	if !strings.Contains(rendered, "┌") || !strings.Contains(rendered, "┬") || !strings.Contains(rendered, "└") {
+		t.Fatalf("expected terminal table borders, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "Name") || !strings.Contains(rendered, "Alpha") || !strings.Contains(rendered, "456") {
+		t.Fatalf("expected table contents preserved, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownBodyLinesClampsTableWidth(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest(
+		"| Column A | Column B | Column C |\n| --- | --- | --- |\n| very long content here | another long cell | third long cell |",
+		30,
+		lipgloss.NewStyle(),
+	)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, line := range lines {
+		plain := stripANSI.ReplaceAllString(line, "")
+		if lipgloss.Width(plain) > 30 {
+			t.Fatalf("expected table row width <= 30, got %d for %q", lipgloss.Width(plain), plain)
+		}
+	}
+}
+
+func TestRenderTranscriptClampsStyledLinesToWidth(t *testing.T) {
+	model := app.NewModel()
+	model.Items = []app.Message{
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("宽", 40)},
+		{Role: "system", Kind: "tool_status", Text: "Running read_file | " + strings.Repeat("src/very/long/path/", 8)},
+	}
+
+	rendered := model.RenderTranscriptForTest(24, 6)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, line := range strings.Split(rendered, "\n") {
+		plain := stripANSI.ReplaceAllString(line, "")
+		if lipgloss.Width(plain) > 24 {
+			t.Fatalf("expected transcript line width <= 24, got %d for %q", lipgloss.Width(plain), plain)
+		}
 	}
 }
 

@@ -63,5 +63,6 @@ export type SessionListItem = {
   id: string;
   title: string;
   updatedAt: string;
+  projectRoot?: string | null;
   tags: string[];
 };

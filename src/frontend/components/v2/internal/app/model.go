@@ -154,6 +154,7 @@ type Model struct {
 	MouseCapture           bool
 	SpinnerFrame           int
 	spinnerTickPending     bool
+	QuitWithSummary        bool
 	transcriptCacheWidth   int
 	transcriptCacheVersion int
 	transcriptCacheLines   []string
@@ -176,6 +177,7 @@ type Model struct {
 	ProviderProfiles         map[string]string
 	ProviderProfileSources   map[string]string
 	ProviderNames            map[string]string
+	UsageSummary             BridgeUsageSummary
 	CurrentModel             string
 	CurrentProvider          string
 	CurrentProviderKeySource string
@@ -348,6 +350,9 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	case "set_runtime_metadata":
 		m.BridgeReady = true
 		m.applyRuntimeMetadata(event)
+	case "set_usage_summary":
+		m.BridgeReady = true
+		m.UsageSummary = event.UsageSummary
 	case "set_auth_defaults":
 		m.BridgeReady = true
 		m.AuthProvider = []rune(strings.TrimSpace(event.ProviderBaseURL))
@@ -428,6 +433,7 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.ProviderProfiles = cloneStringMap(snapshot.ProviderProfiles)
 	m.ProviderProfileSources = cloneStringMap(snapshot.ProviderProfileSources)
 	m.ProviderNames = cloneStringMap(snapshot.ProviderNames)
+	m.UsageSummary = snapshot.UsageSummary
 	m.CurrentModel = snapshot.CurrentModel
 	m.CurrentProvider = snapshot.CurrentProvider
 	m.CurrentProviderKeySource = snapshot.CurrentProviderKeySource
@@ -525,6 +531,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		m.ShouldQuit = true
+		m.QuitWithSummary = true
 		if m.bridge != nil {
 			m.bridge.Close()
 		}
@@ -1141,6 +1148,7 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 	switch {
 	case query == "/quit" || query == "/exit":
 		m.ShouldQuit = true
+		m.QuitWithSummary = false
 		if m.bridge != nil {
 			m.bridge.Close()
 		}
@@ -1654,6 +1662,80 @@ func cloneStringMap(items map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func (m *Model) ShouldPrintExitSummary() bool {
+	return m.QuitWithSummary
+}
+
+func (m *Model) ExitSummaryText() string {
+	lines := []string{
+		formatExitSummaryLine("session", emptyFallback(strings.TrimSpace(m.ActiveSessionID), "none")),
+	}
+
+	if title := strings.TrimSpace(m.currentSessionTitle()); title != "" && title != "New session" {
+		lines = append(lines, formatExitSummaryLine("title", title))
+	}
+
+	lines = append(lines,
+		formatExitSummaryLine("project", emptyFallback(strings.TrimSpace(m.AppRoot), "none")),
+		formatExitSummaryLine("model", emptyFallback(strings.TrimSpace(m.CurrentModel), "none")),
+		formatExitSummaryLine("provider", emptyFallback(strings.TrimSpace(m.providerDisplayName(m.CurrentProvider)), "none")),
+		"",
+		formatExitSummaryLine("requests", fmt.Sprintf("%d", maxInt(0, m.UsageSummary.Requests))),
+		formatExitSummaryLine("prompt", fmt.Sprintf("%d", maxInt(0, m.UsageSummary.PromptTokens))),
+		formatExitSummaryLine("cached", fmt.Sprintf("%d", maxInt(0, m.UsageSummary.CachedTokens))),
+		formatExitSummaryLine("completion", fmt.Sprintf("%d", maxInt(0, m.UsageSummary.CompletionTokens))),
+		formatExitSummaryLine("total", fmt.Sprintf("%d", maxInt(0, m.UsageSummary.TotalTokens))),
+	)
+
+	contentWidth := 0
+	for _, line := range lines {
+		contentWidth = maxInt(contentWidth, lipgloss.Width(line))
+	}
+	contentWidth = maxInt(contentWidth, lipgloss.Width("CYRENE SESSION CLOSED"))
+
+	title := lipgloss.NewStyle().
+		Width(contentWidth).
+		Align(lipgloss.Center).
+		Background(lipgloss.Color("#FFF")).
+		Foreground(lipgloss.Color("#000")).
+		Bold(true).
+		Render("CYRENE SESSION CLOSED")
+
+	body := []string{title, ""}
+	for _, line := range lines {
+		body = append(body, padExitSummaryLine(line, contentWidth))
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		Padding(0, 1).
+		Render(strings.Join(body, "\n"))
+
+	return box
+}
+
+func formatExitSummaryLine(label, value string) string {
+	return fmt.Sprintf("%-11s %s", strings.TrimSpace(label), strings.TrimSpace(value))
+}
+
+func padExitSummaryLine(value string, width int) string {
+	padding := maxInt(0, width-lipgloss.Width(value))
+	return value + strings.Repeat(" ", padding)
+}
+
+func (m *Model) currentSessionTitle() string {
+	activeID := strings.TrimSpace(m.ActiveSessionID)
+	if activeID == "" {
+		return ""
+	}
+	for _, session := range m.Sessions {
+		if strings.TrimSpace(session.ID) == activeID {
+			return strings.TrimSpace(session.Title)
+		}
+	}
+	return ""
 }
 
 func findSelectionIndex(items []BridgeSession, id string, fallback int) int {

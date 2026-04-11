@@ -228,7 +228,9 @@ func (m *Model) renderTranscript(width, height int) string {
 	if len(window) > height {
 		window = window[len(window)-height:]
 	}
-	lines = append(lines, window...)
+	for _, line := range window {
+		lines = append(lines, fitToWidth(line, width))
+	}
 	for len(lines) < height {
 		lines = append(lines, "")
 	}
@@ -334,7 +336,7 @@ func renderMessageLines(message Message, width int) []string {
 	label, labelStyle, contentStyle := messageStyles(message)
 	prefixWidth := minInt(10, maxInt(6, width/6))
 	bodyWidth := maxInt(1, width-prefixWidth-1)
-	renderedBody := renderMarkdownBodyLines(message.Text, bodyWidth, contentStyle)
+	renderedBody := renderMarkdownBodyLines(sanitizeTranscriptDisplayText(message), bodyWidth, contentStyle)
 	if len(renderedBody) == 0 {
 		renderedBody = []string{""}
 	}
@@ -351,6 +353,51 @@ func renderMessageLines(message Message, width int) []string {
 	return lines
 }
 
+func sanitizeTranscriptDisplayText(message Message) string {
+	if message.Role != "assistant" || message.Kind != "transcript" {
+		return message.Text
+	}
+
+	rawLines := strings.Split(message.Text, "\n")
+	filtered := make([]string, 0, len(rawLines))
+	lastBlank := false
+	for _, raw := range rawLines {
+		trimmed := strings.TrimSpace(raw)
+		if isLeakedToolProtocolLine(trimmed) {
+			continue
+		}
+		if trimmed == "" {
+			if lastBlank {
+				continue
+			}
+			lastBlank = true
+			filtered = append(filtered, "")
+			continue
+		}
+		lastBlank = false
+		filtered = append(filtered, raw)
+	}
+
+	return strings.Trim(strings.Join(filtered, "\n"), "\n")
+}
+
+func isLeakedToolProtocolLine(trimmed string) bool {
+	if trimmed == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(trimmed, "<invoke "),
+		strings.HasPrefix(trimmed, "</invoke"),
+		strings.HasPrefix(trimmed, "<parameter "),
+		strings.HasPrefix(trimmed, "</parameter"),
+		strings.HasPrefix(trimmed, "<minimax:tool_call"),
+		strings.HasPrefix(trimmed, "</minimax:tool_call"):
+		return true
+	default:
+		return false
+	}
+}
+
 func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) []string {
 	if width <= 0 {
 		return []string{""}
@@ -360,7 +407,8 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 	lines := make([]string, 0, len(rawLines))
 	inCodeBlock := false
 
-	for _, raw := range rawLines {
+	for index := 0; index < len(rawLines); index++ {
+		raw := rawLines[index]
 		trimmed := strings.TrimSpace(raw)
 		if strings.HasPrefix(trimmed, "```") {
 			inCodeBlock = !inCodeBlock
@@ -380,6 +428,12 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			for _, row := range wrapped {
 				lines = append(lines, "│ "+codeBlockStyle.Render(renderCodeLine(row)))
 			}
+			continue
+		}
+
+		if table, consumed, ok := parseMarkdownTable(rawLines[index:]); ok {
+			lines = append(lines, renderMarkdownTable(table, width, baseStyle)...)
+			index += consumed - 1
 			continue
 		}
 
@@ -468,6 +522,213 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		return []string{""}
 	}
 	return lines
+}
+
+type markdownTable struct {
+	Header []string
+	Rows   [][]string
+}
+
+func parseMarkdownTable(lines []string) (markdownTable, int, bool) {
+	if len(lines) < 2 {
+		return markdownTable{}, 0, false
+	}
+	header, ok := parseMarkdownTableRow(lines[0])
+	if !ok {
+		return markdownTable{}, 0, false
+	}
+	if !isMarkdownTableSeparator(lines[1], len(header)) {
+		return markdownTable{}, 0, false
+	}
+
+	rows := make([][]string, 0, len(lines)-2)
+	consumed := 2
+	for ; consumed < len(lines); consumed++ {
+		trimmed := strings.TrimSpace(lines[consumed])
+		if trimmed == "" {
+			break
+		}
+		row, rowOK := parseMarkdownTableRow(lines[consumed])
+		if !rowOK {
+			break
+		}
+		rows = append(rows, normalizeMarkdownTableRow(row, len(header)))
+	}
+
+	return markdownTable{
+		Header: normalizeMarkdownTableRow(header, len(header)),
+		Rows:   rows,
+	}, consumed, true
+}
+
+func parseMarkdownTableRow(line string) ([]string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.Contains(trimmed, "|") {
+		return nil, false
+	}
+	if len(trimmed) < 3 {
+		return nil, false
+	}
+	inner := trimmed
+	if len(trimmed) > 2 {
+		inner = trimmed[1 : len(trimmed)-1]
+	}
+	if !strings.Contains(inner, "|") && !strings.HasPrefix(trimmed, "|") && !strings.HasSuffix(trimmed, "|") {
+		return nil, false
+	}
+
+	if strings.HasPrefix(trimmed, "|") {
+		trimmed = strings.TrimPrefix(trimmed, "|")
+	}
+	if strings.HasSuffix(trimmed, "|") {
+		trimmed = strings.TrimSuffix(trimmed, "|")
+	}
+
+	parts := strings.Split(trimmed, "|")
+	cells := make([]string, 0, len(parts))
+	for _, part := range parts {
+		cells = append(cells, strings.TrimSpace(part))
+	}
+	if len(cells) < 2 {
+		return nil, false
+	}
+	return cells, true
+}
+
+func isMarkdownTableSeparator(line string, columns int) bool {
+	row, ok := parseMarkdownTableRow(line)
+	if !ok || len(row) != columns {
+		return false
+	}
+	for _, cell := range row {
+		trimmed := strings.TrimSpace(cell)
+		if trimmed == "" {
+			return false
+		}
+		for _, r := range trimmed {
+			if r != '-' && r != ':' {
+				return false
+			}
+		}
+		if strings.Count(trimmed, "-") < 3 {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeMarkdownTableRow(row []string, columns int) []string {
+	normalized := make([]string, columns)
+	for index := 0; index < columns; index++ {
+		if index < len(row) {
+			normalized[index] = row[index]
+		} else {
+			normalized[index] = ""
+		}
+	}
+	return normalized
+}
+
+func renderMarkdownTable(table markdownTable, width int, baseStyle lipgloss.Style) []string {
+	columnCount := len(table.Header)
+	if columnCount == 0 || width <= 0 {
+		return []string{""}
+	}
+
+	allRows := make([][]string, 0, len(table.Rows)+1)
+	allRows = append(allRows, table.Header)
+	allRows = append(allRows, table.Rows...)
+
+	plainWidths := make([]int, columnCount)
+	for _, row := range allRows {
+		for index, cell := range row {
+			cellWidth := lipgloss.Width(strings.TrimSpace(cell))
+			if cellWidth > plainWidths[index] {
+				plainWidths[index] = cellWidth
+			}
+		}
+	}
+
+	available := maxInt(columnCount, width-(3*columnCount+1))
+	columnWidths := allocateTableColumnWidths(plainWidths, available)
+
+	lines := []string{
+		renderMarkdownTableRule("┌", "┬", "┐", columnWidths),
+		renderMarkdownTableRow(table.Header, columnWidths, baseStyle.Copy().Bold(true)),
+		renderMarkdownTableRule("├", "┼", "┤", columnWidths),
+	}
+
+	for _, row := range table.Rows {
+		lines = append(lines, renderMarkdownTableRow(row, columnWidths, baseStyle))
+	}
+	lines = append(lines, renderMarkdownTableRule("└", "┴", "┘", columnWidths))
+	return lines
+}
+
+func allocateTableColumnWidths(naturalWidths []int, available int) []int {
+	if len(naturalWidths) == 0 {
+		return nil
+	}
+
+	widths := make([]int, len(naturalWidths))
+	total := 0
+	for index, value := range naturalWidths {
+		widths[index] = maxInt(3, value)
+		total += widths[index]
+	}
+	if total <= available {
+		return widths
+	}
+
+	minTotal := len(widths) * 3
+	if available <= minTotal {
+		for index := range widths {
+			widths[index] = 3
+		}
+		return widths
+	}
+
+	excess := total - available
+	for excess > 0 {
+		target := -1
+		for index, current := range widths {
+			if current <= 3 {
+				continue
+			}
+			if target < 0 || current > widths[target] {
+				target = index
+			}
+		}
+		if target < 0 {
+			break
+		}
+		widths[target]--
+		excess--
+	}
+	return widths
+}
+
+func renderMarkdownTableRule(left, middle, right string, widths []int) string {
+	parts := make([]string, 0, len(widths))
+	for _, width := range widths {
+		parts = append(parts, strings.Repeat("─", maxInt(1, width+2)))
+	}
+	return left + strings.Join(parts, middle) + right
+}
+
+func renderMarkdownTableRow(row []string, widths []int, style lipgloss.Style) string {
+	cells := make([]string, 0, len(widths))
+	for index, width := range widths {
+		value := ""
+		if index < len(row) {
+			value = strings.TrimSpace(row[index])
+		}
+		rendered := renderInlineMarkdown(value, style)
+		padded := fitToWidth(rendered, width)
+		padding := strings.Repeat(" ", maxInt(0, width-lipgloss.Width(padded)))
+		cells = append(cells, " "+padded+padding+" ")
+	}
+	return "│" + strings.Join(cells, "│") + "│"
 }
 
 func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {
@@ -934,12 +1195,21 @@ func (m *Model) renderSessions(width, height int) string {
 			marker = " [current]"
 		}
 		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(session.Title, bodyWidth-16), marker)))
-		lines = append(lines, dimStyle.Render("   "+truncatePlain(session.UpdatedAt, bodyWidth-6)))
+		meta := session.UpdatedAt
+		if project := strings.TrimSpace(session.ProjectRoot); project != "" {
+			meta = fmt.Sprintf("%s  |  %s", session.UpdatedAt, formatProjectPathLabel(project, maxInt(12, bodyWidth-24)))
+		}
+		lines = append(lines, dimStyle.Render("   "+truncatePlain(meta, bodyWidth-6)))
 	}
 	selected := m.Sessions[clampInt(m.SessionIndex, 0, len(m.Sessions)-1)]
 	lines = append(lines, "", sectionStyle.Render("detail"))
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("id %s", selected.ID)))
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("updated %s", selected.UpdatedAt)))
+	if strings.TrimSpace(selected.ProjectRoot) != "" {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("project %s", truncatePlain(selected.ProjectRoot, bodyWidth-8))))
+	} else {
+		lines = append(lines, dimStyle.Render("project none"))
+	}
 	if len(selected.Tags) > 0 {
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("tags %s", strings.Join(selected.Tags, ", "))))
 	} else {
@@ -1646,6 +1916,10 @@ func formatKeySourceLabel(keySource string) string {
 func wrapLinesToWidth(lines []string, width int) []string {
 	wrapped := make([]string, 0, len(lines))
 	for _, line := range lines {
+		if containsANSIEscape(line) {
+			wrapped = append(wrapped, fitToWidth(line, width))
+			continue
+		}
 		wrapped = append(wrapped, wrapPlainText(line, width)...)
 	}
 	return wrapped
@@ -1657,8 +1931,14 @@ func limitBoxLines(lines []string, width, height int) string {
 	}
 	limited := make([]string, 0, height)
 	for _, line := range lines {
-		for _, wrapped := range wrapPlainText(line, maxInt(1, width)) {
-			limited = append(limited, truncatePlain(wrapped, width))
+		var wrappedRows []string
+		if containsANSIEscape(line) {
+			wrappedRows = []string{fitToWidth(line, width)}
+		} else {
+			wrappedRows = wrapPlainText(line, maxInt(1, width))
+		}
+		for _, wrapped := range wrappedRows {
+			limited = append(limited, fitToWidth(wrapped, width))
 			if len(limited) == height {
 				return strings.Join(limited, "\n")
 			}
@@ -1668,6 +1948,10 @@ func limitBoxLines(lines []string, width, height int) string {
 		limited = append(limited, "")
 	}
 	return strings.Join(limited, "\n")
+}
+
+func containsANSIEscape(value string) bool {
+	return strings.Contains(value, "\x1b[")
 }
 
 func framedInnerWidth(style lipgloss.Style, outerWidth int) int {

@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -119,7 +120,7 @@ func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
 	model.ActiveSessionID = "sess-1"
 	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
 	model.Sessions = []app.BridgeSession{
-		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z", Tags: []string{"active"}},
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z", ProjectRoot: "/workspace/current/project", Tags: []string{"active"}},
 		{ID: "sess-2", Title: "Older session", UpdatedAt: "2026-04-10T00:00:00Z"},
 	}
 
@@ -130,6 +131,9 @@ func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
 	}
 	if !strings.Contains(view, "sessions") {
 		t.Fatalf("expected sessions panel content, got %q", view)
+	}
+	if !strings.Contains(view, "/workspace/current/project") && !strings.Contains(view, ".../current/project") {
+		t.Fatalf("expected session project path in panel, got %q", view)
 	}
 	if !strings.Contains(view, "detail") {
 		t.Fatalf("expected detail section, got %q", view)
@@ -246,6 +250,28 @@ func TestCustomProviderNameRendersInFooter(t *testing.T) {
 
 	if !strings.Contains(view, "PROVIDER Work Relay") {
 		t.Fatalf("expected custom provider name in footer, got %q", view)
+	}
+}
+
+func TestAssistantToolProtocolLeakIsHiddenFromTranscript(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.Items = []app.Message{
+		{
+			Role: "assistant",
+			Kind: "transcript",
+			Text: "先看看。\n<invoke name=\"read_files\">\n<parameter name=\"path\">src/a.ts</parameter>\n</invoke>\n已处理。",
+		},
+	}
+
+	view := model.View()
+
+	if strings.Contains(view, "<invoke") || strings.Contains(view, "<parameter") {
+		t.Fatalf("expected leaked tool protocol lines hidden from transcript, got %q", view)
+	}
+	if !strings.Contains(view, "先看看。") || !strings.Contains(view, "已处理。") {
+		t.Fatalf("expected surrounding assistant text preserved, got %q", view)
 	}
 }
 
@@ -420,7 +446,7 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 			"items":[{"role":"user","kind":"transcript","text":"hello"}],
 			"liveText":"draft",
 			"pendingReviews":[{"id":"rev-1","action":"edit_file","path":"a.txt","previewSummary":"sum","previewFull":"full","createdAt":"2026-04-11T00:00:00Z"}],
-			"sessions":[{"id":"sess-1","title":"Demo","updatedAt":"2026-04-11T00:00:00Z","tags":["x"]}],
+			"sessions":[{"id":"sess-1","title":"Demo","updatedAt":"2026-04-11T00:00:00Z","projectRoot":"/workspace/demo","tags":["x"]}],
 			"currentModel":"gpt-5.4",
 			"currentProvider":"https://api.example.com/v1",
 			"currentProviderKeySource":"env",
@@ -440,6 +466,9 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 	}
 	if model.ActiveSessionID != "sess-1" {
 		t.Fatalf("expected active session hydrated, got %q", model.ActiveSessionID)
+	}
+	if len(model.Sessions) != 1 || model.Sessions[0].ProjectRoot != "/workspace/demo" {
+		t.Fatalf("expected session project root hydrated, got %#v", model.Sessions)
 	}
 	if len(model.Items) != 1 || model.Items[0].Text != "hello" {
 		t.Fatalf("expected transcript hydrated, got %#v", model.Items)
@@ -522,6 +551,57 @@ func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 	}
 	if !strings.Contains(model.Notice, "HTTP login updated") {
 		t.Fatalf("expected auth success notice, got %q", model.Notice)
+	}
+}
+
+func TestUsageSummaryAndExitSummaryText(t *testing.T) {
+	model := app.NewModel()
+	model.ActiveSessionID = "sess-2"
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-2", Title: "Resume work", UpdatedAt: "2026-04-11T00:01:00Z", Tags: []string{}},
+	}
+	model.AppRoot = "/workspace/project-b"
+	model.CurrentModel = "gpt-5.4"
+	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+	model.ProviderNames = map[string]string{
+		"https://code.newcli.com/codex/v1": "Work Relay",
+	}
+
+	if err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_usage_summary",
+		"usageSummary":{
+			"requests":3,
+			"promptTokens":1200,
+			"cachedTokens":400,
+			"completionTokens":360,
+			"totalTokens":1560
+		}
+	}`); err != nil {
+		t.Fatalf("set_usage_summary failed: %v", err)
+	}
+
+	summary := model.ExitSummaryText()
+	plainSummary := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(summary, "")
+	if !strings.Contains(plainSummary, "CYRENE SESSION CLOSED") {
+		t.Fatalf("expected terminal-style summary header, got %q", summary)
+	}
+	if !strings.Contains(plainSummary, "┌") || !strings.Contains(plainSummary, "┘") {
+		t.Fatalf("expected boxed summary, got %q", summary)
+	}
+	if !strings.Contains(plainSummary, "session     sess-2") {
+		t.Fatalf("expected session id in summary, got %q", summary)
+	}
+	if !strings.Contains(plainSummary, "title       Resume work") {
+		t.Fatalf("expected session title in summary, got %q", summary)
+	}
+	if !strings.Contains(plainSummary, "provider    Work Relay") {
+		t.Fatalf("expected provider name in summary, got %q", summary)
+	}
+	if !strings.Contains(plainSummary, "requests    3") || !strings.Contains(plainSummary, "cached      400") {
+		t.Fatalf("expected usage counters in summary, got %q", summary)
+	}
+	if strings.HasSuffix(plainSummary, "\nok") {
+		t.Fatalf("expected summary to omit trailing ok, got %q", summary)
 	}
 }
 

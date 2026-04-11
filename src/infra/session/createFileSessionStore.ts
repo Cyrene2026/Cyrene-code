@@ -123,6 +123,7 @@ const sessionListCacheSchema = z.object({
   id: z.string(),
   title: z.string(),
   updatedAt: z.string(),
+  projectRoot: z.string().nullable().optional(),
   tags: z.array(z.string()),
   messageCount: z.number().int().nonnegative(),
   summaryLength: z.number().int().nonnegative(),
@@ -288,6 +289,7 @@ export const createFileSessionStore = (
     id: session.id,
     title: session.title,
     updatedAt: session.updatedAt,
+    projectRoot: session.projectRoot ?? null,
     tags: [...session.tags],
     messageCount: session.messages.length,
     summaryLength: session.summary.trim().length,
@@ -521,6 +523,7 @@ export const createFileSessionStore = (
             id: cached.id,
             title: cached.title,
             updatedAt: cached.updatedAt,
+            projectRoot: cached.projectRoot ?? null,
             tags: [...cached.tags],
           });
           continue;
@@ -533,6 +536,7 @@ export const createFileSessionStore = (
           id: loaded.session.id,
           title: loaded.session.title,
           updatedAt: loaded.session.updatedAt,
+          projectRoot: loaded.session.projectRoot ?? null,
           tags: [...loaded.session.tags],
         });
       }

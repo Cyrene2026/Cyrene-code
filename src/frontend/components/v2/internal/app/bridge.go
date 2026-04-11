@@ -40,10 +40,11 @@ type BridgeReview struct {
 }
 
 type BridgeSession struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	UpdatedAt string   `json:"updatedAt"`
-	Tags      []string `json:"tags"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	UpdatedAt   string   `json:"updatedAt"`
+	ProjectRoot string   `json:"projectRoot,omitempty"`
+	Tags        []string `json:"tags"`
 }
 
 type BridgeAuthStatus struct {
@@ -57,48 +58,58 @@ type BridgeAuthStatus struct {
 	OnboardingEnabled bool   `json:"onboardingAvailable"`
 }
 
+type BridgeUsageSummary struct {
+	Requests         int `json:"requests"`
+	PromptTokens     int `json:"promptTokens"`
+	CachedTokens     int `json:"cachedTokens"`
+	CompletionTokens int `json:"completionTokens"`
+	TotalTokens      int `json:"totalTokens"`
+}
+
 type bridgeSnapshot struct {
-	AppRoot                  string            `json:"appRoot"`
-	Status                   string            `json:"status"`
-	ActiveSessionID          string            `json:"activeSessionId"`
-	Items                    []Message         `json:"items"`
-	LiveText                 string            `json:"liveText"`
-	PendingReviews           []BridgeReview    `json:"pendingReviews"`
-	Sessions                 []BridgeSession   `json:"sessions"`
-	CurrentModel             string            `json:"currentModel"`
-	CurrentProvider          string            `json:"currentProvider"`
-	CurrentProviderKeySource string            `json:"currentProviderKeySource"`
-	AvailableModels          []string          `json:"availableModels"`
-	AvailableProviders       []string          `json:"availableProviders"`
-	ProviderProfiles         map[string]string `json:"providerProfiles"`
-	ProviderProfileSources   map[string]string `json:"providerProfileSources"`
-	ProviderNames            map[string]string `json:"providerNames"`
-	Auth                     BridgeAuthStatus  `json:"auth"`
+	AppRoot                  string             `json:"appRoot"`
+	Status                   string             `json:"status"`
+	ActiveSessionID          string             `json:"activeSessionId"`
+	Items                    []Message          `json:"items"`
+	LiveText                 string             `json:"liveText"`
+	PendingReviews           []BridgeReview     `json:"pendingReviews"`
+	Sessions                 []BridgeSession    `json:"sessions"`
+	CurrentModel             string             `json:"currentModel"`
+	CurrentProvider          string             `json:"currentProvider"`
+	CurrentProviderKeySource string             `json:"currentProviderKeySource"`
+	AvailableModels          []string           `json:"availableModels"`
+	AvailableProviders       []string           `json:"availableProviders"`
+	ProviderProfiles         map[string]string  `json:"providerProfiles"`
+	ProviderProfileSources   map[string]string  `json:"providerProfileSources"`
+	ProviderNames            map[string]string  `json:"providerNames"`
+	UsageSummary             BridgeUsageSummary `json:"usageSummary"`
+	Auth                     BridgeAuthStatus   `json:"auth"`
 }
 
 type bridgeEvent struct {
-	Type                     string            `json:"type"`
-	Snapshot                 *bridgeSnapshot   `json:"snapshot,omitempty"`
-	Message                  string            `json:"message,omitempty"`
-	Status                   string            `json:"status,omitempty"`
-	LiveText                 string            `json:"liveText,omitempty"`
-	Items                    []Message         `json:"items,omitempty"`
-	Sessions                 []BridgeSession   `json:"sessions,omitempty"`
-	ActiveSessionID          string            `json:"activeSessionId,omitempty"`
-	PendingReviews           []BridgeReview    `json:"pendingReviews,omitempty"`
-	CurrentModel             string            `json:"currentModel,omitempty"`
-	CurrentProvider          string            `json:"currentProvider,omitempty"`
-	CurrentProviderKeySource string            `json:"currentProviderKeySource,omitempty"`
-	AvailableModels          []string          `json:"availableModels,omitempty"`
-	AvailableProviders       []string          `json:"availableProviders,omitempty"`
-	ProviderProfiles         map[string]string `json:"providerProfiles,omitempty"`
-	ProviderProfileSources   map[string]string `json:"providerProfileSources,omitempty"`
-	ProviderNames            map[string]string `json:"providerNames,omitempty"`
-	Auth                     BridgeAuthStatus  `json:"auth,omitempty"`
-	AppRoot                  string            `json:"appRoot,omitempty"`
-	ProviderBaseURL          string            `json:"providerBaseUrl,omitempty"`
-	Model                    string            `json:"model,omitempty"`
-	APIKey                   string            `json:"apiKey,omitempty"`
+	Type                     string             `json:"type"`
+	Snapshot                 *bridgeSnapshot    `json:"snapshot,omitempty"`
+	Message                  string             `json:"message,omitempty"`
+	Status                   string             `json:"status,omitempty"`
+	LiveText                 string             `json:"liveText,omitempty"`
+	Items                    []Message          `json:"items,omitempty"`
+	Sessions                 []BridgeSession    `json:"sessions,omitempty"`
+	ActiveSessionID          string             `json:"activeSessionId,omitempty"`
+	PendingReviews           []BridgeReview     `json:"pendingReviews,omitempty"`
+	CurrentModel             string             `json:"currentModel,omitempty"`
+	CurrentProvider          string             `json:"currentProvider,omitempty"`
+	CurrentProviderKeySource string             `json:"currentProviderKeySource,omitempty"`
+	AvailableModels          []string           `json:"availableModels,omitempty"`
+	AvailableProviders       []string           `json:"availableProviders,omitempty"`
+	ProviderProfiles         map[string]string  `json:"providerProfiles,omitempty"`
+	ProviderProfileSources   map[string]string  `json:"providerProfileSources,omitempty"`
+	ProviderNames            map[string]string  `json:"providerNames,omitempty"`
+	UsageSummary             BridgeUsageSummary `json:"usageSummary,omitempty"`
+	Auth                     BridgeAuthStatus   `json:"auth,omitempty"`
+	AppRoot                  string             `json:"appRoot,omitempty"`
+	ProviderBaseURL          string             `json:"providerBaseUrl,omitempty"`
+	Model                    string             `json:"model,omitempty"`
+	APIKey                   string             `json:"apiKey,omitempty"`
 }
 
 type bridgeStartedMsg struct {

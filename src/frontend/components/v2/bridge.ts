@@ -233,6 +233,35 @@ const trimWhitespaceOnlyEdges = (value: string) => {
   return lines.slice(start, end).join("\n");
 };
 
+const clampReadFilesSection = (value: string, maxLines = 18, maxChars = 1200) => {
+  const trimmed = trimWhitespaceOnlyEdges(value);
+  if (!trimmed) {
+    return "(empty file)";
+  }
+
+  const lines = trimmed.split("\n");
+  const visibleLines = lines.slice(0, maxLines);
+  let preview = visibleLines.join("\n");
+  let truncatedByChars = false;
+  if (preview.length > maxChars) {
+    preview = preview.slice(0, maxChars).trimEnd();
+    truncatedByChars = true;
+  }
+
+  const omittedLineCount = Math.max(0, lines.length - visibleLines.length);
+  if (omittedLineCount > 0 || truncatedByChars) {
+    const suffix = [];
+    if (omittedLineCount > 0) {
+      suffix.push(`${omittedLineCount} more line(s)`);
+    }
+    if (truncatedByChars) {
+      suffix.push("truncated");
+    }
+    preview += `\n... (${suffix.join(", ")})`;
+  }
+  return preview;
+};
+
 const normalizeReadFilesDisplayBody = (body: string) => {
   const lines = body.split(/\r?\n/);
   const sections: string[] = [];
@@ -243,8 +272,8 @@ const normalizeReadFilesDisplayBody = (body: string) => {
     if (!currentHeader) {
       return;
     }
-    const content = trimWhitespaceOnlyEdges(currentBody.join("\n"));
-    sections.push(content ? `${currentHeader}\n${content}` : currentHeader);
+    const content = clampReadFilesSection(currentBody.join("\n"));
+    sections.push(`${currentHeader}\n${content}`);
     currentHeader = "";
     currentBody = [];
   };

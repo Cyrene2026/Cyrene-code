@@ -132,6 +132,24 @@ func TestRenderMarkdownBodyLinesHandlesInlineCodeAndFences(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownBodyLinesHandlesListsQuotesAndEmphasis(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("1. **Bold** item\n- _Italic_ bullet\n> quote line", 80, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+
+	if strings.Contains(rendered, "**Bold**") {
+		t.Fatalf("expected bold markers removed, got %q", rendered)
+	}
+	if strings.Contains(rendered, "_Italic_") {
+		t.Fatalf("expected italic markers removed, got %q", rendered)
+	}
+	if strings.Contains(rendered, "> quote line") {
+		t.Fatalf("expected quote marker normalized, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "1. ") || !strings.Contains(rendered, "• ") || !strings.Contains(rendered, "│ ") {
+		t.Fatalf("expected list and quote prefixes rendered, got %q", rendered)
+	}
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a

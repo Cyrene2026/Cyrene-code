@@ -85,7 +85,24 @@ const formatMissingGoMessage = (error) => {
   return lines.join("\n");
 };
 
-await rm(distDir, { recursive: true, force: true });
+const isWindowsLockError = error =>
+  Boolean(
+    error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error.code === "EACCES" || error.code === "EPERM" || error.code === "EBUSY")
+  );
+
+try {
+  await rm(distDir, { recursive: true, force: true });
+} catch (error) {
+  if (!isWindowsLockError(error)) {
+    throw error;
+  }
+  console.warn(
+    `Warning: unable to fully clean ${distDir}; continuing and overwriting build outputs where possible.`
+  );
+}
 await mkdir(distDir, { recursive: true });
 await mkdir(goCacheDir, { recursive: true });
 

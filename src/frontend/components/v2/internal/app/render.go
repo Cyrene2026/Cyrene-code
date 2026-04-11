@@ -14,8 +14,7 @@ var (
 
 	brandChipStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("0")).
-			Background(lipgloss.Color("14")).
+			Foreground(lipgloss.Color("14")).
 			Padding(0, 1)
 
 	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
@@ -28,12 +27,10 @@ var (
 	sectionStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	codeBlockStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("7")).
-			Background(lipgloss.Color("0")).
-			Padding(0, 1)
+			Padding(0, 0)
 	inlineCodeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("14")).
-			Background(lipgloss.Color("0")).
-			Padding(0, 1)
+			Underline(true)
 	codeFenceStyle   = dimStyle.Copy().Italic(true)
 	codeKeywordStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true)
 	codeStringStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
@@ -69,6 +66,7 @@ var startupShadowLogoLines = []string{
 var (
 	diffPattern         = regexp.MustCompile(`^([+-])\s*(\d+)?\s*\|\s?(.*)$`)
 	numberedDiffPattern = regexp.MustCompile(`^\s*(\d+)\s*\|\s?(.*)$`)
+	orderedListPattern  = regexp.MustCompile(`^(\d+)[.)]\s+(.*)$`)
 	kvPattern           = regexp.MustCompile(`^([a-z][a-z0-9_ ]*):\s*(.*)$`)
 	headerKVPattern     = regexp.MustCompile(`^[a-z_]+=.*$`)
 )
@@ -321,11 +319,42 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			for _, row := range wrapPlainText(heading, width) {
 				lines = append(lines, "  "+titleStyle.Bold(true).Render(row))
 			}
+		case orderedListPattern.MatchString(trimmed):
+			matches := orderedListPattern.FindStringSubmatch(trimmed)
+			prefix := ""
+			content := trimmed
+			if len(matches) >= 3 {
+				prefix = strings.TrimSpace(matches[1]) + ". "
+				content = matches[2]
+			}
+			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
+				if index == 0 {
+					lines = append(lines, "  "+dimStyle.Render(prefix)+renderInlineMarkdown(row, baseStyle))
+					continue
+				}
+				lines = append(lines, "  "+strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, baseStyle))
+			}
 		case strings.HasPrefix(trimmed, "- "),
 			strings.HasPrefix(trimmed, "* "),
 			strings.HasPrefix(trimmed, "> "):
-			for _, row := range wrapPlainText(raw, width) {
-				lines = append(lines, "  "+renderInlineMarkdown(row, baseStyle))
+			prefix := ""
+			content := raw
+			style := baseStyle
+			switch {
+			case strings.HasPrefix(trimmed, "- "), strings.HasPrefix(trimmed, "* "):
+				prefix = "• "
+				content = strings.TrimSpace(trimmed[2:])
+			case strings.HasPrefix(trimmed, "> "):
+				prefix = "│ "
+				content = strings.TrimSpace(trimmed[2:])
+				style = dimStyle.Copy()
+			}
+			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
+				if index == 0 {
+					lines = append(lines, "  "+dimStyle.Render(prefix)+renderInlineMarkdown(row, style))
+					continue
+				}
+				lines = append(lines, "  "+strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, style))
 			}
 		default:
 			for _, row := range wrapPlainText(raw, width) {
@@ -341,27 +370,96 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 }
 
 func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {
-	if !strings.Contains(value, "`") {
-		return baseStyle.Render(value)
-	}
-
-	parts := strings.Split(value, "`")
-	if len(parts) < 3 {
-		return baseStyle.Render(value)
-	}
-
 	var builder strings.Builder
+	parts := strings.Split(value, "`")
 	for index, part := range parts {
 		if index%2 == 1 {
 			builder.WriteString(inlineCodeStyle.Render(part))
 			continue
 		}
-		if part == "" {
-			continue
-		}
-		builder.WriteString(baseStyle.Render(part))
+		builder.WriteString(renderInlineEmphasis(part, baseStyle))
 	}
 	return builder.String()
+}
+
+func renderInlineEmphasis(value string, baseStyle lipgloss.Style) string {
+	if value == "" {
+		return ""
+	}
+
+	runes := []rune(value)
+	var builder strings.Builder
+	for index := 0; index < len(runes); {
+		if index+1 < len(runes) {
+			switch {
+			case runes[index] == '*' && runes[index+1] == '*':
+				if end := findInlineMarkerEndString(runes, index+2, "**"); end >= 0 {
+					builder.WriteString(baseStyle.Copy().Bold(true).Render(string(runes[index+2 : end])))
+					index = end + 2
+					continue
+				}
+			case runes[index] == '_' && runes[index+1] == '_':
+				if end := findInlineMarkerEndString(runes, index+2, "__"); end >= 0 {
+					builder.WriteString(baseStyle.Copy().Bold(true).Render(string(runes[index+2 : end])))
+					index = end + 2
+					continue
+				}
+			}
+		}
+
+		switch runes[index] {
+		case '*':
+			if end := findInlineMarkerEndRune(runes, index+1, '*'); end >= 0 {
+				builder.WriteString(baseStyle.Copy().Italic(true).Render(string(runes[index+1 : end])))
+				index = end + 1
+				continue
+			}
+		case '_':
+			if end := findInlineMarkerEndRune(runes, index+1, '_'); end >= 0 {
+				builder.WriteString(baseStyle.Copy().Italic(true).Render(string(runes[index+1 : end])))
+				index = end + 1
+				continue
+			}
+		case '~':
+			if index+1 < len(runes) && runes[index+1] == '~' {
+				if end := findInlineMarkerEndString(runes, index+2, "~~"); end >= 0 {
+					builder.WriteString(baseStyle.Copy().Strikethrough(true).Render(string(runes[index+2 : end])))
+					index = end + 2
+					continue
+				}
+			}
+		}
+
+		builder.WriteString(baseStyle.Render(string(runes[index])))
+		index++
+	}
+	return builder.String()
+}
+
+func findInlineMarkerEndRune(runes []rune, start int, marker rune) int {
+	for index := start; index < len(runes); index++ {
+		if runes[index] == marker {
+			return index
+		}
+	}
+	return -1
+}
+
+func findInlineMarkerEndString(runes []rune, start int, marker string) int {
+	markerRunes := []rune(marker)
+	for index := start; index+len(markerRunes) <= len(runes); index++ {
+		matched := true
+		for offset, r := range markerRunes {
+			if runes[index+offset] != r {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return index
+		}
+	}
+	return -1
 }
 
 func renderDiffRows(sign, lineNumber, content string, width int) []string {
@@ -609,7 +707,11 @@ func (m *Model) renderComposer(width int) string {
 			lines = append(lines, noticeStyle.Render(line))
 		}
 	} else {
-		lines = append(lines, dimStyle.Render("Enter send | Ctrl+J newline | PgUp/PgDn transcript | /help"))
+		helper := "Enter send | Ctrl+J newline | PgUp/PgDn transcript | F6 copy mode | /help"
+		if !m.MouseCapture {
+			helper = "Enter send | Ctrl+J newline | drag select/copy | F6 restore wheel | /help"
+		}
+		lines = append(lines, dimStyle.Render(helper))
 	}
 
 	if m.ActivePanel == PanelNone {
@@ -1369,15 +1471,15 @@ func promptStyleForStatus(status Status) lipgloss.Style {
 func statusBadgeStyle(status Status) lipgloss.Style {
 	switch status {
 	case StatusPreparing:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11"))
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
 	case StatusRequesting, StatusStreaming:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12"))
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	case StatusAwaitingReview:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11"))
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
 	case StatusError:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("9"))
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))
 	default:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10"))
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
 	}
 }
 

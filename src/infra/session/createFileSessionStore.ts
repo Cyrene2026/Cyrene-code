@@ -168,6 +168,25 @@ const sanitizeTitle = (title: string) => {
   return `${normalized.slice(0, 60)}...`;
 };
 
+const isEmptyPlaceholderSession = (session: SessionRecord) => {
+  const summary = session.summary?.trim() ?? "";
+  const pendingDigest = session.pendingDigest?.trim() ?? "";
+  const focus = session.focus ?? [];
+  const tags = session.tags ?? [];
+
+  return (
+    session.title === "New session" &&
+    session.messages.length === 0 &&
+    summary.length === 0 &&
+    pendingDigest.length === 0 &&
+    session.pendingChoice == null &&
+    session.lastStateUpdate == null &&
+    session.inFlightTurn == null &&
+    focus.length === 0 &&
+    tags.length === 0
+  );
+};
+
 const normalizeTag = (tag: string) =>
   tag
     .trim()
@@ -433,6 +452,9 @@ export const createFileSessionStore = (
         if (!loaded) {
           continue;
         }
+        if (isEmptyPlaceholderSession(loaded.session)) {
+          continue;
+        }
         items.push({
           id: loaded.session.id,
           title: loaded.session.title,
@@ -460,6 +482,9 @@ export const createFileSessionStore = (
           continue;
         }
         const session = loaded.session;
+        if (isEmptyPlaceholderSession(session)) {
+          continue;
+        }
         if (normalizedTag && !session.tags.includes(normalizedTag)) {
           continue;
         }

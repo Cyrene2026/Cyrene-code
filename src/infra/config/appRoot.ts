@@ -5,9 +5,10 @@ type AppRootResolveOptions = {
   argv?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 };
 
-type CyreneDirResolveOptions = Pick<AppRootResolveOptions, "cwd" | "env">;
+type CyreneDirResolveOptions = Pick<AppRootResolveOptions, "cwd" | "env" | "platform">;
 
 let configuredAppRoot: string | null = null;
 
@@ -109,7 +110,7 @@ export const resetConfiguredAppRoot = () => {
 export const resolveUserHomeDir = (options?: CyreneDirResolveOptions) => {
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
-  const envHome = resolveHomeFromEnv(env);
+  const envHome = resolveHomeFromEnv(env, options?.platform);
   if (!envHome) {
     return homedir();
   }
@@ -138,6 +139,12 @@ export const getCyreneConfigDir = (
   const env = options?.env ?? process.env;
   const explicitCyreneHome = trimNonEmpty(env.CYRENE_HOME);
   if (explicitCyreneHome) {
+    if (isAbsolute(explicitCyreneHome)) {
+      return resolve(explicitCyreneHome);
+    }
+    if (isWindowsStyleAbsolutePath(explicitCyreneHome)) {
+      return explicitCyreneHome;
+    }
     return resolve(cwd, explicitCyreneHome);
   }
   return join(resolveUserHomeDir(options), ".cyrene");

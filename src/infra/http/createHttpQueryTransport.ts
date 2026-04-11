@@ -237,7 +237,7 @@ export const FILE_TOOL = {
         },
         symbol: {
           type: "string",
-          description: "Symbol name for find_symbol or find_references, such as useChatApp or FileMcpService.",
+          description: "Symbol name for find_symbol or find_references, such as FileMcpService or SessionRepository.",
         },
         query: {
           type: "string",

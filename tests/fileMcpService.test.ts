@@ -1325,6 +1325,9 @@ describe("FileMcpService", () => {
     expect(queued.pending?.previewSummary).toContain("[write preview | overwrite]");
     expect(queued.pending?.previewSummary).toContain("[old - to be overwritten]");
     expect(queued.pending?.previewSummary).toContain("[new + to be written]");
+    expect(queued.pending!.previewSummary.indexOf("[new + to be written]")).toBeLessThan(
+      queued.pending!.previewSummary.indexOf("[old - to be overwritten]")
+    );
   });
 
   test("write_file allows missing target and creates file after approval", async () => {
@@ -1360,6 +1363,25 @@ describe("FileMcpService", () => {
 
     expect(queued.ok).toBe(true);
     expect(queued.pending?.previewSummary).toContain("[create preview | new only]");
+  });
+
+  test("edit_file preview puts new content before removed content", async () => {
+    const { root, service } = await createService();
+    await writeFile(join(root, "edit-target.txt"), "before value\n", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "edit_file",
+      path: "edit-target.txt",
+      find: "before value\n",
+      replace: "after value\n",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.previewSummary).toContain("[new + to be written]");
+    expect(queued.pending?.previewSummary).toContain("[old - to be removed]");
+    expect(queued.pending!.previewSummary.indexOf("[new + to be written]")).toBeLessThan(
+      queued.pending!.previewSummary.indexOf("[old - to be removed]")
+    );
   });
 
   test("edit_file rejects before queue when target does not exist", async () => {

@@ -5079,10 +5079,10 @@ export class FileMcpService {
         const before = await readFile(abs, "utf8");
         return [
           "[write preview | overwrite]",
-          "[old - to be overwritten]",
-          formatDiffLines("-", mode === "summary" ? clip(before, 6000) : before, 1, maxLines),
           "[new + to be written]",
           formatDiffLines("+", nextContent, 1, maxLines),
+          "[old - to be overwritten]",
+          formatDiffLines("-", mode === "summary" ? clip(before, 6000) : before, 1, maxLines),
         ].join("\n");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -5104,17 +5104,17 @@ export class FileMcpService {
       const startLine = hit >= 0 ? lineNumberAtIndex(before, hit) : 1;
       return [
         previewLabel,
-        "[old - to be removed]",
-        formatDiffLines(
-          "-",
-          mode === "summary" ? clip(find, 3000) : find,
-          startLine,
-          maxLines
-        ),
         "[new + to be written]",
         formatDiffLines(
           "+",
           mode === "summary" ? clip(replace, 3000) : replace,
+          startLine,
+          maxLines
+        ),
+        "[old - to be removed]",
+        formatDiffLines(
+          "-",
+          mode === "summary" ? clip(find, 3000) : find,
           startLine,
           maxLines
         ),
@@ -5122,17 +5122,17 @@ export class FileMcpService {
     } catch {
       return [
         previewLabel,
-        "[old - to be removed]",
-        formatDiffLines(
-          "-",
-          mode === "summary" ? clip(find, 3000) : find,
-          1,
-          maxLines
-        ),
         "[new + to be written]",
         formatDiffLines(
           "+",
           mode === "summary" ? clip(replace, 3000) : replace,
+          1,
+          maxLines
+        ),
+        "[old - to be removed]",
+        formatDiffLines(
+          "-",
+          mode === "summary" ? clip(find, 3000) : find,
           1,
           maxLines
         ),

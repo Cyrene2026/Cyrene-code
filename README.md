@@ -4,7 +4,7 @@
 
 # Cyrene
 
-Terminal-first coding assistant built with Bun, React Ink, and a reviewable query loop.
+Terminal-first coding assistant built around a Bun backend, a Go Bubble Tea terminal UI, and a reviewable query loop.
 
 ## Install
 

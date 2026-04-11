@@ -220,6 +220,50 @@ const firstLine = (value: string, fallback = "") =>
     .map(line => line.trim())
     .find(Boolean) ?? fallback;
 
+const trimWhitespaceOnlyEdges = (value: string) => {
+  const lines = value.split(/\r?\n/);
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start] !== undefined && lines[start]!.trim() === "") {
+    start += 1;
+  }
+  while (end > start && lines[end - 1] !== undefined && lines[end - 1]!.trim() === "") {
+    end -= 1;
+  }
+  return lines.slice(start, end).join("\n");
+};
+
+const normalizeReadFilesDisplayBody = (body: string) => {
+  const lines = body.split(/\r?\n/);
+  const sections: string[] = [];
+  let currentHeader = "";
+  let currentBody: string[] = [];
+
+  const flush = () => {
+    if (!currentHeader) {
+      return;
+    }
+    const content = trimWhitespaceOnlyEdges(currentBody.join("\n"));
+    sections.push(content ? `${currentHeader}\n${content}` : currentHeader);
+    currentHeader = "";
+    currentBody = [];
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("[file] ")) {
+      flush();
+      currentHeader = line;
+      continue;
+    }
+    currentBody.push(line);
+  }
+  flush();
+
+  return sections.length > 0
+    ? sections.join("\n\n")
+    : trimWhitespaceOnlyEdges(body);
+};
+
 const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text"> => {
   const normalized = normalizeMcpMessage(raw);
   const summary = summarizeChatToolMessage(raw);
@@ -237,9 +281,12 @@ const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text">
       detail.startsWith("read_yaml ") ||
       detail.startsWith("search_text_context ")
     ) {
+      const displayBody = detail.startsWith("read_files ")
+        ? normalizeReadFilesDisplayBody(body || "(empty)")
+        : trimWhitespaceOnlyEdges(body || "(empty)");
       return {
         kind: "tool_status",
-        text: `Tool: ${detail}\n\`\`\`\n${(body || "(empty)").trim()}\n\`\`\``,
+        text: `Tool: ${detail}\n\`\`\`\n${displayBody}\n\`\`\``,
       };
     }
     if (FILE_MUTATION_ACTIONS.has(action)) {

@@ -211,3 +211,120 @@ func TestAuthAltDigitStillSwitchesField(t *testing.T) {
 		t.Fatalf("expected cursor at model field end, got %d", model.AuthCursor)
 	}
 }
+
+func TestIncrementalBridgeInitHydratesState(t *testing.T) {
+	model := app.NewModel()
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"init",
+		"snapshot":{
+			"appRoot":"/workspace/demo",
+			"status":"idle",
+			"activeSessionId":"sess-1",
+			"items":[{"role":"user","kind":"transcript","text":"hello"}],
+			"liveText":"draft",
+			"pendingReviews":[{"id":"rev-1","action":"edit_file","path":"a.txt","previewSummary":"sum","previewFull":"full","createdAt":"2026-04-11T00:00:00Z"}],
+			"sessions":[{"id":"sess-1","title":"Demo","updatedAt":"2026-04-11T00:00:00Z","tags":["x"]}],
+			"currentModel":"gpt-5.4",
+			"currentProvider":"https://api.example.com/v1",
+			"currentProviderKeySource":"env",
+			"availableModels":["gpt-5.4","gpt-5.3"],
+			"availableProviders":["https://api.example.com/v1"],
+			"providerProfiles":{"https://api.example.com/v1":"openai"},
+			"providerProfileSources":{"https://api.example.com/v1":"manual"},
+			"auth":{"mode":"http","credentialSource":"env","provider":"https://api.example.com/v1","model":"gpt-5.4","persistenceLabel":"env","persistencePath":"","httpReady":true,"onboardingAvailable":false}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("ApplyBridgeEventJSONForTest returned error: %v", err)
+	}
+
+	if !model.BridgeReady {
+		t.Fatalf("expected bridge ready after init")
+	}
+	if model.ActiveSessionID != "sess-1" {
+		t.Fatalf("expected active session hydrated, got %q", model.ActiveSessionID)
+	}
+	if len(model.Items) != 1 || model.Items[0].Text != "hello" {
+		t.Fatalf("expected transcript hydrated, got %#v", model.Items)
+	}
+	if model.LiveText != "draft" {
+		t.Fatalf("expected live text hydrated, got %q", model.LiveText)
+	}
+	if len(model.PendingReviews) != 1 || model.PendingReviews[0].ID != "rev-1" {
+		t.Fatalf("expected pending reviews hydrated, got %#v", model.PendingReviews)
+	}
+	if model.CurrentModel != "gpt-5.4" || model.CurrentProviderKeySource != "env" {
+		t.Fatalf("expected runtime metadata hydrated, got model=%q keySource=%q", model.CurrentModel, model.CurrentProviderKeySource)
+	}
+}
+
+func TestIncrementalBridgeAppendReplaceAndLiveText(t *testing.T) {
+	model := app.NewModel()
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"replace_items","items":[{"role":"user","kind":"transcript","text":"one"}]}`); err != nil {
+		t.Fatalf("replace_items failed: %v", err)
+	}
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"append_items","items":[{"role":"assistant","kind":"transcript","text":"two"},{"role":"system","kind":"tool_status","text":"three"}]}`); err != nil {
+		t.Fatalf("append_items failed: %v", err)
+	}
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_live_text","liveText":"streaming"}`); err != nil {
+		t.Fatalf("set_live_text failed: %v", err)
+	}
+
+	if len(model.Items) != 3 {
+		t.Fatalf("expected 3 transcript items, got %d", len(model.Items))
+	}
+	if model.Items[1].Text != "two" {
+		t.Fatalf("expected appended item, got %#v", model.Items[1])
+	}
+	if model.Items[2].Text != "three" {
+		t.Fatalf("expected batched appended item, got %#v", model.Items[2])
+	}
+	if model.LiveText != "streaming" {
+		t.Fatalf("expected live text updated, got %q", model.LiveText)
+	}
+}
+
+func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthSaving = true
+
+	if err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_sessions",
+		"sessions":[
+			{"id":"sess-1","title":"One","updatedAt":"2026-04-11T00:00:00Z","tags":[]},
+			{"id":"sess-2","title":"Two","updatedAt":"2026-04-11T00:01:00Z","tags":["keep"]}
+		],
+		"activeSessionId":"sess-2"
+	}`); err != nil {
+		t.Fatalf("set_sessions failed: %v", err)
+	}
+	if err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_runtime_metadata",
+		"appRoot":"/workspace/project-b",
+		"auth":{"mode":"http","credentialSource":"env","provider":"https://provider/v1","model":"gpt-5.4","persistenceLabel":"env","persistencePath":"","httpReady":true,"onboardingAvailable":false},
+		"currentModel":"gpt-5.4",
+		"currentProvider":"https://provider/v1",
+		"currentProviderKeySource":"env",
+		"availableModels":["gpt-5.4"],
+		"availableProviders":["https://provider/v1"],
+		"providerProfiles":{"https://provider/v1":"openai"},
+		"providerProfileSources":{"https://provider/v1":"manual"}
+	}`); err != nil {
+		t.Fatalf("set_runtime_metadata failed: %v", err)
+	}
+
+	if model.ActiveSessionID != "sess-2" || model.SessionIndex != 1 {
+		t.Fatalf("expected sessions selection synced, got active=%q index=%d", model.ActiveSessionID, model.SessionIndex)
+	}
+	if model.AppRoot != "/workspace/project-b" {
+		t.Fatalf("expected app root updated, got %q", model.AppRoot)
+	}
+	if model.ActivePanel != app.PanelNone {
+		t.Fatalf("expected auth panel closed after ready auth, got %q", model.ActivePanel)
+	}
+	if !strings.Contains(model.Notice, "HTTP login updated") {
+		t.Fatalf("expected auth success notice, got %q", model.Notice)
+	}
+}

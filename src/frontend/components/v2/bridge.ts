@@ -140,7 +140,25 @@ type BridgeSnapshot = {
 };
 
 type BridgeEvent =
-  | { type: "snapshot"; snapshot: BridgeSnapshot }
+  | { type: "init"; snapshot: BridgeSnapshot }
+  | { type: "set_status"; status: BridgeStatus }
+  | { type: "set_live_text"; liveText: string }
+  | { type: "append_items"; items: BridgeItem[] }
+  | { type: "replace_items"; items: BridgeItem[] }
+  | { type: "set_sessions"; sessions: BridgeSession[]; activeSessionId?: string | null }
+  | { type: "set_pending_reviews"; pendingReviews: BridgeReview[] }
+  | {
+      type: "set_runtime_metadata";
+      auth: BridgeAuthStatus;
+      currentModel: string;
+      currentProvider: string;
+      currentProviderKeySource: string;
+      availableModels: string[];
+      availableProviders: string[];
+      providerProfiles: Record<string, BridgeProviderProfile>;
+      providerProfileSources: Record<string, BridgeProviderProfileSource>;
+      appRoot: string;
+    }
   | { type: "error"; message: string };
 
 type SuspendedRun = {
@@ -281,6 +299,9 @@ class BubbleTeaBridge {
   private sessionSkillUseIds = new Map<string, string[]>();
   private suspended: SuspendedRun | null = null;
   private commandChain: Promise<void> = Promise.resolve();
+  private runtimeMetadataDirty = true;
+  private pendingAppendItems: BridgeItem[] = [];
+  private appendFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   enqueue(command: BridgeCommand) {
     this.commandChain = this.commandChain
@@ -306,8 +327,6 @@ class BubbleTeaBridge {
         return;
       case "list_sessions":
         await this.refreshSessions();
-        await this.refreshRuntimeMetadata();
-        this.emitSnapshot();
         return;
       case "load_session":
         await this.loadSession(command.id);
@@ -329,8 +348,8 @@ class BubbleTeaBridge {
         return;
       case "list_models":
       case "list_providers":
+        this.markRuntimeMetadataDirty();
         await this.refreshRuntimeMetadata();
-        this.emitSnapshot();
         return;
       case "set_model":
         await this.setModel(command.value);
@@ -375,7 +394,7 @@ class BubbleTeaBridge {
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitInit();
   }
 
   private async loadRuntime(root: string) {
@@ -401,6 +420,7 @@ class BubbleTeaBridge {
     this.mcpService = await createMcpRuntime(this.appRoot);
     this.skillsRuntime = await createSkillsRuntime(this.appRoot);
     this.pendingReviews = this.listPendingReviews();
+    this.markRuntimeMetadataDirty();
     await this.refreshRuntimeMetadata();
   }
 
@@ -459,8 +479,15 @@ class BubbleTeaBridge {
     return normalized && manualOverrides[normalized] ? "manual" : "inferred";
   }
 
-  private async refreshRuntimeMetadata() {
+  private markRuntimeMetadataDirty() {
+    this.runtimeMetadataDirty = true;
+  }
+
+  private async refreshRuntimeMetadata(force = false) {
     await this.ensureRuntime();
+    if (!force && !this.runtimeMetadataDirty) {
+      return;
+    }
     this.authStatus = this.authRuntime ? await this.authRuntime.getStatus() : null;
     this.availableModels = [];
     this.availableProviders = [];
@@ -503,6 +530,8 @@ class BubbleTeaBridge {
     }
     this.providerProfiles = nextProfiles;
     this.providerProfileSources = nextProfileSources;
+    this.runtimeMetadataDirty = false;
+    this.emitRuntimeMetadata();
   }
 
   private snapshot(): BridgeSnapshot {
@@ -525,14 +554,109 @@ class BubbleTeaBridge {
     };
   }
 
-  private emit(event: BridgeEvent) {
+  private writeEvent(event: BridgeEvent) {
     process.stdout.write(`${JSON.stringify(event)}\n`);
   }
 
-  private emitSnapshot() {
+  private cancelAppendFlush() {
+    if (this.appendFlushTimer) {
+      clearTimeout(this.appendFlushTimer);
+      this.appendFlushTimer = null;
+    }
+  }
+
+  private discardPendingAppendItems() {
+    this.pendingAppendItems = [];
+    this.cancelAppendFlush();
+  }
+
+  private flushPendingAppendItems() {
+    if (this.pendingAppendItems.length === 0) {
+      this.cancelAppendFlush();
+      return;
+    }
+    const items = this.pendingAppendItems;
+    this.pendingAppendItems = [];
+    this.cancelAppendFlush();
+    this.writeEvent({
+      type: "append_items",
+      items,
+    });
+  }
+
+  private scheduleAppendFlush() {
+    if (this.appendFlushTimer) {
+      return;
+    }
+    this.appendFlushTimer = setTimeout(() => {
+      this.flushPendingAppendItems();
+    }, 12);
+  }
+
+  private emit(event: BridgeEvent) {
+    if (event.type === "init" || event.type === "replace_items") {
+      this.discardPendingAppendItems();
+    } else if (event.type !== "append_items") {
+      this.flushPendingAppendItems();
+    }
+    this.writeEvent(event);
+  }
+
+  private emitInit() {
     this.emit({
-      type: "snapshot",
+      type: "init",
       snapshot: this.snapshot(),
+    });
+  }
+
+  private emitStatus() {
+    this.emit({
+      type: "set_status",
+      status: this.status,
+    });
+  }
+
+  private emitLiveText() {
+    this.emit({
+      type: "set_live_text",
+      liveText: this.liveText,
+    });
+  }
+
+  private emitReplaceItems() {
+    this.emit({
+      type: "replace_items",
+      items: this.items,
+    });
+  }
+
+  private emitSessions() {
+    this.emit({
+      type: "set_sessions",
+      sessions: this.sessions,
+      activeSessionId: this.activeSessionId,
+    });
+  }
+
+  private emitPendingReviews() {
+    this.emit({
+      type: "set_pending_reviews",
+      pendingReviews: this.pendingReviews,
+    });
+  }
+
+  private emitRuntimeMetadata() {
+    this.emit({
+      type: "set_runtime_metadata",
+      auth: toBridgeAuthStatus(this.authStatus),
+      currentModel: this.transport?.getModel() ?? this.authStatus?.model ?? "",
+      currentProvider: this.transport?.getProvider() ?? this.authStatus?.provider ?? "",
+      currentProviderKeySource: this.currentProviderKeySource,
+      availableModels: this.availableModels,
+      availableProviders: this.availableProviders,
+      providerProfiles: this.providerProfiles,
+      providerProfileSources: this.providerProfileSources,
+      appRoot: this.appRoot,
     });
   }
 
@@ -557,9 +681,12 @@ class BubbleTeaBridge {
   private pushItem(item: BridgeItem) {
     if (this.items.length === 1 && this.items[0]?.text === DEFAULT_EMPTY_STATE.text) {
       this.items = [item];
+      this.emitReplaceItems();
       return;
     }
-    this.items = [...this.items, item];
+    this.items.push(item);
+    this.pendingAppendItems.push(item);
+    this.scheduleAppendFlush();
   }
 
   private async pushRuntimeResult(message: string, ok = true) {
@@ -568,8 +695,7 @@ class BubbleTeaBridge {
       kind: ok ? "system_hint" : "error",
       text: message,
     });
-    await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitStatus();
   }
 
   private async pushSystemMessage(
@@ -581,8 +707,6 @@ class BubbleTeaBridge {
       kind: options?.kind ?? "system_hint",
       text,
     });
-    await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
   }
 
   private formatReducerStateMessage(session: SessionRecord | null) {
@@ -710,6 +834,7 @@ class BubbleTeaBridge {
       updatedAt: item.updatedAt,
       tags: [...item.tags],
     }));
+    this.emitSessions();
   }
 
   private async executeSlashCommand(rawText: string) {
@@ -795,7 +920,8 @@ class BubbleTeaBridge {
       this.pendingReviews = this.listPendingReviews();
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
       await this.refreshRuntimeMetadata();
-      this.emitSnapshot();
+      this.emitPendingReviews();
+      this.emitStatus();
       return;
     }
 
@@ -847,7 +973,7 @@ class BubbleTeaBridge {
     this.hydrateTranscript(record);
     await this.refreshRuntimeMetadata();
     if (options?.emit !== false) {
-      this.emitSnapshot();
+      this.emitInit();
     }
   }
 
@@ -891,7 +1017,7 @@ class BubbleTeaBridge {
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitInit();
   }
 
   private async submit(rawText: string) {
@@ -941,10 +1067,10 @@ class BubbleTeaBridge {
     this.liveText = "";
     this.suspended = null;
     this.status = "preparing";
+    this.emitStatus();
     this.pushItem({ role: "user", kind: "transcript", text });
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
 
     const assistantBufferRef = { current: "" };
     try {
@@ -954,14 +1080,18 @@ class BubbleTeaBridge {
         queryMaxToolSteps: this.config!.queryMaxToolSteps,
         transport: this.transport!,
         onState: next => {
+          if (this.status === next.status) {
+            return;
+          }
           this.status = next.status;
-          this.emitSnapshot();
+          this.emitStatus();
         },
         onTextDelta: delta => {
           assistantBufferRef.current += delta;
           this.liveText = parseAssistantStateUpdate(assistantBufferRef.current).visibleText;
           this.status = "streaming";
-          this.emitSnapshot();
+          this.emitStatus();
+          this.emitLiveText();
         },
         onToolStatus: message => {
           this.pushItem({
@@ -969,7 +1099,6 @@ class BubbleTeaBridge {
             kind: "tool_status",
             text: message,
           });
-          this.emitSnapshot();
         },
         onToolCall: async (toolName, input) => {
           const result = await this.mcpService!.handleToolCall(toolName, input);
@@ -983,7 +1112,8 @@ class BubbleTeaBridge {
             });
             this.pendingReviews = this.listPendingReviews();
             this.status = "awaiting_review";
-            this.emitSnapshot();
+            this.emitPendingReviews();
+            this.emitStatus();
             return {
               message: `Approval required ${pending.id} | ${detail}`,
               reviewMode: "block" as const,
@@ -996,7 +1126,6 @@ class BubbleTeaBridge {
             kind: result.ok ? formatted.kind : "error",
             text: formatted.text,
           });
-          this.emitSnapshot();
           return { message: result.message };
         },
         onError: message => {
@@ -1006,7 +1135,7 @@ class BubbleTeaBridge {
             kind: "error",
             text: `Stream error: ${message}`,
           });
-          this.emitSnapshot();
+          this.emitStatus();
         },
       });
 
@@ -1021,7 +1150,7 @@ class BubbleTeaBridge {
       await this.sessionStore!.updateInFlightTurn(session.id, null);
       this.status = "error";
       this.emitError(error instanceof Error ? error.message : String(error));
-      this.emitSnapshot();
+      this.emitStatus();
     }
   }
 
@@ -1054,7 +1183,9 @@ class BubbleTeaBridge {
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitPendingReviews();
+    this.emitStatus();
+    this.emitLiveText();
   }
 
   private createStateDiagnostic(
@@ -1225,7 +1356,9 @@ class BubbleTeaBridge {
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitPendingReviews();
+    this.emitStatus();
+    this.emitLiveText();
   }
 
   private async cancelSuspended(message: string) {
@@ -1249,7 +1382,9 @@ class BubbleTeaBridge {
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitPendingReviews();
+    this.emitStatus();
+    this.emitLiveText();
   }
 
   private async approve(id: string) {
@@ -1261,7 +1396,8 @@ class BubbleTeaBridge {
     if (!result.ok) {
       this.emitError(result.message);
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "error";
-      this.emitSnapshot();
+      this.emitPendingReviews();
+      this.emitStatus();
       return false;
     }
 
@@ -1270,13 +1406,12 @@ class BubbleTeaBridge {
       kind: "review_status",
       text: reviewMessage("Approved", target, firstLine(result.message)),
     });
-    this.emitSnapshot();
+    this.emitPendingReviews();
 
     const suspended = this.suspended;
     if (!suspended) {
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
-      await this.refreshRuntimeMetadata();
-      this.emitSnapshot();
+      this.emitStatus();
       return true;
     }
 
@@ -1301,7 +1436,8 @@ class BubbleTeaBridge {
     if (!result.ok) {
       this.emitError(result.message);
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "error";
-      this.emitSnapshot();
+      this.emitPendingReviews();
+      this.emitStatus();
       return false;
     }
 
@@ -1313,8 +1449,8 @@ class BubbleTeaBridge {
 
     this.pushItem({ role: "system", kind: "review_status", text: message });
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
-    await this.refreshRuntimeMetadata();
-    this.emitSnapshot();
+    this.emitPendingReviews();
+    this.emitStatus();
     return true;
   }
 
@@ -1383,6 +1519,8 @@ class BubbleTeaBridge {
         providerBaseUrl: this.transport!.getProvider(),
         model: this.transport!.getModel(),
       });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
     }
 
     this.status = result.ok ? "idle" : "error";
@@ -1403,6 +1541,8 @@ class BubbleTeaBridge {
         providerBaseUrl: this.transport!.getProvider(),
         model: this.transport!.getModel(),
       });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
     }
 
     this.status = result.ok ? "idle" : "error";
@@ -1417,6 +1557,8 @@ class BubbleTeaBridge {
         providerBaseUrl: this.transport!.getProvider(),
         model: this.transport!.getModel(),
       });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
     }
 
     this.status = result.ok ? "idle" : "error";
@@ -1467,6 +1609,8 @@ class BubbleTeaBridge {
         providerBaseUrl: this.transport.getProvider(),
         model: this.transport.getModel(),
       });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
     }
     this.status = result.ok ? "idle" : "error";
     await this.pushRuntimeResult(result.message, result.ok);
@@ -1491,6 +1635,10 @@ class BubbleTeaBridge {
 
     this.transport = result.transport;
     this.status = result.ok ? "idle" : "error";
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
     await this.pushRuntimeResult(result.message, result.ok);
   }
 
@@ -1504,10 +1652,15 @@ class BubbleTeaBridge {
     const result = await this.authRuntime.logout();
     this.transport = result.transport;
     this.status = result.ok ? "idle" : "error";
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
     await this.pushRuntimeResult(result.message, result.ok);
   }
 
   private dispose() {
+    this.flushPendingAppendItems();
     try {
       this.mcpService?.dispose();
     } catch {

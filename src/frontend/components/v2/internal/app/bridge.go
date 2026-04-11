@@ -75,9 +75,24 @@ type bridgeSnapshot struct {
 }
 
 type bridgeEvent struct {
-	Type     string          `json:"type"`
-	Snapshot *bridgeSnapshot `json:"snapshot,omitempty"`
-	Message  string          `json:"message,omitempty"`
+	Type                     string            `json:"type"`
+	Snapshot                 *bridgeSnapshot   `json:"snapshot,omitempty"`
+	Message                  string            `json:"message,omitempty"`
+	Status                   string            `json:"status,omitempty"`
+	LiveText                 string            `json:"liveText,omitempty"`
+	Items                    []Message         `json:"items,omitempty"`
+	Sessions                 []BridgeSession   `json:"sessions,omitempty"`
+	ActiveSessionID          string            `json:"activeSessionId,omitempty"`
+	PendingReviews           []BridgeReview    `json:"pendingReviews,omitempty"`
+	CurrentModel             string            `json:"currentModel,omitempty"`
+	CurrentProvider          string            `json:"currentProvider,omitempty"`
+	CurrentProviderKeySource string            `json:"currentProviderKeySource,omitempty"`
+	AvailableModels          []string          `json:"availableModels,omitempty"`
+	AvailableProviders       []string          `json:"availableProviders,omitempty"`
+	ProviderProfiles         map[string]string `json:"providerProfiles,omitempty"`
+	ProviderProfileSources   map[string]string `json:"providerProfileSources,omitempty"`
+	Auth                     BridgeAuthStatus  `json:"auth,omitempty"`
+	AppRoot                  string            `json:"appRoot,omitempty"`
 }
 
 type bridgeStartedMsg struct {
@@ -283,6 +298,18 @@ func (c *bridgeClient) waitForExit(wg *sync.WaitGroup) {
 	}
 	c.events <- bridgeExitedMsg{Err: err}
 	close(c.events)
+}
+
+func (e bridgeEvent) appRoot() string {
+	switch e.Type {
+	case "init":
+		if e.Snapshot != nil {
+			return strings.TrimSpace(e.Snapshot.AppRoot)
+		}
+	case "set_runtime_metadata":
+		return strings.TrimSpace(e.AppRoot)
+	}
+	return ""
 }
 
 func detectRepoRoot() (string, error) {

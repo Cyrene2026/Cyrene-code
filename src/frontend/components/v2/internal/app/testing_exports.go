@@ -1,6 +1,10 @@
 package app
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"encoding/json"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 func ParseRootArgForTest(args []string) string {
 	return parseRootArg(args)
@@ -24,4 +28,13 @@ func (m *Model) RenderTranscriptForTest(width, height int) string {
 
 func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style) []string {
 	return renderMarkdownBodyLines(text, width, base)
+}
+
+func (m *Model) ApplyBridgeEventJSONForTest(payload string) error {
+	var event bridgeEvent
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return err
+	}
+	m.handleBridgeEvent(event)
+	return nil
 }

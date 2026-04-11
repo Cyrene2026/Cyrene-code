@@ -118,6 +118,23 @@ const sessionSchema = z.object({
   messages: z.array(messageSchema),
 });
 
+const sessionListCacheSchema = z.object({
+  version: z.literal(1),
+  id: z.string(),
+  title: z.string(),
+  updatedAt: z.string(),
+  tags: z.array(z.string()),
+  messageCount: z.number().int().nonnegative(),
+  summaryLength: z.number().int().nonnegative(),
+  pendingDigestLength: z.number().int().nonnegative(),
+  hasPendingChoice: z.boolean(),
+  hasLastStateUpdate: z.boolean(),
+  hasInFlightTurn: z.boolean(),
+  focusCount: z.number().int().nonnegative(),
+});
+
+type SessionListCacheRecord = z.infer<typeof sessionListCacheSchema>;
+
 const memoryEntrySchema: z.ZodType<SessionMemoryEntry> = z.object({
   id: z.string(),
   sessionId: z.string(),
@@ -187,6 +204,17 @@ const isEmptyPlaceholderSession = (session: SessionRecord) => {
   );
 };
 
+const isEmptyPlaceholderSessionListCache = (session: SessionListCacheRecord) =>
+  session.title === "New session" &&
+  session.messageCount === 0 &&
+  session.summaryLength === 0 &&
+  session.pendingDigestLength === 0 &&
+  !session.hasPendingChoice &&
+  !session.hasLastStateUpdate &&
+  !session.hasInFlightTurn &&
+  session.focusCount === 0 &&
+  session.tags.length === 0;
+
 const normalizeTag = (tag: string) =>
   tag
     .trim()
@@ -206,9 +234,12 @@ const normalizeTagSet = (tags: string[]) =>
 
 const fileNameFor = (id: string) => `${id}.json`;
 const indexFileNameFor = (id: string) => `${id}.index.json`;
+const listCacheFileNameFor = (id: string) => `${id}.list.json`;
 
 const isSessionDataFile = (fileName: string) =>
-  fileName.endsWith(".json") && !fileName.endsWith(".index.json");
+  fileName.endsWith(".json") &&
+  !fileName.endsWith(".index.json") &&
+  !fileName.endsWith(".list.json");
 
 const deriveWorkingStateAllowedPaths = (index: SessionMemoryIndex) => {
   const allowed = new Set<string>();
@@ -250,6 +281,22 @@ export const createFileSessionStore = (
 
   const getSessionPath = (id: string) => join(resolvedSessionDir, fileNameFor(id));
   const getIndexPath = (id: string) => join(resolvedSessionDir, indexFileNameFor(id));
+  const getListCachePath = (id: string) => join(resolvedSessionDir, listCacheFileNameFor(id));
+
+  const toSessionListCache = (session: SessionRecord): SessionListCacheRecord => ({
+    version: 1,
+    id: session.id,
+    title: session.title,
+    updatedAt: session.updatedAt,
+    tags: [...session.tags],
+    messageCount: session.messages.length,
+    summaryLength: session.summary.trim().length,
+    pendingDigestLength: session.pendingDigest.trim().length,
+    hasPendingChoice: session.pendingChoice != null,
+    hasLastStateUpdate: session.lastStateUpdate != null,
+    hasInFlightTurn: session.inFlightTurn != null,
+    focusCount: session.focus.length,
+  });
 
   const readSession = async (id: string): Promise<SessionRecord | null> => {
     await ensureDir();
@@ -276,6 +323,8 @@ export const createFileSessionStore = (
   const writeSession = async (session: SessionRecord) => {
     await ensureDir();
     await writeFile(getSessionPath(session.id), JSON.stringify(session, null, 2), "utf8");
+    const listCache = toSessionListCache(session);
+    await writeFile(getListCachePath(session.id), JSON.stringify(listCache, null, 2), "utf8");
   };
 
   const readMemoryIndex = async (id: string): Promise<SessionMemoryIndex | null> => {
@@ -292,6 +341,21 @@ export const createFileSessionStore = (
   const writeMemoryIndex = async (index: SessionMemoryIndex) => {
     await ensureDir();
     await writeFile(getIndexPath(index.sessionId), JSON.stringify(index, null, 2), "utf8");
+  };
+
+  const readSessionListCache = async (id: string): Promise<SessionListCacheRecord | null> => {
+    await ensureDir();
+    try {
+      const content = await readFile(getListCachePath(id), "utf8");
+      const parsed = JSON.parse(content) as unknown;
+      const normalized = sessionListCacheSchema.parse(parsed);
+      return {
+        ...normalized,
+        tags: normalizeTagSet(normalized.tags),
+      };
+    } catch {
+      return null;
+    }
   };
 
   const syncSessionCaches = (session: SessionRecord, index: SessionMemoryIndex): SessionRecord => {
@@ -448,11 +512,21 @@ export const createFileSessionStore = (
           continue;
         }
         const id = file.name.replace(/\.json$/, "");
-        const loaded = await ensureSessionWithIndex(id);
-        if (!loaded) {
+        const cached = await readSessionListCache(id);
+        if (cached) {
+          if (isEmptyPlaceholderSessionListCache(cached)) {
+            continue;
+          }
+          items.push({
+            id: cached.id,
+            title: cached.title,
+            updatedAt: cached.updatedAt,
+            tags: [...cached.tags],
+          });
           continue;
         }
-        if (isEmptyPlaceholderSession(loaded.session)) {
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded || isEmptyPlaceholderSession(loaded.session)) {
           continue;
         }
         items.push({

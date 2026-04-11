@@ -226,8 +226,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 	case bridgeEventMsg:
 		m.handleBridgeEvent(value.Event)
-		if value.Event.Type == "snapshot" && value.Event.Snapshot != nil {
-			if err := syncProcessAppRoot(value.Event.Snapshot.AppRoot); err != nil {
+		if appRoot := value.Event.appRoot(); appRoot != "" {
+			if err := syncProcessAppRoot(appRoot); err != nil {
 				m.Status = StatusError
 				m.setNotice(fmt.Sprintf("Failed to switch workspace: %v", err), true)
 				return m, nil
@@ -278,59 +278,136 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	switch event.Type {
-	case "snapshot":
-		if event.Snapshot == nil {
+	case "init":
+		m.applyBridgeSnapshot(event.Snapshot)
+	case "set_status":
+		m.BridgeReady = true
+		m.Status = parseStatus(event.Status)
+	case "set_live_text":
+		m.BridgeReady = true
+		if m.LiveText != event.LiveText {
+			m.LiveText = event.LiveText
+			m.invalidateTranscriptCache()
+			m.clampTranscriptOffset()
+		}
+	case "append_items":
+		m.BridgeReady = true
+		if len(event.Items) == 0 {
 			return
 		}
-
-		m.BridgeReady = true
-		m.Items = event.Snapshot.Items
-		m.LiveText = event.Snapshot.LiveText
-		m.PendingReviews = event.Snapshot.PendingReviews
-		m.Sessions = event.Snapshot.Sessions
-		m.ActiveSessionID = event.Snapshot.ActiveSessionID
-		m.Status = parseStatus(event.Snapshot.Status)
-		m.AvailableModels = event.Snapshot.AvailableModels
-		m.AvailableProviders = event.Snapshot.AvailableProviders
-		m.ProviderProfiles = event.Snapshot.ProviderProfiles
-		m.ProviderProfileSources = event.Snapshot.ProviderProfileSources
-		m.CurrentModel = event.Snapshot.CurrentModel
-		m.CurrentProvider = event.Snapshot.CurrentProvider
-		m.CurrentProviderKeySource = event.Snapshot.CurrentProviderKeySource
-		m.Auth = event.Snapshot.Auth
-		m.AppRoot = event.Snapshot.AppRoot
+		if isDefaultEmptyState(m.Items) {
+			m.Items = cloneMessages(event.Items)
+		} else {
+			m.Items = append(m.Items, event.Items...)
+		}
 		m.invalidateTranscriptCache()
-		if m.ProviderProfiles == nil {
-			m.ProviderProfiles = map[string]string{}
-		}
-		if m.ProviderProfileSources == nil {
-			m.ProviderProfileSources = map[string]string{}
-		}
-
-		m.ApprovalIndex = clampInt(m.ApprovalIndex, 0, maxInt(0, len(m.PendingReviews)-1))
-		m.SessionIndex = clampInt(findSelectionIndex(m.Sessions, m.ActiveSessionID, m.SessionIndex), 0, maxInt(0, len(m.Sessions)-1))
-		m.ModelIndex = clampInt(findStringIndex(m.AvailableModels, m.CurrentModel, m.ModelIndex), 0, maxInt(0, len(m.AvailableModels)-1))
-		m.ProviderIndex = clampInt(findStringIndex(m.AvailableProviders, m.CurrentProvider, m.ProviderIndex), 0, maxInt(0, len(m.AvailableProviders)-1))
-		m.ApprovalPreviewOffset = clampInt(m.ApprovalPreviewOffset, 0, maxInt(0, m.currentApprovalPreviewLineCount()-approvalPreviewPageLines))
 		m.clampTranscriptOffset()
-
-		if len(m.PendingReviews) == 0 && m.ActivePanel == PanelApprovals {
-			m.ActivePanel = PanelNone
+	case "replace_items":
+		m.BridgeReady = true
+		m.Items = cloneMessages(event.Items)
+		if len(m.Items) == 0 {
+			m.Items = []Message{}
 		}
-		if m.AuthSaving {
-			m.AuthSaving = false
-			if m.Auth.HTTPReady {
-				m.ActivePanel = PanelNone
-				m.setNotice("HTTP login updated.", false)
-			}
-		}
-		if m.Notice != "" && !m.NoticeIsError {
-			m.Notice = ""
-		}
+		m.invalidateTranscriptCache()
+		m.clampTranscriptOffset()
+	case "set_sessions":
+		m.BridgeReady = true
+		m.Sessions = cloneSessions(event.Sessions)
+		m.ActiveSessionID = event.ActiveSessionID
+		m.SessionIndex = clampInt(findSelectionIndex(m.Sessions, m.ActiveSessionID, m.SessionIndex), 0, maxInt(0, len(m.Sessions)-1))
+	case "set_pending_reviews":
+		m.BridgeReady = true
+		m.PendingReviews = cloneReviews(event.PendingReviews)
+		m.normalizePendingReviewsState()
+	case "set_runtime_metadata":
+		m.BridgeReady = true
+		m.applyRuntimeMetadata(event)
 	case "error":
 		m.Status = StatusError
 		m.AuthSaving = false
 		m.setNotice(event.Message, true)
+	}
+}
+
+func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
+	if snapshot == nil {
+		return
+	}
+
+	m.BridgeReady = true
+	m.Items = cloneMessages(snapshot.Items)
+	m.LiveText = snapshot.LiveText
+	m.PendingReviews = cloneReviews(snapshot.PendingReviews)
+	m.Sessions = cloneSessions(snapshot.Sessions)
+	m.ActiveSessionID = snapshot.ActiveSessionID
+	m.Status = parseStatus(snapshot.Status)
+	m.AvailableModels = cloneStrings(snapshot.AvailableModels)
+	m.AvailableProviders = cloneStrings(snapshot.AvailableProviders)
+	m.ProviderProfiles = cloneStringMap(snapshot.ProviderProfiles)
+	m.ProviderProfileSources = cloneStringMap(snapshot.ProviderProfileSources)
+	m.CurrentModel = snapshot.CurrentModel
+	m.CurrentProvider = snapshot.CurrentProvider
+	m.CurrentProviderKeySource = snapshot.CurrentProviderKeySource
+	m.Auth = snapshot.Auth
+	m.AppRoot = snapshot.AppRoot
+	m.invalidateTranscriptCache()
+	m.normalizeBridgeSelections()
+	m.handleAuthRefreshSideEffects()
+	if m.Notice != "" && !m.NoticeIsError {
+		m.Notice = ""
+	}
+}
+
+func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
+	m.AvailableModels = cloneStrings(event.AvailableModels)
+	m.AvailableProviders = cloneStrings(event.AvailableProviders)
+	m.ProviderProfiles = cloneStringMap(event.ProviderProfiles)
+	m.ProviderProfileSources = cloneStringMap(event.ProviderProfileSources)
+	m.CurrentModel = event.CurrentModel
+	m.CurrentProvider = event.CurrentProvider
+	m.CurrentProviderKeySource = event.CurrentProviderKeySource
+	m.Auth = event.Auth
+	if strings.TrimSpace(event.AppRoot) != "" {
+		m.AppRoot = event.AppRoot
+	}
+	m.normalizeRuntimeMetadataState()
+	m.handleAuthRefreshSideEffects()
+}
+
+func (m *Model) normalizeBridgeSelections() {
+	m.normalizePendingReviewsState()
+	m.normalizeRuntimeMetadataState()
+	m.SessionIndex = clampInt(findSelectionIndex(m.Sessions, m.ActiveSessionID, m.SessionIndex), 0, maxInt(0, len(m.Sessions)-1))
+	m.clampTranscriptOffset()
+}
+
+func (m *Model) normalizePendingReviewsState() {
+	m.ApprovalIndex = clampInt(m.ApprovalIndex, 0, maxInt(0, len(m.PendingReviews)-1))
+	m.ApprovalPreviewOffset = clampInt(m.ApprovalPreviewOffset, 0, maxInt(0, m.currentApprovalPreviewLineCount()-approvalPreviewPageLines))
+	if len(m.PendingReviews) == 0 && m.ActivePanel == PanelApprovals {
+		m.ActivePanel = PanelNone
+	}
+}
+
+func (m *Model) normalizeRuntimeMetadataState() {
+	if m.ProviderProfiles == nil {
+		m.ProviderProfiles = map[string]string{}
+	}
+	if m.ProviderProfileSources == nil {
+		m.ProviderProfileSources = map[string]string{}
+	}
+	m.ModelIndex = clampInt(findStringIndex(m.AvailableModels, m.CurrentModel, m.ModelIndex), 0, maxInt(0, len(m.AvailableModels)-1))
+	m.ProviderIndex = clampInt(findStringIndex(m.AvailableProviders, m.CurrentProvider, m.ProviderIndex), 0, maxInt(0, len(m.AvailableProviders)-1))
+}
+
+func (m *Model) handleAuthRefreshSideEffects() {
+	if !m.AuthSaving {
+		return
+	}
+	m.AuthSaving = false
+	if m.Auth.HTTPReady {
+		m.ActivePanel = PanelNone
+		m.setNotice("HTTP login updated.", false)
 	}
 }
 
@@ -1333,6 +1410,66 @@ func (m *Model) deleteBackward() {
 	next = append(next, m.Input[m.Cursor:]...)
 	m.Input = next
 	m.Cursor--
+}
+
+func isDefaultEmptyState(items []Message) bool {
+	return len(items) == 1 &&
+		items[0].Role == "system" &&
+		items[0].Kind == "system_hint" &&
+		items[0].Text == "No messages in the current session. Start typing."
+}
+
+func cloneMessages(items []Message) []Message {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]Message, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneReviews(items []BridgeReview) []BridgeReview {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]BridgeReview, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneSessions(items []BridgeSession) []BridgeSession {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]BridgeSession, len(items))
+	copy(cloned, items)
+	for index := range cloned {
+		if len(items[index].Tags) == 0 {
+			continue
+		}
+		cloned[index].Tags = append([]string(nil), items[index].Tags...)
+	}
+	return cloned
+}
+
+func cloneStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]string, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneStringMap(items map[string]string) map[string]string {
+	if len(items) == 0 {
+		return map[string]string{}
+	}
+	cloned := make(map[string]string, len(items))
+	for key, value := range items {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func findSelectionIndex(items []BridgeSession, id string, fallback int) int {

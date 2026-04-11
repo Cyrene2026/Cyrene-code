@@ -130,6 +130,9 @@ const createWorkspaceEscapeSymlink = async (root: string) => {
   );
 };
 
+const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
+  env?.PATH ?? env?.Path;
+
 const createFakePersistentShellFactory = () => {
   const dataListeners: Array<(data: string) => void> = [];
   const exitListeners: Array<(event: { exitCode: number; signal?: string | number }) => void> =
@@ -3326,9 +3329,9 @@ describe("FileMcpService", () => {
 
   test("open_shell spawns the persistent shell with a restricted environment", async () => {
     const previousApiKey = process.env.CYRENE_API_KEY;
-    const previousPath = process.env.PATH;
+    const previousPath = getPathEnvValue(process.env);
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = process.env.PATH ?? "/usr/bin";
+    process.env.PATH = previousPath ?? "/usr/bin";
 
     const fakePty = createFakePersistentShellFactory();
     const { service, cleanup } = await createIsolatedService({
@@ -3343,7 +3346,7 @@ describe("FileMcpService", () => {
 
       expect(opened.ok).toBe(true);
       expect(fakePty.state.env.CYRENE_API_KEY).toBeUndefined();
-      expect(fakePty.state.env.PATH).toBe(process.env.PATH);
+      expect(getPathEnvValue(fakePty.state.env)).toBe(getPathEnvValue(process.env));
     } finally {
       await cleanup();
       if (previousApiKey === undefined) {
@@ -3353,6 +3356,7 @@ describe("FileMcpService", () => {
       }
       if (previousPath === undefined) {
         delete process.env.PATH;
+        delete process.env.Path;
       } else {
         process.env.PATH = previousPath;
       }

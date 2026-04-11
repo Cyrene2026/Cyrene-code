@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { resolve } from "node:path";
 import { StdioMcpAdapter } from "../src/core/mcp";
 
 type FakeChildProcess = EventEmitter & {
@@ -128,6 +129,9 @@ const createFakeSpawnProcess = () => {
   };
 };
 
+const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
+  env?.PATH ?? env?.Path;
+
 describe("StdioMcpAdapter", () => {
   test("initializes over stdio, lists tools and calls a remote tool", async () => {
     const fakeProcess = createFakeSpawnProcess();
@@ -171,9 +175,10 @@ describe("StdioMcpAdapter", () => {
 
   test("passes server cwd and env to spawned stdio process", async () => {
     const previousApiKey = process.env.CYRENE_API_KEY;
-    const previousPath = process.env.PATH;
+    const previousPath = getPathEnvValue(process.env);
+    const appRoot = process.platform === "win32" ? "C:/workspace/project" : "/workspace/project";
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = process.env.PATH ?? "/usr/bin";
+    process.env.PATH = previousPath ?? "/usr/bin";
 
     const fakeProcess = createFakeSpawnProcess();
     const capture: {
@@ -200,7 +205,7 @@ describe("StdioMcpAdapter", () => {
         tools: [],
       } as any,
       {
-        appRoot: "/workspace/project",
+        appRoot,
         spawnProcess: ((_command: string, _args: string[], options?: {
           cwd?: string;
           env?: NodeJS.ProcessEnv;
@@ -219,14 +224,12 @@ describe("StdioMcpAdapter", () => {
         throw new Error("spawn options were not captured");
       }
       const spawnOptions = capture.current;
-      expect(spawnOptions.cwd).toBe("/workspace/project/tools/docs");
+      expect(spawnOptions.cwd).toBe(resolve(appRoot, "tools/docs"));
       expect((spawnOptions.env as Record<string, string> | undefined)?.DOCS_API_KEY).toBe(
         "demo-key"
       );
       expect((spawnOptions.env as Record<string, string> | undefined)?.CYRENE_API_KEY).toBeUndefined();
-      expect((spawnOptions.env as Record<string, string> | undefined)?.PATH).toBe(
-        process.env.PATH
-      );
+      expect(getPathEnvValue(spawnOptions.env)).toBe(getPathEnvValue(process.env));
     } finally {
       adapter.dispose();
       if (previousApiKey === undefined) {
@@ -236,6 +239,7 @@ describe("StdioMcpAdapter", () => {
       }
       if (previousPath === undefined) {
         delete process.env.PATH;
+        delete process.env.Path;
       } else {
         process.env.PATH = previousPath;
       }

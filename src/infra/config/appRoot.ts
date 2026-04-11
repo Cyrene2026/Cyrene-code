@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, posix, resolve, win32 } from "node:path";
 
 type AppRootResolveOptions = {
   argv?: string[];
@@ -26,6 +26,18 @@ const WINDOWS_UNC_ABSOLUTE_PATH = /^\\\\[^\\]/;
 const isWindowsStyleAbsolutePath = (value: string) =>
   WINDOWS_DRIVE_ABSOLUTE_PATH.test(value) ||
   WINDOWS_UNC_ABSOLUTE_PATH.test(value);
+
+const pathApiForPlatform = (platform?: NodeJS.Platform) =>
+  platform === "win32" ? win32 : posix;
+
+const joinCyreneDir = (homeDir: string, platform?: NodeJS.Platform) => {
+  if (platform === "win32") {
+    const trimmed = homeDir.replace(/[\\/]+$/, "");
+    const separator = trimmed.includes("/") ? "/" : "\\";
+    return `${trimmed}${separator}.cyrene`;
+  }
+  return posix.join(homeDir, ".cyrene");
+};
 
 const resolveHomeFromEnv = (
   env: NodeJS.ProcessEnv,
@@ -110,20 +122,21 @@ export const resetConfiguredAppRoot = () => {
 export const resolveUserHomeDir = (options?: CyreneDirResolveOptions) => {
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
+  const pathApi = pathApiForPlatform(options?.platform);
   const envHome = resolveHomeFromEnv(env, options?.platform);
   if (!envHome) {
     return homedir();
-  }
-
-  if (isAbsolute(envHome)) {
-    return resolve(envHome);
   }
 
   if (isWindowsStyleAbsolutePath(envHome)) {
     return envHome;
   }
 
-  return resolve(cwd, envHome);
+  if (isAbsolute(envHome)) {
+    return pathApi.resolve(envHome);
+  }
+
+  return pathApi.resolve(cwd, envHome);
 };
 
 export const getLegacyProjectCyreneDir = (appRoot = resolveAppRoot()) =>
@@ -137,15 +150,16 @@ export const getCyreneConfigDir = (
     typeof appRootOrOptions === "string" ? maybeOptions : appRootOrOptions;
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
+  const pathApi = pathApiForPlatform(options?.platform);
   const explicitCyreneHome = trimNonEmpty(env.CYRENE_HOME);
   if (explicitCyreneHome) {
-    if (isAbsolute(explicitCyreneHome)) {
-      return resolve(explicitCyreneHome);
-    }
     if (isWindowsStyleAbsolutePath(explicitCyreneHome)) {
       return explicitCyreneHome;
     }
-    return resolve(cwd, explicitCyreneHome);
+    if (isAbsolute(explicitCyreneHome)) {
+      return pathApi.resolve(explicitCyreneHome);
+    }
+    return pathApi.resolve(cwd, explicitCyreneHome);
   }
-  return join(resolveUserHomeDir(options), ".cyrene");
+  return joinCyreneDir(resolveUserHomeDir(options), options?.platform);
 };

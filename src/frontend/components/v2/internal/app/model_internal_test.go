@@ -2,6 +2,7 @@ package app
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -33,7 +34,11 @@ func TestSyncProcessAppRoot(t *testing.T) {
 		t.Fatalf("getwd after sync: %v", err)
 	}
 	if currentCwd != target {
-		t.Fatalf("cwd = %q, want %q", currentCwd, target)
+		resolvedCwd, cwdErr := filepath.EvalSymlinks(currentCwd)
+		resolvedTarget, targetErr := filepath.EvalSymlinks(target)
+		if cwdErr != nil || targetErr != nil || resolvedCwd != resolvedTarget {
+			t.Fatalf("cwd = %q, want %q", currentCwd, target)
+		}
 	}
 	if got := os.Getenv("CYRENE_ROOT"); got != target {
 		t.Fatalf("CYRENE_ROOT = %q, want %q", got, target)

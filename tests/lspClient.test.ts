@@ -120,6 +120,9 @@ const createFakeLspSpawn = () => {
   };
 };
 
+const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
+  env?.PATH ?? env?.Path;
+
 describe("LspClient environment", () => {
   afterEach(async () => {
     await Promise.all(
@@ -131,9 +134,9 @@ describe("LspClient environment", () => {
 
   test("spawns LSP servers with a restricted environment and preserves explicit overrides", async () => {
     const previousApiKey = process.env.CYRENE_API_KEY;
-    const previousPath = process.env.PATH;
+    const previousPath = getPathEnvValue(process.env);
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = process.env.PATH ?? "/usr/bin";
+    process.env.PATH = previousPath ?? "/usr/bin";
 
     const root = await mkdtemp(join(tmpdir(), "cyrene-lsp-test-"));
     tempRoots.push(root);
@@ -166,7 +169,7 @@ describe("LspClient environment", () => {
 
       const env = fake.getLastOptions()?.env ?? {};
       expect(env.CYRENE_API_KEY).toBeUndefined();
-      expect(env.PATH).toBe(process.env.PATH);
+      expect(getPathEnvValue(env)).toBe(getPathEnvValue(process.env));
       expect(env.CUSTOM_LSP_FLAG).toBe("enabled");
     } finally {
       await manager.dispose();
@@ -177,6 +180,7 @@ describe("LspClient environment", () => {
       }
       if (previousPath === undefined) {
         delete process.env.PATH;
+        delete process.env.Path;
       } else {
         process.env.PATH = previousPath;
       }

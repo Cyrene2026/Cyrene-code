@@ -93,6 +93,9 @@ const createFakeTsServerSpawn = (handlers: {
   };
 };
 
+const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
+  env?.PATH ?? env?.Path;
+
 describe("TsServerClient", () => {
   afterEach(async () => {
     await Promise.all(
@@ -207,9 +210,9 @@ describe("TsServerClient", () => {
 
   test("spawns tsserver with a restricted environment and preserves explicit overrides", async () => {
     const previousApiKey = process.env.CYRENE_API_KEY;
-    const previousPath = process.env.PATH;
+    const previousPath = getPathEnvValue(process.env);
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = process.env.PATH ?? "/usr/bin";
+    process.env.PATH = previousPath ?? "/usr/bin";
 
     const root = await mkdtemp(join(tmpdir(), "cyrene-tsserver-test-"));
     tempRoots.push(root);
@@ -255,7 +258,7 @@ describe("TsServerClient", () => {
       await client.hover(filePath, 1, 14);
       const env = fake.getLastOptions()?.env ?? {};
       expect(env.CYRENE_API_KEY).toBeUndefined();
-      expect(env.PATH).toBe(process.env.PATH);
+      expect(getPathEnvValue(env)).toBe(getPathEnvValue(process.env));
       expect(env.CUSTOM_TOOL_FLAG).toBe("enabled");
     } finally {
       client.dispose();
@@ -266,6 +269,7 @@ describe("TsServerClient", () => {
       }
       if (previousPath === undefined) {
         delete process.env.PATH;
+        delete process.env.Path;
       } else {
         process.env.PATH = previousPath;
       }

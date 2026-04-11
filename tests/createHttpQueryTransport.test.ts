@@ -1155,6 +1155,60 @@ describe("createHttpQueryTransport streaming usage", () => {
     );
   });
 
+  test("provider name APIs manage custom labels and persist them", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.getProviderName?.("https://provider-a.test/v1")).toBeNull();
+
+    const setResult = await transport.setProviderName?.(
+      "https://provider-a.test/v1",
+      "Work Relay"
+    );
+    expect(setResult?.ok).toBe(true);
+    expect(transport.listProviderNames?.()).toEqual({
+      "https://provider-a.test/v1": "Work Relay",
+    });
+    expect(transport.getProviderName?.("https://provider-a.test/v1")).toBe(
+      "Work Relay"
+    );
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_names:");
+    expect(persisted).toContain("  - provider: https://provider-a.test/v1");
+    expect(persisted).toContain("    name: Work Relay");
+
+    const clearResult = await transport.setProviderName?.(
+      "https://provider-a.test/v1",
+      null
+    );
+    expect(clearResult?.ok).toBe(true);
+    expect(transport.listProviderNames?.()).toEqual({});
+    expect(transport.getProviderName?.("https://provider-a.test/v1")).toBeNull();
+  });
+
   test("manual profile override forces anthropic family for relay provider and persists", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(

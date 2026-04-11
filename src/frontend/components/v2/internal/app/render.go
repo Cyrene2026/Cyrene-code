@@ -10,21 +10,36 @@ import (
 )
 
 var (
-	rootStyle = lipgloss.NewStyle().Padding(0, 1)
+	rootStyle = lipgloss.NewStyle()
+
+	statusBarColor = lipgloss.Color("#FFF")
+
+	appShellStyle = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("13")).
+			Padding(0)
+
+	frameStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("12")).
+			Padding(0, 1)
+
+	activeFrameStyle = frameStyle.Copy().
+				BorderForeground(lipgloss.Color("11"))
 
 	brandChipStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("14")).
+			Foreground(lipgloss.Color("11")).
 			Padding(0, 1)
 
 	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	asstStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	reviewStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	systemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	sectionStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	asstStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	reviewStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	systemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	sectionStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
 	codeBlockStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("7")).
 			Padding(0, 0)
@@ -39,19 +54,23 @@ var (
 	codePlainStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 
 	inputBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("8")).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("12")).
 			Padding(0, 1)
 
 	focusedInputBoxStyle = inputBoxStyle.Copy().
-				BorderForeground(lipgloss.Color("14"))
+				BorderForeground(lipgloss.Color("11"))
 
 	panelBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("8")).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("12")).
 			Padding(0, 1)
 
-	cursorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	cursorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	statusKeyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	statusChipBase = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			Padding(0, 1)
 )
 
 var startupShadowLogoLines = []string{
@@ -62,6 +81,8 @@ var startupShadowLogoLines = []string{
 	"██╔╝ ╚██████╗   ██║   ██║  ██║███████╗██║ ╚████║███████╗",
 	"╚═╝   ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝",
 }
+
+var statusSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 var (
 	diffPattern         = regexp.MustCompile(`^([+-])\s*(\d+)?\s*\|\s?(.*)$`)
@@ -74,72 +95,125 @@ var (
 func (m *Model) View() string {
 	width := maxInt(50, m.Width)
 	height := maxInt(18, m.Height)
-	contentWidth := maxInt(30, width-2)
+	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
+	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
 
-	header := m.renderHeader(contentWidth)
-	panel := ""
-	panelHeight := m.panelHeight()
-	if panelHeight > 0 {
-		panel = m.renderActivePanel(contentWidth, panelHeight)
-	}
-	statusLine := m.renderStatusLine(contentWidth)
+	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
+	footer := m.renderBottomStatusBar(contentWidth)
+	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	bodyHeight := maxInt(5, contentHeight-fixedHeight)
+	body := m.renderMainArea(contentWidth, bodyHeight)
 
-	fixedHeight := lipgloss.Height(header) + panelHeight + lipgloss.Height(statusLine) + lipgloss.Height(composer)
-	transcriptHeight := maxInt(3, height-fixedHeight-1)
-	transcript := m.renderTranscript(contentWidth, transcriptHeight)
-
-	parts := []string{header, transcript}
-	if panel != "" {
-		parts = append(parts, panel)
+	parts := []string{
+		header,
+		body,
+		composer,
+		footer,
 	}
-	parts = append(parts, statusLine, composer)
-	return rootStyle.Width(width).Height(height).Render(strings.Join(parts, "\n"))
+	content := strings.Join(parts, "\n")
+	return rootStyle.Width(width).Height(height).Render(
+		appShellStyle.Width(contentWidth).Render(content),
+	)
 }
 
-func (m *Model) panelHeight() int {
-	switch m.ActivePanel {
-	case PanelApprovals:
-		return 16
-	case PanelAuth:
-		return 12
-	case PanelSessions, PanelModels, PanelProviders:
-		return 12
-	default:
-		return 0
+func (m *Model) renderMainArea(width, height int) string {
+	contentHeight := maxInt(1, height)
+
+	if m.ActivePanel == PanelNone {
+		return m.renderSessionPane(width, contentHeight, true)
 	}
-}
 
-func (m *Model) renderHeader(width int) string {
-	badge := statusBadgeStyle(m.Status).Render(" " + strings.ToUpper(string(statusLabel(m.Status))) + " ")
-	title := lipgloss.JoinHorizontal(
-		lipgloss.Left,
-		brandChipStyle.Render(" >Cyrene "),
-		titleStyle.Render(" Code"),
-		badge,
-	)
+	if width >= 96 {
+		panelWidth := clampInt(width/3, 34, 54)
+		sessionWidth := maxInt(24, width-panelWidth-1)
+		return lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			m.renderSessionPane(sessionWidth, contentHeight, false),
+			" ",
+			m.renderActivePanel(panelWidth, contentHeight),
+		)
+	}
 
-	meta := fmt.Sprintf(
-		"cwd %s  |  session %s  |  model %s  |  provider %s",
-		emptyFallback(m.AppRoot, "none"),
-		emptyFallback(m.ActiveSessionID, "none"),
-		emptyFallback(m.CurrentModel, "none"),
-		emptyFallback(m.CurrentProvider, "none"),
-	)
-	projectPath := fmt.Sprintf("project %s", emptyFallback(m.AppRoot, "none"))
-	help := "/help  /login  /provider  /model  /sessions  /resume  /review  Esc close panel"
-
+	panelHeight := clampInt(contentHeight/2, 10, 16)
+	sessionHeight := maxInt(4, contentHeight-panelHeight-1)
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		fitToWidth(title, width),
-		dimStyle.Render(truncatePlain(meta, width)),
-		dimStyle.Render(truncatePlain(projectPath, width)),
-		dimStyle.Render(truncatePlain(help, width)),
+		m.renderSessionPane(width, sessionHeight, false),
+		m.renderActivePanel(width, panelHeight),
 	)
+}
+
+func (m *Model) renderTopStatusBar(width int) string {
+	return renderStatusColumns(width,
+		statusColumn{Label: "STATUS", Value: m.renderAnimatedStatusLabel(), Color: statusBarColor},
+		statusColumn{Label: "PANEL", Value: emptyFallback(string(m.ActivePanel), "none"), Color: statusBarColor},
+		statusColumn{Label: "PENDING", Value: fmt.Sprintf("%d", len(m.PendingReviews)), Color: statusBarColor},
+		statusColumn{Label: "PROJECT", Value: formatProjectPathLabel(m.AppRoot, statusValueWidth(width, 4, "PROJECT")), Color: statusBarColor},
+	)
+}
+
+func (m *Model) renderBottomStatusBar(width int) string {
+	return renderStatusColumns(width,
+		statusColumn{Label: "SESSION", Value: emptyFallback(m.ActiveSessionID, "none"), Color: statusBarColor},
+		statusColumn{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), Color: statusBarColor},
+		statusColumn{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), Color: statusBarColor},
+		statusColumn{Label: "KEY", Value: formatKeySourceLabel(m.CurrentProviderKeySource), Color: statusBarColor},
+	)
+}
+
+func (m *Model) renderAnimatedStatusLabel() string {
+	label := strings.ToUpper(string(statusLabel(m.Status)))
+	if !m.isAnimatingStatus() || len(statusSpinnerFrames) == 0 {
+		return label
+	}
+	return statusSpinnerFrames[m.SpinnerFrame%len(statusSpinnerFrames)] + " " + label
+}
+
+type statusColumn struct {
+	Label string
+	Value string
+	Color lipgloss.Color
 }
 
 func fitToWidth(value string, width int) string {
 	return lipgloss.NewStyle().MaxWidth(width).Render(value)
+}
+
+func statusValueWidth(totalWidth, columnCount int, label string) int {
+	if totalWidth <= 0 || columnCount <= 0 {
+		return 1
+	}
+	cellWidth := maxInt(1, totalWidth/columnCount)
+	return maxInt(1, cellWidth-lipgloss.Width(strings.TrimSpace(label))-1)
+}
+
+func renderStatusColumns(width int, columns ...statusColumn) string {
+	if len(columns) == 0 || width <= 0 {
+		return ""
+	}
+	baseWidth := width / len(columns)
+	remainder := width % len(columns)
+	rendered := make([]string, 0, len(columns))
+	for index, column := range columns {
+		cellWidth := baseWidth
+		if index < remainder {
+			cellWidth++
+		}
+		text := truncatePlain(
+			fmt.Sprintf("%s %s", strings.ToUpper(strings.TrimSpace(column.Label)), emptyFallback(strings.TrimSpace(column.Value), "none")),
+			maxInt(1, cellWidth),
+		)
+		rendered = append(rendered, lipgloss.NewStyle().
+			Width(cellWidth).
+			MaxWidth(cellWidth).
+			Align(lipgloss.Center).
+			Background(column.Color).
+			Foreground(lipgloss.Color("0")).
+			Bold(true).
+			Render(text))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
 }
 
 func (m *Model) renderTranscript(width, height int) string {
@@ -159,6 +233,17 @@ func (m *Model) renderTranscript(width, height int) string {
 		lines = append(lines, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m *Model) renderSessionPane(width, height int, active bool) string {
+	style := frameStyle.Copy().BorderForeground(lipgloss.Color("11"))
+	if active {
+		style = activeFrameStyle.Copy().BorderForeground(lipgloss.Color("11"))
+	}
+	bodyWidth := framedInnerWidth(style, width)
+	bodyHeight := framedInnerHeight(style, height)
+	lines := strings.Split(m.renderTranscript(bodyWidth, maxInt(1, bodyHeight)), "\n")
+	return style.Width(bodyWidth).Height(bodyHeight).Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) renderTranscriptLines(width int) []string {
@@ -183,7 +268,7 @@ func (m *Model) renderTranscriptLines(width int) []string {
 	lines := make([]string, 0, len(items)*3)
 	for index, item := range items {
 		lines = append(lines, renderMessageLines(item, width)...)
-		if index < len(items)-1 {
+		if index < len(items)-1 && item.Kind == "transcript" && items[index+1].Kind != "transcript" {
 			lines = append(lines, "")
 		}
 	}
@@ -224,16 +309,21 @@ func (m *Model) renderStartupLines(width int) []string {
 
 	lines = append(lines,
 		"",
-		titleStyle.Bold(true).Render("Cyrene Code"),
-		dimStyle.Render("Terminal-first coding assistant for the current workspace."),
+		titleStyle.Bold(true).Render("terminal workspace"),
+		dimStyle.Render("Bubble Tea terminal workspace for the current project."),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("mode %s  |  model %s  |  provider %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.CurrentModel, "none"), emptyFallback(m.CurrentProvider, "none")), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("session %s  |  pending %d", emptyFallback(m.ActiveSessionID, "none"), len(m.PendingReviews)), width)),
 		"",
-		reviewStyle.Bold(true).Render("Start here"),
-		"> Explain this repository  - summarize structure, stack, or one file.",
-		"> Fix something  - point to failing behavior and let Cyrene patch it.",
-		"> Connect HTTP  - use /login to save credentials.",
-		"> Continue  - use /sessions, /review, /model, or /provider.",
+		reviewStyle.Bold(true).Render("fast paths"),
+		"• Explain this repo  - summarize structure, stack, or one file.",
+		"• Fix a bug  - describe the failure and let Cyrene patch it.",
+		"• Connect HTTP  - use /login to save credentials.",
+		"• Continue work  - use /sessions, /review, /model, or /provider.",
+		"",
+		sectionStyle.Render("terminal advantages"),
+		"• Keyboard-first panels for sessions, approvals, providers, and models.",
+		"• Dense transcript + inspector layout when a panel is open.",
+		"• One-screen workflow without leaving the terminal.",
 		"",
 		"Use /help for full command reference.",
 	)
@@ -242,12 +332,21 @@ func (m *Model) renderStartupLines(width int) []string {
 
 func renderMessageLines(message Message, width int) []string {
 	label, labelStyle, contentStyle := messageStyles(message)
-	bodyWidth := maxInt(1, width-2)
+	prefixWidth := minInt(10, maxInt(6, width/6))
+	bodyWidth := maxInt(1, width-prefixWidth-1)
 	renderedBody := renderMarkdownBodyLines(message.Text, bodyWidth, contentStyle)
-	lines := make([]string, 0, len(renderedBody)+1)
-	lines = append(lines, labelStyle.Render(label))
-	for _, row := range renderedBody {
-		lines = append(lines, row)
+	if len(renderedBody) == 0 {
+		renderedBody = []string{""}
+	}
+	lines := make([]string, 0, len(renderedBody))
+	prefix := lipgloss.NewStyle().Width(prefixWidth).MaxWidth(prefixWidth).Render(label)
+	padding := strings.Repeat(" ", prefixWidth)
+	for index, row := range renderedBody {
+		if index == 0 {
+			lines = append(lines, labelStyle.Render(prefix)+" "+row)
+			continue
+		}
+		lines = append(lines, dimStyle.Render(padding)+" "+row)
 	}
 	return lines
 }
@@ -267,7 +366,7 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			inCodeBlock = !inCodeBlock
 			lang := strings.TrimSpace(strings.TrimPrefix(trimmed, "```"))
 			if lang != "" {
-				lines = append(lines, "  "+codeFenceStyle.Render("code "+lang))
+				lines = append(lines, codeFenceStyle.Render("code "+lang))
 			}
 			continue
 		}
@@ -275,11 +374,11 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		if inCodeBlock {
 			wrapped := wrapPlainText(raw, maxInt(1, width-2))
 			if len(wrapped) == 0 {
-				lines = append(lines, "  "+codeBlockStyle.Render(""))
+				lines = append(lines, "│ "+codeBlockStyle.Render(""))
 				continue
 			}
 			for _, row := range wrapped {
-				lines = append(lines, "  "+codeBlockStyle.Render(renderCodeLine(row)))
+				lines = append(lines, "│ "+codeBlockStyle.Render(renderCodeLine(row)))
 			}
 			continue
 		}
@@ -302,7 +401,7 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			lines = append(lines, renderDiffRows(sign, lineNumber, content, width)...)
 		case strings.HasPrefix(trimmed, "@@"):
 			for _, row := range wrapPlainText(raw, width) {
-				lines = append(lines, "  "+asstStyle.Bold(true).Render(row))
+				lines = append(lines, asstStyle.Bold(true).Render(row))
 			}
 		case strings.HasPrefix(trimmed, "[diff preview]"),
 			strings.HasPrefix(trimmed, "[create preview"),
@@ -312,12 +411,12 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			strings.HasPrefix(trimmed, "[old -"),
 			strings.HasPrefix(trimmed, "[new +"):
 			for _, row := range wrapPlainText(raw, width) {
-				lines = append(lines, "  "+sectionStyle.Render(row))
+				lines = append(lines, sectionStyle.Render(row))
 			}
 		case strings.HasPrefix(trimmed, "#"):
 			heading := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
 			for _, row := range wrapPlainText(heading, width) {
-				lines = append(lines, "  "+titleStyle.Bold(true).Render(row))
+				lines = append(lines, titleStyle.Bold(true).Render(row))
 			}
 		case orderedListPattern.MatchString(trimmed):
 			matches := orderedListPattern.FindStringSubmatch(trimmed)
@@ -329,10 +428,10 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			}
 			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
 				if index == 0 {
-					lines = append(lines, "  "+dimStyle.Render(prefix)+renderInlineMarkdown(row, baseStyle))
+					lines = append(lines, dimStyle.Render(prefix)+renderInlineMarkdown(row, baseStyle))
 					continue
 				}
-				lines = append(lines, "  "+strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, baseStyle))
+				lines = append(lines, strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, baseStyle))
 			}
 		case strings.HasPrefix(trimmed, "- "),
 			strings.HasPrefix(trimmed, "* "),
@@ -351,20 +450,22 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			}
 			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
 				if index == 0 {
-					lines = append(lines, "  "+dimStyle.Render(prefix)+renderInlineMarkdown(row, style))
+					lines = append(lines, dimStyle.Render(prefix)+renderInlineMarkdown(row, style))
 					continue
 				}
-				lines = append(lines, "  "+strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, style))
+				lines = append(lines, strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, style))
 			}
+		case trimmed == "":
+			lines = append(lines, "")
 		default:
 			for _, row := range wrapPlainText(raw, width) {
-				lines = append(lines, "  "+renderInlineMarkdown(row, baseStyle))
+				lines = append(lines, renderInlineMarkdown(row, baseStyle))
 			}
 		}
 	}
 
 	if len(lines) == 0 {
-		return []string{"  "}
+		return []string{""}
 	}
 	return lines
 }
@@ -472,7 +573,7 @@ func renderDiffRows(sign, lineNumber, content string, width int) []string {
 		prefix += " " + dimStyle.Render(fmt.Sprintf("%4s |", lineNumber))
 	}
 	if content == "" {
-		return []string{"  " + prefix}
+		return []string{prefix}
 	}
 
 	contentWidth := maxInt(8, width-lipgloss.Width(prefix)-1)
@@ -483,7 +584,7 @@ func renderDiffRows(sign, lineNumber, content string, width int) []string {
 		if index > 0 {
 			rowPrefix = strings.Repeat(" ", maxInt(1, lipgloss.Width(prefix)))
 		}
-		lines = append(lines, "  "+rowPrefix+" "+renderCodeLine(row))
+		lines = append(lines, rowPrefix+" "+renderCodeLine(row))
 	}
 	return lines
 }
@@ -663,14 +764,7 @@ func (m *Model) renderActivePanel(width, height int) string {
 }
 
 func (m *Model) renderStatusLine(width int) string {
-	line := fmt.Sprintf(
-		"mode %s  |  key %s  |  pending %d  |  panel %s",
-		emptyFallback(m.Auth.Mode, "local"),
-		formatKeySourceLabel(m.CurrentProviderKeySource),
-		len(m.PendingReviews),
-		emptyFallback(string(m.ActivePanel), "none"),
-	)
-	return dimStyle.Render(truncatePlain(line, width))
+	return ""
 }
 
 func (m *Model) renderComposer(width int) string {
@@ -707,23 +801,19 @@ func (m *Model) renderComposer(width int) string {
 			lines = append(lines, noticeStyle.Render(line))
 		}
 	} else {
-		helper := "Enter send | Ctrl+J newline | PgUp/PgDn transcript | F6 copy mode | /help"
+		helper := "Enter send | Ctrl+J newline | PgUp/PgDn scroll | F6 copy mode | /help"
 		if !m.MouseCapture {
 			helper = "Enter send | Ctrl+J newline | drag select/copy | F6 restore wheel | /help"
 		}
 		lines = append(lines, dimStyle.Render(helper))
 	}
 
-	if m.ActivePanel == PanelNone {
-		suggestions := suggestSlashCommands(string(m.Input), 3)
-		if len(suggestions) > 0 {
-			lines = append(lines, dimStyle.Render("commands"))
-			for _, item := range suggestions {
-				for _, row := range wrapPlainText(fmt.Sprintf("  %s - %s", item.Command, item.Description), contentWidth) {
-					lines = append(lines, dimStyle.Render(row))
-				}
-			}
+	if matches := suggestSlashCommands(string(m.Input), 3); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+		parts := make([]string, 0, len(matches))
+		for _, item := range matches {
+			parts = append(parts, item.Command)
 		}
+		lines = append(lines, sectionStyle.Render("match  ")+dimStyle.Render(truncatePlain(strings.Join(parts, "  |  "), contentWidth-8)))
 	}
 
 	return style.
@@ -773,8 +863,8 @@ func (m *Model) renderApprovals(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.PendingReviews), m.ApprovalIndex, approvalQueuePageSize)
 	lines := []string{
-		reviewStyle.Bold(true).Render(fmt.Sprintf("[review]  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("Up/Down: select  Left/Right: page  Tab: summary/full  j/k or PgUp/PgDn: preview scroll  a: approve  r/d: reject  Esc: close"),
+		reviewStyle.Bold(true).Render(fmt.Sprintf("approvals  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
+		dimStyle.Render("↑/↓ select  ←/→ page  Tab mode  j/k preview  a approve  r reject  Esc"),
 	}
 
 	if len(m.PendingReviews) == 0 {
@@ -783,8 +873,7 @@ func (m *Model) renderApprovals(width, height int) string {
 	}
 
 	selected := m.PendingReviews[m.ApprovalIndex]
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("action %s  |  path %s  |  id %s", selected.Action, truncatePlain(selected.Path, maxInt(12, bodyWidth-34)), selected.ID)))
-	lines = append(lines, sectionStyle.Render("[queue]"))
+	lines = append(lines, sectionStyle.Render("queue"))
 	for index := page.Start; index < page.End; index++ {
 		item := m.PendingReviews[index]
 		prefix := "  "
@@ -797,10 +886,9 @@ func (m *Model) renderApprovals(width, height int) string {
 		lines = append(lines, lineStyle.Render(line))
 	}
 
-	lines = append(lines, "")
-	lines = append(lines, sectionStyle.Render("[selection]"))
-	lines = append(lines, dimStyle.Render(describeApprovalAction(selected.Action)))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("created %s", emptyFallback(selected.CreatedAt, "unknown"))))
+	lines = append(lines, sectionStyle.Render("detail"))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("%s  |  %s", selected.Action, truncatePlain(selected.Path, maxInt(8, bodyWidth-16)))))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("id %s  |  %s", truncatePlain(selected.ID, 14), emptyFallback(selected.CreatedAt, "unknown"))))
 	previewSource := selected.PreviewSummary
 	if m.ApprovalPreview == ApprovalFull && strings.TrimSpace(selected.PreviewFull) != "" {
 		previewSource = selected.PreviewFull
@@ -809,13 +897,13 @@ func (m *Model) renderApprovals(width, height int) string {
 	previewWindow := previewWindow(previewLines, m.ApprovalPreviewOffset, approvalPreviewPageLines)
 	addCount, delCount := approvalDiffStats(previewLines)
 	lines = append(lines,
-		sectionStyle.Render("[preview]"),
+		sectionStyle.Render("preview"),
 		dimStyle.Render(fmt.Sprintf("%s  %d-%d/%d  |  +%d -%d", m.ApprovalPreview, previewWindow.Start+1, previewWindow.End, previewWindow.Total, addCount, delCount)),
 	)
 	for _, line := range previewWindow.Lines {
-		lines = append(lines, renderApprovalPreviewLine(line, bodyWidth))
+		lines = append(lines, renderApprovalPreviewLines(line, bodyWidth)...)
 	}
-	lines = append(lines, dimStyle.Render("Tab preview  |  a approve  |  r/d reject  |  j/k scroll  |  Esc close"))
+	lines = append(lines, dimStyle.Render("j/k scroll  |  a approve  |  r reject"))
 
 	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 }
@@ -825,13 +913,14 @@ func (m *Model) renderSessions(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.Sessions), m.SessionIndex, sessionPanelPageSize)
 	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("Sessions  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("Up/Down: select  Left/Right: page  Enter: load  n: new  r: refresh  Esc: close"),
+		asstStyle.Bold(true).Render(fmt.Sprintf("sessions  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
+		dimStyle.Render("↑/↓ select  ←/→ page  Enter load  n new  r refresh  Esc close"),
 	}
 	if len(m.Sessions) == 0 {
 		lines = append(lines, dimStyle.Render("No saved sessions."))
 		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 	}
+	lines = append(lines, sectionStyle.Render("list"))
 	for index := page.Start; index < page.End; index++ {
 		session := m.Sessions[index]
 		prefix := "  "
@@ -848,9 +937,14 @@ func (m *Model) renderSessions(width, height int) string {
 		lines = append(lines, dimStyle.Render("   "+truncatePlain(session.UpdatedAt, bodyWidth-6)))
 	}
 	selected := m.Sessions[clampInt(m.SessionIndex, 0, len(m.Sessions)-1)]
-	lines = append(lines, "", sectionStyle.Render("[preview]"))
+	lines = append(lines, "", sectionStyle.Render("detail"))
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("id %s", selected.ID)))
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("updated %s", selected.UpdatedAt)))
+	if len(selected.Tags) > 0 {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("tags %s", strings.Join(selected.Tags, ", "))))
+	} else {
+		lines = append(lines, dimStyle.Render("tags none"))
+	}
 	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 }
 
@@ -859,13 +953,14 @@ func (m *Model) renderModels(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.AvailableModels), m.ModelIndex, modelPanelPageSize)
 	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("Models  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("Up/Down: select  Left/Right: page  Enter: switch  r: refresh  Esc: close"),
+		asstStyle.Bold(true).Render(fmt.Sprintf("models  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
+		dimStyle.Render("↑/↓ select  ←/→ page  Enter switch  r refresh  Esc close"),
 	}
 	if len(m.AvailableModels) == 0 {
 		lines = append(lines, dimStyle.Render("No models available."))
 		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 	}
+	lines = append(lines, sectionStyle.Render("list"))
 	for index := page.Start; index < page.End; index++ {
 		model := m.AvailableModels[index]
 		prefix := "  "
@@ -879,8 +974,13 @@ func (m *Model) renderModels(width, height int) string {
 			marker = " [current]"
 		}
 		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(model, bodyWidth-20), marker)))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("   family %s  |  provider %s", modelFamily(model), truncatePlain(emptyFallback(m.CurrentProvider, "none"), maxInt(8, bodyWidth-40)))))
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("   family %s", modelFamily(model))))
 	}
+	selected := m.AvailableModels[clampInt(m.ModelIndex, 0, len(m.AvailableModels)-1)]
+	lines = append(lines, "", sectionStyle.Render("detail"))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("selected %s", selected)))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("family %s", modelFamily(selected))))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("provider %s", truncatePlain(emptyFallback(m.CurrentProvider, "none"), bodyWidth))))
 	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 }
 
@@ -889,16 +989,20 @@ func (m *Model) renderProviders(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, providerPanelPageSize)
 	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("Providers  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("Up/Down: select  Left/Right: page  Enter: switch  r: refresh  Esc: close"),
+		asstStyle.Bold(true).Render(fmt.Sprintf("providers  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
+		dimStyle.Render("↑/↓ select  ←/→ page  Enter switch  r refresh  Esc close"),
 	}
 	for _, row := range wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth) {
+		lines = append(lines, dimStyle.Render(row))
+	}
+	for _, row := range wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth) {
 		lines = append(lines, dimStyle.Render(row))
 	}
 	if len(m.AvailableProviders) == 0 {
 		lines = append(lines, dimStyle.Render("No providers available."))
 		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 	}
+	lines = append(lines, sectionStyle.Render("list"))
 	for index := page.Start; index < page.End; index++ {
 		provider := m.AvailableProviders[index]
 		prefix := "  "
@@ -911,17 +1015,19 @@ func (m *Model) renderProviders(width, height int) string {
 		if provider == m.CurrentProvider {
 			marker = " [current]"
 		}
+		name := m.providerDisplayName(provider)
 		profile := formatProviderProfileLabel(m.providerProfile(provider))
 		source := formatProviderProfileSourceLabel(m.providerProfileSource(provider))
-		endpoint := providerEndpointKind(provider, m.providerProfile(provider))
-		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-18)), bodyWidth-20), marker)))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("   profile %s  |  source %s  |  endpoint %s", profile, source, endpoint)))
+		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)))
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("   endpoint %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-16)), bodyWidth-4))))
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("   profile %s  |  source %s", profile, source)))
 	}
 	selected := m.AvailableProviders[clampInt(m.ProviderIndex, 0, len(m.AvailableProviders)-1)]
-	lines = append(lines, "", sectionStyle.Render("[preview]"))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("selected %s", selected)))
+	lines = append(lines, "", sectionStyle.Render("detail"))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("selected %s", m.providerDisplayName(selected))))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("url %s", truncatePlain(selected, bodyWidth-4))))
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("profile %s  |  source %s", formatProviderProfileLabel(m.providerProfile(selected)), formatProviderProfileSourceLabel(m.providerProfileSource(selected)))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("key source %s", formatKeySourceLabel(m.CurrentProviderKeySource))))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("endpoint %s  |  key %s", providerEndpointKind(selected, m.providerProfile(selected)), formatKeySourceLabel(m.CurrentProviderKeySource))))
 	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
 }
 
@@ -929,8 +1035,8 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	lines := []string{
-		asstStyle.Bold(true).Render("HTTP Login"),
-		dimStyle.Render("1/2/3 jump fields  |  Enter next/connect  |  Tab/Up/Down switch step  |  Esc close"),
+		asstStyle.Bold(true).Render("auth"),
+		dimStyle.Render("1/2/3 jump  |  Enter next/connect  |  Tab/↑/↓ step  |  Esc close"),
 	}
 
 	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider)
@@ -940,16 +1046,16 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	if m.AuthStep == AuthStepConfirm {
 		confirmLine = asstStyle.Bold(true).Render(confirmLine)
 	}
-	lines = append(lines, providerLine, apiLine, modelLine, confirmLine)
+	lines = append(lines, sectionStyle.Render("fields"), providerLine, apiLine, modelLine, confirmLine)
 	lines = append(lines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
 	if strings.TrimSpace(m.Auth.PersistencePath) != "" {
 		lines = append(lines, dimStyle.Render(truncatePlain(m.Auth.PersistencePath, bodyWidth)))
 	}
 
 	if m.AuthStep == AuthStepConfirm {
-		lines = append(lines, "", dimStyle.Render("Press Enter to save login and rebuild the transport."))
+		lines = append(lines, "", sectionStyle.Render("detail"), dimStyle.Render("Press Enter to save login and rebuild the transport."))
 	} else {
-		lines = append(lines, "")
+		lines = append(lines, "", sectionStyle.Render("editor"))
 		for _, row := range m.authEditorLines(bodyWidth) {
 			lines = append(lines, row)
 		}
@@ -1017,6 +1123,17 @@ func (m *Model) providerProfile(provider string) string {
 	default:
 		return "custom"
 	}
+}
+
+func (m *Model) providerDisplayName(provider string) string {
+	trimmed := strings.TrimSpace(provider)
+	if trimmed == "" || trimmed == "none" {
+		return "none"
+	}
+	if value := strings.TrimSpace(m.ProviderNames[trimmed]); value != "" {
+		return value
+	}
+	return formatProviderName(trimmed, m.providerProfile(trimmed))
 }
 
 func (m *Model) providerProfileSource(provider string) string {
@@ -1219,32 +1336,64 @@ func approvalDiffStats(lines []approvalPreviewLine) (int, int) {
 	return add, del
 }
 
-func renderApprovalPreviewLine(line approvalPreviewLine, width int) string {
+func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 	maxWidth := maxInt(1, width)
 	switch line.Kind {
 	case "section":
-		return dimStyle.Bold(true).Render(truncatePlain("[section] "+emptyFallback(line.Section, "preview"), maxWidth))
+		return []string{dimStyle.Bold(true).Render(truncatePlain("== "+emptyFallback(line.Section, "preview")+" ==", maxWidth))}
 	case "hunk":
-		return asstStyle.Bold(true).Render(truncatePlain(line.Text, maxWidth))
+		return []string{asstStyle.Bold(true).Render(truncatePlain(line.Text, maxWidth))}
 	case "add":
-		label := "+"
-		if strings.TrimSpace(line.LineNumber) != "" {
-			label = fmt.Sprintf("+ %s |", line.LineNumber)
-		}
-		return userStyle.Render(truncatePlain(fmt.Sprintf("%s %s", label, emptyFallback(line.Content, line.Text)), maxWidth))
+		return renderTerminalDiffRows("+", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, userStyle)
 	case "remove":
-		label := "-"
-		if strings.TrimSpace(line.LineNumber) != "" {
-			label = fmt.Sprintf("- %s |", line.LineNumber)
-		}
-		return errorStyle.Render(truncatePlain(fmt.Sprintf("%s %s", label, emptyFallback(line.Content, line.Text)), maxWidth))
+		return renderTerminalDiffRows("-", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, errorStyle)
 	case "kv":
-		return dimStyle.Render(truncatePlain(line.Key+": ", maxWidth)) + asstStyle.Render(truncatePlain(line.Val, maxWidth))
+		keyPrefix := dimStyle.Render(line.Key + ": ")
+		valueWidth := maxInt(1, maxWidth-lipgloss.Width(line.Key)-2)
+		wrapped := wrapPlainText(line.Val, valueWidth)
+		if len(wrapped) == 0 {
+			return []string{truncatePlain(keyPrefix, maxWidth)}
+		}
+		lines := make([]string, 0, len(wrapped))
+		for index, row := range wrapped {
+			if index == 0 {
+				lines = append(lines, truncatePlain(keyPrefix+asstStyle.Render(row), maxWidth))
+				continue
+			}
+			lines = append(lines, truncatePlain(strings.Repeat(" ", lipgloss.Width(line.Key)+2)+asstStyle.Render(row), maxWidth))
+		}
+		return lines
 	case "blank":
-		return ""
+		return []string{""}
 	default:
-		return truncatePlain(line.Text, maxWidth)
+		wrapped := wrapPlainText(line.Text, maxWidth)
+		if len(wrapped) == 0 {
+			return []string{""}
+		}
+		return wrapped
 	}
+}
+
+func renderTerminalDiffRows(sign, lineNumber, content string, width int, style lipgloss.Style) []string {
+	gutter := sign
+	if strings.TrimSpace(lineNumber) != "" {
+		gutter = fmt.Sprintf("%s %4s │", sign, lineNumber)
+	}
+	contentWidth := maxInt(1, width-lipgloss.Width(gutter)-1)
+	wrapped := wrapPlainText(content, contentWidth)
+	if len(wrapped) == 0 {
+		wrapped = []string{""}
+	}
+	lines := make([]string, 0, len(wrapped))
+	continuation := strings.Repeat(" ", maxInt(1, lipgloss.Width(gutter)))
+	for index, row := range wrapped {
+		left := gutter
+		if index > 0 {
+			left = continuation
+		}
+		lines = append(lines, style.Render(left+" "+renderCodeLine(row)))
+	}
+	return lines
 }
 
 func actionBadge(action string) string {
@@ -1324,6 +1473,100 @@ func formatProviderLabel(provider string, max int) string {
 		hostPath += parsed.Path
 	}
 	return truncatePlain(hostPath, max)
+}
+
+func formatProviderName(provider, profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "openai":
+		return "OpenAI"
+	case "gemini":
+		return "Gemini"
+	case "anthropic":
+		return "Anthropic"
+	case "local":
+		return "Local"
+	}
+
+	trimmed := strings.TrimSpace(provider)
+	if trimmed == "" || trimmed == "none" {
+		return "none"
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err == nil && parsed.Hostname() != "" {
+		host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+		if host == "localhost" || host == "127.0.0.1" {
+			return "Local"
+		}
+		labels := strings.Split(host, ".")
+		candidate := ""
+		if len(labels) >= 2 {
+			candidate = labels[len(labels)-2]
+		} else if len(labels) == 1 {
+			candidate = labels[0]
+		}
+		candidate = strings.Trim(candidate, "-_ ")
+		if candidate != "" {
+			return strings.ToUpper(candidate[:1]) + candidate[1:]
+		}
+	}
+
+	return truncatePlain(trimmed, 24)
+}
+
+func formatProjectPathLabel(projectPath string, max int) string {
+	trimmed := strings.TrimSpace(projectPath)
+	if trimmed == "" || trimmed == "none" {
+		return "none"
+	}
+	if max <= 0 || lipgloss.Width(trimmed) <= max {
+		return trimmed
+	}
+
+	separator := "/"
+	if strings.Contains(trimmed, `\`) {
+		separator = `\`
+	}
+
+	root := ""
+	switch {
+	case strings.HasPrefix(trimmed, `\\`):
+		root = `\\`
+	case len(trimmed) >= 3 && trimmed[1] == ':' && (trimmed[2] == '\\' || trimmed[2] == '/'):
+		root = trimmed[:3]
+	case len(trimmed) >= 2 && trimmed[1] == ':':
+		root = trimmed[:2]
+	case strings.HasPrefix(trimmed, "/"):
+		root = "/"
+	}
+
+	segments := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '/' || r == '\\'
+	})
+	if len(segments) == 0 {
+		return truncateMiddlePlain(trimmed, max)
+	}
+
+	minKeep := 2
+	if len(segments) < minKeep {
+		minKeep = len(segments)
+	}
+	for keep := minInt(4, len(segments)); keep >= minKeep; keep-- {
+		tail := strings.Join(segments[len(segments)-keep:], separator)
+		candidate := "..." + separator + tail
+		if root != "" {
+			candidate = root + "..." + separator + tail
+		}
+		if lipgloss.Width(candidate) <= max {
+			return candidate
+		}
+	}
+
+	last := segments[len(segments)-1]
+	if root != "" {
+		return truncateMiddlePlain(root+last, max)
+	}
+	return truncateMiddlePlain(last, max)
 }
 
 func formatProviderProfileLabel(profile string) string {
@@ -1438,22 +1681,22 @@ func framedInnerHeight(style lipgloss.Style, outerHeight int) int {
 func messageStyles(message Message) (string, lipgloss.Style, lipgloss.Style) {
 	switch message.Kind {
 	case "tool_status":
-		return "tool", reviewStyle.Bold(true), reviewStyle
+		return "tool>", reviewStyle.Bold(true), reviewStyle
 	case "review_status":
-		return "review", reviewStyle.Bold(true), reviewStyle
+		return "review>", reviewStyle.Bold(true), reviewStyle
 	case "system_hint":
-		return "system", systemStyle.Bold(true), systemStyle
+		return "system>", systemStyle.Bold(true), systemStyle
 	case "error":
-		return "error", errorStyle.Bold(true), errorStyle
+		return "error>", errorStyle.Bold(true), errorStyle
 	}
 
 	switch message.Role {
 	case "user":
-		return "you", userStyle.Bold(true), lipgloss.NewStyle()
+		return "user>", userStyle.Bold(true), lipgloss.NewStyle()
 	case "assistant":
-		return "cyrene", asstStyle.Bold(true), lipgloss.NewStyle()
+		return "assistant>", asstStyle.Bold(true), lipgloss.NewStyle()
 	default:
-		return "system", systemStyle.Bold(true), systemStyle
+		return "system>", systemStyle.Bold(true), systemStyle
 	}
 }
 
@@ -1515,6 +1758,46 @@ func truncatePlain(value string, width int) string {
 		runes = runes[:len(runes)-1]
 	}
 	return string(runes) + "~"
+}
+
+func truncateMiddlePlain(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(value) <= width {
+		return value
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
+	}
+
+	runes := []rune(value)
+	leftBudget := (width - 3) / 2
+	rightBudget := width - 3 - leftBudget
+
+	left := make([]rune, 0, leftBudget)
+	leftWidth := 0
+	for _, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if leftWidth+rw > leftBudget {
+			break
+		}
+		left = append(left, r)
+		leftWidth += rw
+	}
+
+	right := make([]rune, 0, rightBudget)
+	rightWidth := 0
+	for index := len(runes) - 1; index >= 0; index-- {
+		rw := lipgloss.Width(string(runes[index]))
+		if rightWidth+rw > rightBudget {
+			break
+		}
+		right = append([]rune{runes[index]}, right...)
+		rightWidth += rw
+	}
+
+	return string(left) + "..." + string(right)
 }
 
 func wrapPlainText(value string, width int) []string {

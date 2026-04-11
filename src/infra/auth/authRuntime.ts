@@ -17,6 +17,7 @@ type LoadedProviderMetadata = {
   currentModel?: string;
   providers: string[];
   providerProfiles: ProviderProfileOverrideMap;
+  providerNames: Record<string, string>;
 };
 
 type ResolvedAuthState = {
@@ -339,6 +340,21 @@ export const createAuthRuntime = (
           )
         ) as string[],
         providerProfiles: normalizedProviderProfiles,
+        providerNames: Object.fromEntries(
+          Object.entries(loaded.providerNames ?? {})
+            .map(([provider, name]) => {
+              try {
+                const normalized = normalizeProviderBaseUrl(provider);
+                const trimmedName = trimNonEmpty(name);
+                return normalized && trimmedName
+                  ? ([normalized, trimmedName] as const)
+                  : null;
+              } catch {
+                return null;
+              }
+            })
+            .filter((entry): entry is [string, string] => Boolean(entry))
+        ),
       };
     } catch {
       return {
@@ -346,6 +362,7 @@ export const createAuthRuntime = (
         currentModel: trimNonEmpty(effectiveEnv.CYRENE_MODEL) ?? "gpt-4o-mini",
         providers: [],
         providerProfiles: {},
+        providerNames: {},
       };
     }
   };
@@ -631,6 +648,7 @@ export const createAuthRuntime = (
         providerBaseUrl: validation.normalizedProviderBaseUrl,
         providers: nextProviders,
         providerProfiles: existingMetadata.providerProfiles,
+        providerNames: existingMetadata.providerNames,
       },
       options.appRoot,
       {

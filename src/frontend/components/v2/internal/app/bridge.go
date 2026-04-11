@@ -23,6 +23,7 @@ type bridgeCommand struct {
 	Text            string `json:"text,omitempty"`
 	ID              string `json:"id,omitempty"`
 	Value           string `json:"value,omitempty"`
+	Name            string `json:"name,omitempty"`
 	Profile         string `json:"profile,omitempty"`
 	ProviderBaseURL string `json:"providerBaseUrl,omitempty"`
 	APIKey          string `json:"apiKey,omitempty"`
@@ -71,6 +72,7 @@ type bridgeSnapshot struct {
 	AvailableProviders       []string          `json:"availableProviders"`
 	ProviderProfiles         map[string]string `json:"providerProfiles"`
 	ProviderProfileSources   map[string]string `json:"providerProfileSources"`
+	ProviderNames            map[string]string `json:"providerNames"`
 	Auth                     BridgeAuthStatus  `json:"auth"`
 }
 
@@ -91,6 +93,7 @@ type bridgeEvent struct {
 	AvailableProviders       []string          `json:"availableProviders,omitempty"`
 	ProviderProfiles         map[string]string `json:"providerProfiles,omitempty"`
 	ProviderProfileSources   map[string]string `json:"providerProfileSources,omitempty"`
+	ProviderNames            map[string]string `json:"providerNames,omitempty"`
 	Auth                     BridgeAuthStatus  `json:"auth,omitempty"`
 	AppRoot                  string            `json:"appRoot,omitempty"`
 	ProviderBaseURL          string            `json:"providerBaseUrl,omitempty"`

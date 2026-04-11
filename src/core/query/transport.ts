@@ -30,11 +30,20 @@ export type ProviderProfileOverrideMap = Record<
   Exclude<ProviderProfile, "custom">
 >;
 
+export type ProviderNameOverrideMap = Record<string, string>;
+
 export type ProviderProfileSetResult = {
   ok: boolean;
   message: string;
   provider?: string;
   profile?: ProviderProfile;
+};
+
+export type ProviderNameSetResult = {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  name?: string;
 };
 
 export type QueryTransport = {
@@ -47,6 +56,12 @@ export type QueryTransport = {
   ) => Promise<ProviderProfileSetResult>;
   getProviderProfile?: (provider?: string) => ProviderProfile | null;
   listProviderProfiles?: () => ProviderProfileOverrideMap;
+  setProviderName?: (
+    provider: string,
+    name: string | null
+  ) => Promise<ProviderNameSetResult>;
+  getProviderName?: (provider?: string) => string | null;
+  listProviderNames?: () => ProviderNameOverrideMap;
   setModel: (model: string) => Promise<ModelSetResult>;
   listModels: () => Promise<string[]>;
   listProviders: () => Promise<string[]>;

@@ -59,19 +59,32 @@ export const loadModelYaml = async (
   providerBaseUrl?: string;
   providers: string[];
   providerProfiles: Record<string, PersistedProviderProfile>;
+  providerNames?: Record<string, string>;
 }> => {
   const content = await readModelFile(appRoot, context);
   const models: string[] = [];
   const providers: string[] = [];
   const providerProfiles: Record<string, PersistedProviderProfile> = {};
+  const providerNames: Record<string, string> = {};
   let defaultModel: string | undefined;
   let lastUsedModel: string | undefined;
   let providerBaseUrl: string | undefined;
-  let section: "root" | "models" | "providers" | "provider_profiles" = "root";
+  let section:
+    | "root"
+    | "models"
+    | "providers"
+    | "provider_profiles"
+    | "provider_names" = "root";
   let pendingProviderProfile:
     | {
         provider?: string;
         profile?: PersistedProviderProfile;
+      }
+    | null = null;
+  let pendingProviderName:
+    | {
+        provider?: string;
+        name?: string;
       }
     | null = null;
 
@@ -85,6 +98,19 @@ export const loadModelYaml = async (
         pendingProviderProfile.profile;
     }
     pendingProviderProfile = null;
+  };
+
+  const flushPendingProviderName = () => {
+    if (
+      pendingProviderName?.provider &&
+      pendingProviderName?.name &&
+      pendingProviderName.provider.trim() &&
+      pendingProviderName.name.trim()
+    ) {
+      providerNames[pendingProviderName.provider.trim()] =
+        pendingProviderName.name.trim();
+    }
+    pendingProviderName = null;
   };
 
   for (const raw of content.split(/\r?\n/)) {
@@ -107,6 +133,8 @@ export const loadModelYaml = async (
     if (line === "models:") {
       if (section === "provider_profiles") {
         flushPendingProviderProfile();
+      } else if (section === "provider_names") {
+        flushPendingProviderName();
       }
       section = "models";
       continue;
@@ -114,6 +142,8 @@ export const loadModelYaml = async (
     if (line === "providers:") {
       if (section === "provider_profiles") {
         flushPendingProviderProfile();
+      } else if (section === "provider_names") {
+        flushPendingProviderName();
       }
       section = "providers";
       continue;
@@ -121,8 +151,19 @@ export const loadModelYaml = async (
     if (line === "provider_profiles:") {
       if (section === "provider_profiles") {
         flushPendingProviderProfile();
+      } else if (section === "provider_names") {
+        flushPendingProviderName();
       }
       section = "provider_profiles";
+      continue;
+    }
+    if (line === "provider_names:") {
+      if (section === "provider_profiles") {
+        flushPendingProviderProfile();
+      } else if (section === "provider_names") {
+        flushPendingProviderName();
+      }
+      section = "provider_names";
       continue;
     }
     if (section === "provider_profiles") {
@@ -172,6 +213,45 @@ export const loadModelYaml = async (
         continue;
       }
     }
+    if (section === "provider_names") {
+      if (line.startsWith("-")) {
+        flushPendingProviderName();
+        const rawEntry = line.slice(1).trim();
+        if (!rawEntry) {
+          pendingProviderName = {};
+          continue;
+        }
+        if (rawEntry.startsWith("provider:")) {
+          const provider = parseScalar(rawEntry.slice("provider:".length));
+          pendingProviderName = provider ? { provider } : {};
+          continue;
+        }
+        if (rawEntry.startsWith("name:")) {
+          const name = parseScalar(rawEntry.slice("name:".length));
+          pendingProviderName = name ? { name } : {};
+          continue;
+        }
+        const provider = parseScalar(rawEntry);
+        pendingProviderName = provider ? { provider } : {};
+        continue;
+      }
+      if (line.startsWith("provider:")) {
+        const provider = parseScalar(line.slice("provider:".length));
+        pendingProviderName = {
+          ...(pendingProviderName ?? {}),
+          ...(provider ? { provider } : {}),
+        };
+        continue;
+      }
+      if (line.startsWith("name:")) {
+        const name = parseScalar(line.slice("name:".length));
+        pendingProviderName = {
+          ...(pendingProviderName ?? {}),
+          ...(name ? { name } : {}),
+        };
+        continue;
+      }
+    }
     if (line.startsWith("-") && section === "models") {
       const model = parseScalar(line.slice(1));
       if (model) {
@@ -188,6 +268,8 @@ export const loadModelYaml = async (
   }
   if (section === "provider_profiles") {
     flushPendingProviderProfile();
+  } else if (section === "provider_names") {
+    flushPendingProviderName();
   }
 
   if (models.length === 0) {
@@ -201,6 +283,7 @@ export const loadModelYaml = async (
     providerBaseUrl,
     providers,
     providerProfiles,
+    providerNames,
   };
 };
 
@@ -212,6 +295,7 @@ export const saveModelYaml = async (
     providerBaseUrl?: string;
     providers?: string[];
     providerProfiles?: Record<string, PersistedProviderProfile>;
+    providerNames?: Record<string, string>;
   },
   appRoot = resolveAppRoot(),
   context?: ModelCatalogContext
@@ -228,6 +312,10 @@ export const saveModelYaml = async (
       ([provider, profile]) =>
         Boolean(provider) && isPersistedProviderProfile(profile)
     )
+    .sort(([left], [right]) => left.localeCompare(right));
+  const providerNameEntries = Object.entries(options?.providerNames ?? {})
+    .map(([provider, name]) => [provider.trim(), name.trim()] as const)
+    .filter(([provider, name]) => Boolean(provider) && Boolean(name))
     .sort(([left], [right]) => left.localeCompare(right));
   if (unique.length === 0) {
     throw new Error("Cannot save empty model list");
@@ -257,6 +345,15 @@ export const saveModelYaml = async (
           ...providerProfileEntries.flatMap(([provider, profile]) => [
             `  - provider: ${provider}`,
             `    profile: ${profile}`,
+          ]),
+        ]
+      : []),
+    ...(providerNameEntries.length > 0
+      ? [
+          "provider_names:",
+          ...providerNameEntries.flatMap(([provider, name]) => [
+            `  - provider: ${provider}`,
+            `    name: ${name}`,
           ]),
         ]
       : []),

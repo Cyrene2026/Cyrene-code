@@ -62,6 +62,9 @@ type BridgeCommand =
   | { type: "list_provider_profiles" }
   | { type: "set_provider_profile"; profile: string; value?: string }
   | { type: "clear_provider_profile"; value?: string }
+  | { type: "list_provider_names" }
+  | { type: "set_provider_name"; name: string; value?: string }
+  | { type: "clear_provider_name"; value?: string }
   | {
       type: "login";
       providerBaseUrl: string;
@@ -137,6 +140,7 @@ type BridgeSnapshot = {
   availableProviders: string[];
   providerProfiles: Record<string, BridgeProviderProfile>;
   providerProfileSources: Record<string, BridgeProviderProfileSource>;
+  providerNames: Record<string, string>;
   auth: BridgeAuthStatus;
 };
 
@@ -158,6 +162,7 @@ type BridgeEvent =
       availableProviders: string[];
       providerProfiles: Record<string, BridgeProviderProfile>;
       providerProfileSources: Record<string, BridgeProviderProfileSource>;
+      providerNames: Record<string, string>;
       appRoot: string;
     }
   | {
@@ -379,6 +384,7 @@ class BubbleTeaBridge {
   private availableProviders: string[] = [];
   private providerProfiles: Record<string, BridgeProviderProfile> = {};
   private providerProfileSources: Record<string, BridgeProviderProfileSource> = {};
+  private providerNames: Record<string, string> = {};
   private stateUpdateCount = 0;
   private sessionSkillUseIds = new Map<string, string[]>();
   private suspended: SuspendedRun | null = null;
@@ -455,6 +461,15 @@ class BubbleTeaBridge {
         return;
       case "clear_provider_profile":
         await this.clearProviderProfile(command.value);
+        return;
+      case "list_provider_names":
+        await this.listProviderNames();
+        return;
+      case "set_provider_name":
+        await this.setProviderName(command.name, command.value);
+        return;
+      case "clear_provider_name":
+        await this.clearProviderName(command.value);
         return;
       case "login":
         await this.login(command.providerBaseUrl, command.apiKey, command.model);
@@ -580,6 +595,7 @@ class BubbleTeaBridge {
     this.availableProviders = [];
     this.providerProfiles = {};
     this.providerProfileSources = {};
+    this.providerNames = {};
 
     try {
       this.availableModels = (await this.transport?.listModels()) ?? [];
@@ -604,6 +620,7 @@ class BubbleTeaBridge {
       )
     ).sort((left, right) => left.localeCompare(right));
     const manualOverrides = this.transport?.listProviderProfiles?.() ?? {};
+    this.providerNames = this.transport?.listProviderNames?.() ?? {};
     const nextProfiles: Record<string, BridgeProviderProfile> = {};
     const nextProfileSources: Record<string, BridgeProviderProfileSource> = {};
     for (const provider of providerUniverse) {
@@ -637,6 +654,7 @@ class BubbleTeaBridge {
       availableProviders: this.availableProviders,
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
+      providerNames: this.providerNames,
       auth: toBridgeAuthStatus(this.authStatus),
     };
   }
@@ -737,6 +755,7 @@ class BubbleTeaBridge {
       availableProviders: this.availableProviders,
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
+      providerNames: this.providerNames,
       appRoot: this.appRoot,
     });
   }
@@ -1679,6 +1698,20 @@ class BubbleTeaBridge {
     await this.pushRuntimeResult(text, true);
   }
 
+  private async listProviderNames() {
+    await this.ensureRuntime();
+    const list = this.transport?.listProviderNames?.() ?? {};
+    const lines = Object.entries(list)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([provider, name]) => `- ${provider} => ${name}`);
+
+    const text =
+      lines.length > 0
+        ? ["Custom provider names:", ...lines].join("\n")
+        : "No custom provider names.";
+    await this.pushRuntimeResult(text, true);
+  }
+
   private async setProviderProfile(rawProfile: string, targetProviderRaw?: string) {
     await this.ensureRuntime();
     const profile = rawProfile.trim().toLowerCase() as ProviderProfile;
@@ -1718,6 +1751,57 @@ class BubbleTeaBridge {
 
   private async clearProviderProfile(targetProviderRaw?: string) {
     await this.setProviderProfile("custom", targetProviderRaw);
+  }
+
+  private async setProviderName(rawName: string, targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    const name = rawName.trim();
+    if (!name) {
+      this.emitError("Provider name cannot be empty.");
+      return;
+    }
+    if (!this.transport?.setProviderName) {
+      this.emitError("Provider naming is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderName(targetProvider, name);
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async clearProviderName(targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    if (!this.transport?.setProviderName) {
+      this.emitError("Provider naming is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderName(targetProvider, null);
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
   }
 
   private async login(providerBaseUrl: string, apiKey: string, model?: string) {

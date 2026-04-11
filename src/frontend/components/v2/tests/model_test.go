@@ -53,8 +53,8 @@ func TestWheelDownReturnsToLiveTail(t *testing.T) {
 		Action: tea.MouseActionPress,
 	})
 
-	if model.TranscriptOffset != 1 {
-		t.Fatalf("expected transcript offset 1, got %d", model.TranscriptOffset)
+	if model.TranscriptOffset != 2 {
+		t.Fatalf("expected transcript offset 2, got %d", model.TranscriptOffset)
 	}
 }
 
@@ -85,6 +85,184 @@ func TestF6TogglesMouseCapture(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyF6})
 	if !model.MouseCapture {
 		t.Fatalf("expected mouse capture re-enabled after second f6")
+	}
+}
+
+func TestViewUsesTerminalFlowPrefixes(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: "inspect this repo"},
+		{Role: "assistant", Kind: "transcript", Text: "working on it"},
+		{Role: "system", Kind: "tool_status", Text: "Running read_file | main.go"},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "user>") {
+		t.Fatalf("expected terminal flow user prefix, got %q", view)
+	}
+	if !strings.Contains(view, "assistant>") {
+		t.Fatalf("expected terminal flow assistant prefix, got %q", view)
+	}
+	if !strings.Contains(view, "tool>") {
+		t.Fatalf("expected terminal flow tool prefix, got %q", view)
+	}
+}
+
+func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 60
+	model.ActivePanel = app.PanelSessions
+	model.ActiveSessionID = "sess-1"
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z", Tags: []string{"active"}},
+		{ID: "sess-2", Title: "Older session", UpdatedAt: "2026-04-10T00:00:00Z"},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "SESSION") {
+		t.Fatalf("expected main session section, got %q", view)
+	}
+	if !strings.Contains(view, "sessions") {
+		t.Fatalf("expected sessions panel content, got %q", view)
+	}
+	if !strings.Contains(view, "detail") {
+		t.Fatalf("expected detail section, got %q", view)
+	}
+}
+
+func TestViewUsesSquareBorders(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
+	model.ActivePanel = app.PanelSessions
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z"},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "┌") {
+		t.Fatalf("expected square border glyphs, got %q", view)
+	}
+	if strings.Contains(view, "╭") {
+		t.Fatalf("expected rounded borders removed, got %q", view)
+	}
+	if !strings.Contains(view, "╔") {
+		t.Fatalf("expected outer special border, got %q", view)
+	}
+}
+
+func TestApprovalPreviewLooksLikeTerminalDiff(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 60
+	model.ActivePanel = app.PanelApprovals
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.PendingReviews = []app.BridgeReview{
+		{
+			ID:             "rev-1",
+			Action:         "edit_file",
+			Path:           "a.txt",
+			PreviewSummary: "@@ chunk @@\n+   12 | added value\n-   10 | removed value",
+			PreviewFull:    "@@ chunk @@\n+   12 | added value\n-   10 | removed value",
+			CreatedAt:      "2026-04-11T00:00:00Z",
+		},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "+   12 │") {
+		t.Fatalf("expected terminal diff add gutter, got %q", view)
+	}
+	if !strings.Contains(view, "-   10 │") {
+		t.Fatalf("expected terminal diff remove gutter, got %q", view)
+	}
+}
+
+func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.AppRoot = "/workspace/demo/project/very/long/path/example"
+	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+
+	view := model.View()
+
+	if strings.Contains(view, "/login  /provider  /model") {
+		t.Fatalf("expected command catalog removed from header, got %q", view)
+	}
+	if !strings.Contains(view, "/help") {
+		t.Fatalf("expected /help hint to remain discoverable, got %q", view)
+	}
+	if !strings.Contains(view, "STATUS") {
+		t.Fatalf("expected top status chips, got %q", view)
+	}
+	headerLine := strings.Split(view, "\n")[1]
+	if strings.Contains(headerLine, "MODE ") {
+		t.Fatalf("expected MODE chip removed from header, got %q", headerLine)
+	}
+	if !strings.Contains(view, "PROJECT") || !strings.Contains(view, ".../path/example") {
+		t.Fatalf("expected project path to use same chip style, got %q", view)
+	}
+	if !strings.Contains(view, "SESSION") || !strings.Contains(view, "MODEL") || !strings.Contains(view, "PROVIDER") || !strings.Contains(view, "KEY") {
+		t.Fatalf("expected bottom evenly spaced status row, got %q", view)
+	}
+	if !strings.Contains(view, "PROVIDER Newcli") {
+		t.Fatalf("expected provider status to show friendly provider name, got %q", view)
+	}
+}
+
+func TestPreparingStatusShowsSpinnerFrame(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.Status = app.StatusPreparing
+	model.SpinnerFrame = 3
+
+	view := model.View()
+
+	if !strings.Contains(view, "⠸ PREPARING") {
+		t.Fatalf("expected animated preparing label, got %q", view)
+	}
+}
+
+func TestCustomProviderNameRendersInFooter(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+	model.ProviderNames = map[string]string{
+		"https://code.newcli.com/codex/v1": "Work Relay",
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "PROVIDER Work Relay") {
+		t.Fatalf("expected custom provider name in footer, got %q", view)
+	}
+}
+
+func TestComposerShowsSmartCommandMatches(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.Input = []rune("/pro")
+	model.Cursor = len(model.Input)
+
+	view := model.View()
+
+	if !strings.Contains(view, "match") {
+		t.Fatalf("expected smart command matching hint, got %q", view)
+	}
+	if !strings.Contains(view, "/provider") {
+		t.Fatalf("expected provider command in matches, got %q", view)
 	}
 }
 

@@ -57,6 +57,8 @@ const INFO_MESSAGE_OPTIONS = {
 
 const PROVIDER_PROFILE_USAGE =
   "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list";
+const PROVIDER_NAME_USAGE =
+  "Usage: /provider name <display_name> | /provider name clear [url] | /provider name list";
 
 export const handleProviderModelCommand = ({
   query,
@@ -207,6 +209,82 @@ export const handleProviderModelCommand = ({
           ERROR_MESSAGE_OPTIONS
         );
       }
+    });
+    clearInput();
+    return true;
+  }
+
+  if (query.startsWith("/provider name")) {
+    enqueueTask(async () => {
+      if (query === "/provider name list") {
+        const overrides = transport.listProviderNames?.() ?? {};
+        const lines = Object.entries(overrides)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([provider, name]) => `- ${provider} => ${name}`);
+        pushSystemMessage(
+          lines.length > 0
+            ? ["Custom provider names:", ...lines].join("\n")
+            : "No custom provider names."
+        );
+        return;
+      }
+
+      if (query === "/provider name") {
+        pushSystemMessage(PROVIDER_NAME_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+
+      if (query.startsWith("/provider name clear")) {
+        if (!transport.setProviderName) {
+          pushSystemMessage(
+            "Provider naming is unavailable in this transport.",
+            ERROR_MESSAGE_OPTIONS
+          );
+          return;
+        }
+        const targetProvider =
+          query.slice("/provider name clear".length).trim() ||
+          transport.getProvider();
+        if (!targetProvider || targetProvider === "none") {
+          pushSystemMessage(
+            "No active provider. Use /provider <url> first, or pass [url] explicitly.",
+            ERROR_MESSAGE_OPTIONS
+          );
+          return;
+        }
+        const result = await transport.setProviderName(targetProvider, null);
+        pushSystemMessage(
+          result.ok ? result.message : `[provider name failed] ${result.message}`,
+          result.ok ? INFO_MESSAGE_OPTIONS : ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      if (!transport.setProviderName) {
+        pushSystemMessage(
+          "Provider naming is unavailable in this transport.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+      const displayName = query.slice("/provider name".length).trim();
+      if (!displayName) {
+        pushSystemMessage(PROVIDER_NAME_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+      const targetProvider = transport.getProvider();
+      if (!targetProvider || targetProvider === "none") {
+        pushSystemMessage(
+          "No active provider. Use /provider <url> first.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+      const result = await transport.setProviderName(targetProvider, displayName);
+      pushSystemMessage(
+        result.ok ? result.message : `[provider name failed] ${result.message}`,
+        result.ok ? INFO_MESSAGE_OPTIONS : ERROR_MESSAGE_OPTIONS
+      );
     });
     clearInput();
     return true;

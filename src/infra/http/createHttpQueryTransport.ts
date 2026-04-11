@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type {
+  ProviderNameOverrideMap,
   ProviderProfile,
   ProviderProfileOverrideMap,
   QueryTransport,
@@ -1357,6 +1358,7 @@ export const createHttpQueryTransport = (
   let availableModels: string[] = [];
   let providerCatalog = currentProvider ? [currentProvider] : ([] as string[]);
   let providerProfileOverrides: ProviderProfileOverrideMap = {};
+  let providerNameOverrides: ProviderNameOverrideMap = {};
   let initializationError: string | null = null;
   const sessionQueries = new Map<
     string,
@@ -1413,6 +1415,39 @@ export const createHttpQueryTransport = (
     };
     return normalizedProvider;
   };
+  const getProviderNameOverride = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return providerNameOverrides[normalizedProvider] ?? null;
+  };
+  const setProviderNameOverride = (
+    provider: string | undefined,
+    name: string | null
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    const trimmedName = name?.trim();
+    if (!trimmedName) {
+      if (normalizedProvider in providerNameOverrides) {
+        const next = { ...providerNameOverrides };
+        delete next[normalizedProvider];
+        providerNameOverrides = next;
+      }
+      return normalizedProvider;
+    }
+    if (providerNameOverrides[normalizedProvider] === trimmedName) {
+      return normalizedProvider;
+    }
+    providerNameOverrides = {
+      ...providerNameOverrides,
+      [normalizedProvider]: trimmedName,
+    };
+    return normalizedProvider;
+  };
   const normalizeLoadedProviderProfiles = (
     profiles: Record<string, string | undefined> | undefined
   ): ProviderProfileOverrideMap => {
@@ -1428,6 +1463,20 @@ export const createHttpQueryTransport = (
       normalizedEntries.push([normalizedProvider, profile]);
     }
     return Object.fromEntries(normalizedEntries) as ProviderProfileOverrideMap;
+  };
+  const normalizeLoadedProviderNames = (
+    names: Record<string, string | undefined> | undefined
+  ): ProviderNameOverrideMap => {
+    const normalizedEntries: Array<[string, string]> = [];
+    for (const [provider, name] of Object.entries(names ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      const normalizedName = name?.trim();
+      if (!normalizedProvider || !normalizedName) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, normalizedName]);
+    }
+    return Object.fromEntries(normalizedEntries);
   };
   const resolvePersistedModels = () =>
     availableModels.length > 0
@@ -1446,6 +1495,7 @@ export const createHttpQueryTransport = (
       providerBaseUrl: provider,
       providers: providerCatalog,
       providerProfiles: providerProfileOverrides,
+      providerNames: providerNameOverrides,
     }, appRoot, {
       cwd: options?.cwd,
       env: effectiveEnv,
@@ -1494,10 +1544,12 @@ export const createHttpQueryTransport = (
       providerProfileOverrides = normalizeLoadedProviderProfiles(
         local.providerProfiles
       );
+      providerNameOverrides = normalizeLoadedProviderNames(local.providerNames);
       const localProvider = resolveProviderBaseUrl(local.providerBaseUrl);
       providerCatalog = dedupeProviders([
         ...local.providers,
         ...Object.keys(providerProfileOverrides),
+        ...Object.keys(providerNameOverrides),
         localProvider,
         currentProvider,
       ]);
@@ -1643,6 +1695,56 @@ export const createHttpQueryTransport = (
       return getProviderProfileOverride(normalizedProvider) ?? "custom";
     },
     listProviderProfiles: () => ({ ...providerProfileOverrides }),
+    setProviderName: async (provider: string, name: string | null) => {
+      await modelInit;
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+
+      const previousOverrides = providerNameOverrides;
+      const previousProviderCatalog = [...providerCatalog];
+      const trimmedName = name?.trim() ?? "";
+
+      setProviderNameOverride(normalizedProvider, trimmedName || null);
+      providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
+
+      try {
+        await persistCatalog(resolvePersistedModels(), currentModel, currentProvider);
+      } catch (error) {
+        providerNameOverrides = previousOverrides;
+        providerCatalog = previousProviderCatalog;
+        return {
+          ok: false,
+          message:
+            error instanceof Error
+              ? `Failed to save provider name: ${error.message}`
+              : `Failed to save provider name: ${String(error)}`,
+        };
+      }
+
+      return {
+        ok: true,
+        message: trimmedName
+          ? `Provider name set: ${normalizedProvider} => ${trimmedName}`
+          : `Provider name cleared: ${normalizedProvider}`,
+        provider: normalizedProvider,
+        name: trimmedName || undefined,
+      };
+    },
+    getProviderName: (provider?: string) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider) {
+        return null;
+      }
+      return getProviderNameOverride(normalizedProvider);
+    },
+    listProviderNames: () => ({ ...providerNameOverrides }),
     setModel: async (model: string) => {
       await modelInit;
       const next = model.trim();
@@ -1692,6 +1794,7 @@ export const createHttpQueryTransport = (
       providerCatalog = dedupeProviders([
         ...providerCatalog,
         ...Object.keys(providerProfileOverrides),
+        ...Object.keys(providerNameOverrides),
         currentProvider,
       ]);
       return [...providerCatalog];

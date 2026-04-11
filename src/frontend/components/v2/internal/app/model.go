@@ -54,7 +54,10 @@ const (
 	approvalQueuePageSize    = 5
 	approvalPreviewPageLines = 20
 	mouseDoubleClickWindow   = 400 * time.Millisecond
+	statusSpinnerInterval    = 120 * time.Millisecond
 )
+
+type statusSpinnerTickMsg struct{}
 
 var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/help", Description: "show command list"},
@@ -66,6 +69,9 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/provider profile list", Description: "list manual provider profile overrides"},
 	{Command: "/provider profile <openai|gemini|anthropic|custom> [url]", Description: "override provider profile (custom clears override)"},
 	{Command: "/provider profile clear [url]", Description: "clear manual provider profile override"},
+	{Command: "/provider name list", Description: "list custom provider names"},
+	{Command: "/provider name <display_name>", Description: "set custom name for current provider"},
+	{Command: "/provider name clear [url]", Description: "clear custom provider name"},
 	{Command: "/provider <url>", Description: "switch provider directly (also accepts openai/gemini/anthropic)"},
 	{Command: "/model", Description: "open model picker"},
 	{Command: "/model refresh", Description: "refresh available models"},
@@ -146,6 +152,8 @@ type Model struct {
 	Notice                 string
 	NoticeIsError          bool
 	MouseCapture           bool
+	SpinnerFrame           int
+	spinnerTickPending     bool
 	transcriptCacheWidth   int
 	transcriptCacheVersion int
 	transcriptCacheLines   []string
@@ -167,6 +175,7 @@ type Model struct {
 	AvailableProviders       []string
 	ProviderProfiles         map[string]string
 	ProviderProfileSources   map[string]string
+	ProviderNames            map[string]string
 	CurrentModel             string
 	CurrentProvider          string
 	CurrentProviderKeySource string
@@ -197,6 +206,7 @@ func NewModel() *Model {
 		MouseCapture:           true,
 		ProviderProfiles:       map[string]string{},
 		ProviderProfileSources: map[string]string{},
+		ProviderNames:          map[string]string{},
 		Items: []Message{{
 			Role: "system",
 			Kind: "system_hint",
@@ -210,7 +220,7 @@ func (m *Model) Init() tea.Cmd {
 	if m.MouseCapture {
 		cmds = append(cmds, tea.EnableMouseCellMotion)
 	}
-	return tea.Batch(cmds...)
+	return m.withStatusSpinner(tea.Batch(cmds...))
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -220,25 +230,33 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.BridgeReady = false
 		m.Status = StatusPreparing
 		m.setNotice("Bubble Tea bridge started.", false)
-		return m, tea.Batch(
+		return m, m.withStatusSpinner(tea.Batch(
 			waitForBridgeEvent(m.bridge),
 			sendBridgeCommand(m.bridge, bridgeCommand{Type: "init"}),
-		)
+		))
+	case statusSpinnerTickMsg:
+		m.spinnerTickPending = false
+		if !m.isAnimatingStatus() {
+			m.SpinnerFrame = 0
+			return m, nil
+		}
+		m.SpinnerFrame = (m.SpinnerFrame + 1) % len(statusSpinnerFrames)
+		return m, m.withStatusSpinner(nil)
 	case bridgeEventMsg:
 		m.handleBridgeEvent(value.Event)
 		if appRoot := value.Event.appRoot(); appRoot != "" {
 			if err := syncProcessAppRoot(appRoot); err != nil {
 				m.Status = StatusError
 				m.setNotice(fmt.Sprintf("Failed to switch workspace: %v", err), true)
-				return m, nil
+				return m, m.withStatusSpinner(nil)
 			}
 		}
-		return m, waitForBridgeEvent(m.bridge)
+		return m, m.withStatusSpinner(waitForBridgeEvent(m.bridge))
 	case bridgeErrorMsg:
 		m.Status = StatusError
 		m.AuthSaving = false
 		m.setNotice(value.Message, true)
-		return m, nil
+		return m, m.withStatusSpinner(nil)
 	case bridgeExitedMsg:
 		m.BridgeReady = false
 		m.bridge = nil
@@ -249,16 +267,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if !m.ShouldQuit {
 			m.setNotice("Bridge exited.", true)
 		}
-		return m, nil
+		return m, m.withStatusSpinner(nil)
 	case tea.WindowSizeMsg:
 		m.Width = value.Width
 		m.Height = value.Height
 		m.invalidateTranscriptCache()
 		m.clampTranscriptOffset()
-		return m, nil
+		return m, m.withStatusSpinner(nil)
 	case tea.MouseMsg:
 		if value.Action != tea.MouseActionPress {
-			return m, nil
+			return m, m.withStatusSpinner(nil)
 		}
 		switch value.Button {
 		case tea.MouseButtonWheelUp:
@@ -266,14 +284,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			m.handleWheelScroll(1)
 		case tea.MouseButtonLeft:
-			return m.handleMouseLeftClick(value)
+			nextModel, cmd := m.handleMouseLeftClick(value)
+			if typed, ok := nextModel.(*Model); ok {
+				return typed, typed.withStatusSpinner(cmd)
+			}
+			return nextModel, cmd
 		}
-		return m, nil
+		return m, m.withStatusSpinner(nil)
 	case tea.KeyMsg:
-		return m.handleKey(value)
+		nextModel, cmd := m.handleKey(value)
+		if typed, ok := nextModel.(*Model); ok {
+			return typed, typed.withStatusSpinner(cmd)
+		}
+		return nextModel, cmd
 	}
 
-	return m, nil
+	return m, m.withStatusSpinner(nil)
 }
 
 func (m *Model) handleBridgeEvent(event bridgeEvent) {
@@ -354,6 +380,37 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	}
 }
 
+func (m *Model) isAnimatingStatus() bool {
+	switch m.Status {
+	case StatusPreparing, StatusRequesting, StatusStreaming, StatusAwaitingReview:
+		return true
+	default:
+		return false
+	}
+}
+
+func statusSpinnerTickCmd() tea.Cmd {
+	return tea.Tick(statusSpinnerInterval, func(time.Time) tea.Msg {
+		return statusSpinnerTickMsg{}
+	})
+}
+
+func (m *Model) withStatusSpinner(cmd tea.Cmd) tea.Cmd {
+	if !m.isAnimatingStatus() {
+		m.spinnerTickPending = false
+		m.SpinnerFrame = 0
+		return cmd
+	}
+	if m.spinnerTickPending {
+		return cmd
+	}
+	m.spinnerTickPending = true
+	if cmd == nil {
+		return statusSpinnerTickCmd()
+	}
+	return tea.Batch(cmd, statusSpinnerTickCmd())
+}
+
 func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	if snapshot == nil {
 		return
@@ -370,6 +427,7 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.AvailableProviders = cloneStrings(snapshot.AvailableProviders)
 	m.ProviderProfiles = cloneStringMap(snapshot.ProviderProfiles)
 	m.ProviderProfileSources = cloneStringMap(snapshot.ProviderProfileSources)
+	m.ProviderNames = cloneStringMap(snapshot.ProviderNames)
 	m.CurrentModel = snapshot.CurrentModel
 	m.CurrentProvider = snapshot.CurrentProvider
 	m.CurrentProviderKeySource = snapshot.CurrentProviderKeySource
@@ -388,6 +446,7 @@ func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
 	m.AvailableProviders = cloneStrings(event.AvailableProviders)
 	m.ProviderProfiles = cloneStringMap(event.ProviderProfiles)
 	m.ProviderProfileSources = cloneStringMap(event.ProviderProfileSources)
+	m.ProviderNames = cloneStringMap(event.ProviderNames)
 	m.CurrentModel = event.CurrentModel
 	m.CurrentProvider = event.CurrentProvider
 	m.CurrentProviderKeySource = event.CurrentProviderKeySource
@@ -420,6 +479,9 @@ func (m *Model) normalizeRuntimeMetadataState() {
 	}
 	if m.ProviderProfileSources == nil {
 		m.ProviderProfileSources = map[string]string{}
+	}
+	if m.ProviderNames == nil {
+		m.ProviderNames = map[string]string{}
 	}
 	m.ModelIndex = clampInt(findStringIndex(m.AvailableModels, m.CurrentModel, m.ModelIndex), 0, maxInt(0, len(m.AvailableModels)-1))
 	m.ProviderIndex = clampInt(findStringIndex(m.AvailableProviders, m.CurrentProvider, m.ProviderIndex), 0, maxInt(0, len(m.AvailableProviders)-1))
@@ -579,14 +641,28 @@ func (m *Model) clampTranscriptOffset() {
 func (m *Model) transcriptViewportMetrics() (int, int) {
 	width := maxInt(50, m.Width)
 	height := maxInt(18, m.Height)
-	contentWidth := maxInt(30, width-2)
-	header := m.renderHeader(contentWidth)
-	panelHeight := m.panelHeight()
-	statusLine := m.renderStatusLine(contentWidth)
+	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
+	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
+	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
-	fixedHeight := lipgloss.Height(header) + panelHeight + lipgloss.Height(statusLine) + lipgloss.Height(composer)
-	transcriptHeight := maxInt(3, height-fixedHeight-1)
-	return contentWidth, transcriptHeight
+	footer := m.renderBottomStatusBar(contentWidth)
+	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	bodyHeight := maxInt(5, contentHeight-fixedHeight)
+	contentAreaHeight := maxInt(1, bodyHeight)
+
+	if m.ActivePanel == PanelNone {
+		return framedInnerWidth(activeFrameStyle, contentWidth), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
+	}
+
+	if contentWidth >= 96 {
+		panelWidth := clampInt(contentWidth/3, 34, 54)
+		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
+		return framedInnerWidth(activeFrameStyle, sessionWidth), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
+	}
+
+	panelHeight := clampInt(contentAreaHeight/2, 10, 16)
+	sessionHeight := maxInt(4, contentAreaHeight-panelHeight-1)
+	return framedInnerWidth(activeFrameStyle, contentWidth), maxInt(1, framedInnerHeight(activeFrameStyle, sessionHeight))
 }
 
 func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -594,7 +670,7 @@ func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	index, ok := m.panelListIndexAtMouse(msg.Y)
+	index, ok := m.panelListIndexAtMouse(msg.X, msg.Y)
 	if !ok {
 		return m, nil
 	}
@@ -636,9 +712,12 @@ func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) panelListIndexAtMouse(mouseY int) (int, bool) {
-	panelTop, ok := m.activePanelTop()
+func (m *Model) panelListIndexAtMouse(mouseX, mouseY int) (int, bool) {
+	panelLeft, panelTop, panelWidth, _, ok := m.activePanelRect()
 	if !ok {
+		return 0, false
+	}
+	if mouseX < panelLeft || mouseX >= panelLeft+panelWidth {
 		return 0, false
 	}
 	innerY := mouseY - panelTop - 1
@@ -652,30 +731,58 @@ func (m *Model) panelListIndexAtMouse(mouseY int) (int, bool) {
 	case PanelModels:
 		return listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, modelPanelPageSize, innerY, 2)
 	case PanelProviders:
-		width := maxInt(50, m.Width)
-		contentWidth := maxInt(30, width-2)
-		bodyWidth := framedInnerWidth(panelBoxStyle, contentWidth)
-		dataStartLine := 2 + len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth))
+		bodyWidth := framedInnerWidth(panelBoxStyle, panelWidth)
+		dataStartLine := 2 +
+			len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
+			len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
 		return listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, providerPanelPageSize, innerY, dataStartLine)
 	default:
 		return 0, false
 	}
 }
 
-func (m *Model) activePanelTop() (int, bool) {
-	panelHeight := m.panelHeight()
-	if panelHeight <= 0 {
-		return 0, false
+func (m *Model) activePanelRect() (int, int, int, int, bool) {
+	if m.ActivePanel == PanelNone {
+		return 0, 0, 0, 0, false
 	}
 	width := maxInt(50, m.Width)
 	height := maxInt(18, m.Height)
-	contentWidth := maxInt(30, width-2)
-	header := m.renderHeader(contentWidth)
-	statusLine := m.renderStatusLine(contentWidth)
+	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
+	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
+	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
-	fixedHeight := lipgloss.Height(header) + panelHeight + lipgloss.Height(statusLine) + lipgloss.Height(composer)
-	transcriptHeight := maxInt(3, height-fixedHeight-1)
-	return lipgloss.Height(header) + transcriptHeight, true
+	footer := m.renderBottomStatusBar(contentWidth)
+	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	bodyHeight := maxInt(5, contentHeight-fixedHeight)
+	contentAreaHeight := maxInt(1, bodyHeight)
+	panelTop := 1 + lipgloss.Height(header) + 1 + 1
+	panelLeft := 1
+	if contentWidth >= 96 {
+		panelWidth := clampInt(contentWidth/3, 34, 54)
+		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
+		panelLeft += sessionWidth + 1
+		return panelLeft, panelTop, panelWidth, contentAreaHeight, true
+	}
+	panelHeight := clampInt(contentAreaHeight/2, 10, 16)
+	sessionHeight := maxInt(4, contentAreaHeight-panelHeight-1)
+	panelTop += sessionHeight
+	return panelLeft, panelTop, contentWidth, panelHeight, true
+}
+
+func (m *Model) panelHeight() int {
+	if m.ActivePanel == PanelNone {
+		return 0
+	}
+	width := maxInt(50, m.Width)
+	height := maxInt(18, m.Height)
+	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
+	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
+	header := m.renderTopStatusBar(contentWidth)
+	composer := m.renderComposer(contentWidth)
+	footer := m.renderBottomStatusBar(contentWidth)
+	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	bodyHeight := maxInt(5, contentHeight-fixedHeight)
+	return maxInt(1, bodyHeight)
 }
 
 func listIndexAtPanelLine(total, selected, pageSize, innerY, dataStartLine int) (int, bool) {
@@ -1205,6 +1312,27 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Loading provider profile overrides...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_profiles"})
+	case query == "/provider name":
+		m.setNotice("Usage: /provider name <display_name> | /provider name clear [url] | /provider name list", true)
+		return true, nil
+	case query == "/provider name list":
+		m.Status = StatusPreparing
+		m.setNotice("Loading custom provider names...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_names"})
+	case strings.HasPrefix(query, "/provider name clear"):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider name clear"))
+		m.Status = StatusPreparing
+		m.setNotice("Clearing custom provider name...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "clear_provider_name", Value: tail})
+	case strings.HasPrefix(query, "/provider name "):
+		name := strings.TrimSpace(strings.TrimPrefix(query, "/provider name "))
+		if name == "" {
+			m.setNotice("Usage: /provider name <display_name>", true)
+			return true, nil
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Saving custom provider name...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider_name", Name: name})
 	case strings.HasPrefix(query, "/provider profile clear"):
 		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider profile clear"))
 		m.Status = StatusPreparing

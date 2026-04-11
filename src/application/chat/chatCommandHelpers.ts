@@ -50,6 +50,18 @@ export const COMMAND_SPECS: CommandSpec[] = [
     description: "clear manual provider profile override",
   },
   {
+    command: "/provider name list",
+    description: "list custom provider names",
+  },
+  {
+    command: "/provider name <display_name>",
+    description: "set a custom name for the current provider",
+  },
+  {
+    command: "/provider name clear [url]",
+    description: "clear custom provider name",
+  },
+  {
     command: "/provider <url>",
     description:
       "switch provider directly (also accepts openai/gemini/anthropic)",
@@ -276,6 +288,10 @@ const getSlashInsertValue = (command: string) => {
       return "/provider profile ";
     case "/provider profile clear [url]":
       return "/provider profile clear ";
+    case "/provider name <display_name>":
+      return "/provider name ";
+    case "/provider name clear [url]":
+      return "/provider name clear ";
     case "/model <name>":
       return "/model ";
     case "/system <text>":

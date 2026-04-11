@@ -95,6 +95,11 @@ func TestClampTranscriptOffsetPreventsOverscrollAccumulation(t *testing.T) {
 		{Role: "user", Kind: "transcript", Text: "three"},
 		{Role: "assistant", Kind: "transcript", Text: "four"},
 		{Role: "user", Kind: "transcript", Text: "five"},
+		{Role: "assistant", Kind: "transcript", Text: "six"},
+		{Role: "user", Kind: "transcript", Text: "seven"},
+		{Role: "assistant", Kind: "transcript", Text: "eight"},
+		{Role: "user", Kind: "transcript", Text: "nine"},
+		{Role: "assistant", Kind: "transcript", Text: "ten"},
 	}
 
 	for range 20 {

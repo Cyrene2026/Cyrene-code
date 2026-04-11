@@ -4,13 +4,29 @@ import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const binaryName = process.platform === "win32" ? "cyrene-v2.exe" : "cyrene-v2";
 const currentDir = dirname(fileURLToPath(import.meta.url));
-const binaryPath = resolve(currentDir, "..", "dist", binaryName);
+const goos = process.platform === "win32" ? "windows" : process.platform;
+const goarch =
+  process.arch === "x64"
+    ? "amd64"
+    : process.arch === "arm64"
+      ? "arm64"
+      : null;
+
+if (!goarch) {
+  console.error(`Unsupported architecture for packaged Cyrene binary: ${process.arch}`);
+  process.exit(1);
+}
+
+const platformBinaryName = `cyrene-v2-${goos}-${goarch}${process.platform === "win32" ? ".exe" : ""}`;
+const legacyBinaryName = process.platform === "win32" ? "cyrene-v2.exe" : "cyrene-v2";
+const preferredBinaryPath = resolve(currentDir, "..", "dist", platformBinaryName);
+const legacyBinaryPath = resolve(currentDir, "..", "dist", legacyBinaryName);
+const binaryPath = existsSync(preferredBinaryPath) ? preferredBinaryPath : legacyBinaryPath;
 
 if (!existsSync(binaryPath)) {
   console.error(`Missing built CLI binary: ${binaryPath}`);
-  console.error("Run `bun run build` first.");
+  console.error(`Expected packaged binary for ${goos}/${goarch}: ${platformBinaryName}`);
   process.exit(1);
 }
 

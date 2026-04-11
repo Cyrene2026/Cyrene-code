@@ -328,3 +328,32 @@ func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 		t.Fatalf("expected auth success notice, got %q", model.Notice)
 	}
 }
+
+func TestSetAuthDefaultsHydratesLoginPanelFields(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_auth_defaults",
+		"providerBaseUrl":"https://api.example.com/v1",
+		"model":"gpt-5.4",
+		"apiKey":"sk-live"
+	}`)
+	if err != nil {
+		t.Fatalf("ApplyBridgeEventJSONForTest returned error: %v", err)
+	}
+
+	if got := string(model.AuthProvider); got != "https://api.example.com/v1" {
+		t.Fatalf("expected auth provider hydrated, got %q", got)
+	}
+	if got := string(model.AuthModel); got != "gpt-5.4" {
+		t.Fatalf("expected auth model hydrated, got %q", got)
+	}
+	if got := string(model.AuthAPIKey); got != "sk-live" {
+		t.Fatalf("expected auth api key hydrated, got %q", got)
+	}
+	if model.AuthCursor != len([]rune("sk-live")) {
+		t.Fatalf("expected auth cursor at API key tail, got %d", model.AuthCursor)
+	}
+}

@@ -322,6 +322,19 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	case "set_runtime_metadata":
 		m.BridgeReady = true
 		m.applyRuntimeMetadata(event)
+	case "set_auth_defaults":
+		m.BridgeReady = true
+		m.AuthProvider = []rune(strings.TrimSpace(event.ProviderBaseURL))
+		m.AuthModel = []rune(strings.TrimSpace(event.Model))
+		m.AuthAPIKey = []rune(event.APIKey)
+		switch m.AuthStep {
+		case AuthStepProvider:
+			m.AuthCursor = len(m.AuthProvider)
+		case AuthStepAPIKey:
+			m.AuthCursor = len(m.AuthAPIKey)
+		case AuthStepModel:
+			m.AuthCursor = len(m.AuthModel)
+		}
 	case "error":
 		m.Status = StatusError
 		m.AuthSaving = false
@@ -1215,8 +1228,8 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider", Value: provider})
 	case query == "/login":
 		m.openAuthPanel()
-		m.setNotice("Login panel opened.", false)
-		return true, nil
+		m.setNotice("Login panel opened. Loading saved credential...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "get_login_defaults"})
 	case query == "/logout":
 		m.Status = StatusPreparing
 		m.setNotice("Logging out from HTTP provider...", false)

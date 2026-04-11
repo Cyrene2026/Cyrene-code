@@ -93,6 +93,9 @@ type bridgeEvent struct {
 	ProviderProfileSources   map[string]string `json:"providerProfileSources,omitempty"`
 	Auth                     BridgeAuthStatus  `json:"auth,omitempty"`
 	AppRoot                  string            `json:"appRoot,omitempty"`
+	ProviderBaseURL          string            `json:"providerBaseUrl,omitempty"`
+	Model                    string            `json:"model,omitempty"`
+	APIKey                   string            `json:"apiKey,omitempty"`
 }
 
 type bridgeStartedMsg struct {

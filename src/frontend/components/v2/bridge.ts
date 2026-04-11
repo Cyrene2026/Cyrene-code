@@ -58,6 +58,7 @@ type BridgeCommand =
   | { type: "set_model"; value: string }
   | { type: "set_provider"; value: string }
   | { type: "refresh_models" }
+  | { type: "get_login_defaults" }
   | { type: "list_provider_profiles" }
   | { type: "set_provider_profile"; profile: string; value?: string }
   | { type: "clear_provider_profile"; value?: string }
@@ -158,6 +159,12 @@ type BridgeEvent =
       providerProfiles: Record<string, BridgeProviderProfile>;
       providerProfileSources: Record<string, BridgeProviderProfileSource>;
       appRoot: string;
+    }
+  | {
+      type: "set_auth_defaults";
+      providerBaseUrl: string;
+      model: string;
+      apiKey: string;
     }
   | { type: "error"; message: string };
 
@@ -359,6 +366,9 @@ class BubbleTeaBridge {
         return;
       case "refresh_models":
         await this.refreshModels();
+        return;
+      case "get_login_defaults":
+        await this.emitAuthDefaults();
         return;
       case "list_provider_profiles":
         await this.listProviderProfiles();
@@ -651,6 +661,25 @@ class BubbleTeaBridge {
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
       appRoot: this.appRoot,
+    });
+  }
+
+  private async emitAuthDefaults() {
+    await this.ensureRuntime();
+    const providerBaseUrl =
+      this.transport?.getProvider() ?? this.authStatus?.provider ?? "";
+    const normalizedProvider =
+      providerBaseUrl && providerBaseUrl !== "local-core" && providerBaseUrl !== "none"
+        ? providerBaseUrl
+        : "";
+    const apiKey = normalizedProvider
+      ? (await this.authRuntime?.getSavedApiKey(normalizedProvider)) ?? ""
+      : "";
+    this.emit({
+      type: "set_auth_defaults",
+      providerBaseUrl: normalizedProvider,
+      model: this.transport?.getModel() ?? this.authStatus?.model ?? "",
+      apiKey,
     });
   }
 

@@ -27,6 +27,7 @@
   "files": [
     "bin",
     "dist",
+    "src",
     "assets/brand",
     "LICENSE",
     "README.md",

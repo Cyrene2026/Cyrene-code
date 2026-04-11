@@ -372,7 +372,6 @@ func looksLikeRepoRoot(dir string) bool {
 	required := []string{
 		filepath.Join(dir, "package.json"),
 		filepath.Join(dir, "src", "frontend", "components", "v2", "bridge.ts"),
-		filepath.Join(dir, "src", "frontend", "components", "v2", "main.go"),
 	}
 
 	for _, path := range required {

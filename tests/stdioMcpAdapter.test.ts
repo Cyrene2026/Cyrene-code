@@ -132,6 +132,21 @@ const createFakeSpawnProcess = () => {
 const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
   env?.PATH ?? env?.Path;
 
+const setPathEnvValue = (value: string) => {
+  process.env.PATH = value;
+  process.env.Path = value;
+};
+
+const restorePathEnvValue = (value: string | undefined) => {
+  if (value === undefined) {
+    delete process.env.PATH;
+    delete process.env.Path;
+    return;
+  }
+  process.env.PATH = value;
+  process.env.Path = value;
+};
+
 describe("StdioMcpAdapter", () => {
   test("initializes over stdio, lists tools and calls a remote tool", async () => {
     const fakeProcess = createFakeSpawnProcess();
@@ -178,7 +193,7 @@ describe("StdioMcpAdapter", () => {
     const previousPath = getPathEnvValue(process.env);
     const appRoot = process.platform === "win32" ? "C:/workspace/project" : "/workspace/project";
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = previousPath ?? "/usr/bin";
+    setPathEnvValue(previousPath ?? "/usr/bin");
 
     const fakeProcess = createFakeSpawnProcess();
     const capture: {
@@ -238,10 +253,9 @@ describe("StdioMcpAdapter", () => {
         process.env.CYRENE_API_KEY = previousApiKey;
       }
       if (previousPath === undefined) {
-        delete process.env.PATH;
-        delete process.env.Path;
+        restorePathEnvValue(undefined);
       } else {
-        process.env.PATH = previousPath;
+        restorePathEnvValue(previousPath);
       }
     }
   });

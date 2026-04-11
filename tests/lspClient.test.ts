@@ -123,6 +123,21 @@ const createFakeLspSpawn = () => {
 const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
   env?.PATH ?? env?.Path;
 
+const setPathEnvValue = (value: string) => {
+  process.env.PATH = value;
+  process.env.Path = value;
+};
+
+const restorePathEnvValue = (value: string | undefined) => {
+  if (value === undefined) {
+    delete process.env.PATH;
+    delete process.env.Path;
+    return;
+  }
+  process.env.PATH = value;
+  process.env.Path = value;
+};
+
 describe("LspClient environment", () => {
   afterEach(async () => {
     await Promise.all(
@@ -136,7 +151,7 @@ describe("LspClient environment", () => {
     const previousApiKey = process.env.CYRENE_API_KEY;
     const previousPath = getPathEnvValue(process.env);
     process.env.CYRENE_API_KEY = "should-not-leak";
-    process.env.PATH = previousPath ?? "/usr/bin";
+    setPathEnvValue(previousPath ?? "/usr/bin");
 
     const root = await mkdtemp(join(tmpdir(), "cyrene-lsp-test-"));
     tempRoots.push(root);
@@ -179,10 +194,9 @@ describe("LspClient environment", () => {
         process.env.CYRENE_API_KEY = previousApiKey;
       }
       if (previousPath === undefined) {
-        delete process.env.PATH;
-        delete process.env.Path;
+        restorePathEnvValue(undefined);
       } else {
-        process.env.PATH = previousPath;
+        restorePathEnvValue(previousPath);
       }
     }
   });

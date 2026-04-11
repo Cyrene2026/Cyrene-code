@@ -27,11 +27,13 @@ const isWindowsStyleAbsolutePath = (value: string) =>
   WINDOWS_DRIVE_ABSOLUTE_PATH.test(value) ||
   WINDOWS_UNC_ABSOLUTE_PATH.test(value);
 
+const effectivePlatform = (platform?: NodeJS.Platform) => platform ?? process.platform;
+
 const pathApiForPlatform = (platform?: NodeJS.Platform) =>
-  platform === "win32" ? win32 : posix;
+  effectivePlatform(platform) === "win32" ? win32 : posix;
 
 const joinCyreneDir = (homeDir: string, platform?: NodeJS.Platform) => {
-  if (platform === "win32") {
+  if (effectivePlatform(platform) === "win32") {
     const trimmed = homeDir.replace(/[\\/]+$/, "");
     const separator = trimmed.includes("/") ? "/" : "\\";
     return `${trimmed}${separator}.cyrene`;

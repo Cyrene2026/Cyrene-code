@@ -14,6 +14,7 @@ const SAFE_SUBPROCESS_ENV_KEYS = new Set([
   "NUMBER_OF_PROCESSORS",
   "OS",
   "PATH",
+  "Path",
   "PATHEXT",
   "PROGRAMDATA",
   "PROGRAMFILES",

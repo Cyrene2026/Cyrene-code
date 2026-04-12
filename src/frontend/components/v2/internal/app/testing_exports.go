@@ -32,6 +32,14 @@ func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style)
 	return renderMarkdownBodyLines(text, width, base)
 }
 
+func StartupLogoColorForTest(row, col, rowCount, colCount int) lipgloss.CompleteColor {
+	return startupLogoColorAt(row, col, rowCount, colCount)
+}
+
+func RenderStartupLogoLineForTest(text string, row, rowCount, colCount int) string {
+	return renderGradientLogoLine(text, row, rowCount, colCount)
+}
+
 func SuggestSlashCommandsForTest(input string, limit int) []string {
 	matches := suggestSlashCommands(input, limit)
 	result := make([]string, 0, len(matches))

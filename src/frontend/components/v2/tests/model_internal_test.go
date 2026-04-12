@@ -10,6 +10,7 @@ import (
 	"cyrenecode/v2/internal/app"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func TestSyncProcessAppRoot(t *testing.T) {
@@ -201,6 +202,54 @@ func TestRenderTranscriptClampsStyledLinesToWidth(t *testing.T) {
 		if lipgloss.Width(plain) > 24 {
 			t.Fatalf("expected transcript line width <= 24, got %d for %q", lipgloss.Width(plain), plain)
 		}
+	}
+}
+
+func TestStartupLogoColorUsesDiagonalGradientAcrossProfiles(t *testing.T) {
+	topLeft := app.StartupLogoColorForTest(0, 0, 6, 10)
+	topRight := app.StartupLogoColorForTest(0, 9, 6, 10)
+	bottomLeft := app.StartupLogoColorForTest(5, 0, 6, 10)
+	bottomRight := app.StartupLogoColorForTest(5, 9, 6, 10)
+
+	if topLeft.TrueColor != "#2F81FF" || topLeft.ANSI256 != "27" || topLeft.ANSI != "12" {
+		t.Fatalf("unexpected top-left color: %+v", topLeft)
+	}
+	if bottomRight.TrueColor != "#A855F7" || bottomRight.ANSI256 != "135" || bottomRight.ANSI != "13" {
+		t.Fatalf("unexpected bottom-right color: %+v", bottomRight)
+	}
+	if topRight != bottomLeft {
+		t.Fatalf("expected equal colors on the same diagonal, got top-right=%+v bottom-left=%+v", topRight, bottomLeft)
+	}
+	if topLeft == bottomRight {
+		t.Fatalf("expected diagonal endpoints to differ, got %+v and %+v", topLeft, bottomRight)
+	}
+}
+
+func TestRenderStartupLogoLineAdaptsToTerminalProfiles(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	trueColorLine := app.RenderStartupLogoLineForTest("AB", 0, 2, 2)
+	if !strings.Contains(trueColorLine, "38;2;") {
+		t.Fatalf("expected truecolor escape sequence, got %q", trueColorLine)
+	}
+
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	ansi256Line := app.RenderStartupLogoLineForTest("AB", 0, 2, 2)
+	if !strings.Contains(ansi256Line, "38;5;") {
+		t.Fatalf("expected ansi256 escape sequence, got %q", ansi256Line)
+	}
+
+	lipgloss.SetColorProfile(termenv.ANSI)
+	ansiLine := app.RenderStartupLogoLineForTest("AB", 0, 2, 2)
+	if strings.Contains(ansiLine, "\x1b[38;2;") || strings.Contains(ansiLine, "\x1b[38;5;") {
+		t.Fatalf("expected ansi16 escape sequence, got %q", ansiLine)
+	}
+	if !strings.Contains(ansiLine, "94m") {
+		t.Fatalf("expected bright blue ansi sequence, got %q", ansiLine)
 	}
 }
 

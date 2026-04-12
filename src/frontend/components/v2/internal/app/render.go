@@ -15,6 +15,11 @@ var (
 
 	statusBarColor = lipgloss.Color("#FFF")
 
+	startupLogoTrueColorStart = rgbColor{R: 0x2F, G: 0x81, B: 0xFF}
+	startupLogoTrueColorEnd   = rgbColor{R: 0xA8, G: 0x55, B: 0xF7}
+	startupLogoANSI256Palette = []string{"27", "33", "39", "63", "69", "99", "129", "135"}
+	startupLogoANSIPalette    = []string{"12", "12", "13", "13"}
+
 	appShellStyle = lipgloss.NewStyle().
 			Border(lipgloss.DoubleBorder()).
 			BorderForeground(lipgloss.Color("13")).
@@ -212,6 +217,83 @@ type statusColumn struct {
 	Color lipgloss.Color
 }
 
+type rgbColor struct {
+	R int
+	G int
+	B int
+}
+
+func (c rgbColor) hex() string {
+	return fmt.Sprintf("#%02X%02X%02X", clampInt(c.R, 0, 255), clampInt(c.G, 0, 255), clampInt(c.B, 0, 255))
+}
+
+func interpolateRGB(start, end rgbColor, step, maxStep int) rgbColor {
+	if maxStep <= 0 {
+		return start
+	}
+	return rgbColor{
+		R: start.R + ((end.R-start.R)*step)/maxStep,
+		G: start.G + ((end.G-start.G)*step)/maxStep,
+		B: start.B + ((end.B-start.B)*step)/maxStep,
+	}
+}
+
+func startupLogoDiagonalStep(row, col, rowCount, colCount int) (int, int) {
+	maxRow := maxInt(1, rowCount-1)
+	maxCol := maxInt(1, colCount-1)
+	rowStep := clampInt(row, 0, maxRow) * 1024 / maxRow
+	colStep := clampInt(col, 0, maxCol) * 1024 / maxCol
+	return rowStep + colStep, 2048
+}
+
+func startupLogoPaletteIndex(step, maxStep, paletteLen int) int {
+	if paletteLen <= 1 || maxStep <= 0 {
+		return 0
+	}
+	return clampInt((step*(paletteLen-1))/maxStep, 0, paletteLen-1)
+}
+
+func startupLogoColorAt(row, col, rowCount, colCount int) lipgloss.CompleteColor {
+	step, maxStep := startupLogoDiagonalStep(row, col, rowCount, colCount)
+	trueColor := interpolateRGB(startupLogoTrueColorStart, startupLogoTrueColorEnd, step, maxStep).hex()
+	ansi256 := startupLogoANSI256Palette[startupLogoPaletteIndex(step, maxStep, len(startupLogoANSI256Palette))]
+	ansi := startupLogoANSIPalette[startupLogoPaletteIndex(step, maxStep, len(startupLogoANSIPalette))]
+	return lipgloss.CompleteColor{
+		TrueColor: trueColor,
+		ANSI256:   ansi256,
+		ANSI:      ansi,
+	}
+}
+
+func renderGradientLogoLine(value string, rowIndex, rowCount, colCount int) string {
+	runes := []rune(value)
+	if len(runes) == 0 {
+		return ""
+	}
+
+	var builder strings.Builder
+	for index, r := range runes {
+		if r == ' ' {
+			builder.WriteRune(r)
+			continue
+		}
+		colIndex := clampInt(index, 0, maxInt(0, colCount-1))
+		builder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(startupLogoColorAt(rowIndex, colIndex, rowCount, colCount)).Render(string(r)))
+	}
+	return builder.String()
+}
+
+func startupLogoLinesForWidth(width int) ([]string, int) {
+	lines := make([]string, 0, len(startupShadowLogoLines))
+	maxWidth := 0
+	for _, line := range startupShadowLogoLines {
+		truncated := truncatePlain(line, width)
+		lines = append(lines, truncated)
+		maxWidth = maxInt(maxWidth, lipgloss.Width(truncated))
+	}
+	return lines, maxWidth
+}
+
 func fitToWidth(value string, width int) string {
 	return lipgloss.NewStyle().MaxWidth(width).Render(value)
 }
@@ -395,14 +477,9 @@ func (m *Model) shouldShowStartupView() bool {
 
 func (m *Model) renderStartupLines(width int) []string {
 	lines := make([]string, 0, len(startupShadowLogoLines)+18)
-	lines = append(lines, asstStyle.Bold(true).Render(">Cyrene"))
-	lines = append(lines, "")
-	for index, line := range startupShadowLogoLines {
-		if index%2 == 0 {
-			lines = append(lines, asstStyle.Bold(true).Render(truncatePlain(line, width)))
-		} else {
-			lines = append(lines, reviewStyle.Bold(true).Render(truncatePlain(line, width)))
-		}
+	logoLines, logoWidth := startupLogoLinesForWidth(width)
+	for index, line := range logoLines {
+		lines = append(lines, renderGradientLogoLine(line, index, len(logoLines), logoWidth))
 	}
 
 	lines = append(lines,
@@ -430,7 +507,6 @@ func (m *Model) renderStartupLines(width int) []string {
 
 func (m *Model) renderCompactStartupLines(width int) []string {
 	lines := []string{
-		asstStyle.Bold(true).Render(">Cyrene"),
 		titleStyle.Bold(true).Render("terminal workspace"),
 		dimStyle.Render("Startup splash is compressed while the inspector is open."),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("active panel  %s", emptyFallback(string(m.ActivePanel), "none")), width)),

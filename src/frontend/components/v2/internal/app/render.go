@@ -198,6 +198,7 @@ func (m *Model) renderBottomStatusBar(width int) string {
 	return renderStatusColumns(width,
 		statusColumn{Label: "SESSION", Value: emptyFallback(m.ActiveSessionID, "none"), Color: statusBarColor},
 		statusColumn{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), Color: statusBarColor},
+		statusColumn{Label: "FORMAT", Value: formatTransportFormatLabel(m.currentProviderFormat()), Color: statusBarColor},
 		statusColumn{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), Color: statusBarColor},
 		statusColumn{Label: "KEY", Value: formatKeySourceLabel(m.CurrentProviderKeySource), Color: statusBarColor},
 	)
@@ -513,6 +514,7 @@ func (m *Model) renderCompactStartupLines(width int) []string {
 		dimStyle.Render(truncatePlain(fmt.Sprintf("project       %s", formatProjectPathLabel(m.AppRoot, maxInt(12, width-14))), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("session       %s", emptyFallback(m.ActiveSessionID, "none")), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("model         %s", emptyFallback(m.CurrentModel, "none")), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("format        %s", formatTransportFormatLabel(m.currentProviderFormat())), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("provider      %s", m.providerDisplayName(m.CurrentProvider)), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("key source    %s", formatKeySourceLabel(m.CurrentProviderKeySource)), width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("pending       %d", len(m.PendingReviews)), width)),
@@ -1505,6 +1507,18 @@ func (m *Model) renderProviders(width, height int) string {
 	for _, row := range wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth) {
 		bodyLines = append(bodyLines, dimStyle.Render(row))
 	}
+	for _, row := range wrapPlainText("provider type commands: /provider type list | /provider type <type> [url]", bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(row))
+	}
+	for _, row := range wrapPlainText("provider format commands: /provider format list | /provider format <format> [url]", bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(row))
+	}
+	for _, row := range wrapPlainText("provider endpoint commands: /provider endpoint list | /provider endpoint <kind> <path|url> [provider]", bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(row))
+	}
+	for _, row := range wrapPlainText("endpoint kinds: responses | chat_completions | models | anthropic_messages | gemini_generate_content", bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(row))
+	}
 	for _, row := range wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth) {
 		bodyLines = append(bodyLines, dimStyle.Render(row))
 	}
@@ -1528,10 +1542,11 @@ func (m *Model) renderProviders(width, height int) string {
 		}
 		name := m.providerDisplayName(provider)
 		profile := formatProviderProfileLabel(m.providerProfile(provider))
+		format := formatTransportFormatLabel(m.providerFormat(provider))
 		source := formatProviderProfileSourceLabel(m.providerProfileSource(provider))
 		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)))
-		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   endpoint %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-16)), bodyWidth-4))))
-		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   profile %s  |  source %s", profile, source)))
+		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   endpoint %s  |  source %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-30)), maxInt(8, bodyWidth-4)), source)))
+		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   profile %s  |  format %s", profile, format)))
 	}
 	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
 		Offset:  maxInt(0, page.CurrentPage-1),
@@ -1543,7 +1558,11 @@ func (m *Model) renderProviders(width, height int) string {
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("selected %s", m.providerDisplayName(selected))))
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("url %s", truncatePlain(selected, bodyWidth-4))))
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("profile %s  |  source %s", formatProviderProfileLabel(m.providerProfile(selected)), formatProviderProfileSourceLabel(m.providerProfileSource(selected)))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("endpoint %s  |  key %s", providerEndpointKind(selected, m.providerProfile(selected)), formatKeySourceLabel(m.CurrentProviderKeySource))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("format %s  |  host %s", formatTransportFormatLabel(m.providerFormat(selected)), providerEndpointKind(selected, m.providerProfile(selected)))))
+	for _, line := range m.providerEndpointDetailLines(selected, bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(line))
+	}
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("key %s", formatKeySourceLabel(m.CurrentProviderKeySource))))
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
@@ -1552,19 +1571,20 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	stepLabel := strings.ToUpper(strings.ReplaceAll(string(m.AuthStep), "_", " "))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "1/2/3 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
+		renderPanelHeaderColumns(bodyWidth, "1/2/3/4 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
 	bodyLines := []string{}
 
 	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider)
-	apiLine := formatAuthFieldLine(2, "API Key", maskSecret(string(m.AuthAPIKey)), m.AuthStep == AuthStepAPIKey)
-	modelLine := formatAuthFieldLine(3, "Model", emptyFallback(strings.TrimSpace(string(m.AuthModel)), m.CurrentModel), m.AuthStep == AuthStepModel)
-	confirmLine := "[4] Confirm and connect"
+	typeLine := formatAuthFieldLine(2, "Provider Type", string(m.AuthProviderType), m.AuthStep == AuthStepProviderType)
+	apiLine := formatAuthFieldLine(3, "API Key", maskSecret(string(m.AuthAPIKey)), m.AuthStep == AuthStepAPIKey)
+	modelLine := formatAuthFieldLine(4, "Model", emptyFallback(strings.TrimSpace(string(m.AuthModel)), m.CurrentModel), m.AuthStep == AuthStepModel)
+	confirmLine := "[5] Confirm and connect"
 	if m.AuthStep == AuthStepConfirm {
 		confirmLine = asstStyle.Bold(true).Render(confirmLine)
 	}
-	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, apiLine, modelLine, confirmLine)
+	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, typeLine, apiLine, modelLine, confirmLine)
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
 	if strings.TrimSpace(m.Auth.PersistencePath) != "" {
 		bodyLines = append(bodyLines, dimStyle.Render(truncatePlain(m.Auth.PersistencePath, bodyWidth)))
@@ -1604,6 +1624,8 @@ func (m *Model) authEditorLines(width int) []string {
 	switch m.AuthStep {
 	case AuthStepProvider:
 		current = string(m.AuthProvider)
+	case AuthStepProviderType:
+		current = string(m.AuthProviderType)
 	case AuthStepAPIKey:
 		current = maskSecret(string(m.AuthAPIKey))
 	case AuthStepModel:
@@ -1652,6 +1674,63 @@ func (m *Model) providerDisplayName(provider string) string {
 		return value
 	}
 	return formatProviderName(trimmed, m.providerProfile(trimmed))
+}
+
+func (m *Model) currentProviderFormat() string {
+	if format := strings.TrimSpace(m.CurrentProviderFormat); format != "" {
+		return format
+	}
+	return m.providerFormat(m.CurrentProvider)
+}
+
+func (m *Model) providerFormat(provider string) string {
+	trimmed := strings.TrimSpace(provider)
+	if trimmed == "" || trimmed == "none" {
+		return "none"
+	}
+	if trimmed == strings.TrimSpace(m.CurrentProvider) {
+		if format := strings.TrimSpace(m.CurrentProviderFormat); format != "" {
+			return format
+		}
+	}
+	if value := strings.TrimSpace(m.ProviderFormats[trimmed]); value != "" {
+		return value
+	}
+	if strings.ToLower(strings.TrimSpace(m.providerProfile(trimmed))) == "anthropic" {
+		return "anthropic_messages"
+	}
+	return "openai_chat"
+}
+
+func (m *Model) providerEndpoint(provider, kind string) string {
+	trimmed := strings.TrimSpace(provider)
+	if trimmed == "" || trimmed == "none" {
+		return ""
+	}
+	if value := strings.TrimSpace(m.ProviderEndpoints[trimmed][kind]); value != "" {
+		return value
+	}
+	return ""
+}
+
+func (m *Model) providerEndpointDetailLines(provider string, bodyWidth int) []string {
+	type endpointRow struct {
+		label string
+		kind  string
+	}
+	rows := []endpointRow{
+		{label: "responses", kind: "responses"},
+		{label: "chat", kind: "chat_completions"},
+		{label: "models", kind: "models"},
+		{label: "anthropic", kind: "anthropic_messages"},
+		{label: "gemini", kind: "gemini_generate_content"},
+	}
+	lines := make([]string, 0, len(rows))
+	for _, row := range rows {
+		label := fmt.Sprintf("%-10s %s", row.label, formatProviderEndpointLabel(m.providerEndpoint(provider, row.kind)))
+		lines = append(lines, truncatePlain(label, maxInt(8, bodyWidth-4)))
+	}
+	return lines
 }
 
 func (m *Model) providerProfileSource(provider string) string {
@@ -2115,6 +2194,31 @@ func formatProviderProfileSourceLabel(source string) string {
 	default:
 		return "inferred"
 	}
+}
+
+func formatTransportFormatLabel(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "openai_chat":
+		return "OpenAI Chat"
+	case "openai_responses":
+		return "OpenAI Responses"
+	case "anthropic_messages":
+		return "Anthropic Messages"
+	case "gemini_generate_content":
+		return "Gemini Native"
+	case "", "none":
+		return "none"
+	default:
+		return strings.TrimSpace(format)
+	}
+}
+
+func formatProviderEndpointLabel(endpoint string) string {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return "auto"
+	}
+	return trimmed
 }
 
 func providerEndpointKind(provider, profile string) string {

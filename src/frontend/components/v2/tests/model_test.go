@@ -492,7 +492,9 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	model.Width = 120
 	model.Height = 32
 	model.AppRoot = "/workspace/demo/project/very/long/path/example"
+	model.CurrentModel = "gpt-5.4"
 	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+	model.CurrentProviderFormat = "openai_responses"
 
 	view := model.View()
 
@@ -512,11 +514,14 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	if !strings.Contains(view, "PROJECT") || !strings.Contains(view, ".../path/example") {
 		t.Fatalf("expected project path to use same chip style, got %q", view)
 	}
-	if !strings.Contains(view, "SESSION") || !strings.Contains(view, "MODEL") || !strings.Contains(view, "PROVIDER") || !strings.Contains(view, "KEY") {
+	if !strings.Contains(view, "SESSION") || !strings.Contains(view, "MODEL") || !strings.Contains(view, "FORMAT") || !strings.Contains(view, "PROVIDER") || !strings.Contains(view, "KEY") {
 		t.Fatalf("expected bottom evenly spaced status row, got %q", view)
 	}
 	if !strings.Contains(view, "PROVIDER Newcli") {
 		t.Fatalf("expected provider status to show friendly provider name, got %q", view)
+	}
+	if !strings.Contains(view, "FORMAT OpenAI Responses") {
+		t.Fatalf("expected provider format in footer, got %q", view)
 	}
 }
 
@@ -653,6 +658,54 @@ func TestExtensionsEnableShowsDynamicTargets(t *testing.T) {
 	}
 }
 
+func TestProviderEndpointShowsDynamicKindSuggestions(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/provider endpoint ")})
+
+	view := model.View()
+	for _, value := range []string{"responses", "chat_completions", "models"} {
+		if !strings.Contains(view, value) {
+			t.Fatalf("expected endpoint kind suggestion %q, got %q", value, view)
+		}
+	}
+}
+
+func TestProviderEndpointClearShowsDynamicKindSuggestions(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/provider endpoint clear ")})
+
+	view := model.View()
+	for _, value := range []string{"responses", "chat_completions", "models"} {
+		if !strings.Contains(view, value) {
+			t.Fatalf("expected clear kind suggestion %q, got %q", value, view)
+		}
+	}
+}
+
+func TestTabCompletesProviderEndpointKind(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/provider endpoint chat")})
+	model.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if got := string(model.Input); got != "/provider endpoint chat_completions " {
+		t.Fatalf("expected endpoint kind completion, got %q", got)
+	}
+}
+
+func TestTabCompletesProviderEndpointClearKind(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/provider endpoint clear ge")})
+	model.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if got := string(model.Input); got != "/provider endpoint clear gemini_generate_content " {
+		t.Fatalf("expected clear kind completion, got %q", got)
+	}
+}
+
 func TestPreparingStatusShowsSpinnerFrame(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
@@ -672,6 +725,7 @@ func TestCustomProviderNameRendersInFooter(t *testing.T) {
 	model.Width = 120
 	model.Height = 32
 	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+	model.CurrentProviderFormat = "gemini_generate_content"
 	model.ProviderNames = map[string]string{
 		"https://code.newcli.com/codex/v1": "Work Relay",
 	}
@@ -680,6 +734,51 @@ func TestCustomProviderNameRendersInFooter(t *testing.T) {
 
 	if !strings.Contains(view, "PROVIDER Work Relay") {
 		t.Fatalf("expected custom provider name in footer, got %q", view)
+	}
+	if !strings.Contains(view, "FORMAT Gemini Native") {
+		t.Fatalf("expected provider format in footer, got %q", view)
+	}
+}
+
+func TestProvidersPanelShowsProviderFormat(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 44
+	model.ActivePanel = app.PanelProviders
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.CurrentProvider = "https://api.example.com/v1"
+	model.CurrentProviderFormat = "openai_responses"
+	model.CurrentProviderKeySource = "CYRENE_OPENAI_API_KEY"
+	model.AvailableProviders = []string{"https://api.example.com/v1"}
+	model.ProviderProfiles = map[string]string{
+		"https://api.example.com/v1": "openai",
+	}
+	model.ProviderEndpoints = map[string]map[string]string{
+		"https://api.example.com/v1": {
+			"responses": "/responses",
+			"models":    "https://catalog.example.com/models",
+		},
+	}
+	model.ProviderProfileSources = map[string]string{
+		"https://api.example.com/v1": "manual",
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "format OpenAI Responses") {
+		t.Fatalf("expected provider format in panel detail, got %q", view)
+	}
+	if !strings.Contains(view, "profile OpenAI-compatible  |  format") {
+		t.Fatalf("expected provider format in panel list, got %q", view)
+	}
+	if !strings.Contains(view, "endpoint kinds:") || !strings.Contains(view, "chat_completions") {
+		t.Fatalf("expected provider panel endpoint kind hint, got %q", view)
+	}
+	if !strings.Contains(view, "responses  /responses") {
+		t.Fatalf("expected provider endpoint override in panel detail, got %q", view)
+	}
+	if !strings.Contains(view, "models     https://catalog.example.com/models") {
+		t.Fatalf("expected provider models endpoint override in panel detail, got %q", view)
 	}
 }
 
@@ -836,10 +935,10 @@ func TestAuthAltDigitStillSwitchesField(t *testing.T) {
 	model.AuthModel = []rune("deepseek-reasoner")
 	model.AuthCursor = 0
 
-	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}, Alt: true})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}, Alt: true})
 
 	if model.AuthStep != app.AuthStepModel {
-		t.Fatalf("expected alt+3 to switch to model field, got %q", model.AuthStep)
+		t.Fatalf("expected alt+4 to switch to model field, got %q", model.AuthStep)
 	}
 	if model.AuthCursor != len(model.AuthModel) {
 		t.Fatalf("expected cursor at model field end, got %d", model.AuthCursor)
@@ -879,10 +978,12 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 			"sessions":[{"id":"sess-1","title":"Demo","updatedAt":"2026-04-11T00:00:00Z","projectRoot":"/workspace/demo","tags":["x"]}],
 			"currentModel":"gpt-5.4",
 			"currentProvider":"https://api.example.com/v1",
+			"currentProviderFormat":"openai_responses",
 			"currentProviderKeySource":"env",
 			"availableModels":["gpt-5.4","gpt-5.3"],
 			"availableProviders":["https://api.example.com/v1"],
 			"providerProfiles":{"https://api.example.com/v1":"openai"},
+			"providerFormats":{"https://api.example.com/v1":"openai_responses"},
 			"providerProfileSources":{"https://api.example.com/v1":"manual"},
 			"auth":{"mode":"http","credentialSource":"env","provider":"https://api.example.com/v1","model":"gpt-5.4","persistenceLabel":"env","persistencePath":"","httpReady":true,"onboardingAvailable":false}
 		}
@@ -911,6 +1012,12 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 	}
 	if model.CurrentModel != "gpt-5.4" || model.CurrentProviderKeySource != "env" {
 		t.Fatalf("expected runtime metadata hydrated, got model=%q keySource=%q", model.CurrentModel, model.CurrentProviderKeySource)
+	}
+	if model.CurrentProviderFormat != "openai_responses" {
+		t.Fatalf("expected provider format hydrated, got %q", model.CurrentProviderFormat)
+	}
+	if model.ProviderFormats["https://api.example.com/v1"] != "openai_responses" {
+		t.Fatalf("expected provider format overrides hydrated, got %#v", model.ProviderFormats)
 	}
 }
 
@@ -961,10 +1068,12 @@ func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 		"auth":{"mode":"http","credentialSource":"env","provider":"https://provider/v1","model":"gpt-5.4","persistenceLabel":"env","persistencePath":"","httpReady":true,"onboardingAvailable":false},
 		"currentModel":"gpt-5.4",
 		"currentProvider":"https://provider/v1",
+		"currentProviderFormat":"gemini_generate_content",
 		"currentProviderKeySource":"env",
 		"availableModels":["gpt-5.4"],
 		"availableProviders":["https://provider/v1"],
 		"providerProfiles":{"https://provider/v1":"openai"},
+		"providerFormats":{"https://provider/v1":"gemini_generate_content"},
 		"providerProfileSources":{"https://provider/v1":"manual"}
 	}`); err != nil {
 		t.Fatalf("set_runtime_metadata failed: %v", err)
@@ -975,6 +1084,9 @@ func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 	}
 	if model.AppRoot != "/workspace/project-b" {
 		t.Fatalf("expected app root updated, got %q", model.AppRoot)
+	}
+	if model.CurrentProviderFormat != "gemini_generate_content" {
+		t.Fatalf("expected provider format updated, got %q", model.CurrentProviderFormat)
 	}
 	if model.ActivePanel != app.PanelNone {
 		t.Fatalf("expected auth panel closed after ready auth, got %q", model.ActivePanel)
@@ -1042,6 +1154,7 @@ func TestSetAuthDefaultsHydratesLoginPanelFields(t *testing.T) {
 	err := model.ApplyBridgeEventJSONForTest(`{
 		"type":"set_auth_defaults",
 		"providerBaseUrl":"https://api.example.com/v1",
+		"providerType":"openai-compatible",
 		"model":"gpt-5.4",
 		"apiKey":"sk-live"
 	}`)
@@ -1051,6 +1164,9 @@ func TestSetAuthDefaultsHydratesLoginPanelFields(t *testing.T) {
 
 	if got := string(model.AuthProvider); got != "https://api.example.com/v1" {
 		t.Fatalf("expected auth provider hydrated, got %q", got)
+	}
+	if got := string(model.AuthProviderType); got != "openai-compatible" {
+		t.Fatalf("expected auth provider type hydrated, got %q", got)
 	}
 	if got := string(model.AuthModel); got != "gpt-5.4" {
 		t.Fatalf("expected auth model hydrated, got %q", got)
@@ -1073,6 +1189,7 @@ func TestSetAuthDefaultsFocusesAPIKeyWhenProviderAndModelKnownButKeyMissing(t *t
 	err := model.ApplyBridgeEventJSONForTest(`{
 		"type":"set_auth_defaults",
 		"providerBaseUrl":"https://api.example.com/v1",
+		"providerType":"openai-compatible",
 		"model":"gpt-5.4",
 		"apiKey":""
 	}`)
@@ -1085,5 +1202,28 @@ func TestSetAuthDefaultsFocusesAPIKeyWhenProviderAndModelKnownButKeyMissing(t *t
 	}
 	if model.AuthCursor != 0 {
 		t.Fatalf("expected api key cursor at start, got %d", model.AuthCursor)
+	}
+}
+
+func TestSetAuthDefaultsFocusesProviderTypeWhenProviderKnownButTypeMissing(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_auth_defaults",
+		"providerBaseUrl":"https://api.example.com/v1",
+		"providerType":"",
+		"model":"gpt-5.4",
+		"apiKey":"sk-live"
+	}`)
+	if err != nil {
+		t.Fatalf("ApplyBridgeEventJSONForTest returned error: %v", err)
+	}
+
+	if model.AuthStep != app.AuthStepProviderType {
+		t.Fatalf("expected auth panel to focus provider type, got %q", model.AuthStep)
+	}
+	if model.AuthCursor != 0 {
+		t.Fatalf("expected provider type cursor at start, got %d", model.AuthCursor)
 	}
 }

@@ -1,9 +1,25 @@
 import { z } from "zod";
-import type {
-  ProviderNameOverrideMap,
-  ProviderProfile,
-  ProviderProfileOverrideMap,
-  QueryTransport,
+import {
+  inferProviderType,
+  isProviderType,
+  resolveProviderTypeFamily,
+  resolveProviderTypeFormat,
+  type ProviderEndpointKind,
+  type ProviderEndpointOverrideEntry,
+  type ProviderEndpointOverrideMap,
+  type ProviderEndpointSetResult,
+  type ProviderFormatOverrideMap,
+  type ProviderModelCatalogMode,
+  type ProviderModelCatalogModeMap,
+  type ProviderNameOverrideMap,
+  type ProviderFormatSetResult,
+  type ProviderProfile,
+  type ProviderProfileOverrideMap,
+  type ProviderType,
+  type ProviderTypeOverrideMap,
+  type ProviderTypeSetResult,
+  type QueryTransport,
+  type TransportFormat,
 } from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
@@ -29,6 +45,19 @@ type ProviderAlias = keyof typeof PROVIDER_ALIASES;
 type ProviderFamily = "openai" | "gemini" | "anthropic" | "glm";
 type ManualProviderProfile = Exclude<ProviderProfile, "custom">;
 const PROVIDER_PROFILE_VALUES = ["openai", "gemini", "anthropic"] as const;
+const TRANSPORT_FORMAT_VALUES = [
+  "openai_chat",
+  "openai_responses",
+  "anthropic_messages",
+  "gemini_generate_content",
+] as const;
+const PROVIDER_ENDPOINT_KIND_VALUES = [
+  "responses",
+  "chat_completions",
+  "models",
+  "anthropic_messages",
+  "gemini_generate_content",
+] as const;
 
 type ParsedProvider = {
   providerBaseUrl: string;
@@ -39,6 +68,12 @@ const isManualProviderProfile = (
   value: string
 ): value is ManualProviderProfile =>
   (PROVIDER_PROFILE_VALUES as readonly string[]).includes(value);
+
+const isTransportFormat = (value: string): value is TransportFormat =>
+  (TRANSPORT_FORMAT_VALUES as readonly string[]).includes(value);
+
+const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
+  (PROVIDER_ENDPOINT_KIND_VALUES as readonly string[]).includes(value);
 
 const parseSseEventData = (rawEvent: string): string[] => {
   const lines = rawEvent.split("\n");
@@ -100,6 +135,15 @@ const extractUsageEvent = (payload: unknown) => {
       totalTokens: usage.totalTokens,
     }),
   };
+};
+
+const formatHttpFailure = (
+  label: "Stream error" | "Model fetch failed",
+  response: Response,
+  requestUrl: string
+) => {
+  const resolvedUrl = response.url?.trim() || requestUrl;
+  return `${label}: ${response.status} ${response.statusText} | url ${resolvedUrl}`;
 };
 
 export const FILE_TOOL = {
@@ -432,13 +476,24 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
 
 const trimProviderInput = (value: string) => value.trim();
 
+const repairCommonSchemeTypos = (value: string) => {
+  const trimmed = value.trim();
+  if (/^https\/\//i.test(trimmed)) {
+    return `https://${trimmed.slice("https//".length)}`;
+  }
+  if (/^http\/\//i.test(trimmed)) {
+    return `http://${trimmed.slice("http//".length)}`;
+  }
+  return trimmed;
+};
+
 const resolveProviderAlias = (value: string) => {
   const normalizedKey = trimProviderInput(value).toLowerCase() as ProviderAlias;
   return PROVIDER_ALIASES[normalizedKey];
 };
 
 const parseProviderBaseUrl = (provider: string): ParsedProvider => {
-  const trimmed = trimProviderInput(provider);
+  const trimmed = repairCommonSchemeTypos(trimProviderInput(provider));
   if (!trimmed) {
     throw new Error("Provider cannot be empty.");
   }
@@ -484,7 +539,42 @@ export const normalizeProviderBaseUrl = (url: string) =>
 const resolveProviderFamily = (providerBaseUrl: string): ProviderFamily =>
   parseProviderBaseUrl(providerBaseUrl).family;
 
-const resolveChatCompletionsUrl = (baseUrl: string) => {
+const resolveProviderEndpointOverrideUrl = (
+  baseUrl: string,
+  override: string
+) => {
+  const trimmed = override.trim();
+  if (!trimmed) {
+    throw new Error("Provider endpoint override cannot be empty.");
+  }
+  const repaired = repairCommonSchemeTypos(trimmed);
+  try {
+    const absolute = new URL(repaired);
+    if (absolute.protocol !== "http:" && absolute.protocol !== "https:") {
+      throw new Error("Provider endpoint override must use http or https.");
+    }
+    return absolute.toString();
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "Provider endpoint override must use http or https."
+    ) {
+      throw error;
+    }
+  }
+
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  const baseWithSlash = normalized.endsWith("/") ? normalized : `${normalized}/`;
+  return new URL(repaired, baseWithSlash).toString();
+};
+
+const resolveChatCompletionsUrl = (
+  baseUrl: string,
+  endpointOverride?: string | null
+) => {
+  if (endpointOverride?.trim()) {
+    return resolveProviderEndpointOverrideUrl(baseUrl, endpointOverride);
+  }
   const normalized = normalizeProviderBaseUrl(baseUrl);
   const family = resolveProviderFamily(normalized);
   if (normalized.endsWith("/chat/completions")) {
@@ -503,7 +593,28 @@ const resolveChatCompletionsUrl = (baseUrl: string) => {
   }
   return `${normalized}/v1/chat/completions`;
 };
-const resolveModelsUrl = (baseUrl: string) => {
+
+const resolveResponsesUrls = (baseUrl: string, endpointOverride?: string | null) => {
+  if (endpointOverride?.trim()) {
+    return [resolveProviderEndpointOverrideUrl(baseUrl, endpointOverride)];
+  }
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  if (normalized.endsWith("/responses")) {
+    return [normalized];
+  }
+  if (normalized.endsWith("/openai")) {
+    return [`${normalized}/responses`];
+  }
+  if (normalized.endsWith("/v1")) {
+    return [`${normalized}/responses`];
+  }
+  return [`${normalized}/responses`, `${normalized}/v1/responses`];
+};
+
+const resolveModelsUrl = (baseUrl: string, endpointOverride?: string | null) => {
+  if (endpointOverride?.trim()) {
+    return resolveProviderEndpointOverrideUrl(baseUrl, endpointOverride);
+  }
   const normalized = normalizeProviderBaseUrl(baseUrl);
   const family = resolveProviderFamily(normalized);
   if (normalized.endsWith("/models")) {
@@ -523,7 +634,13 @@ const resolveModelsUrl = (baseUrl: string) => {
   return `${normalized}/v1/models`;
 };
 
-const resolveAnthropicMessagesUrl = (baseUrl: string) => {
+const resolveAnthropicMessagesUrl = (
+  baseUrl: string,
+  endpointOverride?: string | null
+) => {
+  if (endpointOverride?.trim()) {
+    return resolveProviderEndpointOverrideUrl(baseUrl, endpointOverride);
+  }
   const normalized = normalizeProviderBaseUrl(baseUrl);
   if (normalized.endsWith("/messages")) {
     return normalized;
@@ -532,6 +649,38 @@ const resolveAnthropicMessagesUrl = (baseUrl: string) => {
     return `${normalized}/messages`;
   }
   return `${normalized}/v1/messages`;
+};
+
+const resolveGeminiGenerateContentUrl = (
+  baseUrl: string,
+  model: string,
+  endpointOverride?: string | null
+) => {
+  if (endpointOverride?.trim()) {
+    return resolveProviderEndpointOverrideUrl(
+      baseUrl,
+      endpointOverride.replaceAll("{model}", encodeURIComponent(model))
+    );
+  }
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  if (normalized.includes("/openai")) {
+    throw new Error(
+      "gemini_generate_content requires a native Gemini base URL, not the OpenAI-compatible /openai endpoint."
+    );
+  }
+  if (/\/models\/[^/?#]+$/.test(normalized)) {
+    return `${normalized}:streamGenerateContent?alt=sse`;
+  }
+  if (normalized.endsWith("/models")) {
+    return `${normalized}/${model}:streamGenerateContent?alt=sse`;
+  }
+  if (normalized.endsWith("/v1beta")) {
+    return `${normalized}/models/${model}:streamGenerateContent?alt=sse`;
+  }
+  if (normalized.endsWith("/v1")) {
+    return `${normalized}/models/${model}:streamGenerateContent?alt=sse`;
+  }
+  return `${normalized}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 };
 const DONE_EVENT = JSON.stringify({ type: "done" });
 const resolveProviderBaseUrl = (baseUrl: string | undefined) => {
@@ -707,6 +856,7 @@ async function* streamSseOpenAI(
     includeReasoning?: boolean;
     temperature?: number;
     family?: ProviderFamily;
+    endpointOverride?: string | null;
   }
 ): AsyncGenerator<string> {
   const headers: Record<string, string> = {
@@ -718,7 +868,13 @@ async function* streamSseOpenAI(
     headers["x-goog-api-key"] = apiKey;
   }
 
-  const response = await fetch(resolveChatCompletionsUrl(baseUrl), {
+  const requestUrl = resolveChatCompletionsUrl(
+    baseUrl,
+    options?.endpointOverride
+  );
+  const response = await fetch(
+    requestUrl,
+    {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -735,10 +891,11 @@ async function* streamSseOpenAI(
         { role: "user", content: query },
       ],
     }),
-  });
+    }
+  );
 
   if (!response.ok || !response.body) {
-    throw new Error(`Stream error: ${response.status} ${response.statusText}`);
+    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
   }
 
   const reader = response.body.getReader();
@@ -892,6 +1049,820 @@ async function* streamSseOpenAI(
   yield DONE_EVENT;
 }
 
+type GeminiSchema = {
+  type?: string;
+  description?: string;
+  enum?: unknown[];
+  format?: string;
+  minimum?: number;
+  maximum?: number;
+  required?: string[];
+  items?: GeminiSchema;
+  properties?: Record<string, GeminiSchema>;
+};
+
+const sanitizeGeminiSchema = (value: unknown): GeminiSchema | undefined => {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const record = value as {
+    type?: unknown;
+    description?: unknown;
+    enum?: unknown;
+    format?: unknown;
+    minimum?: unknown;
+    maximum?: unknown;
+    required?: unknown;
+    items?: unknown;
+    properties?: unknown;
+  };
+  const schema: GeminiSchema = {};
+
+  if (typeof record.type === "string" && record.type.trim()) {
+    schema.type = record.type;
+  }
+  if (typeof record.description === "string" && record.description.trim()) {
+    schema.description = record.description;
+  }
+  if (Array.isArray(record.enum) && record.enum.length > 0) {
+    schema.enum = [...record.enum];
+  }
+  if (typeof record.format === "string" && record.format.trim()) {
+    schema.format = record.format;
+  }
+  if (typeof record.minimum === "number" && Number.isFinite(record.minimum)) {
+    schema.minimum = record.minimum;
+  }
+  if (typeof record.maximum === "number" && Number.isFinite(record.maximum)) {
+    schema.maximum = record.maximum;
+  }
+  if (Array.isArray(record.required)) {
+    const required = record.required.filter(
+      (item): item is string => typeof item === "string" && item.trim().length > 0
+    );
+    if (required.length > 0) {
+      schema.required = required;
+    }
+  }
+
+  const items = sanitizeGeminiSchema(record.items);
+  if (items) {
+    schema.items = items;
+  }
+
+  if (record.properties && typeof record.properties === "object") {
+    const properties = Object.entries(record.properties).reduce<Record<string, GeminiSchema>>(
+      (accumulator, [key, child]) => {
+        const sanitized = sanitizeGeminiSchema(child);
+        if (sanitized) {
+          accumulator[key] = sanitized;
+        }
+        return accumulator;
+      },
+      {}
+    );
+    if (Object.keys(properties).length > 0) {
+      schema.properties = properties;
+    }
+  }
+
+  if (Object.keys(schema).length === 0) {
+    return undefined;
+  }
+  return schema;
+};
+
+const GEMINI_TOOL = {
+  functionDeclarations: [
+    {
+      name: FILE_TOOL.function.name,
+      description: FILE_TOOL.function.description,
+      parameters: sanitizeGeminiSchema(FILE_TOOL.function.parameters) ?? {
+        type: "object",
+      },
+    },
+  ],
+};
+
+type ResponsesUsageState = {
+  lastEmitted?: string;
+};
+
+const emitResponseToolCallIfReady = (
+  current: { name?: string; args: string; emitted: boolean }
+) => {
+  if (!current.name || current.emitted) {
+    return null;
+  }
+  let parsedArgs: unknown = {};
+  try {
+    parsedArgs = current.args ? JSON.parse(current.args) : {};
+  } catch {
+    return null;
+  }
+  if (
+    parsedArgs &&
+    typeof parsedArgs === "object" &&
+    Object.keys(parsedArgs as Record<string, unknown>).length === 0
+  ) {
+    return null;
+  }
+  current.emitted = true;
+  return JSON.stringify({
+    type: "tool_call",
+    toolName: current.name,
+    input: parsedArgs,
+  });
+};
+
+const extractResponsesUsageEvent = (
+  payload: unknown,
+  state: ResponsesUsageState
+) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    usage?: unknown;
+    response?: { usage?: unknown };
+  };
+  const usageCandidate = record.usage ?? record.response?.usage;
+  if (!usageCandidate || typeof usageCandidate !== "object") {
+    return null;
+  }
+
+  const usageRecord = usageCandidate as {
+    input_tokens?: unknown;
+    output_tokens?: unknown;
+    total_tokens?: unknown;
+    input_tokens_details?: { cached_tokens?: unknown };
+  };
+  const promptTokens =
+    typeof usageRecord.input_tokens === "number"
+      ? Math.max(0, Math.floor(usageRecord.input_tokens))
+      : 0;
+  const completionTokens =
+    typeof usageRecord.output_tokens === "number"
+      ? Math.max(0, Math.floor(usageRecord.output_tokens))
+      : 0;
+  const totalTokens =
+    typeof usageRecord.total_tokens === "number"
+      ? Math.max(0, Math.floor(usageRecord.total_tokens))
+      : promptTokens + completionTokens;
+  const cachedTokens =
+    typeof usageRecord.input_tokens_details?.cached_tokens === "number"
+      ? Math.max(0, Math.floor(usageRecord.input_tokens_details.cached_tokens))
+      : undefined;
+  const signature = `${promptTokens}:${cachedTokens ?? 0}:${completionTokens}:${totalTokens}`;
+  if (state.lastEmitted === signature) {
+    return null;
+  }
+  state.lastEmitted = signature;
+  return JSON.stringify({
+    type: "usage",
+    promptTokens,
+    ...(typeof cachedTokens === "number" ? { cachedTokens } : {}),
+    completionTokens,
+    totalTokens,
+  });
+};
+
+async function* streamSseOpenAIResponses(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  query: string,
+  options?: {
+    temperature?: number;
+    family?: ProviderFamily;
+    endpointOverride?: string | null;
+  }
+): AsyncGenerator<string> {
+  const headers: Record<string, string> = {
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+  if (options?.family === "gemini") {
+    headers["x-goog-api-key"] = apiKey;
+  }
+
+  const body = JSON.stringify({
+    model,
+    temperature: options?.temperature ?? 0.2,
+    stream: true,
+    tool_choice: "auto",
+    tools: [FILE_TOOL],
+    instructions: TOOL_USAGE_SYSTEM_PROMPT,
+    input: query,
+  });
+  const candidateUrls = resolveResponsesUrls(
+    baseUrl,
+    options?.endpointOverride
+  );
+  let attemptedUrl = candidateUrls[0] ?? baseUrl;
+  let response = await fetch(attemptedUrl, {
+    method: "POST",
+    headers,
+    body,
+  });
+
+  if (
+    candidateUrls.length > 1 &&
+    !response.ok &&
+    (response.status === 404 ||
+      response.status === 405 ||
+      response.status === 410 ||
+      response.status === 501)
+  ) {
+    attemptedUrl = candidateUrls[1]!;
+    response = await fetch(attemptedUrl, {
+      method: "POST",
+      headers,
+      body,
+    });
+  }
+
+  if (!response.ok || !response.body) {
+    throw new Error(formatHttpFailure("Stream error", response, attemptedUrl));
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const usageState: ResponsesUsageState = {};
+  const toolState = new Map<
+    string,
+    {
+      name?: string;
+      args: string;
+      emitted: boolean;
+    }
+  >();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+    let splitIndex = buffer.indexOf("\n\n");
+    while (splitIndex !== -1) {
+      const rawEvent = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+
+      const dataLines = parseSseEventData(rawEvent);
+      for (const line of dataLines) {
+        if (line === "[DONE]") {
+          yield DONE_EVENT;
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(line) as {
+            type?: unknown;
+            delta?: unknown;
+            item_id?: unknown;
+            output_index?: unknown;
+            item?: {
+              type?: unknown;
+              name?: unknown;
+              arguments?: unknown;
+              call_id?: unknown;
+            };
+            response?: { output?: Array<unknown>; usage?: unknown };
+          };
+          const usageEvent = extractResponsesUsageEvent(parsed, usageState);
+          if (usageEvent) {
+            yield usageEvent;
+          }
+
+          const eventType =
+            typeof parsed.type === "string" ? parsed.type : "";
+          if (
+            (eventType === "response.output_text.delta" ||
+              eventType === "response.refusal.delta") &&
+            typeof parsed.delta === "string" &&
+            parsed.delta
+          ) {
+            yield JSON.stringify({
+              type: "text_delta",
+              text: parsed.delta,
+            });
+          }
+
+          if (
+            eventType === "response.output_item.added" ||
+            eventType === "response.output_item.done"
+          ) {
+            const item = parsed.item;
+            const itemType = typeof item?.type === "string" ? item.type : "";
+            if (itemType === "function_call") {
+              const key =
+                (typeof parsed.item_id === "string" && parsed.item_id) ||
+                (typeof item?.call_id === "string" && item.call_id) ||
+                String(parsed.output_index ?? 0);
+              const current = toolState.get(key) ?? {
+                args: "",
+                emitted: false,
+              };
+              if (typeof item?.name === "string") {
+                current.name = item.name;
+              }
+              if (typeof item?.arguments === "string") {
+                current.args = item.arguments;
+              }
+              toolState.set(key, current);
+              const toolEvent = emitResponseToolCallIfReady(current);
+              if (toolEvent) {
+                yield toolEvent;
+              }
+            }
+          }
+
+          if (eventType === "response.function_call_arguments.delta") {
+            const key =
+              (typeof parsed.item_id === "string" && parsed.item_id) ||
+              String(parsed.output_index ?? 0);
+            const current = toolState.get(key) ?? {
+              args: "",
+              emitted: false,
+            };
+            if (typeof parsed.delta === "string") {
+              current.args += parsed.delta;
+            }
+            toolState.set(key, current);
+            const toolEvent = emitResponseToolCallIfReady(current);
+            if (toolEvent) {
+              yield toolEvent;
+            }
+          }
+
+          if (eventType === "response.completed") {
+            if (parsed.response?.output) {
+              for (const item of parsed.response.output) {
+                if (!item || typeof item !== "object") {
+                  continue;
+                }
+                const record = item as {
+                  type?: unknown;
+                  name?: unknown;
+                  arguments?: unknown;
+                  call_id?: unknown;
+                };
+                if (record.type !== "function_call") {
+                  continue;
+                }
+                const key =
+                  (typeof record.call_id === "string" && record.call_id) ||
+                  String(toolState.size);
+                const current = toolState.get(key) ?? {
+                  args: "",
+                  emitted: false,
+                };
+                if (typeof record.name === "string") {
+                  current.name = record.name;
+                }
+                if (typeof record.arguments === "string") {
+                  current.args = record.arguments;
+                }
+                toolState.set(key, current);
+                const toolEvent = emitResponseToolCallIfReady(current);
+                if (toolEvent) {
+                  yield toolEvent;
+                }
+              }
+            }
+            yield DONE_EVENT;
+            return;
+          }
+        } catch {
+          // ignore malformed SSE data line
+        }
+      }
+
+      splitIndex = buffer.indexOf("\n\n");
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    const dataLines = parseSseEventData(buffer);
+    for (const line of dataLines) {
+      if (line === "[DONE]") {
+        yield DONE_EVENT;
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(line) as {
+          type?: unknown;
+          delta?: unknown;
+          item_id?: unknown;
+          output_index?: unknown;
+          item?: {
+            type?: unknown;
+            name?: unknown;
+            arguments?: unknown;
+            call_id?: unknown;
+          };
+          response?: { output?: Array<unknown>; usage?: unknown };
+        };
+        const usageEvent = extractResponsesUsageEvent(parsed, usageState);
+        if (usageEvent) {
+          yield usageEvent;
+        }
+
+        const eventType =
+          typeof parsed.type === "string" ? parsed.type : "";
+        if (
+          (eventType === "response.output_text.delta" ||
+            eventType === "response.refusal.delta") &&
+          typeof parsed.delta === "string" &&
+          parsed.delta
+        ) {
+          yield JSON.stringify({
+            type: "text_delta",
+            text: parsed.delta,
+          });
+        }
+
+        if (
+          eventType === "response.output_item.added" ||
+          eventType === "response.output_item.done"
+        ) {
+          const item = parsed.item;
+          const itemType = typeof item?.type === "string" ? item.type : "";
+          if (itemType === "function_call") {
+            const key =
+              (typeof parsed.item_id === "string" && parsed.item_id) ||
+              (typeof item?.call_id === "string" && item.call_id) ||
+              String(parsed.output_index ?? 0);
+            const current = toolState.get(key) ?? {
+              args: "",
+              emitted: false,
+            };
+            if (typeof item?.name === "string") {
+              current.name = item.name;
+            }
+            if (typeof item?.arguments === "string") {
+              current.args = item.arguments;
+            }
+            toolState.set(key, current);
+            const toolEvent = emitResponseToolCallIfReady(current);
+            if (toolEvent) {
+              yield toolEvent;
+            }
+          }
+        }
+
+        if (eventType === "response.function_call_arguments.delta") {
+          const key =
+            (typeof parsed.item_id === "string" && parsed.item_id) ||
+            String(parsed.output_index ?? 0);
+          const current = toolState.get(key) ?? {
+            args: "",
+            emitted: false,
+          };
+          if (typeof parsed.delta === "string") {
+            current.args += parsed.delta;
+          }
+          toolState.set(key, current);
+          const toolEvent = emitResponseToolCallIfReady(current);
+          if (toolEvent) {
+            yield toolEvent;
+          }
+        }
+
+        if (eventType === "response.completed") {
+          if (parsed.response?.output) {
+            for (const item of parsed.response.output) {
+              if (!item || typeof item !== "object") {
+                continue;
+              }
+              const record = item as {
+                type?: unknown;
+                name?: unknown;
+                arguments?: unknown;
+                call_id?: unknown;
+              };
+              if (record.type !== "function_call") {
+                continue;
+              }
+              const key =
+                (typeof record.call_id === "string" && record.call_id) ||
+                String(toolState.size);
+              const current = toolState.get(key) ?? {
+                args: "",
+                emitted: false,
+              };
+              if (typeof record.name === "string") {
+                current.name = record.name;
+              }
+              if (typeof record.arguments === "string") {
+                current.args = record.arguments;
+              }
+              toolState.set(key, current);
+              const toolEvent = emitResponseToolCallIfReady(current);
+              if (toolEvent) {
+                yield toolEvent;
+              }
+            }
+          }
+          yield DONE_EVENT;
+          return;
+        }
+      } catch {
+        // ignore malformed SSE data line
+      }
+    }
+  }
+
+  yield DONE_EVENT;
+}
+
+type GeminiUsageState = {
+  lastEmitted?: string;
+};
+
+const extractGeminiUsageEvent = (
+  payload: unknown,
+  state: GeminiUsageState
+) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const usageRecord = (payload as { usageMetadata?: unknown }).usageMetadata;
+  if (!usageRecord || typeof usageRecord !== "object") {
+    return null;
+  }
+
+  const typedUsage = usageRecord as {
+    promptTokenCount?: unknown;
+    cachedContentTokenCount?: unknown;
+    candidatesTokenCount?: unknown;
+    totalTokenCount?: unknown;
+  };
+  const promptTokens =
+    typeof typedUsage.promptTokenCount === "number"
+      ? Math.max(0, Math.floor(typedUsage.promptTokenCount))
+      : 0;
+  const cachedTokens =
+    typeof typedUsage.cachedContentTokenCount === "number"
+      ? Math.max(0, Math.floor(typedUsage.cachedContentTokenCount))
+      : undefined;
+  const completionTokens =
+    typeof typedUsage.candidatesTokenCount === "number"
+      ? Math.max(0, Math.floor(typedUsage.candidatesTokenCount))
+      : 0;
+  const totalTokens =
+    typeof typedUsage.totalTokenCount === "number"
+      ? Math.max(0, Math.floor(typedUsage.totalTokenCount))
+      : promptTokens + completionTokens;
+  const signature = `${promptTokens}:${cachedTokens ?? 0}:${completionTokens}:${totalTokens}`;
+  if (state.lastEmitted === signature) {
+    return null;
+  }
+  state.lastEmitted = signature;
+  return JSON.stringify({
+    type: "usage",
+    promptTokens,
+    ...(typeof cachedTokens === "number" ? { cachedTokens } : {}),
+    completionTokens,
+    totalTokens,
+  });
+};
+
+const collectGeminiCandidateParts = (payload: unknown) => {
+  if (!payload || typeof payload !== "object") {
+    return [] as Array<Record<string, unknown>>;
+  }
+
+  const candidates = (payload as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) {
+    return [] as Array<Record<string, unknown>>;
+  }
+
+  return candidates.flatMap(candidate => {
+    if (!candidate || typeof candidate !== "object") {
+      return [];
+    }
+    const content = (candidate as { content?: unknown }).content;
+    if (!content || typeof content !== "object") {
+      return [];
+    }
+    const parts = (content as { parts?: unknown }).parts;
+    if (!Array.isArray(parts)) {
+      return [];
+    }
+    return parts.filter(
+      (part): part is Record<string, unknown> =>
+        Boolean(part) && typeof part === "object"
+    );
+  });
+};
+
+const extractGeminiTextEvents = (payload: unknown) =>
+  collectGeminiCandidateParts(payload)
+    .map(part => (typeof part.text === "string" ? part.text : ""))
+    .filter(Boolean)
+    .map(text => JSON.stringify({ type: "text_delta", text }));
+
+const extractGeminiToolEvents = (
+  payload: unknown,
+  emitted: Set<string>
+) => {
+  const events: string[] = [];
+  for (const part of collectGeminiCandidateParts(payload)) {
+    const functionCall = part.functionCall;
+    if (!functionCall || typeof functionCall !== "object") {
+      continue;
+    }
+
+    const typedFunctionCall = functionCall as {
+      id?: unknown;
+      name?: unknown;
+      args?: unknown;
+    };
+    const toolName =
+      typeof typedFunctionCall.name === "string" ? typedFunctionCall.name : "";
+    if (!toolName) {
+      continue;
+    }
+
+    let input: unknown = {};
+    if (typeof typedFunctionCall.args === "string") {
+      try {
+        input = JSON.parse(typedFunctionCall.args);
+      } catch {
+        input = { raw: typedFunctionCall.args };
+      }
+    } else if (
+      typedFunctionCall.args &&
+      typeof typedFunctionCall.args === "object"
+    ) {
+      input = typedFunctionCall.args;
+    }
+
+    if (
+      input &&
+      typeof input === "object" &&
+      Object.keys(input as Record<string, unknown>).length === 0
+    ) {
+      continue;
+    }
+
+    const signature = [
+      typeof typedFunctionCall.id === "string" ? typedFunctionCall.id : "",
+      toolName,
+      JSON.stringify(input),
+    ].join(":");
+    if (emitted.has(signature)) {
+      continue;
+    }
+    emitted.add(signature);
+    events.push(
+      JSON.stringify({
+        type: "tool_call",
+        toolName,
+        input,
+      })
+    );
+  }
+  return events;
+};
+
+async function* streamSseGeminiGenerateContent(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  query: string,
+  options?: {
+    temperature?: number;
+    endpointOverride?: string | null;
+  }
+): AsyncGenerator<string> {
+  const requestUrl = resolveGeminiGenerateContentUrl(
+    baseUrl,
+    model,
+    options?.endpointOverride
+  );
+  const response = await fetch(
+    requestUrl,
+    {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: TOOL_USAGE_SYSTEM_PROMPT }],
+        },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: query }],
+          },
+        ],
+        tools: [GEMINI_TOOL],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: "AUTO",
+          },
+        },
+        generationConfig: {
+          temperature: options?.temperature ?? 0.2,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok || !response.body) {
+    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const usageState: GeminiUsageState = {};
+  const emittedToolCalls = new Set<string>();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+    let splitIndex = buffer.indexOf("\n\n");
+    while (splitIndex !== -1) {
+      const rawEvent = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+
+      const dataLines = parseSseEventData(rawEvent);
+      for (const line of dataLines) {
+        if (line === "[DONE]") {
+          yield DONE_EVENT;
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(line) as unknown;
+          const usageEvent = extractGeminiUsageEvent(parsed, usageState);
+          if (usageEvent) {
+            yield usageEvent;
+          }
+          for (const event of extractGeminiTextEvents(parsed)) {
+            yield event;
+          }
+          for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
+            yield event;
+          }
+        } catch {
+          // ignore malformed SSE data line
+        }
+      }
+
+      splitIndex = buffer.indexOf("\n\n");
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    const dataLines = parseSseEventData(buffer);
+    for (const line of dataLines) {
+      if (line === "[DONE]") {
+        yield DONE_EVENT;
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        const usageEvent = extractGeminiUsageEvent(parsed, usageState);
+        if (usageEvent) {
+          yield usageEvent;
+        }
+        for (const event of extractGeminiTextEvents(parsed)) {
+          yield event;
+        }
+        for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
+          yield event;
+        }
+      } catch {
+        // ignore malformed SSE data line
+      }
+    }
+  }
+
+  yield DONE_EVENT;
+}
+
 const ANTHROPIC_TOOL = {
   name: FILE_TOOL.function.name,
   description: FILE_TOOL.function.description,
@@ -902,6 +1873,28 @@ type AnthropicUsageState = {
   inputTokens?: number;
   outputTokens?: number;
   lastEmitted?: string;
+};
+
+const parseAnthropicToolArgs = (rawArgs: string): unknown => {
+  const trimmed = rawArgs.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Anthropic may emit an empty input object at block start before streaming
+    // the real JSON arguments via input_json_delta chunks.
+    if (trimmed.startsWith("{}")) {
+      try {
+        return JSON.parse(trimmed.slice(2).trimStart());
+      } catch {
+        // fall through to raw payload below
+      }
+    }
+    return { raw: rawArgs };
+  }
 };
 
 const extractAnthropicUsageEvent = (
@@ -959,30 +1952,37 @@ async function* streamSseAnthropic(
   apiKey: string,
   model: string,
   query: string,
-  options?: { temperature?: number }
+  options?: { temperature?: number; endpointOverride?: string | null }
 ): AsyncGenerator<string> {
-  const response = await fetch(resolveAnthropicMessagesUrl(baseUrl), {
-    method: "POST",
-    headers: {
-      Accept: "text/event-stream",
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model,
-      stream: true,
-      max_tokens: 4096,
-      temperature: options?.temperature ?? 0.2,
-      system: TOOL_USAGE_SYSTEM_PROMPT,
-      tools: [ANTHROPIC_TOOL],
-      tool_choice: { type: "auto" },
-      messages: [{ role: "user", content: query }],
-    }),
-  });
+  const requestUrl = resolveAnthropicMessagesUrl(
+    baseUrl,
+    options?.endpointOverride
+  );
+  const response = await fetch(
+    requestUrl,
+    {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        stream: true,
+        max_tokens: 4096,
+        temperature: options?.temperature ?? 0.2,
+        system: TOOL_USAGE_SYSTEM_PROMPT,
+        tools: [ANTHROPIC_TOOL],
+        tool_choice: { type: "auto" },
+        messages: [{ role: "user", content: query }],
+      }),
+    }
+  );
 
   if (!response.ok || !response.body) {
-    throw new Error(`Stream error: ${response.status} ${response.statusText}`);
+    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
   }
 
   const reader = response.body.getReader();
@@ -1063,7 +2063,10 @@ async function* streamSseAnthropic(
                 contentBlock?.input &&
                 typeof contentBlock.input === "object"
               ) {
-                current.args = JSON.stringify(contentBlock.input);
+                const serializedInput = JSON.stringify(contentBlock.input);
+                if (serializedInput !== "{}") {
+                  current.args = serializedInput;
+                }
               }
               toolState.set(index, current);
             }
@@ -1100,12 +2103,7 @@ async function* streamSseAnthropic(
           if (eventType === "content_block_stop") {
             const current = toolState.get(index);
             if (current?.name && !current.emitted) {
-              let parsedArgs: unknown = {};
-              try {
-                parsedArgs = current.args ? JSON.parse(current.args) : {};
-              } catch {
-                parsedArgs = { raw: current.args };
-              }
+              const parsedArgs = parseAnthropicToolArgs(current.args);
               if (
                 parsedArgs &&
                 typeof parsedArgs === "object" &&
@@ -1185,10 +2183,42 @@ const parseModelsPayload = (payload: unknown): string[] => {
   return Array.from(new Set(models));
 };
 
+const shouldFallbackToManualModelCatalog = (status: number) =>
+  status === 404 || status === 405 || status === 410 || status === 501;
+
+const buildManualModelCatalog = (options: {
+  providerBaseUrl: string;
+  providerFamily: ProviderFamily;
+  preferredModel?: string;
+  currentModel?: string;
+}): ProviderModelCatalogResult => {
+  const fallbackModel = resolveDefaultModelForFamily(options.providerFamily);
+  const selectedModel =
+    options.preferredModel?.trim() ||
+    options.currentModel?.trim() ||
+    fallbackModel;
+  const models = Array.from(
+    new Set(
+      [
+        options.preferredModel?.trim(),
+        options.currentModel?.trim(),
+        selectedModel,
+      ].filter(Boolean)
+    )
+  ) as string[];
+  return {
+    providerBaseUrl: options.providerBaseUrl,
+    models,
+    selectedModel,
+    catalogMode: "manual",
+  };
+};
+
 export type ProviderModelCatalogResult = {
   providerBaseUrl: string;
   models: string[];
   selectedModel: string;
+  catalogMode: ProviderModelCatalogMode;
 };
 
 export const fetchProviderModelCatalog = async (options: {
@@ -1197,13 +2227,15 @@ export const fetchProviderModelCatalog = async (options: {
   preferredModel?: string;
   currentModel?: string;
   familyOverride?: ProviderFamily;
+  endpointOverride?: string | null;
 }): Promise<ProviderModelCatalogResult> => {
   const parsedProvider = parseProviderBaseUrl(options.baseUrl);
   const providerBaseUrl = parsedProvider.providerBaseUrl;
   const providerFamily = options.familyOverride ?? parsedProvider.family;
+  const requestUrl = resolveModelsUrl(providerBaseUrl, options.endpointOverride);
   const response =
     providerFamily === "anthropic"
-      ? await fetch(resolveModelsUrl(providerBaseUrl), {
+      ? await fetch(requestUrl, {
           method: "GET",
           headers: {
             Accept: "application/json",
@@ -1211,7 +2243,7 @@ export const fetchProviderModelCatalog = async (options: {
             "anthropic-version": "2023-06-01",
           },
         })
-      : await fetch(resolveModelsUrl(providerBaseUrl), {
+      : await fetch(requestUrl, {
           method: "GET",
           headers: {
             Accept: "application/json",
@@ -1222,7 +2254,15 @@ export const fetchProviderModelCatalog = async (options: {
           },
         });
   if (!response.ok) {
-    throw new Error(`Model fetch failed: ${response.status} ${response.statusText}`);
+    if (shouldFallbackToManualModelCatalog(response.status)) {
+      return buildManualModelCatalog({
+        providerBaseUrl,
+        providerFamily,
+        preferredModel: options.preferredModel,
+        currentModel: options.currentModel,
+      });
+    }
+    throw new Error(formatHttpFailure("Model fetch failed", response, requestUrl));
   }
   const payload = (await response.json()) as unknown;
   const models = parseModelsPayload(payload);
@@ -1245,6 +2285,7 @@ export const fetchProviderModelCatalog = async (options: {
     providerBaseUrl,
     models,
     selectedModel,
+    catalogMode: "api",
   };
 };
 
@@ -1263,6 +2304,53 @@ const resolveDefaultModelForFamily = (family: ProviderFamily) =>
     : family === "glm"
       ? "glm-4-flash"
       : "gpt-4o-mini";
+
+const resolveDefaultFormatForProvider = (
+  provider: string | undefined,
+  familyOverride?: ProviderFamily
+): TransportFormat => {
+  const normalizedProvider = resolveProviderBaseUrl(provider);
+  const family =
+    familyOverride ??
+    (normalizedProvider ? resolveProviderFamily(normalizedProvider) : "openai");
+  if (family === "anthropic") {
+    return "anthropic_messages";
+  }
+  if (
+    family === "gemini" &&
+    normalizedProvider &&
+    !normalizedProvider.includes("/openai")
+  ) {
+    try {
+      if (
+        new URL(normalizedProvider).hostname.toLowerCase() ===
+        "generativelanguage.googleapis.com"
+      ) {
+        return "gemini_generate_content";
+      }
+    } catch {
+      // Fall through to the default OpenAI-compatible format.
+    }
+  }
+  if (normalizedProvider && normalizedProvider.endsWith("/responses")) {
+    return "openai_responses";
+  }
+  return "openai_chat";
+};
+
+const resolveDefaultTypeForProvider = (
+  provider: string | undefined,
+  familyOverride?: ProviderFamily
+): ProviderType | null => {
+  const normalizedProvider = resolveProviderBaseUrl(provider);
+  const family =
+    familyOverride ??
+    (normalizedProvider ? resolveProviderFamily(normalizedProvider) : "openai");
+  return inferProviderType({
+    family,
+    format: resolveDefaultFormatForProvider(normalizedProvider, family),
+  });
+};
 
 const resolveApiKeySourceForFamily = (
   family: ProviderFamily,
@@ -1374,6 +2462,10 @@ export const createHttpQueryTransport = (
   let availableModels: string[] = [];
   let providerCatalog = currentProvider ? [currentProvider] : ([] as string[]);
   let providerProfileOverrides: ProviderProfileOverrideMap = {};
+  let providerTypeOverrides: ProviderTypeOverrideMap = {};
+  let providerModelModes: ProviderModelCatalogModeMap = {};
+  let providerFormatOverrides: ProviderFormatOverrideMap = {};
+  let providerEndpointOverrides: ProviderEndpointOverrideMap = {};
   let providerNameOverrides: ProviderNameOverrideMap = {};
   let initializationError: string | null = null;
   const sessionQueries = new Map<
@@ -1384,14 +2476,52 @@ export const createHttpQueryTransport = (
       model: string;
       apiKey: string;
       family: ProviderFamily;
+      format: TransportFormat;
+      endpointOverrides: ProviderEndpointOverrideEntry;
     }
   >();
   const dedupeProviders = (providers: Array<string | undefined>) =>
     Array.from(new Set(providers.map(provider => resolveProviderBaseUrl(provider)).filter(Boolean))) as string[];
+  const getProviderTypeOverride = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return providerTypeOverrides[normalizedProvider] ?? null;
+  };
+  const setProviderTypeOverride = (
+    provider: string | undefined,
+    type: ProviderType | null
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    if (!type) {
+      if (normalizedProvider in providerTypeOverrides) {
+        const next = { ...providerTypeOverrides };
+        delete next[normalizedProvider];
+        providerTypeOverrides = next;
+      }
+      return normalizedProvider;
+    }
+    if (providerTypeOverrides[normalizedProvider] === type) {
+      return normalizedProvider;
+    }
+    providerTypeOverrides = {
+      ...providerTypeOverrides,
+      [normalizedProvider]: type,
+    };
+    return normalizedProvider;
+  };
   const resolveFamilyForProvider = (provider: string | undefined): ProviderFamily => {
     const normalizedProvider = resolveProviderBaseUrl(provider);
     if (!normalizedProvider) {
       return "openai";
+    }
+    const overrideType = getProviderTypeOverride(normalizedProvider);
+    if (overrideType) {
+      return resolveProviderTypeFamily(overrideType);
     }
     const overrideFamily = providerProfileOverrides[normalizedProvider];
     if (overrideFamily) {
@@ -1431,12 +2561,162 @@ export const createHttpQueryTransport = (
     };
     return normalizedProvider;
   };
+  const getProviderModelMode = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return "api" as const;
+    }
+    return providerModelModes[normalizedProvider] ?? "api";
+  };
+  const hasResolvedProviderModelMode = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return false;
+    }
+    return normalizedProvider in providerModelModes;
+  };
+  const setProviderModelMode = (
+    provider: string | undefined,
+    mode: ProviderModelCatalogMode
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    if (providerModelModes[normalizedProvider] === mode) {
+      return normalizedProvider;
+    }
+    providerModelModes = {
+      ...providerModelModes,
+      [normalizedProvider]: mode,
+    };
+    return normalizedProvider;
+  };
+  const getProviderFormatOverride = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return providerFormatOverrides[normalizedProvider] ?? null;
+  };
+  const resolveLegacyFormatForProvider = (
+    provider: string | undefined,
+    familyOverride?: ProviderFamily
+  ): TransportFormat | null => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return (
+      getProviderFormatOverride(normalizedProvider) ??
+      resolveDefaultFormatForProvider(
+        normalizedProvider,
+        familyOverride ?? resolveFamilyForProvider(normalizedProvider)
+      )
+    );
+  };
+  const setProviderFormatOverride = (
+    provider: string | undefined,
+    format: TransportFormat | null
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    if (!format) {
+      if (normalizedProvider in providerFormatOverrides) {
+        const next = { ...providerFormatOverrides };
+        delete next[normalizedProvider];
+        providerFormatOverrides = next;
+      }
+      return normalizedProvider;
+    }
+    if (providerFormatOverrides[normalizedProvider] === format) {
+      return normalizedProvider;
+    }
+    providerFormatOverrides = {
+      ...providerFormatOverrides,
+      [normalizedProvider]: format,
+    };
+    return normalizedProvider;
+  };
   const getProviderNameOverride = (provider: string | undefined) => {
     const normalizedProvider = resolveProviderBaseUrl(provider);
     if (!normalizedProvider) {
       return null;
     }
     return providerNameOverrides[normalizedProvider] ?? null;
+  };
+  const cloneProviderEndpointOverrideEntry = (
+    entry: ProviderEndpointOverrideEntry | undefined
+  ): ProviderEndpointOverrideEntry => ({ ...(entry ?? {}) });
+  const cloneProviderEndpointOverrideMap = (
+    endpoints: ProviderEndpointOverrideMap
+  ): ProviderEndpointOverrideMap =>
+    Object.fromEntries(
+      Object.entries(endpoints).map(([provider, entry]) => [
+        provider,
+        cloneProviderEndpointOverrideEntry(entry),
+      ])
+    );
+  const getProviderEndpointOverrides = (provider: string | undefined) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return {};
+    }
+    return cloneProviderEndpointOverrideEntry(
+      providerEndpointOverrides[normalizedProvider]
+    );
+  };
+  const getProviderEndpointOverride = (
+    provider: string | undefined,
+    kind: ProviderEndpointKind
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return providerEndpointOverrides[normalizedProvider]?.[kind] ?? null;
+  };
+  const setProviderEndpointOverride = (
+    provider: string | undefined,
+    kind: ProviderEndpointKind,
+    endpoint: string | null
+  ) => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    const trimmedEndpoint = endpoint?.trim();
+    const currentEntry = providerEndpointOverrides[normalizedProvider] ?? {};
+    if (!trimmedEndpoint) {
+      if (kind in currentEntry) {
+        const nextEntry = { ...currentEntry };
+        delete nextEntry[kind];
+        if (Object.keys(nextEntry).length === 0) {
+          const next = { ...providerEndpointOverrides };
+          delete next[normalizedProvider];
+          providerEndpointOverrides = next;
+        } else {
+          providerEndpointOverrides = {
+            ...providerEndpointOverrides,
+            [normalizedProvider]: nextEntry,
+          };
+        }
+      }
+      return normalizedProvider;
+    }
+    if (currentEntry[kind] === trimmedEndpoint) {
+      return normalizedProvider;
+    }
+    providerEndpointOverrides = {
+      ...providerEndpointOverrides,
+      [normalizedProvider]: {
+        ...currentEntry,
+        [kind]: trimmedEndpoint,
+      },
+    };
+    return normalizedProvider;
   };
   const setProviderNameOverride = (
     provider: string | undefined,
@@ -1480,6 +2760,48 @@ export const createHttpQueryTransport = (
     }
     return Object.fromEntries(normalizedEntries) as ProviderProfileOverrideMap;
   };
+  const normalizeLoadedProviderTypes = (
+    types: Record<string, string | undefined> | undefined
+  ): ProviderTypeOverrideMap => {
+    const normalizedEntries: Array<[string, ProviderType]> = [];
+    for (const [provider, type] of Object.entries(types ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider || !type || !isProviderType(type)) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, type]);
+    }
+    return Object.fromEntries(normalizedEntries) as ProviderTypeOverrideMap;
+  };
+  const normalizeLoadedProviderFormats = (
+    formats: Record<string, string | undefined> | undefined
+  ): ProviderFormatOverrideMap => {
+    const normalizedEntries: Array<[string, TransportFormat]> = [];
+    for (const [provider, format] of Object.entries(formats ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider || !format || !isTransportFormat(format)) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, format]);
+    }
+    return Object.fromEntries(normalizedEntries) as ProviderFormatOverrideMap;
+  };
+  const normalizeLoadedProviderModelModes = (
+    modes: Record<string, string | undefined> | undefined
+  ): ProviderModelCatalogModeMap => {
+    const normalizedEntries: Array<[string, ProviderModelCatalogMode]> = [];
+    for (const [provider, mode] of Object.entries(modes ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (
+        !normalizedProvider ||
+        (mode !== "api" && mode !== "manual")
+      ) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, mode]);
+    }
+    return Object.fromEntries(normalizedEntries) as ProviderModelCatalogModeMap;
+  };
   const normalizeLoadedProviderNames = (
     names: Record<string, string | undefined> | undefined
   ): ProviderNameOverrideMap => {
@@ -1494,12 +2816,78 @@ export const createHttpQueryTransport = (
     }
     return Object.fromEntries(normalizedEntries);
   };
+  const normalizeLoadedProviderEndpoints = (
+    endpoints: ProviderEndpointOverrideMap | undefined
+  ): ProviderEndpointOverrideMap => {
+    const normalizedEntries: Array<[string, ProviderEndpointOverrideEntry]> = [];
+    for (const [provider, entry] of Object.entries(endpoints ?? {})) {
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        continue;
+      }
+      const normalizedEntry = Object.fromEntries(
+        Object.entries(entry ?? {})
+          .map(([kind, endpoint]) => {
+            const trimmedEndpoint = endpoint?.trim();
+            return isProviderEndpointKind(kind) && trimmedEndpoint
+              ? ([kind, trimmedEndpoint] as const)
+              : null;
+          })
+          .filter(
+            (endpointEntry): endpointEntry is [ProviderEndpointKind, string] =>
+              Boolean(endpointEntry)
+          )
+      ) as ProviderEndpointOverrideEntry;
+      if (Object.keys(normalizedEntry).length === 0) {
+        continue;
+      }
+      normalizedEntries.push([normalizedProvider, normalizedEntry]);
+    }
+    return Object.fromEntries(normalizedEntries);
+  };
   const resolvePersistedModels = () =>
     availableModels.length > 0
       ? [...availableModels]
       : currentModel.trim()
         ? [currentModel]
         : ["gpt-4o-mini"];
+  const resolveTypeForProvider = (
+    provider: string | undefined,
+    familyOverride?: ProviderFamily,
+    formatOverride?: TransportFormat
+  ): ProviderType | null => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    return (
+      getProviderTypeOverride(normalizedProvider) ??
+      inferProviderType({
+        family: familyOverride ?? resolveFamilyForProvider(normalizedProvider),
+        format:
+          formatOverride ??
+          resolveLegacyFormatForProvider(
+            normalizedProvider,
+            familyOverride ?? resolveFamilyForProvider(normalizedProvider)
+          ) ??
+          resolveDefaultFormatForProvider(normalizedProvider),
+      })
+    );
+  };
+  const resolveFormatForProvider = (
+    provider: string | undefined,
+    familyOverride?: ProviderFamily
+  ): TransportFormat | null => {
+    const normalizedProvider = resolveProviderBaseUrl(provider);
+    if (!normalizedProvider) {
+      return null;
+    }
+    const overrideType = getProviderTypeOverride(normalizedProvider);
+    if (overrideType) {
+      return resolveProviderTypeFormat(overrideType, normalizedProvider);
+    }
+    return resolveLegacyFormatForProvider(normalizedProvider, familyOverride);
+  };
   const persistCatalog = async (
     models: string[],
     selectedModel: string,
@@ -1511,6 +2899,10 @@ export const createHttpQueryTransport = (
       providerBaseUrl: provider,
       providers: providerCatalog,
       providerProfiles: providerProfileOverrides,
+      providerTypes: providerTypeOverrides,
+      providerModelModes,
+      providerFormats: providerFormatOverrides,
+      providerEndpoints: providerEndpointOverrides,
       providerNames: providerNameOverrides,
     }, appRoot, {
       cwd: options?.cwd,
@@ -1537,12 +2929,20 @@ export const createHttpQueryTransport = (
       preferredModel,
       currentModel,
       familyOverride: resolveFamilyForProvider(targetProvider),
+      endpointOverride: getProviderEndpointOverride(targetProvider, "models"),
     });
-    await persistCatalog(
-      catalog.models,
-      catalog.selectedModel,
-      catalog.providerBaseUrl
-    );
+    const previousProviderModelModes = providerModelModes;
+    setProviderModelMode(catalog.providerBaseUrl, catalog.catalogMode);
+    try {
+      await persistCatalog(
+        catalog.models,
+        catalog.selectedModel,
+        catalog.providerBaseUrl
+      );
+    } catch (error) {
+      providerModelModes = previousProviderModelModes;
+      throw error;
+    }
     availableModels = catalog.models;
     currentModel = catalog.selectedModel;
     currentProvider = catalog.providerBaseUrl;
@@ -1560,11 +2960,25 @@ export const createHttpQueryTransport = (
       providerProfileOverrides = normalizeLoadedProviderProfiles(
         local.providerProfiles
       );
+      providerTypeOverrides = normalizeLoadedProviderTypes(local.providerTypes);
+      providerModelModes = normalizeLoadedProviderModelModes(
+        local.providerModelModes
+      );
+      providerFormatOverrides = normalizeLoadedProviderFormats(
+        local.providerFormats
+      );
+      providerEndpointOverrides = normalizeLoadedProviderEndpoints(
+        local.providerEndpoints
+      );
       providerNameOverrides = normalizeLoadedProviderNames(local.providerNames);
       const localProvider = resolveProviderBaseUrl(local.providerBaseUrl);
       providerCatalog = dedupeProviders([
         ...local.providers,
         ...Object.keys(providerProfileOverrides),
+        ...Object.keys(providerTypeOverrides),
+        ...Object.keys(providerModelModes),
+        ...Object.keys(providerFormatOverrides),
+        ...Object.keys(providerEndpointOverrides),
         ...Object.keys(providerNameOverrides),
         localProvider,
         currentProvider,
@@ -1632,10 +3046,13 @@ export const createHttpQueryTransport = (
         resolveFamilyForProvider
       );
       const vendor = family === "glm" ? "custom" : family;
+      const format = resolveFormatForProvider(normalizedProvider, family) ?? undefined;
       return {
         provider: normalizedProvider,
         vendor,
         keySource,
+        type: family === "glm" ? undefined : resolveTypeForProvider(normalizedProvider, family, format),
+        format,
       };
     },
     setProviderProfile: async (provider: string, profile: ProviderProfile) => {
@@ -1659,11 +3076,13 @@ export const createHttpQueryTransport = (
       }
 
       const previousOverrides = providerProfileOverrides;
+      const previousTypeOverrides = providerTypeOverrides;
       const previousProvider = currentProvider;
       const previousModel = currentModel;
       const previousModels = [...availableModels];
       const previousProviderCatalog = [...providerCatalog];
 
+      setProviderTypeOverride(normalizedProvider, null);
       setProviderProfileOverride(
         normalizedProvider,
         isCustomProfile ? null : normalizedProfile
@@ -1678,6 +3097,7 @@ export const createHttpQueryTransport = (
         }
       } catch (error) {
         providerProfileOverrides = previousOverrides;
+        providerTypeOverrides = previousTypeOverrides;
         currentProvider = previousProvider;
         currentModel = previousModel;
         availableModels = previousModels;
@@ -1711,6 +3131,276 @@ export const createHttpQueryTransport = (
       return getProviderProfileOverride(normalizedProvider) ?? "custom";
     },
     listProviderProfiles: () => ({ ...providerProfileOverrides }),
+    setProviderType: async (
+      provider: string,
+      type: ProviderType | null
+    ): Promise<ProviderTypeSetResult> => {
+      await modelInit;
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+
+      const normalizedType =
+        typeof type === "string" && type.trim()
+          ? (type.trim().toLowerCase() as ProviderType)
+          : null;
+      if (normalizedType && !isProviderType(normalizedType)) {
+        return {
+          ok: false,
+          message:
+            "Provider type must be one of: openai-compatible, openai-responses, gemini, anthropic.",
+        };
+      }
+
+      const previousTypeOverrides = providerTypeOverrides;
+      const previousProfileOverrides = providerProfileOverrides;
+      const previousFormatOverrides = providerFormatOverrides;
+      const previousProvider = currentProvider;
+      const previousModel = currentModel;
+      const previousModels = [...availableModels];
+      const previousProviderCatalog = [...providerCatalog];
+
+      if (normalizedType) {
+        setProviderProfileOverride(normalizedProvider, null);
+        setProviderFormatOverride(normalizedProvider, null);
+      }
+      setProviderTypeOverride(normalizedProvider, normalizedType);
+      providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
+
+      try {
+        if (currentProvider === normalizedProvider) {
+          await refreshFromApi(undefined, normalizedProvider);
+        } else {
+          await persistCatalog(resolvePersistedModels(), currentModel, currentProvider);
+        }
+      } catch (error) {
+        providerTypeOverrides = previousTypeOverrides;
+        providerProfileOverrides = previousProfileOverrides;
+        providerFormatOverrides = previousFormatOverrides;
+        currentProvider = previousProvider;
+        currentModel = previousModel;
+        availableModels = previousModels;
+        providerCatalog = previousProviderCatalog;
+        return {
+          ok: false,
+          message:
+            error instanceof Error
+              ? `Failed to apply provider type: ${error.message}`
+              : `Failed to apply provider type: ${String(error)}`,
+        };
+      }
+
+      const appliedOverride = getProviderTypeOverride(normalizedProvider);
+      return {
+        ok: true,
+        message: appliedOverride
+          ? `Provider type override set: ${normalizedProvider} => ${appliedOverride}`
+          : `Provider type override cleared: ${normalizedProvider}`,
+        provider: normalizedProvider,
+        type:
+          appliedOverride ??
+          resolveDefaultTypeForProvider(
+            normalizedProvider,
+            resolveFamilyForProvider(normalizedProvider)
+          ) ??
+          undefined,
+      };
+    },
+    getProviderType: (provider?: string) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider) {
+        return null;
+      }
+      return resolveTypeForProvider(normalizedProvider);
+    },
+    listProviderTypes: () => ({ ...providerTypeOverrides }),
+    setProviderFormat: async (
+      provider: string,
+      format: TransportFormat | null
+    ): Promise<ProviderFormatSetResult> => {
+      await modelInit;
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+
+      const normalizedFormat =
+        typeof format === "string" && format.trim()
+          ? (format.trim().toLowerCase() as TransportFormat)
+          : null;
+      if (normalizedFormat && !isTransportFormat(normalizedFormat)) {
+        return {
+          ok: false,
+          message:
+            "Format must be one of: openai_chat, openai_responses, anthropic_messages, gemini_generate_content.",
+        };
+      }
+
+      const previousOverrides = providerFormatOverrides;
+      const previousTypeOverrides = providerTypeOverrides;
+      const previousProviderCatalog = [...providerCatalog];
+
+      setProviderTypeOverride(normalizedProvider, null);
+      setProviderFormatOverride(normalizedProvider, normalizedFormat);
+      providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
+
+      try {
+        await persistCatalog(resolvePersistedModels(), currentModel, currentProvider);
+      } catch (error) {
+        providerFormatOverrides = previousOverrides;
+        providerTypeOverrides = previousTypeOverrides;
+        providerCatalog = previousProviderCatalog;
+        return {
+          ok: false,
+          message:
+            error instanceof Error
+              ? `Failed to apply provider format: ${error.message}`
+              : `Failed to apply provider format: ${String(error)}`,
+        };
+      }
+
+      const appliedOverride = getProviderFormatOverride(normalizedProvider);
+      return {
+        ok: true,
+        message: appliedOverride
+          ? `Provider format override set: ${normalizedProvider} => ${appliedOverride}`
+          : `Provider format override cleared: ${normalizedProvider}`,
+        provider: normalizedProvider,
+        format:
+          appliedOverride ??
+          resolveDefaultFormatForProvider(
+            normalizedProvider,
+            resolveFamilyForProvider(normalizedProvider)
+          ),
+      };
+    },
+    getProviderFormat: (provider?: string) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider) {
+        return null;
+      }
+      return resolveFormatForProvider(normalizedProvider);
+    },
+    listProviderFormats: () => ({ ...providerFormatOverrides }),
+    setProviderEndpoint: async (
+      provider: string,
+      kind: ProviderEndpointKind,
+      endpoint: string | null
+    ): Promise<ProviderEndpointSetResult> => {
+      await modelInit;
+      const normalizedProvider = resolveProviderBaseUrl(provider);
+      if (!normalizedProvider) {
+        return {
+          ok: false,
+          message: "Provider cannot be empty.",
+        };
+      }
+      if (!isProviderEndpointKind(kind)) {
+        return {
+          ok: false,
+          message:
+            "Endpoint kind must be one of: responses, chat_completions, models, anthropic_messages, gemini_generate_content.",
+        };
+      }
+
+      const trimmedEndpoint = endpoint?.trim() ?? "";
+      if (trimmedEndpoint.includes(" ")) {
+        return {
+          ok: false,
+          message:
+            "Endpoint override must be a single path or absolute URL without spaces.",
+        };
+      }
+      if (trimmedEndpoint) {
+        try {
+          switch (kind) {
+            case "responses":
+              resolveResponsesUrls(normalizedProvider, trimmedEndpoint);
+              break;
+            case "chat_completions":
+              resolveChatCompletionsUrl(normalizedProvider, trimmedEndpoint);
+              break;
+            case "models":
+              resolveModelsUrl(normalizedProvider, trimmedEndpoint);
+              break;
+            case "anthropic_messages":
+              resolveAnthropicMessagesUrl(normalizedProvider, trimmedEndpoint);
+              break;
+            case "gemini_generate_content":
+              resolveGeminiGenerateContentUrl(
+                normalizedProvider,
+                currentModel || resolveDefaultModelForFamily(resolveFamilyForProvider(normalizedProvider)),
+                trimmedEndpoint
+              );
+              break;
+          }
+        } catch (error) {
+          return {
+            ok: false,
+            message:
+              error instanceof Error
+                ? error.message
+                : `Invalid endpoint override: ${String(error)}`,
+          };
+        }
+      }
+
+      const previousOverrides = providerEndpointOverrides;
+      const previousProviderCatalog = [...providerCatalog];
+
+      setProviderEndpointOverride(normalizedProvider, kind, trimmedEndpoint || null);
+      providerCatalog = dedupeProviders([normalizedProvider, ...providerCatalog]);
+
+      try {
+        await persistCatalog(resolvePersistedModels(), currentModel, currentProvider);
+      } catch (error) {
+        providerEndpointOverrides = previousOverrides;
+        providerCatalog = previousProviderCatalog;
+        return {
+          ok: false,
+          message:
+            error instanceof Error
+              ? `Failed to apply provider endpoint: ${error.message}`
+              : `Failed to apply provider endpoint: ${String(error)}`,
+        };
+      }
+
+      const appliedOverride = getProviderEndpointOverride(normalizedProvider, kind);
+      return {
+        ok: true,
+        message: appliedOverride
+          ? `Provider ${kind} endpoint override set: ${normalizedProvider} => ${appliedOverride}`
+          : `Provider ${kind} endpoint override cleared: ${normalizedProvider}`,
+        provider: normalizedProvider,
+        kind,
+        endpoint: appliedOverride ?? undefined,
+      };
+    },
+    getProviderEndpoint: (
+      provider: string | undefined,
+      kind: ProviderEndpointKind
+    ) => {
+      const normalizedProvider = resolveProviderBaseUrl(
+        provider ?? currentProvider ?? baseUrl
+      );
+      if (!normalizedProvider || !isProviderEndpointKind(kind)) {
+        return null;
+      }
+      return getProviderEndpointOverride(normalizedProvider, kind);
+    },
+    listProviderEndpoints: () =>
+      cloneProviderEndpointOverrideMap(providerEndpointOverrides),
     setProviderName: async (provider: string, name: string | null) => {
       await modelInit;
       const normalizedProvider = resolveProviderBaseUrl(provider);
@@ -1778,18 +3468,37 @@ export const createHttpQueryTransport = (
             "No available models. Run /model refresh to load catalog.",
         };
       }
-      if (!availableModels.includes(next)) {
+      let manualModelMode = getProviderModelMode(currentProvider) === "manual";
+      if (
+        !manualModelMode &&
+        !availableModels.includes(next) &&
+        hasResolvedProviderModelMode(currentProvider) === false &&
+        currentProvider
+      ) {
+        try {
+          await refreshFromApi(next, currentProvider);
+          manualModelMode = getProviderModelMode(currentProvider) === "manual";
+        } catch {
+          manualModelMode = false;
+        }
+      }
+      if (!availableModels.includes(next) && !manualModelMode) {
         return {
           ok: false,
           message: `Model "${next}" is not in model catalog.`,
         };
       }
       const previousModel = currentModel;
+      const previousModels = [...availableModels];
+      if (!availableModels.includes(next)) {
+        availableModels = [...availableModels, next];
+      }
       currentModel = next;
       try {
         await persistCatalog(availableModels, next, currentProvider);
       } catch (error) {
         currentModel = previousModel;
+        availableModels = previousModels;
         return {
           ok: false,
           message:
@@ -1810,6 +3519,9 @@ export const createHttpQueryTransport = (
       providerCatalog = dedupeProviders([
         ...providerCatalog,
         ...Object.keys(providerProfileOverrides),
+        ...Object.keys(providerTypeOverrides),
+        ...Object.keys(providerFormatOverrides),
+        ...Object.keys(providerEndpointOverrides),
         ...Object.keys(providerNameOverrides),
         currentProvider,
       ]);
@@ -1905,6 +3617,9 @@ export const createHttpQueryTransport = (
         );
       }
       const providerFamily = resolveFamilyForProvider(targetProvider);
+      const providerFormat =
+        resolveFormatForProvider(targetProvider, providerFamily) ??
+        resolveDefaultFormatForProvider(targetProvider, providerFamily);
       const modelForRequest =
         currentModel || resolveDefaultModelForFamily(providerFamily);
       const sessionId = crypto.randomUUID();
@@ -1914,6 +3629,8 @@ export const createHttpQueryTransport = (
         model: modelForRequest,
         apiKey: targetApiKey,
         family: providerFamily,
+        format: providerFormat,
+        endpointOverrides: getProviderEndpointOverrides(targetProvider),
       });
       return `openai://${sessionId}`;
     },
@@ -1926,7 +3643,7 @@ export const createHttpQueryTransport = (
         throw new Error("Invalid HTTP stream session.");
       }
 
-      if (session.family === "anthropic") {
+      if (session.format === "anthropic_messages") {
         for await (const event of streamSseAnthropic(
           session.provider,
           session.apiKey,
@@ -1934,6 +3651,40 @@ export const createHttpQueryTransport = (
           session.query,
           {
             temperature: requestTemperature,
+            endpointOverride: session.endpointOverrides.anthropic_messages,
+          }
+        )) {
+          yield event;
+        }
+        return;
+      }
+
+      if (session.format === "openai_responses") {
+        for await (const event of streamSseOpenAIResponses(
+          session.provider,
+          session.apiKey,
+          session.model,
+          session.query,
+          {
+            temperature: requestTemperature,
+            family: session.family,
+            endpointOverride: session.endpointOverrides.responses,
+          }
+        )) {
+          yield event;
+        }
+        return;
+      }
+
+      if (session.format === "gemini_generate_content") {
+        for await (const event of streamSseGeminiGenerateContent(
+          session.provider,
+          session.apiKey,
+          session.model,
+          session.query,
+          {
+            temperature: requestTemperature,
+            endpointOverride: session.endpointOverrides.gemini_generate_content,
           }
         )) {
           yield event;
@@ -1946,14 +3697,15 @@ export const createHttpQueryTransport = (
         session.apiKey,
         session.model,
         session.query,
-        {
-          includeReasoning: includeReasoningInTranscript,
-          temperature: requestTemperature,
-          family: session.family,
+          {
+            includeReasoning: includeReasoningInTranscript,
+            temperature: requestTemperature,
+            family: session.family,
+            endpointOverride: session.endpointOverrides.chat_completions,
+          }
+        )) {
+          yield event;
         }
-      )) {
-        yield event;
-      }
     },
   };
 };

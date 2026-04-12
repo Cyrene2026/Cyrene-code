@@ -14,10 +14,15 @@ import {
 } from "../../../core/extensions";
 import { buildPromptWithContext } from "../../../core/session/buildPromptWithContext";
 import { runQuerySession, type RunQuerySessionResult } from "../../../core/query/runQuerySession";
-import type {
-  QueryTransport,
-  ProviderProfile,
-  ProviderProfileOverrideMap,
+import {
+  PROVIDER_ENDPOINT_KINDS,
+  type ProviderEndpointKind,
+  type ProviderEndpointOverrideMap,
+  type ProviderProfile,
+  type ProviderProfileOverrideMap,
+  type ProviderType,
+  type QueryTransport,
+  type TransportFormat,
 } from "../../../core/query/transport";
 import { normalizeProviderBaseUrl } from "../../../infra/http/createHttpQueryTransport";
 import {
@@ -64,9 +69,23 @@ type BridgeCommand =
   | { type: "set_provider"; value: string }
   | { type: "refresh_models" }
   | { type: "get_login_defaults" }
+  | { type: "list_provider_types" }
+  | { type: "set_provider_type"; providerType: string; value?: string }
+  | { type: "clear_provider_type"; value?: string }
   | { type: "list_provider_profiles" }
   | { type: "set_provider_profile"; profile: string; value?: string }
   | { type: "clear_provider_profile"; value?: string }
+  | { type: "list_provider_formats" }
+  | { type: "set_provider_format"; format: string; value?: string }
+  | { type: "clear_provider_format"; value?: string }
+  | { type: "list_provider_endpoints" }
+  | {
+      type: "set_provider_endpoint";
+      kind: ProviderEndpointKind;
+      endpoint: string;
+      value?: string;
+    }
+  | { type: "clear_provider_endpoint"; kind: ProviderEndpointKind; value?: string }
   | { type: "list_provider_names" }
   | { type: "set_provider_name"; name: string; value?: string }
   | { type: "clear_provider_name"; value?: string }
@@ -75,6 +94,7 @@ type BridgeCommand =
       providerBaseUrl: string;
       apiKey: string;
       model?: string;
+      providerType?: ProviderType;
     }
   | { type: "logout" }
   | { type: "shutdown" };
@@ -130,6 +150,7 @@ type BridgeProviderProfile =
   | "none";
 
 type BridgeProviderProfileSource = "manual" | "inferred" | "local" | "none";
+type BridgeTransportFormat = TransportFormat;
 
 type BridgeUsageSummary = {
   requests: number;
@@ -164,10 +185,13 @@ type BridgeSnapshot = {
   sessions: BridgeSession[];
   currentModel: string;
   currentProvider: string;
+  currentProviderFormat: BridgeTransportFormat | "";
   currentProviderKeySource: string;
   availableModels: string[];
   availableProviders: string[];
   providerProfiles: Record<string, BridgeProviderProfile>;
+  providerFormats: Record<string, BridgeTransportFormat>;
+  providerEndpoints: ProviderEndpointOverrideMap;
   providerProfileSources: Record<string, BridgeProviderProfileSource>;
   providerNames: Record<string, string>;
   managedSkills: BridgeManagedSkill[];
@@ -189,10 +213,13 @@ type BridgeEvent =
       auth: BridgeAuthStatus;
       currentModel: string;
       currentProvider: string;
+      currentProviderFormat: BridgeTransportFormat | "";
       currentProviderKeySource: string;
       availableModels: string[];
       availableProviders: string[];
       providerProfiles: Record<string, BridgeProviderProfile>;
+      providerFormats: Record<string, BridgeTransportFormat>;
+      providerEndpoints: ProviderEndpointOverrideMap;
       providerProfileSources: Record<string, BridgeProviderProfileSource>;
       providerNames: Record<string, string>;
       managedSkills: BridgeManagedSkill[];
@@ -205,6 +232,7 @@ type BridgeEvent =
       providerBaseUrl: string;
       model: string;
       apiKey: string;
+      providerType?: ProviderType;
     }
   | { type: "error"; message: string };
 
@@ -229,6 +257,9 @@ const EMPTY_USAGE_SUMMARY: BridgeUsageSummary = {
   completionTokens: 0,
   totalTokens: 0,
 };
+
+const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
+  (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
 const isHighRiskReviewAction = (action: string) =>
   action === "apply_patch" ||
@@ -424,9 +455,12 @@ class BubbleTeaBridge {
   private sessions: BridgeSession[] = [];
   private authStatus: AuthStatus | null = null;
   private currentProviderKeySource = "";
+  private currentProviderFormat: BridgeTransportFormat | "" = "";
   private availableModels: string[] = [];
   private availableProviders: string[] = [];
   private providerProfiles: Record<string, BridgeProviderProfile> = {};
+  private providerFormats: Record<string, BridgeTransportFormat> = {};
+  private providerEndpoints: ProviderEndpointOverrideMap = {};
   private providerProfileSources: Record<string, BridgeProviderProfileSource> = {};
   private providerNames: Record<string, string> = {};
   private managedSkills: BridgeManagedSkill[] = [];
@@ -500,6 +534,15 @@ class BubbleTeaBridge {
       case "get_login_defaults":
         await this.emitAuthDefaults();
         return;
+      case "list_provider_types":
+        await this.listProviderTypes();
+        return;
+      case "set_provider_type":
+        await this.setProviderType(command.providerType, command.value);
+        return;
+      case "clear_provider_type":
+        await this.clearProviderType(command.value);
+        return;
       case "list_provider_profiles":
         await this.listProviderProfiles();
         return;
@@ -508,6 +551,24 @@ class BubbleTeaBridge {
         return;
       case "clear_provider_profile":
         await this.clearProviderProfile(command.value);
+        return;
+      case "list_provider_formats":
+        await this.listProviderFormats();
+        return;
+      case "set_provider_format":
+        await this.setProviderFormat(command.format, command.value);
+        return;
+      case "clear_provider_format":
+        await this.clearProviderFormat(command.value);
+        return;
+      case "list_provider_endpoints":
+        await this.listProviderEndpoints();
+        return;
+      case "set_provider_endpoint":
+        await this.setProviderEndpoint(command.kind, command.endpoint, command.value);
+        return;
+      case "clear_provider_endpoint":
+        await this.clearProviderEndpoint(command.kind, command.value);
         return;
       case "list_provider_names":
         await this.listProviderNames();
@@ -519,7 +580,12 @@ class BubbleTeaBridge {
         await this.clearProviderName(command.value);
         return;
       case "login":
-        await this.login(command.providerBaseUrl, command.apiKey, command.model);
+        await this.login(
+          command.providerBaseUrl,
+          command.apiKey,
+          command.model,
+          command.providerType
+        );
         return;
       case "logout":
         await this.logout();
@@ -645,6 +711,8 @@ class BubbleTeaBridge {
     this.availableModels = [];
     this.availableProviders = [];
     this.providerProfiles = {};
+    this.providerFormats = {};
+    this.providerEndpoints = {};
     this.providerProfileSources = {};
     this.providerNames = {};
     this.managedSkills = [];
@@ -665,6 +733,10 @@ class BubbleTeaBridge {
     const currentProvider = this.transport?.getProvider() ?? this.authStatus?.provider ?? "";
     this.currentProviderKeySource =
       this.transport?.describeProvider?.(currentProvider).keySource ?? "";
+    this.currentProviderFormat =
+      this.transport?.getProviderFormat?.(currentProvider) ??
+      this.transport?.describeProvider?.(currentProvider).format ??
+      "";
 
     const providerUniverse = Array.from(
       new Set(
@@ -674,6 +746,8 @@ class BubbleTeaBridge {
       )
     ).sort((left, right) => left.localeCompare(right));
     const manualOverrides = this.transport?.listProviderProfiles?.() ?? {};
+    this.providerFormats = this.transport?.listProviderFormats?.() ?? {};
+    this.providerEndpoints = this.transport?.listProviderEndpoints?.() ?? {};
     this.providerNames = this.transport?.listProviderNames?.() ?? {};
     const nextProfiles: Record<string, BridgeProviderProfile> = {};
     const nextProfileSources: Record<string, BridgeProviderProfileSource> = {};
@@ -720,10 +794,13 @@ class BubbleTeaBridge {
       sessions: this.sessions,
       currentModel: this.transport?.getModel() ?? this.authStatus?.model ?? "",
       currentProvider: this.transport?.getProvider() ?? this.authStatus?.provider ?? "",
+      currentProviderFormat: this.currentProviderFormat,
       currentProviderKeySource: this.currentProviderKeySource,
       availableModels: this.availableModels,
       availableProviders: this.availableProviders,
       providerProfiles: this.providerProfiles,
+      providerFormats: this.providerFormats,
+      providerEndpoints: this.providerEndpoints,
       providerProfileSources: this.providerProfileSources,
       providerNames: this.providerNames,
       managedSkills: this.managedSkills,
@@ -824,10 +901,13 @@ class BubbleTeaBridge {
       auth: toBridgeAuthStatus(this.authStatus),
       currentModel: this.transport?.getModel() ?? this.authStatus?.model ?? "",
       currentProvider: this.transport?.getProvider() ?? this.authStatus?.provider ?? "",
+      currentProviderFormat: this.currentProviderFormat,
       currentProviderKeySource: this.currentProviderKeySource,
       availableModels: this.availableModels,
       availableProviders: this.availableProviders,
       providerProfiles: this.providerProfiles,
+      providerFormats: this.providerFormats,
+      providerEndpoints: this.providerEndpoints,
       providerProfileSources: this.providerProfileSources,
       providerNames: this.providerNames,
       managedSkills: this.managedSkills,
@@ -889,6 +969,7 @@ class BubbleTeaBridge {
       providerBaseUrl: normalizedProvider,
       model: this.transport?.getModel() ?? this.authStatus?.model ?? "",
       apiKey,
+      providerType: this.transport?.getProviderType?.(normalizedProvider) ?? undefined,
     });
   }
 
@@ -1410,7 +1491,7 @@ class BubbleTeaBridge {
           this.pushItem({
             role: "system",
             kind: "error",
-            text: `Stream error: ${message}`,
+            text: message,
           });
           this.emitStatus();
         },
@@ -1856,6 +1937,52 @@ class BubbleTeaBridge {
     await this.pushRuntimeResult(text, true);
   }
 
+  private async listProviderTypes() {
+    await this.ensureRuntime();
+    const list = this.transport?.listProviderTypes?.() ?? {};
+    const lines = Object.entries(list)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([provider, type]) => `- ${provider} => ${type}`);
+
+    const text =
+      lines.length > 0
+        ? ["Manual provider type overrides:", ...lines].join("\n")
+        : "No manual provider type overrides.";
+    await this.pushRuntimeResult(text, true);
+  }
+
+  private async listProviderFormats() {
+    await this.ensureRuntime();
+    const list = this.transport?.listProviderFormats?.() ?? {};
+    const lines = Object.entries(list)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([provider, format]) => `- ${provider} => ${format}`);
+
+    const text =
+      lines.length > 0
+        ? ["Manual provider transport format overrides:", ...lines].join("\n")
+        : "No manual provider transport format overrides.";
+    await this.pushRuntimeResult(text, true);
+  }
+
+  private async listProviderEndpoints() {
+    await this.ensureRuntime();
+    const list = this.transport?.listProviderEndpoints?.() ?? {};
+    const lines = Object.entries(list)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .flatMap(([provider, endpoints]) =>
+        Object.entries(endpoints ?? {})
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([kind, endpoint]) => `- ${provider} [${kind}] => ${endpoint}`)
+      );
+
+    const text =
+      lines.length > 0
+        ? ["Manual provider endpoint overrides:", ...lines].join("\n")
+        : "No manual provider endpoint overrides.";
+    await this.pushRuntimeResult(text, true);
+  }
+
   private async listProviderNames() {
     await this.ensureRuntime();
     const list = this.transport?.listProviderNames?.() ?? {};
@@ -1911,6 +2038,208 @@ class BubbleTeaBridge {
     await this.setProviderProfile("custom", targetProviderRaw);
   }
 
+  private async setProviderType(rawType: string, targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    const providerType = rawType.trim().toLowerCase() as ProviderType;
+    if (
+      providerType !== "openai-compatible" &&
+      providerType !== "openai-responses" &&
+      providerType !== "gemini" &&
+      providerType !== "anthropic"
+    ) {
+      this.emitError(
+        "Provider type must be openai-compatible, openai-responses, gemini, or anthropic."
+      );
+      return;
+    }
+    if (!this.transport?.setProviderType) {
+      this.emitError("Provider type override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderType(targetProvider, providerType);
+    if (result.ok) {
+      await this.authRuntime?.syncSelection({
+        providerBaseUrl: this.transport.getProvider(),
+        model: this.transport.getModel(),
+      });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async clearProviderType(targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    if (!this.transport?.setProviderType) {
+      this.emitError("Provider type override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderType(targetProvider, null);
+    if (result.ok) {
+      await this.authRuntime?.syncSelection({
+        providerBaseUrl: this.transport.getProvider(),
+        model: this.transport.getModel(),
+      });
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async setProviderFormat(rawFormat: string, targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    const format = rawFormat.trim().toLowerCase() as TransportFormat;
+    if (
+      format !== "openai_chat" &&
+      format !== "openai_responses" &&
+      format !== "anthropic_messages" &&
+      format !== "gemini_generate_content"
+    ) {
+      this.emitError(
+        "Format must be openai_chat, openai_responses, anthropic_messages, or gemini_generate_content."
+      );
+      return;
+    }
+    if (!this.transport?.setProviderFormat) {
+      this.emitError("Provider format override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderFormat(targetProvider, format);
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async clearProviderFormat(targetProviderRaw?: string) {
+    await this.ensureRuntime();
+    if (!this.transport?.setProviderFormat) {
+      this.emitError("Provider format override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderFormat(targetProvider, null);
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async setProviderEndpoint(
+    kind: ProviderEndpointKind,
+    rawEndpoint: string,
+    targetProviderRaw?: string
+  ) {
+    await this.ensureRuntime();
+    if (!isProviderEndpointKind(kind)) {
+      this.emitError(
+        "Endpoint kind must be responses, chat_completions, models, anthropic_messages, or gemini_generate_content."
+      );
+      return;
+    }
+    const endpoint = rawEndpoint.trim();
+    if (!endpoint) {
+      this.emitError("Endpoint override cannot be empty.");
+      return;
+    }
+    if (!this.transport?.setProviderEndpoint) {
+      this.emitError("Provider endpoint override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderEndpoint(
+      targetProvider,
+      kind,
+      endpoint
+    );
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
+  private async clearProviderEndpoint(
+    kind: ProviderEndpointKind,
+    targetProviderRaw?: string
+  ) {
+    await this.ensureRuntime();
+    if (!isProviderEndpointKind(kind)) {
+      this.emitError(
+        "Endpoint kind must be responses, chat_completions, models, anthropic_messages, or gemini_generate_content."
+      );
+      return;
+    }
+    if (!this.transport?.setProviderEndpoint) {
+      this.emitError("Provider endpoint override is unavailable in this transport.");
+      return;
+    }
+
+    const targetProvider =
+      targetProviderRaw?.trim() || this.transport.getProvider() || this.authStatus?.provider || "";
+    if (!targetProvider || targetProvider === "none") {
+      this.emitError("No active provider. Use /provider <url> first, or pass [url] explicitly.");
+      return;
+    }
+
+    const result = await this.transport.setProviderEndpoint(
+      targetProvider,
+      kind,
+      null
+    );
+    if (result.ok) {
+      this.markRuntimeMetadataDirty();
+      await this.refreshRuntimeMetadata();
+    }
+    this.status = result.ok ? "idle" : "error";
+    await this.pushRuntimeResult(result.message, result.ok);
+  }
+
   private async setProviderName(rawName: string, targetProviderRaw?: string) {
     await this.ensureRuntime();
     const name = rawName.trim();
@@ -1962,7 +2291,12 @@ class BubbleTeaBridge {
     await this.pushRuntimeResult(result.message, result.ok);
   }
 
-  private async login(providerBaseUrl: string, apiKey: string, model?: string) {
+  private async login(
+    providerBaseUrl: string,
+    apiKey: string,
+    model?: string,
+    providerType?: ProviderType
+  ) {
     await this.ensureRuntime();
     if (!this.authRuntime) {
       this.emitError("Auth runtime unavailable.");
@@ -1973,6 +2307,7 @@ class BubbleTeaBridge {
       providerBaseUrl: providerBaseUrl.trim(),
       apiKey: apiKey.trim(),
       model: model?.trim() || undefined,
+      providerType,
     });
 
     this.transport = result.transport;

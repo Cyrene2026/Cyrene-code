@@ -173,6 +173,7 @@ describe("createAuthRuntime", () => {
         providerBaseUrl: "https://unused.test/v1",
         models: ["gpt-test"],
         selectedModel: "gpt-test",
+        catalogMode: "api" as const,
       })),
     });
 
@@ -193,6 +194,7 @@ describe("createAuthRuntime", () => {
         providerBaseUrl: "https://api.anthropic.com",
         models: ["claude-3-7-sonnet-latest"],
         selectedModel: "claude-3-7-sonnet-latest",
+        catalogMode: "api" as const,
       };
     });
     const runtime = createAuthRuntime({
@@ -209,6 +211,32 @@ describe("createAuthRuntime", () => {
 
     expect(result.ok).toBe(true);
     expect(result.normalizedProviderBaseUrl).toBe("https://api.anthropic.com");
+  });
+
+  test("validateLoginInput accepts manual model mode when provider has no /models endpoint", async () => {
+    const appRoot = await createTempRoot();
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: createMemoryApiKeyStore(),
+      fetchProviderModelCatalogImpl: mock(async () => ({
+        providerBaseUrl: "https://rawchat.cn/codex",
+        models: ["codex-mini"],
+        selectedModel: "codex-mini",
+        catalogMode: "manual" as const,
+      })) as any,
+    });
+
+    const result = await runtime.validateLoginInput({
+      providerBaseUrl: "https://rawchat.cn/codex",
+      apiKey: "sk-test",
+      model: "codex-mini",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("manual model mode");
+    expect(result.providerModelMode).toBe("manual");
+    expect(result.availableModels).toEqual(["codex-mini"]);
   });
 
   test("validateLoginInput rejects quoted api keys and hidden whitespace", async () => {
@@ -234,6 +262,24 @@ describe("createAuthRuntime", () => {
     expect(spaced.message).toContain("control characters");
   });
 
+  test("validateLoginInput rejects unsupported explicit provider types", async () => {
+    const appRoot = await createTempRoot();
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: createMemoryApiKeyStore(),
+    });
+
+    const result = await runtime.validateLoginInput({
+      providerBaseUrl: "https://provider.test/v1",
+      providerType: "codex" as any,
+      apiKey: "sk-test",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Provider type must be one of");
+  });
+
   test("saveLogin persists provider metadata, saves the key, and switches to HTTP immediately", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();
@@ -245,6 +291,7 @@ describe("createAuthRuntime", () => {
           providerBaseUrl?: string;
           providers: string[];
           providerProfiles: Record<string, "openai" | "gemini" | "anthropic">;
+          providerModelModes?: Record<string, "api" | "manual">;
         }
       | undefined;
     const saveModelYamlImpl = mock(
@@ -259,6 +306,7 @@ describe("createAuthRuntime", () => {
             string,
             "openai" | "gemini" | "anthropic"
           >;
+          providerModelModes?: Record<string, "api" | "manual">;
         }
       ) => {
         savedModelState = {
@@ -268,6 +316,7 @@ describe("createAuthRuntime", () => {
           providerBaseUrl: options?.providerBaseUrl,
           providers: options?.providers ?? [],
           providerProfiles: options?.providerProfiles ?? {},
+          providerModelModes: options?.providerModelModes ?? {},
         };
       }
     );
@@ -275,6 +324,7 @@ describe("createAuthRuntime", () => {
       providerBaseUrl: "https://provider.test/v1",
       models: ["gpt-a", "gpt-b"],
       selectedModel: "gpt-b",
+      catalogMode: "api" as const,
     }));
     const runtime = createAuthRuntime({
       appRoot,
@@ -326,6 +376,7 @@ describe("createAuthRuntime", () => {
           providerBaseUrl: "https://api.anthropic.com",
           models: ["claude-3-7-sonnet-latest"],
           selectedModel: "claude-3-7-sonnet-latest",
+          catalogMode: "api" as const,
         };
       }
     );
@@ -363,6 +414,91 @@ describe("createAuthRuntime", () => {
     );
   });
 
+  test("saveLogin persists manual model mode for providers without /models", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    let savedModelState:
+      | {
+          models: string[];
+          defaultModel?: string;
+          lastUsedModel?: string;
+          providerBaseUrl?: string;
+          providers: string[];
+          providerProfiles: Record<string, "openai" | "gemini" | "anthropic">;
+          providerModelModes?: Record<string, "api" | "manual">;
+        }
+      | undefined;
+    const saveModelYamlImpl = mock(
+      async (
+        models: string[],
+        defaultModel: string,
+        options?: {
+          lastUsedModel?: string;
+          providerBaseUrl?: string;
+          providers?: string[];
+          providerProfiles?: Record<
+            string,
+            "openai" | "gemini" | "anthropic"
+          >;
+          providerModelModes?: Record<string, "api" | "manual">;
+        }
+      ) => {
+        savedModelState = {
+          models,
+          defaultModel,
+          lastUsedModel: options?.lastUsedModel,
+          providerBaseUrl: options?.providerBaseUrl,
+          providers: options?.providers ?? [],
+          providerProfiles: options?.providerProfiles ?? {},
+          providerModelModes: options?.providerModelModes ?? {},
+        };
+      }
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      saveModelYamlImpl,
+      fetchProviderModelCatalogImpl: mock(async () => ({
+        providerBaseUrl: "https://rawchat.cn/codex",
+        models: ["codex-mini"],
+        selectedModel: "codex-mini",
+        catalogMode: "manual" as const,
+      })) as any,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("codex-mini", "https://rawchat.cn/codex")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => {
+        if (!savedModelState) {
+          throw new Error("missing");
+        }
+        return savedModelState;
+      }),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "https://rawchat.cn/codex",
+      apiKey: "sk-live",
+      model: "codex-mini",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(saveModelYamlImpl).toHaveBeenCalledWith(
+      ["codex-mini"],
+      "codex-mini",
+      expect.objectContaining({
+        providerBaseUrl: "https://rawchat.cn/codex",
+        lastUsedModel: "codex-mini",
+        providerModelModes: {
+          "https://rawchat.cn/codex": "manual",
+        },
+      }),
+      appRoot,
+      expect.any(Object)
+    );
+  });
+
   test("saveLogin uses provider profile overrides to validate relays and bind remembered keys", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();
@@ -374,6 +510,7 @@ describe("createAuthRuntime", () => {
           providerBaseUrl: "https://relay.test/v1",
           models: ["claude-relay"],
           selectedModel: "claude-relay",
+          catalogMode: "api" as const,
         };
       }
     );
@@ -413,6 +550,143 @@ describe("createAuthRuntime", () => {
     );
   });
 
+  test("saveLogin persists explicit provider types and clears conflicting legacy overrides", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    let savedModelState:
+      | {
+          models: string[];
+          defaultModel?: string;
+          lastUsedModel?: string;
+          providerBaseUrl?: string;
+          providers: string[];
+          providerProfiles: Record<string, "openai" | "gemini" | "anthropic">;
+          providerFormats: Record<
+            string,
+            | "openai_chat"
+            | "openai_responses"
+            | "anthropic_messages"
+            | "gemini_generate_content"
+          >;
+          providerTypes: Record<
+            string,
+            "openai-compatible" | "openai-responses" | "gemini" | "anthropic"
+          >;
+          providerModelModes?: Record<string, "api" | "manual">;
+        }
+      | undefined;
+    const saveModelYamlImpl = mock(
+      async (
+        models: string[],
+        defaultModel: string,
+        options?: {
+          lastUsedModel?: string;
+          providerBaseUrl?: string;
+          providers?: string[];
+          providerProfiles?: Record<
+            string,
+            "openai" | "gemini" | "anthropic"
+          >;
+          providerFormats?: Record<
+            string,
+            | "openai_chat"
+            | "openai_responses"
+            | "anthropic_messages"
+            | "gemini_generate_content"
+          >;
+          providerTypes?: Record<
+            string,
+            "openai-compatible" | "openai-responses" | "gemini" | "anthropic"
+          >;
+          providerModelModes?: Record<string, "api" | "manual">;
+        }
+      ) => {
+        savedModelState = {
+          models,
+          defaultModel,
+          lastUsedModel: options?.lastUsedModel,
+          providerBaseUrl: options?.providerBaseUrl,
+          providers: options?.providers ?? [],
+          providerProfiles: options?.providerProfiles ?? {},
+          providerFormats: options?.providerFormats ?? {},
+          providerTypes: options?.providerTypes ?? {},
+          providerModelModes: options?.providerModelModes ?? {},
+        };
+      }
+    );
+    const fetchProviderModelCatalogImpl = mock(
+      async (options: { baseUrl: string; familyOverride?: string }) => {
+        expect(options.baseUrl).toBe("https://relay.test/v1");
+        expect(options.familyOverride).toBe("anthropic");
+        return {
+          providerBaseUrl: "https://relay.test/v1",
+          models: ["claude-relay"],
+          selectedModel: "claude-relay",
+          catalogMode: "api" as const,
+        };
+      }
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      saveModelYamlImpl,
+      fetchProviderModelCatalogImpl: fetchProviderModelCatalogImpl as any,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("claude-relay", "https://relay.test/v1")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => {
+        if (savedModelState) {
+          return savedModelState;
+        }
+        return {
+          models: ["claude-relay"],
+          defaultModel: "claude-relay",
+          lastUsedModel: "claude-relay",
+          providerBaseUrl: "https://relay.test/v1",
+          providers: ["https://relay.test/v1"],
+          providerProfiles: {
+            "https://relay.test/v1": "gemini" as const,
+          },
+          providerFormats: {
+            "https://relay.test/v1": "openai_responses" as const,
+          },
+          providerTypes: {},
+        };
+      }),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "https://relay.test/v1",
+      providerType: "anthropic",
+      apiKey: "relay-anthropic-key",
+      model: "claude-relay",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.current("CYRENE_ANTHROPIC_API_KEY")).toBe(
+      "relay-anthropic-key"
+    );
+    expect(saveModelYamlImpl).toHaveBeenCalledWith(
+      ["claude-relay"],
+      "claude-relay",
+      expect.objectContaining({
+        providerBaseUrl: "https://relay.test/v1",
+        providerProfiles: {},
+        providerFormats: {},
+        providerTypes: {
+          "https://relay.test/v1": "anthropic",
+        },
+      }),
+      appRoot,
+      expect.any(Object)
+    );
+    expect(await runtime.getSavedApiKey("https://relay.test/v1")).toBe(
+      "relay-anthropic-key"
+    );
+  });
+
   test("saveLogin overrides explicit launch env for the current run", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore("persisted-old-key");
@@ -436,6 +710,7 @@ describe("createAuthRuntime", () => {
         providerBaseUrl: "https://next-provider.test/v1",
         models: ["gpt-next"],
         selectedModel: "gpt-next",
+        catalogMode: "api" as const,
       })),
       loadModelYamlImpl: mock(async () => ({
         models: ["gpt-next"],
@@ -492,6 +767,7 @@ describe("createAuthRuntime", () => {
         providerBaseUrl: "https://provider.test/v1",
         models: ["gpt-4o-mini", "gpt-4.1"],
         selectedModel: "gpt-4.1",
+        catalogMode: "api" as const,
       })),
       loadModelYamlImpl: mock(async () => ({
         models: ["gpt-4o-mini", "gpt-4.1"],

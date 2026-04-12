@@ -2,12 +2,21 @@ import { createHttpQueryTransport, fetchProviderModelCatalog, normalizeProviderB
 import { createLocalCoreTransport } from "../local/createLocalCoreTransport";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import {
+  isProviderType,
+  resolveProviderTypeFamily,
+} from "../../core/query/transport";
+import {
   createUserScopedApiKeyStore,
   type ManagedAuthEnvName,
   type UserScopedApiKeyStore,
 } from "./userScopedApiKeyStore";
 import type {
+  ProviderEndpointOverrideMap,
+  ProviderFormatOverrideMap,
+  ProviderModelCatalogModeMap,
   ProviderProfileOverrideMap,
+  ProviderType,
+  ProviderTypeOverrideMap,
   QueryTransport,
 } from "../../core/query/transport";
 import type { AuthLoginInput, AuthStatus, AuthValidationResult } from "./types";
@@ -17,6 +26,10 @@ type LoadedProviderMetadata = {
   currentModel?: string;
   providers: string[];
   providerProfiles: ProviderProfileOverrideMap;
+  providerTypes: ProviderTypeOverrideMap;
+  providerModelModes: ProviderModelCatalogModeMap;
+  providerFormats: ProviderFormatOverrideMap;
+  providerEndpoints: ProviderEndpointOverrideMap;
   providerNames: Record<string, string>;
 };
 
@@ -136,9 +149,14 @@ const inferProviderFamilyFromBaseUrl = (
 
 const resolveProviderFamily = (
   providerBaseUrl: string,
-  providerProfiles?: ProviderProfileOverrideMap
+  providerProfiles?: ProviderProfileOverrideMap,
+  providerTypes?: ProviderTypeOverrideMap
 ): ProviderFamily => {
   const normalized = normalizeProviderBaseUrl(providerBaseUrl);
+  const explicitType = providerTypes?.[normalized];
+  if (explicitType) {
+    return resolveProviderTypeFamily(explicitType);
+  }
   return providerProfiles?.[normalized] ?? inferProviderFamilyFromBaseUrl(normalized);
 };
 
@@ -254,10 +272,11 @@ export const createAuthRuntime = (
   const resolveRememberedApiKeyForProvider = (
     providerBaseUrl: string | undefined,
     storedApiKeys: ManagedAuthEnvValues,
-    providerProfiles?: ProviderProfileOverrideMap
+    providerProfiles?: ProviderProfileOverrideMap,
+    providerTypes?: ProviderTypeOverrideMap
   ) => {
     const family = providerBaseUrl
-      ? resolveProviderFamily(providerBaseUrl, providerProfiles)
+      ? resolveProviderFamily(providerBaseUrl, providerProfiles, providerTypes)
       : "openai";
     const familyEnvName = resolveApiKeyEnvNameForFamily(family);
     const familySpecificKey = trimNonEmpty(storedApiKeys[familyEnvName]);
@@ -283,10 +302,11 @@ export const createAuthRuntime = (
   const resolveEffectiveApiKeyForProvider = (
     providerBaseUrl: string | undefined,
     storedApiKeys: ManagedAuthEnvValues,
-    providerProfiles?: ProviderProfileOverrideMap
+    providerProfiles?: ProviderProfileOverrideMap,
+    providerTypes?: ProviderTypeOverrideMap
   ) => {
     const family = providerBaseUrl
-      ? resolveProviderFamily(providerBaseUrl, providerProfiles)
+      ? resolveProviderFamily(providerBaseUrl, providerProfiles, providerTypes)
       : "openai";
     const familyEnvName = resolveApiKeyEnvNameForFamily(family);
     const familySpecificKey = resolveEffectiveApiKeyValue(familyEnvName, storedApiKeys);
@@ -354,6 +374,23 @@ export const createAuthRuntime = (
               Boolean(entry)
           )
       ) as ProviderProfileOverrideMap;
+      const normalizedProviderTypes = Object.fromEntries(
+        Object.entries(loaded.providerTypes ?? {})
+          .map(([provider, type]) => {
+            try {
+              const normalized = normalizeProviderBaseUrl(provider);
+              return normalized && type && isProviderType(type)
+                ? ([normalized, type] as const)
+                : null;
+            } catch {
+              return null;
+            }
+          })
+          .filter(
+            (entry): entry is [string, ProviderTypeOverrideMap[string]] =>
+              Boolean(entry)
+          )
+      ) as ProviderTypeOverrideMap;
       return {
         providerBaseUrl: normalizedProvider
           ? normalizeProviderBaseUrl(normalizedProvider)
@@ -366,11 +403,70 @@ export const createAuthRuntime = (
           new Set(
             [
               ...loaded.providers,
+              ...Object.keys(normalizedProviderProfiles),
+              ...Object.keys(normalizedProviderTypes),
               trimNonEmpty(loaded.providerBaseUrl),
             ].filter(Boolean)
           )
         ) as string[],
         providerProfiles: normalizedProviderProfiles,
+        providerTypes: normalizedProviderTypes,
+        providerModelModes: Object.fromEntries(
+          Object.entries(loaded.providerModelModes ?? {})
+            .map(([provider, mode]) => {
+              try {
+                const normalized = normalizeProviderBaseUrl(provider);
+                return normalized && (mode === "api" || mode === "manual")
+                  ? ([normalized, mode] as const)
+                  : null;
+              } catch {
+                return null;
+              }
+            })
+            .filter((entry): entry is [string, ProviderModelCatalogModeMap[string]] => Boolean(entry))
+        ) as ProviderModelCatalogModeMap,
+        providerFormats: Object.fromEntries(
+          Object.entries(loaded.providerFormats ?? {})
+            .map(([provider, format]) => {
+              try {
+                const normalized = normalizeProviderBaseUrl(provider);
+                return normalized && format
+                  ? ([normalized, format] as const)
+                  : null;
+              } catch {
+                return null;
+              }
+            })
+            .filter(
+              (entry): entry is [string, ProviderFormatOverrideMap[string]] =>
+                Boolean(entry)
+            )
+        ) as ProviderFormatOverrideMap,
+        providerEndpoints: Object.fromEntries(
+          Object.entries(loaded.providerEndpoints ?? {})
+            .map(([provider, endpoints]) => {
+              try {
+                const normalized = normalizeProviderBaseUrl(provider);
+                if (!normalized) {
+                  return null;
+                }
+                const normalizedEndpoints = Object.fromEntries(
+                  Object.entries(endpoints ?? {})
+                    .map(([kind, endpoint]) => {
+                      const trimmedEndpoint = trimNonEmpty(endpoint);
+                      return trimmedEndpoint ? ([kind, trimmedEndpoint] as const) : null;
+                    })
+                    .filter((entry): entry is [string, string] => Boolean(entry))
+                );
+                return Object.keys(normalizedEndpoints).length > 0
+                  ? ([normalized, normalizedEndpoints] as const)
+                  : null;
+              } catch {
+                return null;
+              }
+            })
+            .filter((entry): entry is [string, ProviderEndpointOverrideMap[string]] => Boolean(entry))
+        ) as ProviderEndpointOverrideMap,
         providerNames: Object.fromEntries(
           Object.entries(loaded.providerNames ?? {})
             .map(([provider, name]) => {
@@ -393,6 +489,10 @@ export const createAuthRuntime = (
         currentModel: trimNonEmpty(effectiveEnv.CYRENE_MODEL) ?? "gpt-4o-mini",
         providers: [],
         providerProfiles: {},
+        providerTypes: {},
+        providerModelModes: {},
+        providerFormats: {},
+        providerEndpoints: {},
         providerNames: {},
       };
     }
@@ -421,7 +521,8 @@ export const createAuthRuntime = (
     const resolvedApiKey = resolveEffectiveApiKeyForProvider(
       providerBaseUrl,
       storedApiKeys,
-      metadata.providerProfiles
+      metadata.providerProfiles,
+      metadata.providerTypes
     );
     if (resolvedApiKey?.apiKey) {
       apiKey = resolvedApiKey.apiKey;
@@ -539,6 +640,18 @@ export const createAuthRuntime = (
       };
     }
     const apiKey = apiKeyValidation.value;
+    const providerType =
+      typeof input.providerType === "string" && input.providerType.trim()
+        ? input.providerType.trim().toLowerCase()
+        : undefined;
+    if (providerType && !isProviderType(providerType)) {
+      return {
+        ok: false,
+        message:
+          "Provider type must be one of: openai-compatible, openai-responses, gemini, anthropic.",
+        persistenceTarget,
+      };
+    }
 
     const preferredModel = trimNonEmpty(input.model);
     try {
@@ -553,17 +666,28 @@ export const createAuthRuntime = (
         currentModel: preferredModel ?? resolved.currentModel ?? "gpt-4o-mini",
         familyOverride: resolveProviderFamily(
           normalizedProviderBaseUrl,
-          metadata.providerProfiles
+          metadata.providerProfiles,
+          providerType && isProviderType(providerType)
+            ? {
+                ...metadata.providerTypes,
+                [normalizedProviderBaseUrl]: providerType,
+              }
+            : metadata.providerTypes
         ),
       });
       return {
         ok: true,
-        message: `Validated provider. Loaded ${catalog.models.length} model(s). Initial model: ${catalog.selectedModel}`,
+        message:
+          catalog.catalogMode === "manual"
+            ? `Validated provider. /models is unavailable; using manual model mode. Initial model: ${catalog.selectedModel}`
+            : `Validated provider. Loaded ${catalog.models.length} model(s). Initial model: ${catalog.selectedModel}`,
         persistenceTarget,
         normalizedProviderBaseUrl: catalog.providerBaseUrl,
         normalizedApiKey: apiKey,
         selectedModel: catalog.selectedModel,
         availableModels: catalog.models,
+        providerModelMode: catalog.catalogMode,
+        providerType: providerType as ProviderType | undefined,
       };
     } catch (error) {
       return {
@@ -632,7 +756,8 @@ export const createAuthRuntime = (
     return resolveRememberedApiKeyForProvider(
       normalized,
       storedApiKeys,
-      metadata.providerProfiles
+      metadata.providerProfiles,
+      metadata.providerTypes
     )?.apiKey;
   };
 
@@ -660,7 +785,13 @@ export const createAuthRuntime = (
     const existingMetadata = await loadProviderMetadata();
     const providerFamily = resolveProviderFamily(
       validation.normalizedProviderBaseUrl,
-      existingMetadata.providerProfiles
+      existingMetadata.providerProfiles,
+      validation.providerType
+        ? {
+            ...existingMetadata.providerTypes,
+            [validation.normalizedProviderBaseUrl]: validation.providerType,
+          }
+        : existingMetadata.providerTypes
     );
     const providerEnvName = resolveApiKeyEnvNameForFamily(providerFamily);
     const nextProviders = Array.from(
@@ -671,6 +802,12 @@ export const createAuthRuntime = (
         ].filter(Boolean)
       )
     );
+    const nextProviderProfiles = { ...existingMetadata.providerProfiles };
+    const nextProviderFormats = { ...existingMetadata.providerFormats };
+    if (validation.providerType) {
+      delete nextProviderProfiles[validation.normalizedProviderBaseUrl];
+      delete nextProviderFormats[validation.normalizedProviderBaseUrl];
+    }
     await saveModelYamlImpl(
       validation.availableModels,
       validation.selectedModel,
@@ -678,7 +815,20 @@ export const createAuthRuntime = (
         lastUsedModel: validation.selectedModel,
         providerBaseUrl: validation.normalizedProviderBaseUrl,
         providers: nextProviders,
-        providerProfiles: existingMetadata.providerProfiles,
+        providerProfiles: nextProviderProfiles,
+        providerTypes: validation.providerType
+          ? {
+              ...existingMetadata.providerTypes,
+              [validation.normalizedProviderBaseUrl]: validation.providerType,
+            }
+          : existingMetadata.providerTypes,
+        providerModelModes: {
+          ...existingMetadata.providerModelModes,
+          [validation.normalizedProviderBaseUrl]:
+            validation.providerModelMode ?? "api",
+        },
+        providerFormats: nextProviderFormats,
+        providerEndpoints: existingMetadata.providerEndpoints,
         providerNames: existingMetadata.providerNames,
       },
       options.appRoot,

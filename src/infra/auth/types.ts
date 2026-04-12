@@ -1,3 +1,8 @@
+import type {
+  ProviderModelCatalogMode,
+  ProviderType,
+} from "../../core/query/transport";
+
 export type AuthCredentialSource = "process_env" | "user_env" | "none";
 
 export type AuthMode = "http" | "local";
@@ -36,6 +41,7 @@ export type AuthLoginInput = {
   providerBaseUrl: string;
   apiKey: string;
   model?: string;
+  providerType?: ProviderType;
 };
 
 export type AuthValidationResult = {
@@ -46,4 +52,6 @@ export type AuthValidationResult = {
   normalizedApiKey?: string;
   selectedModel?: string;
   availableModels?: string[];
+  providerModelMode?: ProviderModelCatalogMode;
+  providerType?: ProviderType;
 };

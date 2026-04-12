@@ -38,6 +38,19 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { command: "/provider", description: "open provider picker" },
   { command: "/provider refresh", description: "refresh current provider models" },
   {
+    command: "/provider type list",
+    description: "list manual provider type overrides",
+  },
+  {
+    command:
+      "/provider type <openai-compatible|openai-responses|gemini|anthropic> [url]",
+    description: "set explicit provider type",
+  },
+  {
+    command: "/provider type clear [url]",
+    description: "clear explicit provider type override",
+  },
+  {
     command: "/provider profile list",
     description: "list manual provider profile overrides",
   },
@@ -48,6 +61,32 @@ export const COMMAND_SPECS: CommandSpec[] = [
   {
     command: "/provider profile clear [url]",
     description: "clear manual provider profile override",
+  },
+  {
+    command:
+      "/provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url]",
+    description: "override provider transport format",
+  },
+  {
+    command: "/provider format clear [url]",
+    description: "clear manual provider transport format override",
+  },
+  {
+    command: "/provider format list",
+    description: "list manual provider transport format overrides",
+  },
+  {
+    command:
+      "/provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider]",
+    description: "override provider endpoint by transport kind",
+  },
+  {
+    command: "/provider endpoint clear <kind> [provider]",
+    description: "clear manual provider endpoint override by kind",
+  },
+  {
+    command: "/provider endpoint list",
+    description: "list manual provider endpoint overrides",
   },
   {
     command: "/provider name list",
@@ -315,6 +354,14 @@ const getSlashInsertValue = (command: string) => {
       return "/provider profile ";
     case "/provider profile clear [url]":
       return "/provider profile clear ";
+    case "/provider type <openai-compatible|openai-responses|gemini|anthropic> [url]":
+      return "/provider type ";
+    case "/provider type clear [url]":
+      return "/provider type clear ";
+    case "/provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url]":
+      return "/provider format ";
+    case "/provider format clear [url]":
+      return "/provider format clear ";
     case "/provider name <display_name>":
       return "/provider name ";
     case "/provider name clear [url]":

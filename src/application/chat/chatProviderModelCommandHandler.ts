@@ -1,8 +1,11 @@
-import type {
-  ProviderProfile,
-  ProviderProfileOverrideMap,
-  ProviderRuntimeInfo,
-  QueryTransport,
+import {
+  PROVIDER_ENDPOINT_KINDS,
+  type ProviderEndpointKind,
+  type ProviderProfile,
+  type ProviderType,
+  type ProviderProfileOverrideMap,
+  type ProviderRuntimeInfo,
+  type QueryTransport,
 } from "../../core/query/transport";
 import type { ChatItem } from "../../shared/types/chat";
 
@@ -57,8 +60,14 @@ const INFO_MESSAGE_OPTIONS = {
 
 const PROVIDER_PROFILE_USAGE =
   "Usage: /provider profile <openai|gemini|anthropic|custom> [url] | /provider profile clear [url] | /provider profile list";
+const PROVIDER_TYPE_USAGE =
+  "Usage: /provider type <openai-compatible|openai-responses|gemini|anthropic> [url] | /provider type clear [url] | /provider type list";
+const PROVIDER_ENDPOINT_USAGE =
+  "Usage: /provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider] | /provider endpoint clear <kind> [provider] | /provider endpoint list";
 const PROVIDER_NAME_USAGE =
   "Usage: /provider name <display_name> | /provider name clear [url] | /provider name list";
+const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
+  (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
 export const handleProviderModelCommand = ({
   query,
@@ -214,6 +223,107 @@ export const handleProviderModelCommand = ({
     return true;
   }
 
+  if (query.startsWith("/provider type")) {
+    enqueueTask(async () => {
+      if (!transport.setProviderType) {
+        pushSystemMessage(
+          "Provider type override is unavailable in this transport.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      if (query === "/provider type list") {
+        const overrides = transport.listProviderTypes?.() ?? {};
+        const lines = Object.entries(overrides)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([provider, type]) => `- ${provider} => ${type}`);
+        pushSystemMessage(
+          lines.length > 0
+            ? ["Manual provider type overrides:", ...lines].join("\n")
+            : "No manual provider type overrides."
+        );
+        return;
+      }
+
+      if (query === "/provider type") {
+        pushSystemMessage(PROVIDER_TYPE_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+
+      const rawArgs = query
+        .slice("/provider type".length)
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      if (rawArgs.length === 0) {
+        pushSystemMessage(PROVIDER_TYPE_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+
+      const typeToken = rawArgs[0]?.toLowerCase();
+      const normalizedType =
+        typeToken === "clear"
+          ? null
+          : (
+              typeToken === "openai-compatible" ||
+              typeToken === "openai-responses" ||
+              typeToken === "gemini" ||
+              typeToken === "anthropic"
+            )
+            ? (typeToken as ProviderType)
+            : undefined;
+      if (typeof normalizedType === "undefined") {
+        pushSystemMessage(
+          "Provider type must be one of: openai-compatible, openai-responses, gemini, anthropic (or clear).",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      const targetProvider =
+        rawArgs.slice(1).join(" ").trim() || transport.getProvider();
+      if (!targetProvider || targetProvider === "none") {
+        pushSystemMessage(
+          "No active provider. Use /provider <url> first, or pass [url] explicitly.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      if (
+        isRepeatedActionInteraction(
+          `command:provider-type:${targetProvider}:${normalizedType ?? "clear"}`
+        )
+      ) {
+        return;
+      }
+
+      const result = await transport.setProviderType(
+        targetProvider,
+        normalizedType
+      );
+      updateCurrentProviderState(transport.getProvider());
+      updateCurrentModelState(transport.getModel());
+      if (result.ok) {
+        await syncAuthSelection?.({
+          providerBaseUrl: transport.getProvider(),
+          model: transport.getModel(),
+        });
+      }
+      if (result.ok) {
+        pushSystemMessage(result.message, INFO_MESSAGE_OPTIONS);
+      } else {
+        pushSystemMessage(
+          `[provider type failed] ${result.message}`,
+          ERROR_MESSAGE_OPTIONS
+        );
+      }
+    });
+    clearInput();
+    return true;
+  }
+
   if (query.startsWith("/provider name")) {
     enqueueTask(async () => {
       if (query === "/provider name list") {
@@ -290,6 +400,107 @@ export const handleProviderModelCommand = ({
     return true;
   }
 
+  if (query.startsWith("/provider endpoint")) {
+    enqueueTask(async () => {
+      if (!transport.setProviderEndpoint) {
+        pushSystemMessage(
+          "Provider endpoint override is unavailable in this transport.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      if (query === "/provider endpoint list") {
+        const overrides = transport.listProviderEndpoints?.() ?? {};
+        const lines = Object.entries(overrides)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .flatMap(([provider, endpoints]) =>
+            Object.entries(endpoints ?? {})
+              .sort(([left], [right]) => left.localeCompare(right))
+              .map(([kind, endpoint]) => `- ${provider} [${kind}] => ${endpoint}`)
+          );
+        pushSystemMessage(
+          lines.length > 0
+            ? ["Manual provider endpoint overrides:", ...lines].join("\n")
+            : "No manual provider endpoint overrides."
+        );
+        return;
+      }
+
+      if (query === "/provider endpoint") {
+        pushSystemMessage(PROVIDER_ENDPOINT_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+
+      if (query.startsWith("/provider endpoint clear")) {
+        const args = query
+          .slice("/provider endpoint clear".length)
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        const endpointKind = args[0]?.trim().toLowerCase();
+        if (!endpointKind || !isProviderEndpointKind(endpointKind)) {
+          pushSystemMessage(PROVIDER_ENDPOINT_USAGE, ERROR_MESSAGE_OPTIONS);
+          return;
+        }
+        const targetProvider = args.slice(1).join(" ").trim() || transport.getProvider();
+        if (!targetProvider || targetProvider === "none") {
+          pushSystemMessage(
+            "No active provider. Use /provider <url> first, or pass [provider] explicitly.",
+            ERROR_MESSAGE_OPTIONS
+          );
+          return;
+        }
+        const result = await transport.setProviderEndpoint(
+          targetProvider,
+          endpointKind,
+          null
+        );
+        pushSystemMessage(
+          result.ok
+            ? result.message
+            : `[provider endpoint failed] ${result.message}`,
+          result.ok ? INFO_MESSAGE_OPTIONS : ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      const args = query.slice("/provider endpoint".length).trim().split(/\s+/).filter(Boolean);
+      if (args.length < 2) {
+        pushSystemMessage(PROVIDER_ENDPOINT_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+      const endpointKind = args[0]?.trim().toLowerCase();
+      const endpoint = args[1]?.trim();
+      const targetProvider = args.slice(2).join(" ").trim() || transport.getProvider();
+      if (!endpointKind || !isProviderEndpointKind(endpointKind) || !endpoint) {
+        pushSystemMessage(PROVIDER_ENDPOINT_USAGE, ERROR_MESSAGE_OPTIONS);
+        return;
+      }
+      if (!targetProvider || targetProvider === "none") {
+        pushSystemMessage(
+          "No active provider. Use /provider <url> first, or pass [provider] explicitly.",
+          ERROR_MESSAGE_OPTIONS
+        );
+        return;
+      }
+
+      const result = await transport.setProviderEndpoint(
+        targetProvider,
+        endpointKind,
+        endpoint
+      );
+      pushSystemMessage(
+        result.ok
+          ? result.message
+          : `[provider endpoint failed] ${result.message}`,
+        result.ok ? INFO_MESSAGE_OPTIONS : ERROR_MESSAGE_OPTIONS
+      );
+    });
+    clearInput();
+    return true;
+  }
+
   if (query === "/provider refresh") {
     enqueueTask(async () => {
       const result = await transport.refreshModels();
@@ -318,7 +529,7 @@ export const handleProviderModelCommand = ({
     enqueueTask(async () => {
       if (!nextProvider) {
         pushSystemMessage(
-          "Usage: /provider <base_url|openai|gemini|anthropic> | /provider refresh | /provider profile ..."
+          "Usage: /provider <base_url|openai|gemini|anthropic> | /provider refresh | /provider type ... | /provider profile ..."
         );
         return;
       }

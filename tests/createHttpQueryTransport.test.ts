@@ -730,6 +730,139 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(restartedTransport.getModel()).toBe("gpt-next");
   });
 
+  test("providers without /models fall back to manual model mode and still stream", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: codex-mini",
+        "last_used_model: codex-mini",
+        "provider_base_url: https://rawchat.cn/codex",
+        "models:",
+        "  - codex-mini",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"ok"}}]}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://rawchat.cn/codex/v1/models") {
+        return new Response("not found", { status: 404 });
+      }
+      if (url === "https://rawchat.cn/codex/v1/chat/completions") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://rawchat.cn/codex",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "codex-mini",
+      },
+    });
+
+    expect(await transport.listModels()).toEqual(["codex-mini"]);
+    expect(transport.getModel()).toBe("codex-mini");
+    expect(transport.getProviderFormat?.()).toBe("openai_chat");
+    expect(await transport.refreshModels()).toEqual({
+      ok: true,
+      message: "Model list refreshed: 1 models",
+      models: ["codex-mini"],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls[0]?.url).toBe("https://rawchat.cn/codex/v1/models");
+    expect(fetchCalls[1]?.url).toBe(
+      "https://rawchat.cn/codex/v1/chat/completions"
+    );
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "ok" }),
+      JSON.stringify({ type: "done" }),
+    ]);
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_model_modes:");
+    expect(persisted).toContain("  - provider: https://rawchat.cn/codex");
+    expect(persisted).toContain("    mode: manual");
+  });
+
+  test("manual model mode lets setModel add arbitrary models and persist them", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: codex-mini",
+        "last_used_model: codex-mini",
+        "provider_base_url: https://rawchat.cn/codex",
+        "provider_model_modes:",
+        "  - provider: https://rawchat.cn/codex",
+        "    mode: manual",
+        "models:",
+        "  - codex-mini",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://rawchat.cn/codex",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "codex-mini",
+      },
+    });
+
+    expect(await transport.listModels()).toEqual(["codex-mini"]);
+    expect(await transport.setModel("codex-max")).toEqual({
+      ok: true,
+      message: "Model switched to: codex-max",
+    });
+    expect(await transport.listModels()).toEqual(["codex-mini", "codex-max"]);
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("default_model: codex-max");
+    expect(persisted).toContain("last_used_model: codex-max");
+    expect(persisted).toContain("  - codex-mini");
+    expect(persisted).toContain("  - codex-max");
+    expect(persisted).toContain("provider_model_modes:");
+    expect(persisted).toContain("    mode: manual");
+  });
+
   test("model catalog follows CYRENE_HOME instead of current cwd", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     const cwdElsewhere = await mkdtemp(join(tmpdir(), "cyrene-http-cwd-"));
@@ -925,6 +1058,15 @@ describe("createHttpQueryTransport streaming usage", () => {
     );
   });
 
+  test("repairs provider URLs missing the scheme colon", () => {
+    expect(normalizeProviderBaseUrl("https//rawchat.cn/codex")).toBe(
+      "https://rawchat.cn/codex"
+    );
+    expect(normalizeProviderBaseUrl("http//relay.test/api")).toBe(
+      "http://relay.test/api"
+    );
+  });
+
   test("describeProvider reports vendor and key source", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
@@ -954,11 +1096,15 @@ describe("createHttpQueryTransport streaming usage", () => {
       provider: "https://api.openai.com/v1",
       vendor: "openai",
       keySource: "CYRENE_OPENAI_API_KEY",
+      type: "openai-compatible",
+      format: "openai_chat",
     });
     expect(transport.describeProvider?.("gemini")).toEqual({
       provider: "https://generativelanguage.googleapis.com/v1beta/openai",
       vendor: "gemini",
       keySource: "CYRENE_GEMINI_API_KEY",
+      type: "gemini",
+      format: "openai_chat",
     });
   });
 
@@ -1026,6 +1172,7 @@ describe("createHttpQueryTransport streaming usage", () => {
       provider: "https://open.bigmodel.cn/api/paas/v4",
       vendor: "custom",
       keySource: "CYRENE_API_KEY",
+      format: "openai_chat",
     });
 
     const streamUrl = await transport.requestStreamUrl("hello");
@@ -1160,6 +1307,272 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(transport.getProviderProfile?.("https://relay.test/openai")).toBe(
       "custom"
     );
+  });
+
+  test("provider format override APIs manage manual map and persist", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.getProviderFormat?.("https://provider-a.test/v1")).toBe(
+      "openai_chat"
+    );
+
+    const setResult = await transport.setProviderFormat?.(
+      "https://provider-a.test/v1",
+      "openai_responses"
+    );
+    expect(setResult?.ok).toBe(true);
+    expect(transport.listProviderFormats?.()).toEqual({
+      "https://provider-a.test/v1": "openai_responses",
+    });
+    expect(transport.getProviderFormat?.("https://provider-a.test/v1")).toBe(
+      "openai_responses"
+    );
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_formats:");
+    expect(persisted).toContain("  - provider: https://provider-a.test/v1");
+    expect(persisted).toContain("    format: openai_responses");
+
+    const clearResult = await transport.setProviderFormat?.(
+      "https://provider-a.test/v1",
+      null
+    );
+    expect(clearResult?.ok).toBe(true);
+    expect(transport.listProviderFormats?.()).toEqual({});
+    expect(transport.getProviderFormat?.("https://provider-a.test/v1")).toBe(
+      "openai_chat"
+    );
+  });
+
+  test("provider type override APIs manage manual map, persist, and clear legacy overrides", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const provider = "https://relay.test/v1";
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderProfile?.(provider, "anthropic");
+    await transport.setProviderFormat?.(provider, "openai_responses");
+    expect(transport.listProviderProfiles?.()).toEqual({
+      [provider]: "anthropic",
+    });
+    expect(transport.listProviderFormats?.()).toEqual({
+      [provider]: "openai_responses",
+    });
+
+    const setResult = await transport.setProviderType?.(provider, "anthropic");
+    expect(setResult?.ok).toBe(true);
+    expect(setResult?.type).toBe("anthropic");
+    expect(transport.listProviderTypes?.()).toEqual({
+      [provider]: "anthropic",
+    });
+    expect(transport.listProviderProfiles?.()).toEqual({});
+    expect(transport.listProviderFormats?.()).toEqual({});
+    expect(transport.getProviderType?.(provider)).toBe("anthropic");
+    expect(transport.getProviderFormat?.(provider)).toBe(
+      "anthropic_messages"
+    );
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_types:");
+    expect(persisted).toContain(`  - provider: ${provider}`);
+    expect(persisted).toContain("    type: anthropic");
+    expect(persisted).not.toContain("provider_profiles:");
+    expect(persisted).not.toContain("provider_formats:");
+
+    const reloaded = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+    await reloaded.listModels();
+    expect(reloaded.listProviderTypes?.()).toEqual({
+      [provider]: "anthropic",
+    });
+    expect(reloaded.getProviderType?.(provider)).toBe("anthropic");
+    expect(reloaded.getProviderFormat?.(provider)).toBe(
+      "anthropic_messages"
+    );
+  });
+
+  test("legacy provider overrides clear explicit provider type overrides", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const openaiRelay = "https://relay-openai.test/v1";
+    const geminiRelay = "https://relay-gemini.test";
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+
+    const setOpenAiType = await transport.setProviderType?.(
+      openaiRelay,
+      "openai-responses"
+    );
+    expect(setOpenAiType?.ok).toBe(true);
+    expect(transport.listProviderTypes?.()).toEqual({
+      [openaiRelay]: "openai-responses",
+    });
+
+    const setFormat = await transport.setProviderFormat?.(
+      openaiRelay,
+      "openai_chat"
+    );
+    expect(setFormat?.ok).toBe(true);
+    expect(transport.listProviderTypes?.()).toEqual({});
+    expect(transport.listProviderFormats?.()).toEqual({
+      [openaiRelay]: "openai_chat",
+    });
+    expect(transport.getProviderType?.(openaiRelay)).toBe(
+      "openai-compatible"
+    );
+
+    const setGeminiType = await transport.setProviderType?.(
+      geminiRelay,
+      "gemini"
+    );
+    expect(setGeminiType?.ok).toBe(true);
+    expect(transport.listProviderTypes?.()).toEqual({
+      [geminiRelay]: "gemini",
+    });
+
+    const setProfile = await transport.setProviderProfile?.(
+      geminiRelay,
+      "gemini"
+    );
+    expect(setProfile?.ok).toBe(true);
+    expect(transport.listProviderTypes?.()).toEqual({});
+    expect(transport.listProviderProfiles?.()).toEqual({
+      [geminiRelay]: "gemini",
+    });
+    expect(transport.getProviderType?.(geminiRelay)).toBe("gemini");
+  });
+
+  test("provider endpoint override APIs manage manual maps by kind and persist", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-main",
+        "last_used_model: gpt-main",
+        "provider_base_url: https://provider-a.test/v1",
+        "providers:",
+        "  - https://provider-a.test/v1",
+        "models:",
+        "  - gpt-main",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "shared-key",
+      },
+    });
+
+    await transport.listModels();
+    expect(
+      transport.getProviderEndpoint?.("https://provider-a.test/v1", "responses")
+    ).toBeNull();
+
+    const setResult = await transport.setProviderEndpoint?.(
+      "https://provider-a.test/v1",
+      "responses",
+      "/responses"
+    );
+    expect(setResult?.ok).toBe(true);
+    expect(transport.listProviderEndpoints?.()).toEqual({
+      "https://provider-a.test/v1": {
+        responses: "/responses",
+      },
+    });
+    expect(
+      transport.getProviderEndpoint?.("https://provider-a.test/v1", "responses")
+    ).toBe("/responses");
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("provider_endpoints:");
+    expect(persisted).toContain("  - provider: https://provider-a.test/v1");
+    expect(persisted).toContain("    kind: responses");
+    expect(persisted).toContain("    endpoint: /responses");
+
+    const clearResult = await transport.setProviderEndpoint?.(
+      "https://provider-a.test/v1",
+      "responses",
+      null
+    );
+    expect(clearResult?.ok).toBe(true);
+    expect(transport.listProviderEndpoints?.()).toEqual({});
+    expect(
+      transport.getProviderEndpoint?.("https://provider-a.test/v1", "responses")
+    ).toBeNull();
   });
 
   test("provider name APIs manage custom labels and persist them", async () => {
@@ -1420,6 +1833,936 @@ describe("createHttpQueryTransport streaming usage", () => {
       })
     );
     expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+  });
+
+  test("anthropic tool input ignores empty object seeds before streamed json deltas", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_start',
+              'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"file","input":{}}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"action\\": \\"list_dir\\", "}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"path\\": \\".\\"}"}}',
+              "",
+              'event: content_block_stop',
+              'data: {"type":"content_block_stop","index":0}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toContain(
+      JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "list_dir", path: "." },
+      })
+    );
+    expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+  });
+
+  test("openai responses format streams text/tool/usage events via responses API", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"hello"}',
+              "",
+              'data: {"type":"response.output_item.added","item_id":"fc_1","item":{"type":"function_call","name":"file"}}',
+              "",
+              'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"action\\":\\"read_file\\",\\"path\\":\\"README.md\\"}"}',
+              "",
+              'data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16,"input_tokens_details":{"cached_tokens":9}}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const formatResult = await transport.setProviderFormat?.(
+      "https://example.test/v1",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.model).toBe("gpt-test");
+    expect(requestBody.stream).toBe(true);
+    expect(requestBody.tool_choice).toBe("auto");
+    expect(requestBody.input).toBe("hello");
+    expect(requestBody.instructions).toBe(TOOL_USAGE_SYSTEM_PROMPT);
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "read_file", path: "README.md" },
+      }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 11,
+        cachedTokens: 9,
+        completionTokens: 5,
+        totalTokens: 16,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("openai responses format falls back to /responses for providers without /v1 suffix", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://relay.test/api",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"hello"}',
+              "",
+              'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://relay.test/api/responses") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/api",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const formatResult = await transport.setProviderFormat?.(
+      "https://relay.test/api",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/api/responses");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 3,
+        completionTokens: 2,
+        totalTokens: 5,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("openai responses format uses explicit provider endpoint override when configured", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://relay.test/api",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"hello"}',
+              "",
+              'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://relay.test/custom/responses") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/api",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const formatResult = await transport.setProviderFormat?.(
+      "https://relay.test/api",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://relay.test/api",
+      "responses",
+      "https://relay.test/custom/responses"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/custom/responses");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 3,
+        completionTokens: 2,
+        totalTokens: 5,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("provider endpoint override repairs absolute URLs missing the scheme colon", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://relay.test/api",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"hello"}',
+              "",
+              'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://rawchat.cn/codex/responses") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/api",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const formatResult = await transport.setProviderFormat?.(
+      "https://relay.test/api",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://relay.test/api",
+      "responses",
+      "https//rawchat.cn/codex/responses"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://rawchat.cn/codex/responses");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 3,
+        completionTokens: 2,
+        totalTokens: 5,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("openai chat format uses explicit chat_completions endpoint override when configured", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://relay.test/api",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"hello"}}]}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://relay.test/custom/chat/completions") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/api",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://relay.test/api",
+      "chat_completions",
+      "https://relay.test/custom/chat/completions"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/custom/chat/completions");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 7,
+        completionTokens: 3,
+        totalTokens: 10,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("stream errors include the final request URL", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://rawchat.cn/codex",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    globalThis.fetch = mock(async (url: string) => {
+      if (url === "https://rawchat.cn/codex/v1/chat/completions") {
+        return new Response("not found", { status: 404, statusText: "Not Found" });
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://rawchat.cn/codex",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const streamUrl = await transport.requestStreamUrl("hello");
+
+    await expect(async () => {
+      for await (const _event of transport.stream(streamUrl)) {
+        // unreachable
+      }
+    }).toThrow(
+      "Stream error: 404 Not Found | url https://rawchat.cn/codex/v1/chat/completions"
+    );
+  });
+
+  test("codex-style providers with /v1 stay on chat format until explicitly overridden", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: codex-mini",
+        "last_used_model: codex-mini",
+        "provider_base_url: https://code.newcli.com/codex/v1",
+        "models:",
+        "  - codex-mini",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://code.newcli.com/codex/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "codex-mini",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.getProviderFormat?.()).toBe("openai_chat");
+
+    const formatResult = await transport.setProviderFormat?.(
+      "https://code.newcli.com/codex/v1",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+    expect(transport.getProviderFormat?.()).toBe("openai_responses");
+  });
+
+  test("model refresh uses explicit models endpoint override when configured", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-old",
+        "last_used_model: gpt-old",
+        "provider_base_url: https://relay.test/api",
+        "models:",
+        "  - gpt-old",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://relay.test/custom/models") {
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "gpt-new" }, { id: "gpt-fast" }],
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_API_KEY: "test-key",
+      },
+    });
+
+    await transport.listModels();
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://relay.test/api",
+      "models",
+      "https://relay.test/custom/models"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const refreshResult = await transport.refreshModels();
+    expect(refreshResult).toEqual({
+      ok: true,
+      message: "Model list refreshed: 2 models",
+      models: ["gpt-new", "gpt-fast"],
+    });
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/custom/models");
+  });
+
+  test("anthropic format uses explicit anthropic_messages endpoint override when configured", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://relay.test/custom/messages") {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    await transport.listModels();
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://api.anthropic.com",
+      "anthropic_messages",
+      "https://relay.test/custom/messages"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe("https://relay.test/custom/messages");
+    expect(events).toContain(JSON.stringify({ type: "text_delta", text: "ok" }));
+    expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+  });
+
+  test("native Gemini format uses explicit generateContent endpoint override when configured", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gemini-2.5-flash",
+        "last_used_model: gemini-2.5-flash",
+        "provider_base_url: https://generativelanguage.googleapis.com/v1beta",
+        "models:",
+        "  - gemini-2.5-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (
+        url ===
+        "https://relay.test/native/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+      ) {
+        return new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://generativelanguage.googleapis.com/v1beta",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+        CYRENE_MODEL: "gemini-2.5-flash",
+      },
+    });
+
+    await transport.listModels();
+    const endpointResult = await transport.setProviderEndpoint?.(
+      "https://generativelanguage.googleapis.com/v1beta",
+      "gemini_generate_content",
+      "https://relay.test/native/models/{model}:streamGenerateContent?alt=sse"
+    );
+    expect(endpointResult?.ok).toBe(true);
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe(
+      "https://relay.test/native/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    );
+    expect(events).toEqual([
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 5,
+        completionTokens: 2,
+        totalTokens: 7,
+      }),
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("native Gemini format streams text/tool/usage events via generateContent SSE", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gemini-2.5-flash",
+        "last_used_model: gemini-2.5-flash",
+        "provider_base_url: https://generativelanguage.googleapis.com/v1beta",
+        "models:",
+        "  - gemini-2.5-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}',
+              "",
+              'data: {"candidates":[{"content":{"parts":[{"text":"world"},{"functionCall":{"name":"file","args":{"action":"read_file","path":"README.md"}}}]}}],"usageMetadata":{"promptTokenCount":12,"cachedContentTokenCount":4,"candidatesTokenCount":7,"totalTokenCount":19}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://generativelanguage.googleapis.com/v1beta",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+        CYRENE_MODEL: "gemini-2.5-flash",
+      },
+    });
+
+    await transport.listModels();
+    expect(transport.getProviderFormat?.()).toBe("gemini_generate_content");
+    expect(transport.describeProvider?.()?.format).toBe("gemini_generate_content");
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    );
+    expect(
+      (fetchCalls[0]?.init?.headers as Record<string, string>)?.[
+        "x-goog-api-key"
+      ]
+    ).toBe("gemini-key");
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.contents).toEqual([
+      {
+        role: "user",
+        parts: [{ text: "hello" }],
+      },
+    ]);
+    expect(requestBody.systemInstruction).toEqual({
+      parts: [{ text: TOOL_USAGE_SYSTEM_PROMPT }],
+    });
+    expect(requestBody.toolConfig).toEqual({
+      functionCallingConfig: {
+        mode: "AUTO",
+      },
+    });
+    expect(requestBody.tools?.[0]?.functionDeclarations?.[0]?.name).toBe("file");
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello " }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 12,
+        cachedTokens: 4,
+        completionTokens: 7,
+        totalTokens: 19,
+      }),
+      JSON.stringify({ type: "text_delta", text: "world" }),
+      JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "read_file", path: "README.md" },
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
   });
 
 });

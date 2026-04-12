@@ -21,16 +21,98 @@ export type ProviderRuntimeInfo = {
   provider: string;
   vendor: "openai" | "gemini" | "anthropic" | "custom" | "local" | "none";
   keySource: string;
+  type?: ProviderType;
+  format?: TransportFormat;
 };
 
 export type ProviderProfile = "openai" | "gemini" | "anthropic" | "custom";
+export type TransportFormat =
+  | "openai_chat"
+  | "openai_responses"
+  | "anthropic_messages"
+  | "gemini_generate_content";
+export type ProviderType =
+  | "openai-compatible"
+  | "openai-responses"
+  | "gemini"
+  | "anthropic";
+export const PROVIDER_TYPES = [
+  "openai-compatible",
+  "openai-responses",
+  "gemini",
+  "anthropic",
+] as const;
+export const isProviderType = (value: string): value is ProviderType =>
+  (PROVIDER_TYPES as readonly string[]).includes(value);
+export const resolveProviderTypeFamily = (
+  type: ProviderType
+): "openai" | "gemini" | "anthropic" =>
+  type === "gemini"
+    ? "gemini"
+    : type === "anthropic"
+      ? "anthropic"
+      : "openai";
+export const resolveProviderTypeFormat = (
+  type: ProviderType,
+  provider?: string
+): TransportFormat => {
+  if (type === "anthropic") {
+    return "anthropic_messages";
+  }
+  if (type === "gemini") {
+    return provider?.includes("/openai")
+      ? "openai_chat"
+      : "gemini_generate_content";
+  }
+  return type === "openai-responses"
+    ? "openai_responses"
+    : "openai_chat";
+};
+export const inferProviderType = (options: {
+  family: "openai" | "gemini" | "anthropic" | "glm";
+  format: TransportFormat;
+}): ProviderType | null => {
+  if (options.family === "anthropic") {
+    return "anthropic";
+  }
+  if (options.family === "gemini") {
+    return "gemini";
+  }
+  if (options.family === "glm") {
+    return null;
+  }
+  return options.format === "openai_responses"
+    ? "openai-responses"
+    : "openai-compatible";
+};
 
 export type ProviderProfileOverrideMap = Record<
   string,
   Exclude<ProviderProfile, "custom">
 >;
+export type ProviderModelCatalogMode = "api" | "manual";
+export type ProviderModelCatalogModeMap = Record<string, ProviderModelCatalogMode>;
 
 export type ProviderNameOverrideMap = Record<string, string>;
+export type ProviderTypeOverrideMap = Record<string, ProviderType>;
+export type ProviderFormatOverrideMap = Record<string, TransportFormat>;
+export const PROVIDER_ENDPOINT_KINDS = [
+  "responses",
+  "chat_completions",
+  "models",
+  "anthropic_messages",
+  "gemini_generate_content",
+] as const;
+export type ProviderEndpointKind =
+  (typeof PROVIDER_ENDPOINT_KINDS)[number];
+
+export type ProviderEndpointOverrideEntry = Partial<
+  Record<ProviderEndpointKind, string>
+>;
+export type ProviderEndpointOverrideMap = Record<
+  string,
+  ProviderEndpointOverrideEntry
+>;
 
 export type ProviderProfileSetResult = {
   ok: boolean;
@@ -46,6 +128,28 @@ export type ProviderNameSetResult = {
   name?: string;
 };
 
+export type ProviderTypeSetResult = {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  type?: ProviderType;
+};
+
+export type ProviderFormatSetResult = {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  format?: TransportFormat;
+};
+
+export type ProviderEndpointSetResult = {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  kind?: ProviderEndpointKind;
+  endpoint?: string;
+};
+
 export type QueryTransport = {
   getModel: () => string;
   getProvider: () => string;
@@ -56,6 +160,28 @@ export type QueryTransport = {
   ) => Promise<ProviderProfileSetResult>;
   getProviderProfile?: (provider?: string) => ProviderProfile | null;
   listProviderProfiles?: () => ProviderProfileOverrideMap;
+  setProviderType?: (
+    provider: string,
+    type: ProviderType | null
+  ) => Promise<ProviderTypeSetResult>;
+  getProviderType?: (provider?: string) => ProviderType | null;
+  listProviderTypes?: () => ProviderTypeOverrideMap;
+  setProviderFormat?: (
+    provider: string,
+    format: TransportFormat | null
+  ) => Promise<ProviderFormatSetResult>;
+  getProviderFormat?: (provider?: string) => TransportFormat | null;
+  listProviderFormats?: () => ProviderFormatOverrideMap;
+  setProviderEndpoint?: (
+    provider: string,
+    kind: ProviderEndpointKind,
+    endpoint: string | null
+  ) => Promise<ProviderEndpointSetResult>;
+  getProviderEndpoint?: (
+    provider: string | undefined,
+    kind: ProviderEndpointKind
+  ) => string | null;
+  listProviderEndpoints?: () => ProviderEndpointOverrideMap;
   setProviderName?: (
     provider: string,
     name: string | null

@@ -45,6 +45,7 @@ const (
 	ApprovalFull    ApprovalPreviewMode = "full"
 
 	AuthStepProvider AuthStep = "provider"
+	AuthStepProviderType AuthStep = "provider_type"
 	AuthStepAPIKey   AuthStep = "api_key"
 	AuthStepModel    AuthStep = "model"
 	AuthStepConfirm  AuthStep = "confirm"
@@ -66,9 +67,18 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/auth", Description: "show auth mode, source, and persistence target"},
 	{Command: "/provider", Description: "open provider picker"},
 	{Command: "/provider refresh", Description: "refresh current provider models"},
+	{Command: "/provider type list", Description: "list manual provider type overrides"},
+	{Command: "/provider type <openai-compatible|openai-responses|gemini|anthropic> [url]", Description: "set explicit provider type"},
+	{Command: "/provider type clear [url]", Description: "clear explicit provider type override"},
 	{Command: "/provider profile list", Description: "list manual provider profile overrides"},
 	{Command: "/provider profile <openai|gemini|anthropic|custom> [url]", Description: "override provider profile (custom clears override)"},
 	{Command: "/provider profile clear [url]", Description: "clear manual provider profile override"},
+	{Command: "/provider format list", Description: "list manual provider transport format overrides"},
+	{Command: "/provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url]", Description: "override provider transport format"},
+	{Command: "/provider format clear [url]", Description: "clear manual provider transport format override"},
+	{Command: "/provider endpoint list", Description: "list manual provider endpoint overrides"},
+	{Command: "/provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider]", Description: "override provider endpoint by kind"},
+	{Command: "/provider endpoint clear <kind> [provider]", Description: "clear manual provider endpoint override by kind"},
 	{Command: "/provider name list", Description: "list custom provider names"},
 	{Command: "/provider name <display_name>", Description: "set custom name for current provider"},
 	{Command: "/provider name clear [url]", Description: "clear custom provider name"},
@@ -190,6 +200,8 @@ type Model struct {
 	AvailableModels          []string
 	AvailableProviders       []string
 	ProviderProfiles         map[string]string
+	ProviderFormats          map[string]string
+	ProviderEndpoints        map[string]map[string]string
 	ProviderProfileSources   map[string]string
 	ProviderNames            map[string]string
 	ManagedSkills            []BridgeManagedSkill
@@ -197,12 +209,14 @@ type Model struct {
 	UsageSummary             BridgeUsageSummary
 	CurrentModel             string
 	CurrentProvider          string
+	CurrentProviderFormat    string
 	CurrentProviderKeySource string
 	Auth                     BridgeAuthStatus
 	AppRoot                  string
 
 	AuthStep         AuthStep
 	AuthProvider     []rune
+	AuthProviderType []rune
 	AuthAPIKey       []rune
 	AuthModel        []rune
 	AuthCursor       int
@@ -225,6 +239,8 @@ func NewModel() *Model {
 		AuthStep:               AuthStepProvider,
 		MouseCapture:           true,
 		ProviderProfiles:       map[string]string{},
+		ProviderFormats:        map[string]string{},
+		ProviderEndpoints:      map[string]map[string]string{},
 		ProviderProfileSources: map[string]string{},
 		ProviderNames:          map[string]string{},
 		Items: []Message{{
@@ -382,21 +398,26 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	case "set_auth_defaults":
 		m.BridgeReady = true
 		m.AuthProvider = []rune(strings.TrimSpace(event.ProviderBaseURL))
+		m.AuthProviderType = []rune(strings.TrimSpace(event.ProviderType))
 		m.AuthModel = []rune(strings.TrimSpace(event.Model))
 		m.AuthAPIKey = []rune(event.APIKey)
 		if m.ActivePanel == PanelAuth && m.AuthStep == AuthStepProvider {
 			switch {
-			case len(m.AuthProvider) > 0 && len(m.AuthAPIKey) == 0:
+			case len(m.AuthProvider) > 0 && len(m.AuthProviderType) == 0:
+				m.AuthStep = AuthStepProviderType
+			case len(m.AuthProvider) > 0 && len(m.AuthProviderType) > 0 && len(m.AuthAPIKey) == 0:
 				m.AuthStep = AuthStepAPIKey
-			case len(m.AuthProvider) > 0 && len(m.AuthAPIKey) > 0 && len(m.AuthModel) > 0:
+			case len(m.AuthProvider) > 0 && len(m.AuthProviderType) > 0 && len(m.AuthAPIKey) > 0 && len(m.AuthModel) > 0:
 				m.AuthStep = AuthStepConfirm
-			case len(m.AuthProvider) > 0 && len(m.AuthModel) > 0:
+			case len(m.AuthProvider) > 0 && len(m.AuthProviderType) > 0 && len(m.AuthModel) > 0:
 				m.AuthStep = AuthStepAPIKey
 			}
 		}
 		switch m.AuthStep {
 		case AuthStepProvider:
 			m.AuthCursor = len(m.AuthProvider)
+		case AuthStepProviderType:
+			m.AuthCursor = len(m.AuthProviderType)
 		case AuthStepAPIKey:
 			m.AuthCursor = len(m.AuthAPIKey)
 		case AuthStepModel:
@@ -457,6 +478,8 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.AvailableModels = cloneStrings(snapshot.AvailableModels)
 	m.AvailableProviders = cloneStrings(snapshot.AvailableProviders)
 	m.ProviderProfiles = cloneStringMap(snapshot.ProviderProfiles)
+	m.ProviderFormats = cloneStringMap(snapshot.ProviderFormats)
+	m.ProviderEndpoints = cloneNestedStringMap(snapshot.ProviderEndpoints)
 	m.ProviderProfileSources = cloneStringMap(snapshot.ProviderProfileSources)
 	m.ProviderNames = cloneStringMap(snapshot.ProviderNames)
 	m.ManagedSkills = cloneManagedSkills(snapshot.ManagedSkills)
@@ -464,6 +487,7 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.UsageSummary = snapshot.UsageSummary
 	m.CurrentModel = snapshot.CurrentModel
 	m.CurrentProvider = snapshot.CurrentProvider
+	m.CurrentProviderFormat = snapshot.CurrentProviderFormat
 	m.CurrentProviderKeySource = snapshot.CurrentProviderKeySource
 	m.Auth = snapshot.Auth
 	m.AppRoot = snapshot.AppRoot
@@ -479,12 +503,15 @@ func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
 	m.AvailableModels = cloneStrings(event.AvailableModels)
 	m.AvailableProviders = cloneStrings(event.AvailableProviders)
 	m.ProviderProfiles = cloneStringMap(event.ProviderProfiles)
+	m.ProviderFormats = cloneStringMap(event.ProviderFormats)
+	m.ProviderEndpoints = cloneNestedStringMap(event.ProviderEndpoints)
 	m.ProviderProfileSources = cloneStringMap(event.ProviderProfileSources)
 	m.ProviderNames = cloneStringMap(event.ProviderNames)
 	m.ManagedSkills = cloneManagedSkills(event.ManagedSkills)
 	m.ManagedMcpServers = cloneManagedMcpServers(event.ManagedMcpServers)
 	m.CurrentModel = event.CurrentModel
 	m.CurrentProvider = event.CurrentProvider
+	m.CurrentProviderFormat = event.CurrentProviderFormat
 	m.CurrentProviderKeySource = event.CurrentProviderKeySource
 	m.Auth = event.Auth
 	if strings.TrimSpace(event.AppRoot) != "" {
@@ -512,6 +539,12 @@ func (m *Model) normalizePendingReviewsState() {
 func (m *Model) normalizeRuntimeMetadataState() {
 	if m.ProviderProfiles == nil {
 		m.ProviderProfiles = map[string]string{}
+	}
+	if m.ProviderFormats == nil {
+		m.ProviderFormats = map[string]string{}
+	}
+	if m.ProviderEndpoints == nil {
+		m.ProviderEndpoints = map[string]map[string]string{}
 	}
 	if m.ProviderProfileSources == nil {
 		m.ProviderProfileSources = map[string]string{}
@@ -879,7 +912,7 @@ func (m *Model) providerPanelPageSize() int {
 func (m *Model) providerPanelPageSizeForDimensions(width, height int) int {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	return dynamicPanelPageSize(bodyHeight, 9+providerPanelCommandRows(bodyWidth), 3)
+	return dynamicPanelPageSize(bodyHeight, 10+providerPanelCommandRows(bodyWidth), 3)
 }
 
 func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
@@ -894,7 +927,11 @@ func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
 }
 
 func providerPanelCommandRows(bodyWidth int) int {
-	return len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
+	return len(wrapPlainText("provider type commands: /provider type list | /provider type <type> [url]", bodyWidth)) +
+		len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
+		len(wrapPlainText("provider format commands: /provider format list | /provider format <format> [url]", bodyWidth)) +
+		len(wrapPlainText("provider endpoint commands: /provider endpoint list | /provider endpoint <kind> <path|url> [provider]", bodyWidth)) +
+		len(wrapPlainText("endpoint kinds: responses | chat_completions | models | anthropic_messages | gemini_generate_content", bodyWidth)) +
 		len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
 }
 
@@ -1148,12 +1185,19 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		if m.AuthStep == AuthStepConfirm {
 			provider := strings.TrimSpace(string(m.AuthProvider))
+			providerType := strings.TrimSpace(string(m.AuthProviderType))
 			apiKey := strings.TrimSpace(string(m.AuthAPIKey))
 			model := strings.TrimSpace(string(m.AuthModel))
 			if provider == "" {
 				m.AuthStep = AuthStepProvider
 				m.AuthCursor = len(m.AuthProvider)
 				m.setNotice("Provider is required.", true)
+				return m, nil
+			}
+			if providerType == "" {
+				m.AuthStep = AuthStepProviderType
+				m.AuthCursor = len(m.AuthProviderType)
+				m.setNotice("Provider type is required.", true)
 				return m, nil
 			}
 			if apiKey == "" {
@@ -1168,6 +1212,7 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{
 				Type:            "login",
 				ProviderBaseURL: provider,
+				ProviderType:    providerType,
 				APIKey:          apiKey,
 				Model:           model,
 			})
@@ -1216,10 +1261,14 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.AuthCursor = len(m.AuthProvider)
 				return m, nil
 			case '2':
+				m.AuthStep = AuthStepProviderType
+				m.AuthCursor = len(m.AuthProviderType)
+				return m, nil
+			case '3':
 				m.AuthStep = AuthStepAPIKey
 				m.AuthCursor = len(m.AuthAPIKey)
 				return m, nil
-			case '3':
+			case '4':
 				m.AuthStep = AuthStepModel
 				m.AuthCursor = len(m.AuthModel)
 				return m, nil
@@ -1444,6 +1493,27 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Loading provider profile overrides...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_profiles"})
+	case query == "/provider type":
+		m.setNotice("Usage: /provider type <openai-compatible|openai-responses|gemini|anthropic> [url] | /provider type clear [url] | /provider type list", true)
+		return true, nil
+	case query == "/provider type list":
+		m.Status = StatusPreparing
+		m.setNotice("Loading provider type overrides...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_types"})
+	case query == "/provider format":
+		m.setNotice("Usage: /provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url] | /provider format clear [url] | /provider format list", true)
+		return true, nil
+	case query == "/provider format list":
+		m.Status = StatusPreparing
+		m.setNotice("Loading provider transport format overrides...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_formats"})
+	case query == "/provider endpoint":
+		m.setNotice("Usage: /provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider] | /provider endpoint clear <kind> [provider] | /provider endpoint list", true)
+		return true, nil
+	case query == "/provider endpoint list":
+		m.Status = StatusPreparing
+		m.setNotice("Loading provider endpoint overrides...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "list_provider_endpoints"})
 	case query == "/provider name":
 		m.setNotice("Usage: /provider name <display_name> | /provider name clear [url] | /provider name list", true)
 		return true, nil
@@ -1470,6 +1540,30 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Clearing provider profile override...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "clear_provider_profile", Value: tail})
+	case strings.HasPrefix(query, "/provider type clear"):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider type clear"))
+		m.Status = StatusPreparing
+		m.setNotice("Clearing provider type override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "clear_provider_type", Value: tail})
+	case strings.HasPrefix(query, "/provider type "):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider type "))
+		parts := strings.Fields(tail)
+		if len(parts) == 0 {
+			m.setNotice("Usage: /provider type <openai-compatible|openai-responses|gemini|anthropic> [url]", true)
+			return true, nil
+		}
+		providerType := strings.ToLower(parts[0])
+		if providerType != "openai-compatible" && providerType != "openai-responses" && providerType != "gemini" && providerType != "anthropic" {
+			m.setNotice("Provider type must be openai-compatible, openai-responses, gemini, or anthropic.", true)
+			return true, nil
+		}
+		provider := ""
+		if len(parts) > 1 {
+			provider = strings.Join(parts[1:], " ")
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Setting provider type override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider_type", ProviderType: providerType, Value: provider})
 	case strings.HasPrefix(query, "/provider profile "):
 		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider profile "))
 		parts := strings.Fields(tail)
@@ -1489,6 +1583,60 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Setting provider profile override...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider_profile", Profile: profile, Value: provider})
+	case strings.HasPrefix(query, "/provider format clear"):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider format clear"))
+		m.Status = StatusPreparing
+		m.setNotice("Clearing provider transport format override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "clear_provider_format", Value: tail})
+	case strings.HasPrefix(query, "/provider format "):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider format "))
+		parts := strings.Fields(tail)
+		if len(parts) == 0 {
+			m.setNotice("Usage: /provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url]", true)
+			return true, nil
+		}
+		format := strings.ToLower(parts[0])
+		if format != "openai_chat" && format != "openai_responses" && format != "anthropic_messages" && format != "gemini_generate_content" {
+			m.setNotice("Format must be openai_chat, openai_responses, anthropic_messages, or gemini_generate_content.", true)
+			return true, nil
+		}
+		provider := ""
+		if len(parts) > 1 {
+			provider = strings.Join(parts[1:], " ")
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Setting provider transport format override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider_format", Format: format, Value: provider})
+	case strings.HasPrefix(query, "/provider endpoint clear"):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider endpoint clear"))
+		parts := strings.Fields(tail)
+		if len(parts) == 0 || !isProviderEndpointKind(parts[0]) {
+			m.setNotice("Usage: /provider endpoint clear <kind> [provider]", true)
+			return true, nil
+		}
+		provider := ""
+		if len(parts) > 1 {
+			provider = strings.Join(parts[1:], " ")
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Clearing provider endpoint override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "clear_provider_endpoint", Kind: parts[0], Value: provider})
+	case strings.HasPrefix(query, "/provider endpoint "):
+		tail := strings.TrimSpace(strings.TrimPrefix(query, "/provider endpoint "))
+		parts := strings.Fields(tail)
+		if len(parts) < 2 || !isProviderEndpointKind(parts[0]) {
+			m.setNotice("Usage: /provider endpoint <kind> <path|url> [provider]", true)
+			return true, nil
+		}
+		kind := parts[0]
+		endpoint := parts[1]
+		provider := ""
+		if len(parts) > 2 {
+			provider = strings.Join(parts[2:], " ")
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Setting provider endpoint override...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider_endpoint", Kind: kind, Endpoint: endpoint, Value: provider})
 	case strings.HasPrefix(query, "/provider "):
 		provider := strings.TrimSpace(strings.TrimPrefix(query, "/provider "))
 		if provider == "" {
@@ -1588,7 +1736,7 @@ func (m *Model) openAuthPanel() {
 }
 
 func (m *Model) moveAuthStep(delta int) {
-	steps := []AuthStep{AuthStepProvider, AuthStepAPIKey, AuthStepModel, AuthStepConfirm}
+	steps := []AuthStep{AuthStepProvider, AuthStepProviderType, AuthStepAPIKey, AuthStepModel, AuthStepConfirm}
 	currentIndex := 0
 	for index, step := range steps {
 		if step == m.AuthStep {
@@ -1604,6 +1752,9 @@ func (m *Model) moveAuthStep(delta int) {
 func (m *Model) advanceAuthStepOnEnter() {
 	switch m.AuthStep {
 	case AuthStepProvider:
+		m.AuthStep = AuthStepProviderType
+		m.AuthCursor = len(m.AuthProviderType)
+	case AuthStepProviderType:
 		if len(m.AuthAPIKey) > 0 {
 			if len(m.AuthModel) > 0 {
 				m.AuthStep = AuthStepConfirm
@@ -1636,6 +1787,8 @@ func (m *Model) currentAuthFieldLength() int {
 	switch m.AuthStep {
 	case AuthStepProvider:
 		return len(m.AuthProvider)
+	case AuthStepProviderType:
+		return len(m.AuthProviderType)
 	case AuthStepAPIKey:
 		return len(m.AuthAPIKey)
 	case AuthStepModel:
@@ -1649,6 +1802,8 @@ func (m *Model) currentAuthField() *[]rune {
 	switch m.AuthStep {
 	case AuthStepProvider:
 		return &m.AuthProvider
+	case AuthStepProviderType:
+		return &m.AuthProviderType
 	case AuthStepAPIKey:
 		return &m.AuthAPIKey
 	case AuthStepModel:
@@ -1934,6 +2089,34 @@ func cloneStringMap(items map[string]string) map[string]string {
 	return cloned
 }
 
+func cloneNestedStringMap(items map[string]map[string]string) map[string]map[string]string {
+	if len(items) == 0 {
+		return map[string]map[string]string{}
+	}
+	cloned := make(map[string]map[string]string, len(items))
+	for key, value := range items {
+		if len(value) == 0 {
+			cloned[key] = map[string]string{}
+			continue
+		}
+		inner := make(map[string]string, len(value))
+		for innerKey, innerValue := range value {
+			inner[innerKey] = innerValue
+		}
+		cloned[key] = inner
+	}
+	return cloned
+}
+
+func isProviderEndpointKind(value string) bool {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "responses", "chat_completions", "models", "anthropic_messages", "gemini_generate_content":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Model) ShouldPrintExitSummary() bool {
 	return m.QuitWithSummary
 }
@@ -2120,10 +2303,22 @@ func slashInsertValue(command string) string {
 	switch command {
 	case "/provider <url>":
 		return "/provider "
+	case "/provider type <openai-compatible|openai-responses|gemini|anthropic> [url]":
+		return "/provider type "
+	case "/provider type clear [url]":
+		return "/provider type clear "
 	case "/provider profile <openai|gemini|anthropic|custom> [url]":
 		return "/provider profile "
 	case "/provider profile clear [url]":
 		return "/provider profile clear "
+	case "/provider format <openai_chat|openai_responses|anthropic_messages|gemini_generate_content> [url]":
+		return "/provider format "
+	case "/provider format clear [url]":
+		return "/provider format clear "
+	case "/provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider]":
+		return "/provider endpoint "
+	case "/provider endpoint clear <kind> [provider]":
+		return "/provider endpoint clear "
 	case "/provider name <display_name>":
 		return "/provider name "
 	case "/provider name clear [url]":
@@ -2253,6 +2448,25 @@ func extensionExposureModes() []slashCommandSpec {
 	}
 }
 
+func providerEndpointKindModes() []slashCommandSpec {
+	return []slashCommandSpec{
+		{Command: "responses", Description: "OpenAI Responses stream endpoint", InsertValue: "responses "},
+		{Command: "chat_completions", Description: "OpenAI chat/completions stream endpoint", InsertValue: "chat_completions "},
+		{Command: "models", Description: "model catalog fetch endpoint", InsertValue: "models "},
+		{Command: "anthropic_messages", Description: "Anthropic native /messages stream endpoint", InsertValue: "anthropic_messages "},
+		{Command: "gemini_generate_content", Description: "Gemini native generateContent SSE endpoint", InsertValue: "gemini_generate_content "},
+	}
+}
+
+func providerTypeModes() []slashCommandSpec {
+	return []slashCommandSpec{
+		{Command: "openai-compatible", Description: "OpenAI-compatible chat/completions provider", InsertValue: "openai-compatible "},
+		{Command: "openai-responses", Description: "OpenAI Responses API provider", InsertValue: "openai-responses "},
+		{Command: "gemini", Description: "Google Gemini provider", InsertValue: "gemini "},
+		{Command: "anthropic", Description: "Anthropic native provider", InsertValue: "anthropic "},
+	}
+}
+
 func scoreSlashCandidate(query string, candidate string) int {
 	if query == "" {
 		return 100
@@ -2330,10 +2544,67 @@ func (m *Model) extensionTargetSuggestions(prefix string, rawQuery string, limit
 	}
 
 	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].score != results[j].score {
-			return results[i].score > results[j].score
+		return results[i].score > results[j].score
+	})
+
+	items := make([]slashCommandSpec, 0, minInt(limit, len(results)))
+	for _, item := range results {
+		items = append(items, item.item)
+		if len(items) == limit {
+			break
 		}
-		return results[i].item.Command < results[j].item.Command
+	}
+	return items
+}
+
+func providerEndpointKindSuggestions(prefix string, rawQuery string, limit int) []slashCommandSpec {
+	query := strings.TrimSpace(strings.ToLower(rawQuery))
+	type scored struct {
+		item  slashCommandSpec
+		score int
+	}
+	results := make([]scored, 0, 5)
+	for _, mode := range providerEndpointKindModes() {
+		score := scoreSlashCandidate(query, strings.ToLower(mode.Command))
+		if score < 0 && query != "" {
+			continue
+		}
+		mode.InsertValue = prefix + mode.InsertValue
+		results = append(results, scored{item: mode, score: score})
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+
+	items := make([]slashCommandSpec, 0, minInt(limit, len(results)))
+	for _, item := range results {
+		items = append(items, item.item)
+		if len(items) == limit {
+			break
+		}
+	}
+	return items
+}
+
+func providerTypeSuggestions(prefix string, rawQuery string, limit int) []slashCommandSpec {
+	query := strings.TrimSpace(strings.ToLower(rawQuery))
+	type scored struct {
+		item  slashCommandSpec
+		score int
+	}
+	results := make([]scored, 0, 4)
+	for _, mode := range providerTypeModes() {
+		score := scoreSlashCandidate(query, strings.ToLower(mode.Command))
+		if score < 0 && query != "" {
+			continue
+		}
+		mode.InsertValue = prefix + mode.InsertValue
+		results = append(results, scored{item: mode, score: score})
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].score > results[j].score
 	})
 
 	items := make([]slashCommandSpec, 0, minInt(limit, len(results)))
@@ -2347,7 +2618,8 @@ func (m *Model) extensionTargetSuggestions(prefix string, rawQuery string, limit
 }
 
 func (m *Model) dynamicSlashSuggestions(input string, limit int) []slashCommandSpec {
-	trimmed := strings.TrimSpace(strings.ToLower(input))
+	normalized := strings.ToLower(strings.TrimLeftFunc(input, unicode.IsSpace))
+	trimmed := strings.TrimSpace(normalized)
 	switch {
 	case trimmed == "/extensions show" || strings.HasPrefix(trimmed, "/extensions show "):
 		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions show"))
@@ -2359,7 +2631,7 @@ func (m *Model) dynamicSlashSuggestions(input string, limit int) []slashCommandS
 		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions disable"))
 		return m.extensionTargetSuggestions("/extensions disable ", query, limit)
 	case trimmed == "/extensions exposure" || strings.HasPrefix(trimmed, "/extensions exposure "):
-		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions exposure"))
+		rest := strings.TrimSpace(strings.TrimPrefix(normalized, "/extensions exposure"))
 		if rest == "" {
 			modes := extensionExposureModes()
 			for index := range modes {
@@ -2369,7 +2641,7 @@ func (m *Model) dynamicSlashSuggestions(input string, limit int) []slashCommandS
 		}
 
 		fields := strings.Fields(rest)
-		if len(fields) == 1 && !strings.HasSuffix(trimmed, " ") {
+		if len(fields) == 1 && !strings.HasSuffix(normalized, " ") {
 			query := fields[0]
 			filtered := make([]slashCommandSpec, 0, 4)
 			for _, mode := range extensionExposureModes() {
@@ -2398,6 +2670,36 @@ func (m *Model) dynamicSlashSuggestions(input string, limit int) []slashCommandS
 			return nil
 		}
 		return m.extensionTargetSuggestions("/extensions exposure "+mode+" ", targetQuery, limit)
+	case trimmed == "/provider type" || strings.HasPrefix(trimmed, "/provider type "):
+		rest := strings.TrimSpace(strings.TrimPrefix(normalized, "/provider type"))
+		if rest == "" {
+			return providerTypeSuggestions("/provider type ", "", limit)
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 1 && !strings.HasSuffix(normalized, " ") {
+			return providerTypeSuggestions("/provider type ", fields[0], limit)
+		}
+		return nil
+	case trimmed == "/provider endpoint clear" || strings.HasPrefix(trimmed, "/provider endpoint clear "):
+		rest := strings.TrimSpace(strings.TrimPrefix(normalized, "/provider endpoint clear"))
+		if rest == "" {
+			return providerEndpointKindSuggestions("/provider endpoint clear ", "", limit)
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 1 && !strings.HasSuffix(normalized, " ") {
+			return providerEndpointKindSuggestions("/provider endpoint clear ", fields[0], limit)
+		}
+		return nil
+	case trimmed == "/provider endpoint" || strings.HasPrefix(trimmed, "/provider endpoint "):
+		rest := strings.TrimSpace(strings.TrimPrefix(normalized, "/provider endpoint"))
+		if rest == "" {
+			return providerEndpointKindSuggestions("/provider endpoint ", "", limit)
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 1 && !strings.HasSuffix(normalized, " ") {
+			return providerEndpointKindSuggestions("/provider endpoint ", fields[0], limit)
+		}
+		return nil
 	}
 	return nil
 }

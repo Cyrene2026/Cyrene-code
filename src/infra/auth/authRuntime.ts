@@ -154,6 +154,37 @@ const formatPersistenceTarget = (status: AuthStatus) =>
     ? `${status.persistenceTarget.label} (${status.persistenceTarget.path})`
     : "unavailable";
 
+const buildLaunchEnvShadowWarning = (options: {
+  env: NodeJS.ProcessEnv;
+  providerBaseUrl: string;
+  model: string;
+  apiKey: string;
+  providerEnvName: ManagedAuthEnvName;
+}) => {
+  const warnings: string[] = [];
+
+  const launchProvider = trimNonEmpty(options.env.CYRENE_BASE_URL);
+  if (launchProvider && launchProvider !== options.providerBaseUrl) {
+    warnings.push("CYRENE_BASE_URL");
+  }
+
+  const launchModel = trimNonEmpty(options.env.CYRENE_MODEL);
+  if (launchModel && launchModel !== options.model) {
+    warnings.push("CYRENE_MODEL");
+  }
+
+  const launchProviderKey = trimNonEmpty(options.env[options.providerEnvName]);
+  if (launchProviderKey && launchProviderKey !== options.apiKey) {
+    warnings.push(options.providerEnvName);
+  }
+
+  if (warnings.length === 0) {
+    return "";
+  }
+
+  return ` Future launches from this same shell may still use ${warnings.join(", ")} from the current launch environment. Unset those vars or open a new terminal to use the saved login.`;
+};
+
 const buildStatus = (
   source: AuthStatus["credentialSource"],
   providerBaseUrl: string | undefined,
@@ -666,9 +697,16 @@ export const createAuthRuntime = (
 
     const transport = await buildTransport();
     const status = await getStatus();
-    const message = before.hasExplicitProcessKey
+    const shadowWarning = buildLaunchEnvShadowWarning({
+      env: effectiveEnv,
+      providerBaseUrl: validation.normalizedProviderBaseUrl,
+      model: validation.selectedModel,
+      apiKey: validation.normalizedApiKey,
+      providerEnvName,
+    });
+    const message = (before.hasExplicitProcessKey
       ? `Saved login to ${formatPersistenceTarget(status)}. Switched the current run to the newly saved credential.`
-      : `Saved login to ${formatPersistenceTarget(status)}. Switched to HTTP mode.`;
+      : `Saved login to ${formatPersistenceTarget(status)}. Switched to HTTP mode.`) + shadowWarning;
     return {
       ok: true,
       message,

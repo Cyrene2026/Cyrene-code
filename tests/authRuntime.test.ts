@@ -459,6 +459,9 @@ describe("createAuthRuntime", () => {
     expect(result.status.provider).toBe("https://next-provider.test/v1");
     expect(result.status.model).toBe("gpt-next");
     expect(result.message).toContain("Switched the current run to the newly saved credential");
+    expect(result.message).toContain(
+      "Future launches from this same shell may still use CYRENE_BASE_URL, CYRENE_MODEL"
+    );
     expect(createHttpTransport).toHaveBeenLastCalledWith(
       expect.objectContaining({
         env: expect.objectContaining({
@@ -467,6 +470,48 @@ describe("createAuthRuntime", () => {
           CYRENE_MODEL: "gpt-next",
         }),
       })
+    );
+  });
+
+  test("saveLogin warns when a stale provider-specific launch key would shadow the saved login on relaunch", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {
+        CYRENE_BASE_URL: "https://provider.test/v1",
+        CYRENE_MODEL: "gpt-4o-mini",
+        CYRENE_OPENAI_API_KEY: "old-key",
+      } as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+      createHttpTransport: mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+        createStubTransport("gpt-4.1", "https://provider.test/v1")
+      ) as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      fetchProviderModelCatalogImpl: mock(async () => ({
+        providerBaseUrl: "https://provider.test/v1",
+        models: ["gpt-4o-mini", "gpt-4.1"],
+        selectedModel: "gpt-4.1",
+      })),
+      loadModelYamlImpl: mock(async () => ({
+        models: ["gpt-4o-mini", "gpt-4.1"],
+        defaultModel: "gpt-4o-mini",
+        lastUsedModel: "gpt-4o-mini",
+        providerBaseUrl: "https://provider.test/v1",
+        providers: ["https://provider.test/v1"],
+        providerProfiles: {},
+      })),
+    });
+
+    const result = await runtime.saveLogin({
+      providerBaseUrl: "https://provider.test/v1",
+      apiKey: "new-key",
+      model: "gpt-4.1",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain(
+      "Future launches from this same shell may still use CYRENE_MODEL, CYRENE_OPENAI_API_KEY"
     );
   });
 

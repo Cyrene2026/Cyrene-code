@@ -8,6 +8,10 @@ import type { AuthStatus } from "../../../infra/auth/types";
 import { createFileSessionStore } from "../../../infra/session/createFileSessionStore";
 import { createMcpRuntime, type McpRuntime, type PendingReviewItem } from "../../../core/mcp";
 import { createSkillsRuntime, type SkillDefinition, type SkillsRuntime } from "../../../core/skills";
+import {
+  createExtensionManager,
+  type ExtensionManager,
+} from "../../../core/extensions";
 import { buildPromptWithContext } from "../../../core/session/buildPromptWithContext";
 import { runQuerySession, type RunQuerySessionResult } from "../../../core/query/runQuerySession";
 import type {
@@ -33,12 +37,13 @@ import { HELP_TEXT } from "../../../application/chat/chatCommandHelpers";
 import { handleSessionCommand } from "../../../application/chat/chatSessionCommandHandler";
 import { handleSkillsCommand } from "../../../application/chat/chatSkillsCommandHandler";
 import { handleMcpCommand } from "../../../application/chat/chatMcpCommandHandler";
+import { handleExtensionsCommand } from "../../../application/chat/chatExtensionsCommandHandler";
 import {
   normalizeMcpMessage,
   summarizeToolMessage as summarizeChatToolMessage,
 } from "../../../application/chat/toolMessageSummary";
 import {
-  formatActiveSkillsPrompt,
+  formatSelectedExtensionsPrompt,
 } from "../../../application/chat/chatMcpSkillsFormatting";
 
 type BridgeCommand =
@@ -134,6 +139,21 @@ type BridgeUsageSummary = {
   totalTokens: number;
 };
 
+type BridgeManagedSkill = {
+  id: string;
+  label: string;
+  exposure: "hidden" | "hinted" | "scoped" | "full";
+  source: "built_in" | "global" | "project";
+};
+
+type BridgeManagedMcpServer = {
+  id: string;
+  label: string;
+  exposure: "hidden" | "hinted" | "scoped" | "full";
+  scope: "default" | "global" | "project";
+  trusted: boolean;
+};
+
 type BridgeSnapshot = {
   appRoot: string;
   status: BridgeStatus;
@@ -150,6 +170,8 @@ type BridgeSnapshot = {
   providerProfiles: Record<string, BridgeProviderProfile>;
   providerProfileSources: Record<string, BridgeProviderProfileSource>;
   providerNames: Record<string, string>;
+  managedSkills: BridgeManagedSkill[];
+  managedMcpServers: BridgeManagedMcpServer[];
   usageSummary: BridgeUsageSummary;
   auth: BridgeAuthStatus;
 };
@@ -173,6 +195,8 @@ type BridgeEvent =
       providerProfiles: Record<string, BridgeProviderProfile>;
       providerProfileSources: Record<string, BridgeProviderProfileSource>;
       providerNames: Record<string, string>;
+      managedSkills: BridgeManagedSkill[];
+      managedMcpServers: BridgeManagedMcpServer[];
       appRoot: string;
     }
   | { type: "set_usage_summary"; usageSummary: BridgeUsageSummary }
@@ -390,6 +414,7 @@ class BubbleTeaBridge {
   private sessionStore: SessionStore | null = null;
   private mcpService: McpRuntime | null = null;
   private skillsRuntime: SkillsRuntime | null = null;
+  private extensionManager: ExtensionManager | null = null;
 
   private activeSessionId: string | null = null;
   private items: BridgeItem[] = [];
@@ -404,6 +429,8 @@ class BubbleTeaBridge {
   private providerProfiles: Record<string, BridgeProviderProfile> = {};
   private providerProfileSources: Record<string, BridgeProviderProfileSource> = {};
   private providerNames: Record<string, string> = {};
+  private managedSkills: BridgeManagedSkill[] = [];
+  private managedMcpServers: BridgeManagedMcpServer[] = [];
   private usageBySession: Record<string, BridgeUsageSummary> = {};
   private stateUpdateCount = 0;
   private sessionSkillUseIds = new Map<string, string[]>();
@@ -541,6 +568,10 @@ class BubbleTeaBridge {
     });
     this.mcpService = await createMcpRuntime(this.appRoot);
     this.skillsRuntime = await createSkillsRuntime(this.appRoot);
+    this.extensionManager =
+      this.mcpService && this.skillsRuntime
+        ? createExtensionManager(this.mcpService, this.skillsRuntime)
+        : null;
     this.pendingReviews = this.listPendingReviews();
     this.markRuntimeMetadataDirty();
     await this.refreshRuntimeMetadata();
@@ -616,6 +647,8 @@ class BubbleTeaBridge {
     this.providerProfiles = {};
     this.providerProfileSources = {};
     this.providerNames = {};
+    this.managedSkills = [];
+    this.managedMcpServers = [];
     this.usageBySession = {};
 
     try {
@@ -655,6 +688,23 @@ class BubbleTeaBridge {
     }
     this.providerProfiles = nextProfiles;
     this.providerProfileSources = nextProfileSources;
+    this.managedSkills = this.extensionManager
+      ? this.extensionManager.listSkills().map(skill => ({
+          id: skill.id,
+          label: skill.label,
+          exposure: skill.exposure,
+          source: skill.source,
+        }))
+      : [];
+    this.managedMcpServers = this.extensionManager
+      ? this.extensionManager.listMcpServers().map(server => ({
+          id: server.id,
+          label: server.label,
+          exposure: server.exposure,
+          scope: server.scope ?? "default",
+          trusted: server.trusted === true,
+        }))
+      : [];
     this.runtimeMetadataDirty = false;
     this.emitRuntimeMetadata();
   }
@@ -676,6 +726,8 @@ class BubbleTeaBridge {
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
       providerNames: this.providerNames,
+      managedSkills: this.managedSkills,
+      managedMcpServers: this.managedMcpServers,
       usageSummary: this.currentUsageSummary(),
       auth: toBridgeAuthStatus(this.authStatus),
     };
@@ -778,6 +830,8 @@ class BubbleTeaBridge {
       providerProfiles: this.providerProfiles,
       providerProfileSources: this.providerProfileSources,
       providerNames: this.providerNames,
+      managedSkills: this.managedSkills,
+      managedMcpServers: this.managedMcpServers,
       appRoot: this.appRoot,
     });
   }
@@ -1087,6 +1141,26 @@ class BubbleTeaBridge {
       return;
     }
 
+    const extensionsHandled = await handleExtensionsCommand({
+      query,
+      extensionManager: this.extensionManager ?? undefined,
+      skillsService: this.skillsRuntime ?? undefined,
+      mcpService: this.mcpService ?? undefined,
+      activeSessionId: this.activeSessionId,
+      getSessionSkillUseIds: sessionId => this.getSessionSkillUseIds(sessionId),
+      pushSystemMessage: (text, options) =>
+        void this.pushSystemMessage(text, { kind: options?.kind as BridgeItem["kind"] | undefined }),
+      clearInput: () => {},
+    });
+    if (extensionsHandled) {
+      this.pendingReviews = this.listPendingReviews();
+      this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
+      await this.refreshRuntimeMetadata();
+      this.emitPendingReviews();
+      this.emitStatus();
+      return;
+    }
+
     const mcpHandled = await handleMcpCommand({
       query,
       mcpService: this.mcpService!,
@@ -1218,17 +1292,36 @@ class BubbleTeaBridge {
     await this.ensureRuntime();
     const session = await this.ensureActiveSession(text);
     const promptContext = await this.sessionStore!.getPromptContext(session.id, text);
-    const autoSkills = this.skillsRuntime?.resolveForQuery(text) ?? [];
-    const manualSkills = this.resolveSessionSkillUseDefinitions(session.id);
-    const activeSkills = [...manualSkills, ...autoSkills].filter(
-      (skill, index, all) => all.findIndex(item => item.id === skill.id) === index
-    );
+    const manualSkillIds = this.getSessionSkillUseIds(session.id);
+    const selectedExtensions = this.extensionManager?.resolveForQuery(text, {
+      manualSkillIds,
+    });
+    const activeSkills =
+      selectedExtensions?.skills.map(entry => entry.item) ??
+      [
+        ...this.resolveSessionSkillUseDefinitions(session.id),
+        ...(this.skillsRuntime?.resolveForQuery(text) ?? []),
+      ].filter((skill, index, all) => all.findIndex(item => item.id === skill.id) === index);
     const prompt = buildPromptWithContext(
       text,
       this.runtimeSystemPrompt,
       this.promptPolicy!.projectPrompt,
       promptContext,
-      activeSkills.length > 0 ? formatActiveSkillsPrompt(activeSkills) : ""
+      selectedExtensions
+        ? formatSelectedExtensionsPrompt(selectedExtensions)
+        : activeSkills.length > 0
+          ? formatSelectedExtensionsPrompt({
+              skills: activeSkills.map(skill => ({
+                item: {
+                  ...skill,
+                  matchTokens: [],
+                },
+                reason: "manual",
+                score: 0,
+              })),
+              mcpServers: [],
+            })
+          : ""
     );
 
     const startedAt = new Date().toISOString();
@@ -1915,6 +2008,7 @@ class BubbleTeaBridge {
     } catch {
       // Ignore shutdown failures.
     }
+    this.extensionManager = null;
   }
 }
 

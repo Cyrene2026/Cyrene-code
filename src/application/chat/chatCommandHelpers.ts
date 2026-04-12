@@ -107,6 +107,30 @@ export const COMMAND_SPECS: CommandSpec[] = [
   },
   { command: "/skills use <id>", description: "use one skill for the current session only" },
   { command: "/skills reload", description: "reload skills config from disk" },
+  { command: "/extensions", description: "show extensions runtime summary" },
+  { command: "/extensions list", description: "list managed skills and MCP servers" },
+  { command: "/extensions skills", description: "list managed skills with scope/exposure" },
+  { command: "/extensions mcp", description: "list managed MCP servers with trust/scope/exposure" },
+  {
+    command: "/extensions show <id|skill:<id>|mcp:<id>>",
+    description: "inspect one managed skill or MCP server",
+  },
+  {
+    command: "/extensions resolve <query>",
+    description: "preview which extensions would be selected for a query",
+  },
+  {
+    command: "/extensions enable <id|skill:<id>|mcp:<id>>",
+    description: "enable one managed skill or MCP server",
+  },
+  {
+    command: "/extensions disable <id|skill:<id>|mcp:<id>>",
+    description: "disable one managed skill or MCP server",
+  },
+  {
+    command: "/extensions exposure <hidden|hinted|scoped|full> <id|skill:<id>|mcp:<id>>",
+    description: "set exposure policy for one managed skill or MCP server",
+  },
   { command: "/mcp", description: "show MCP runtime summary" },
   { command: "/mcp servers", description: "list registered MCP servers" },
   { command: "/mcp server <id>", description: "inspect one MCP server" },
@@ -266,6 +290,9 @@ const getCommandGroup = (command: string) => {
   if (command.startsWith("/skills")) {
     return "Skills";
   }
+  if (command.startsWith("/extensions")) {
+    return "Extensions";
+  }
   if (command.startsWith("/mcp")) {
     return "MCP";
   }
@@ -320,6 +347,16 @@ const getSlashInsertValue = (command: string) => {
       return "/skills use ";
     case "/skills show <id>":
       return "/skills show ";
+    case "/extensions show <id|skill:<id>|mcp:<id>>":
+      return "/extensions show ";
+    case "/extensions resolve <query>":
+      return "/extensions resolve ";
+    case "/extensions enable <id|skill:<id>|mcp:<id>>":
+      return "/extensions enable ";
+    case "/extensions disable <id|skill:<id>|mcp:<id>>":
+      return "/extensions disable ";
+    case "/extensions exposure <hidden|hinted|scoped|full> <id|skill:<id>|mcp:<id>>":
+      return "/extensions exposure ";
     case "/mcp server <id>":
       return "/mcp server ";
     case "/mcp tools <server>":

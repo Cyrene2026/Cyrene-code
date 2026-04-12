@@ -66,6 +66,23 @@ describe("skills runtime", () => {
 
   test("resolves skills by trigger and explicit $mention", async () => {
     const root = await createWorkspace();
+    await writeFile(
+      join(root, ".cyrene", "skills.yaml"),
+      [
+        "skills:",
+        "  - id: docs-hint",
+        "    label: Docs Hint",
+        "    prompt: Only explicit mention should activate this.",
+        "    triggers: [docs]",
+        "    exposure: hinted",
+        "  - id: hidden-memory",
+        "    label: Hidden Memory",
+        "    prompt: Hidden skill should stay out of auto-selection.",
+        "    triggers: [memory]",
+        "    exposure: hidden",
+      ].join("\n"),
+      "utf8"
+    );
     const runtime = await createSkillsRuntime(root, {
       cwd: root,
       env: {},
@@ -74,8 +91,17 @@ describe("skills runtime", () => {
     const byTrigger = runtime.resolveForQuery("please review this patch");
     expect(byTrigger.some(skill => skill.id === "code-review")).toBe(true);
 
+    const hintedByTrigger = runtime.resolveForQuery("please read the docs first");
+    expect(hintedByTrigger.some(skill => skill.id === "docs-hint")).toBe(false);
+
     const byMention = runtime.resolveForQuery("use $code-review for this");
     expect(byMention.some(skill => skill.id === "code-review")).toBe(true);
+
+    const hintedByMention = runtime.resolveForQuery("use $docs-hint for this");
+    expect(hintedByMention.some(skill => skill.id === "docs-hint")).toBe(true);
+
+    const hiddenByTrigger = runtime.resolveForQuery("memory issue");
+    expect(hiddenByTrigger.some(skill => skill.id === "hidden-memory")).toBe(false);
   });
 
   test("setSkillEnabled persists to project config", async () => {
@@ -91,6 +117,21 @@ describe("skills runtime", () => {
     const skillsText = await readFile(join(root, ".cyrene", "skills.yaml"), "utf8");
     expect(skillsText).toContain("id: code-review");
     expect(skillsText).toContain("enabled: false");
+  });
+
+  test("setSkillExposure persists exposure override to project config", async () => {
+    const root = await createWorkspace();
+    const runtime = await createSkillsRuntime(root, {
+      cwd: root,
+      env: {},
+    });
+
+    const result = await runtime.setSkillExposure?.("code-review", "hinted");
+    expect(result?.ok).toBe(true);
+
+    const skillsText = await readFile(join(root, ".cyrene", "skills.yaml"), "utf8");
+    expect(skillsText).toContain("id: code-review");
+    expect(skillsText).toContain("exposure: hinted");
   });
 
   test("removeSkill persists remove_skills override to project config", async () => {

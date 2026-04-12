@@ -1,4 +1,5 @@
 import { getMcpToolCapabilities, getMcpToolRisk } from "../../McpPolicy";
+import { defaultMcpToolExposureMode } from "../../../extensions/metadata";
 import type { McpConfiguredServer, McpConfiguredTool } from "../../loadMcpConfig";
 import type {
   McpHandleResult,
@@ -85,6 +86,7 @@ const inferRisk = (name: string): McpToolRisk => {
 
 const mergeConfiguredTool = (
   serverId: string,
+  serverExposure: McpConfiguredServer["exposure"],
   remoteTool: RemoteMcpTool,
   configuredTool?: McpConfiguredTool
 ): McpToolDescriptor => ({
@@ -100,10 +102,17 @@ const mergeConfiguredTool = (
   risk: configuredTool?.risk ?? inferRisk(remoteTool.name),
   requiresReview: configuredTool?.requiresReview ?? false,
   enabled: configuredTool?.enabled ?? true,
+  exposure:
+    configuredTool?.exposure ??
+    defaultMcpToolExposureMode(serverExposure ?? "hinted"),
+  tags:
+    configuredTool?.tags && configuredTool.tags.length > 0
+      ? [...configuredTool.tags]
+      : [],
 });
 
 export const buildRemoteToolDescriptors = (
-  server: Pick<McpConfiguredServer, "id" | "tools">,
+  server: Pick<McpConfiguredServer, "id" | "tools" | "exposure">,
   remoteTools: RemoteMcpTool[]
 ): McpToolDescriptor[] => {
   const configuredByName = new Map(
@@ -111,7 +120,12 @@ export const buildRemoteToolDescriptors = (
   );
 
   const remoteDescriptors = remoteTools.map(tool =>
-    mergeConfiguredTool(server.id, tool, configuredByName.get(normalizeName(tool.name)))
+    mergeConfiguredTool(
+      server.id,
+      server.exposure,
+      tool,
+      configuredByName.get(normalizeName(tool.name))
+    )
   );
   const seen = new Set(remoteDescriptors.map(tool => normalizeName(tool.name)));
 
@@ -122,6 +136,7 @@ export const buildRemoteToolDescriptors = (
     remoteDescriptors.push(
       mergeConfiguredTool(
         server.id,
+        server.exposure,
         {
           name: configuredTool.name,
           description: configuredTool.description,

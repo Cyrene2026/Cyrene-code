@@ -5,6 +5,12 @@ import {
   getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
 } from "../../infra/config/appRoot";
+import {
+  defaultMcpServerExposureMode,
+  defaultMcpToolExposureMode,
+  normalizeExtensionExposureMode,
+  type ExtensionExposureMode,
+} from "../extensions/metadata";
 import type { LspServerConfig, MpcAction } from "./toolTypes";
 import { loadFilesystemRuleConfig } from "./adapters/filesystem";
 import { parseYamlDocument, stringifyYamlDocument } from "./simpleYaml";
@@ -29,6 +35,8 @@ export type McpConfiguredTool = {
   risk?: McpToolRisk;
   requiresReview?: boolean;
   enabled?: boolean;
+  exposure?: ExtensionExposureMode;
+  tags?: string[];
 };
 
 export type McpConfiguredServer = {
@@ -48,6 +56,9 @@ export type McpConfiguredServer = {
   allowPrivateNetwork?: boolean;
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  exposure?: ExtensionExposureMode;
+  tags?: string[];
+  hint?: string;
   lspServers?: LspServerConfig[];
   tools: McpConfiguredTool[];
 };
@@ -214,6 +225,7 @@ const normalizeTool = (value: unknown): McpConfiguredTool | null => {
     return {
       name,
       enabled: true,
+      tags: [],
     };
   }
 
@@ -239,6 +251,8 @@ const normalizeTool = (value: unknown): McpConfiguredTool | null => {
           ? value.requiresReview
           : undefined,
     enabled: normalizeBoolean(value.enabled, true),
+    exposure: normalizeExtensionExposureMode(value.exposure),
+    tags: normalizeStringArray(value.tags),
   };
 };
 
@@ -346,6 +360,9 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     ...(normalizeStringRecord(value.headers)
       ? { headers: normalizeStringRecord(value.headers) }
       : {}),
+    exposure: normalizeExtensionExposureMode(value.exposure),
+    tags: normalizeStringArray(value.tags),
+    hint: normalizeString(value.hint),
     ...(lspServers !== undefined ? { lspServers } : {}),
     tools,
   };
@@ -421,6 +438,18 @@ const mergeServer = (
   env: patch.env ? { ...patch.env } : base?.env ? { ...base.env } : undefined,
   headers:
     patch.headers ? { ...patch.headers } : base?.headers ? { ...base.headers } : undefined,
+  exposure:
+    patch.exposure ??
+    base?.exposure ??
+    defaultMcpServerExposureMode({
+      transport: patch.transport ?? base?.transport,
+      enabled: patch.enabled ?? base?.enabled,
+    }),
+  tags:
+    patch.tags && patch.tags.length > 0
+      ? [...patch.tags]
+      : [...(base?.tags ?? [])],
+  hint: patch.hint ?? base?.hint,
   ...(patch.lspServers !== undefined
     ? {
         lspServers: patch.lspServers.map(server => ({
@@ -442,7 +471,26 @@ const mergeServer = (
           })),
         }
       : {}),
-  tools: patch.tools.length > 0 ? [...patch.tools] : [...(base?.tools ?? [])],
+  tools:
+    patch.tools.length > 0
+      ? patch.tools.map(tool => ({
+          ...tool,
+          tags: tool.tags ? [...tool.tags] : [],
+          exposure:
+            tool.exposure ??
+            defaultMcpToolExposureMode(
+              patch.exposure ??
+                base?.exposure ??
+                defaultMcpServerExposureMode({
+                  transport: patch.transport ?? base?.transport,
+                  enabled: patch.enabled ?? base?.enabled,
+                })
+            ),
+        }))
+      : (base?.tools ?? []).map(tool => ({
+          ...tool,
+          tags: tool.tags ? [...tool.tags] : [],
+        })),
 });
 
 const mergeConfigPatches = (
@@ -455,7 +503,11 @@ const mergeConfigPatches = (
     serverMap.set(server.id, {
       ...server,
       aliases: [...server.aliases],
-      tools: [...server.tools],
+      tags: [...(server.tags ?? [])],
+      tools: server.tools.map(tool => ({
+        ...tool,
+        tags: [...(tool.tags ?? [])],
+      })),
     });
   }
 
@@ -491,6 +543,12 @@ const buildDefaultFilesystemServer = async (
     workspaceRoot: ruleConfig.workspaceRoot,
     maxReadBytes: ruleConfig.maxReadBytes,
     requireReview: [...ruleConfig.requireReview],
+    exposure: defaultMcpServerExposureMode({
+      transport: "filesystem",
+      enabled: true,
+    }),
+    tags: ["filesystem", "workspace", "core"],
+    hint: "Core workspace file, git, shell, and LSP operations.",
     lspServers: [...(ruleConfig.lspServers ?? [])],
     tools: [],
   };
@@ -551,6 +609,8 @@ const serializeConfiguredTool = (tool: McpConfiguredTool) => ({
   ...(typeof tool.requiresReview === "boolean"
     ? { requires_review: tool.requiresReview }
     : {}),
+  ...(tool.exposure ? { exposure: tool.exposure } : {}),
+  ...(tool.tags && tool.tags.length > 0 ? { tags: [...tool.tags] } : {}),
   ...(typeof tool.enabled === "boolean" && !tool.enabled
     ? { enabled: tool.enabled }
     : {}),
@@ -579,6 +639,9 @@ const serializeConfiguredServer = (server: McpConfiguredServer) => ({
     : {}),
   ...(typeof server.trusted === "boolean" ? { trusted: server.trusted } : {}),
   ...(server.aliases.length > 0 ? { aliases: [...server.aliases] } : {}),
+  ...(server.exposure ? { exposure: server.exposure } : {}),
+  ...(server.tags && server.tags.length > 0 ? { tags: [...server.tags] } : {}),
+  ...(server.hint ? { hint: server.hint } : {}),
   ...(server.workspaceRoot ? { workspace_root: server.workspaceRoot } : {}),
   ...(server.cwd ? { cwd: server.cwd } : {}),
   ...(typeof server.maxReadBytes === "number"

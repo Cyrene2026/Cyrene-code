@@ -1,4 +1,5 @@
 import type { MpcAction, PendingReviewItem, ToolRequest } from "./toolTypes";
+import type { ExtensionExposureMode } from "../extensions/metadata";
 
 export type McpToolCapability =
   | "read"
@@ -29,6 +30,8 @@ export type McpToolDescriptor = {
   risk: McpToolRisk;
   requiresReview: boolean;
   enabled: boolean;
+  exposure: ExtensionExposureMode;
+  tags: string[];
 };
 
 export type McpServerDescriptor = {
@@ -39,6 +42,11 @@ export type McpServerDescriptor = {
   health: "unknown" | "online" | "offline" | "error";
   transport?: McpServerTransport;
   aliases?: string[];
+  exposure: ExtensionExposureMode;
+  tags: string[];
+  hint?: string;
+  scope?: "default" | "global" | "project";
+  trusted?: boolean;
   lsp?: {
     configuredCount: number;
     serverIds: string[];
@@ -68,6 +76,8 @@ export type McpRuntimeToolInput = {
   risk?: McpToolRisk;
   requiresReview?: boolean;
   enabled?: boolean;
+  exposure?: ExtensionExposureMode;
+  tags?: string[];
 };
 
 export type McpRuntimeServerInput = {
@@ -86,6 +96,9 @@ export type McpRuntimeServerInput = {
   allowPrivateNetwork?: boolean;
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  exposure?: ExtensionExposureMode;
+  tags?: string[];
+  hint?: string;
   tools?: McpRuntimeToolInput[];
 };
 
@@ -174,6 +187,10 @@ export interface McpRuntime {
   setServerEnabled?(
     serverId: string,
     enabled: boolean
+  ): Promise<McpRuntimeMutationResult>;
+  setServerExposure?(
+    serverId: string,
+    exposure: ExtensionExposureMode
   ): Promise<McpRuntimeMutationResult>;
   listLspServers?(filesystemServerId?: string): McpRuntimeLspServerDescriptor[];
   addLspServer?(

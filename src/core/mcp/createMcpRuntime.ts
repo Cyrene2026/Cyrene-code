@@ -39,6 +39,7 @@ import type {
   McpServerAdapter,
   McpServerDescriptor,
 } from "./runtimeTypes";
+import type { ExtensionExposureMode } from "../extensions/metadata";
 
 type CreateMcpRuntimeContext = {
   cwd?: string;
@@ -300,8 +301,13 @@ const createFilesystemServerAdapter = (
     health: server.enabled ? "online" : "offline",
     transport: "filesystem",
     aliases: [...server.aliases],
+    exposure: server.exposure ?? "full",
+    tags: [...(server.tags ?? [])],
+    hint: server.hint,
     lsp: buildFilesystemLspSummary(server.lspServers),
-    tools: buildBuiltinToolDescriptors(server.id, ruleConfig),
+    tools: buildBuiltinToolDescriptors(server.id, ruleConfig, {
+      serverExposure: server.exposure ?? "full",
+    }),
   };
   const toolNames = new Set(descriptor.tools.map(tool => tool.name.toLowerCase()));
 
@@ -414,6 +420,7 @@ const buildLegacyToolServerIds = (config: LoadedMcpConfig) =>
 const cloneConfiguredTool = (tool: McpConfiguredTool): McpConfiguredTool => ({
   ...tool,
   capabilities: tool.capabilities ? [...tool.capabilities] : undefined,
+  tags: tool.tags ? [...tool.tags] : undefined,
 });
 
 const cloneConfiguredServer = (server: McpConfiguredServer): McpConfiguredServer => ({
@@ -423,6 +430,7 @@ const cloneConfiguredServer = (server: McpConfiguredServer): McpConfiguredServer
   args: server.args ? [...server.args] : undefined,
   env: server.env ? { ...server.env } : undefined,
   headers: server.headers ? { ...server.headers } : undefined,
+  tags: server.tags ? [...server.tags] : undefined,
   ...(server.lspServers ? { lspServers: server.lspServers.map(entry => cloneLspServerConfig(entry)) } : {}),
   tools: server.tools.map(tool => cloneConfiguredTool(tool)),
 });
@@ -522,6 +530,9 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
         : undefined,
     env: normalizeEnvRecord(input.env),
     headers: normalizeEnvRecord(input.headers),
+    exposure: input.exposure,
+    tags: input.tags ? [...input.tags] : undefined,
+    hint: input.hint?.trim() || undefined,
     lspServers: [],
     tools: (input.tools ?? []).map(tool => ({
       name: tool.name.trim(),
@@ -531,6 +542,8 @@ const normalizeServerInput = (input: McpRuntimeServerInput): McpConfiguredServer
       risk: tool.risk,
       requiresReview: tool.requiresReview,
       enabled: tool.enabled,
+      exposure: tool.exposure,
+      tags: tool.tags ? [...tool.tags] : undefined,
     })),
   };
 };
@@ -750,15 +763,19 @@ const buildManagerFromConfig = async (
   const adapters: McpServerAdapter[] = [];
 
   for (const server of config.servers) {
+    const origin = config.serverOrigins[server.id];
     const adapter =
       server.transport === "filesystem"
         ? createFilesystemServerAdapter(appRoot, server)
         : await createRemoteServerAdapter(
             appRoot,
             server,
-            config.serverOrigins[server.id],
+            origin,
             context
           );
+    adapter.descriptor.scope = origin?.scope;
+    adapter.descriptor.trusted =
+      server.transport === "filesystem" ? true : server.trusted ?? false;
     if ("initialize" in adapter && typeof adapter.initialize === "function") {
       await adapter.initialize().catch(() => undefined);
     }
@@ -956,6 +973,45 @@ class ManagedMcpRuntime implements McpRuntime {
         normalizedId,
         saved.path
       ),
+      serverId: normalizedId,
+      configPath: saved.path,
+    };
+  }
+
+  async setServerExposure(
+    serverId: string,
+    exposure: ExtensionExposureMode
+  ): Promise<McpRuntimeMutationResult> {
+    const normalizedId = serverId.trim();
+    const currentConfig = this.getConfig();
+    const current =
+      currentConfig.servers.find(server => server.id === normalizedId) ??
+      currentConfig.projectPatch.servers.find(server => server.id === normalizedId);
+
+    if (!current) {
+      return {
+        ok: false,
+        message: `MCP server not found: ${serverId}`,
+      };
+    }
+
+    const patch = cloneConfigPatch(currentConfig.projectPatch);
+    patch.removeServerIds = patch.removeServerIds.filter(id => id !== normalizedId);
+    const existingPatchServer =
+      patch.servers.find(server => server.id === normalizedId) ??
+      toPatchServer(this.appRoot, current);
+
+    upsertPatchServer(patch, {
+      ...existingPatchServer,
+      exposure,
+    });
+
+    const saved = await saveProjectMcpConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: `MCP server exposure updated: ${normalizedId}\nexposure: ${exposure}\nconfig: ${saved.path}`,
       serverId: normalizedId,
       configPath: saved.path,
     };

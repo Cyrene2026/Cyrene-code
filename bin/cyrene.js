@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { handleCyreneCli } from "./lib/cyrene-cli.js";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const goos = process.platform === "win32" ? "windows" : process.platform;
@@ -18,6 +19,14 @@ if (!goarch) {
   process.exit(1);
 }
 
+const result = await handleCyreneCli(process.argv.slice(2), {
+  packageRoot: resolve(currentDir, ".."),
+});
+
+if (result.kind === "handled") {
+  process.exit(result.exitCode);
+}
+
 const platformBinaryName = `cyrene-v2-${goos}-${goarch}${process.platform === "win32" ? ".exe" : ""}`;
 const legacyBinaryName = process.platform === "win32" ? "cyrene-v2.exe" : "cyrene-v2";
 const preferredBinaryPath = resolve(currentDir, "..", "dist", platformBinaryName);
@@ -30,7 +39,7 @@ if (!existsSync(binaryPath)) {
   process.exit(1);
 }
 
-const child = spawn(binaryPath, process.argv.slice(2), {
+const child = spawn(binaryPath, result.args, {
   stdio: "inherit",
 });
 

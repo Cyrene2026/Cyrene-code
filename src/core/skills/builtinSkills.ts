@@ -9,8 +9,10 @@ export const BUILTIN_SKILLS: SkillDefinition[] = [
       "When the user asks for a review, focus on concrete findings first.",
       "Order findings by severity, include file references, then mention open questions and residual test risk.",
     ].join(" "),
-    triggers: ["review", "code review", "审查", "代码审查", "复查"],
+  triggers: ["review", "code review", "审查", "代码审查", "复查"],
     enabled: true,
+    exposure: "scoped",
+    tags: ["review", "quality", "bugs"],
     source: "built_in",
   },
   {
@@ -23,6 +25,8 @@ export const BUILTIN_SKILLS: SkillDefinition[] = [
     ].join(" "),
     triggers: ["mcp", "工具", "tooling"],
     enabled: true,
+    exposure: "scoped",
+    tags: ["mcp", "runtime", "tools"],
     source: "built_in",
   },
 ];

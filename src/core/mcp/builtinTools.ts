@@ -1,3 +1,4 @@
+import { defaultMcpToolExposureMode } from "../extensions/metadata";
 import type { RuleConfig, ToolRequest } from "./toolTypes";
 import { buildMcpPolicyDecision, getMcpToolCapabilities } from "./McpPolicy";
 import type { McpToolDescriptor } from "./runtimeTypes";
@@ -97,7 +98,10 @@ const BUILTIN_TOOL_DESCRIPTIONS: Partial<Record<ToolRequest["action"], string>> 
 
 export const buildBuiltinToolDescriptors = (
   serverId: string,
-  ruleConfig: Pick<RuleConfig, "requireReview">
+  ruleConfig: Pick<RuleConfig, "requireReview">,
+  options?: {
+    serverExposure?: McpToolDescriptor["exposure"];
+  }
 ): McpToolDescriptor[] =>
   BUILTIN_FILE_TOOL_ACTIONS.map(action => {
     const requiresReview =
@@ -119,5 +123,7 @@ export const buildBuiltinToolDescriptors = (
       risk: policy.risk,
       requiresReview: policy.requiresReview,
       enabled: true,
+      exposure: defaultMcpToolExposureMode(options?.serverExposure ?? "full"),
+      tags: [...getMcpToolCapabilities(action), action.replace(/_/g, "-")],
     };
   });

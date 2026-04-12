@@ -16,6 +16,8 @@ const createAdapter = (
     enabled: true,
     source: "built_in",
     health: "online",
+    exposure: "full",
+    tags: [],
     tools: toolNames.map(name => ({
       id: `${id}.${name}`,
       serverId: id,
@@ -25,6 +27,8 @@ const createAdapter = (
       risk: "low",
       requiresReview: false,
       enabled: true,
+      exposure: "full",
+      tags: [],
     })),
   },
   handleToolCall: async () => ({ ok: true, message: "ok" }),

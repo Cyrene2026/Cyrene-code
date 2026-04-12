@@ -438,6 +438,14 @@ describe("createMcpRuntime", () => {
     expect(enableResult?.ok).toBe(true);
     expect(runtime.listServers().find(server => server.id === "docs")?.enabled).toBe(true);
 
+    const exposureResult = await runtime.setServerExposure?.("docs", "scoped");
+    expect(exposureResult?.ok).toBe(true);
+    expect(runtime.listServers().find(server => server.id === "docs")?.exposure).toBe(
+      "scoped"
+    );
+    configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(configText).toContain("exposure: scoped");
+
     const removeResult = await runtime.removeServer?.("docs");
     expect(removeResult?.ok).toBe(true);
     expect(runtime.listServers().some(server => server.id === "docs")).toBe(false);

@@ -27,6 +27,8 @@ const createAdapter = (
     enabled: true,
     source: "built_in",
     health: "online",
+    exposure: "full",
+    tags: [],
     tools: [],
   },
   handleToolCall: mock(async () => ({
@@ -124,6 +126,8 @@ describe("McpManager", () => {
         enabled: true,
         source: "built_in",
         health: "online",
+        exposure: "full",
+        tags: [],
         tools: [
           {
             id: "filesystem.read_file",
@@ -134,6 +138,8 @@ describe("McpManager", () => {
             risk: "low",
             requiresReview: false,
             enabled: true,
+            exposure: "full",
+            tags: [],
           },
         ],
       },

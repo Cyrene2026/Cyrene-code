@@ -1,3 +1,5 @@
+import type { ExtensionExposureMode } from "../extensions/metadata";
+
 export type SkillSource = "built_in" | "global" | "project";
 
 export type SkillDefinition = {
@@ -7,6 +9,8 @@ export type SkillDefinition = {
   prompt: string;
   triggers: string[];
   enabled: boolean;
+  exposure: ExtensionExposureMode;
+  tags: string[];
   source: SkillSource;
   configPath?: string;
 };
@@ -33,6 +37,10 @@ export interface SkillsRuntime {
   setSkillEnabled?(
     skillId: string,
     enabled: boolean
+  ): Promise<SkillsRuntimeMutationResult>;
+  setSkillExposure?(
+    skillId: string,
+    exposure: ExtensionExposureMode
   ): Promise<SkillsRuntimeMutationResult>;
   removeSkill?(skillId: string): Promise<SkillsRuntimeMutationResult>;
 }

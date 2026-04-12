@@ -5,6 +5,10 @@ import {
   getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
 } from "../../infra/config/appRoot";
+import {
+  defaultSkillExposureMode,
+  normalizeExtensionExposureMode,
+} from "../extensions/metadata";
 import { parseYamlDocument, stringifyYamlDocument } from "../mcp/simpleYaml";
 import { BUILTIN_SKILLS } from "./builtinSkills";
 import type { SkillDefinition, SkillSource } from "./types";
@@ -21,6 +25,8 @@ export type SkillConfigEntry = {
   prompt?: string;
   triggers?: string[];
   enabled?: boolean;
+  exposure?: ReturnType<typeof normalizeExtensionExposureMode>;
+  tags?: string[];
 };
 
 export type SkillsConfigPatch = {
@@ -84,6 +90,8 @@ const normalizeSkillEntry = (value: unknown): SkillConfigEntry | null => {
     prompt: normalizeString(value.prompt),
     triggers: normalizeStringArray(value.triggers),
     enabled: typeof value.enabled === "boolean" ? value.enabled : undefined,
+    exposure: normalizeExtensionExposureMode(value.exposure),
+    tags: normalizeStringArray(value.tags),
   };
 };
 
@@ -120,6 +128,11 @@ const mergeSkillEntry = (
       ? [...patch.triggers]
       : [...(base?.triggers ?? [])],
   enabled: patch.enabled ?? base?.enabled,
+  exposure: patch.exposure ?? base?.exposure,
+  tags:
+    patch.tags && patch.tags.length > 0
+      ? [...patch.tags]
+      : [...(base?.tags ?? [])],
 });
 
 const mergeSkillsPatch = (
@@ -187,6 +200,8 @@ const serializeSkillEntry = (skill: SkillConfigEntry) => ({
   ...(skill.triggers && skill.triggers.length > 0
     ? { triggers: [...skill.triggers] }
     : {}),
+  ...(skill.exposure ? { exposure: skill.exposure } : {}),
+  ...(skill.tags && skill.tags.length > 0 ? { tags: [...skill.tags] } : {}),
   ...(typeof skill.enabled === "boolean" ? { enabled: skill.enabled } : {}),
 });
 
@@ -266,7 +281,12 @@ export const loadSkillsConfig = async (
   >();
 
   for (const skill of BUILTIN_SKILLS) {
-    skillMap.set(skill.id, { ...skill, triggers: [...skill.triggers] });
+    skillMap.set(skill.id, {
+      ...skill,
+      triggers: [...skill.triggers],
+      tags: [...skill.tags],
+      exposure: skill.exposure ?? defaultSkillExposureMode(),
+    });
     origins.set(skill.id, { source: "built_in" });
   }
 
@@ -283,6 +303,12 @@ export const loadSkillsConfig = async (
             ? [...skill.triggers]
             : [...(base?.triggers ?? [])],
         enabled: skill.enabled ?? base?.enabled ?? true,
+        exposure:
+          skill.exposure ?? base?.exposure ?? defaultSkillExposureMode(),
+        tags:
+          skill.tags && skill.tags.length > 0
+            ? [...skill.tags]
+            : [...(base?.tags ?? [])],
         source: "global",
         configPath: file.path,
       });
@@ -306,6 +332,12 @@ export const loadSkillsConfig = async (
             ? [...skill.triggers]
             : [...(base?.triggers ?? [])],
         enabled: skill.enabled ?? base?.enabled ?? true,
+        exposure:
+          skill.exposure ?? base?.exposure ?? defaultSkillExposureMode(),
+        tags:
+          skill.tags && skill.tags.length > 0
+            ? [...skill.tags]
+            : [...(base?.tags ?? [])],
         source: "project",
         configPath: file.path,
       });

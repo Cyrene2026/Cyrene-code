@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 var (
@@ -65,6 +66,15 @@ var (
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("12")).
 			Padding(0, 1)
+
+	panelHeaderBarStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("0")).
+				Background(lipgloss.Color("#FFF"))
+
+	panelSummaryStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("15"))
 
 	cursorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	statusKeyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -125,7 +135,7 @@ func (m *Model) renderMainArea(width, height int) string {
 	}
 
 	if width >= 96 {
-		panelWidth := clampInt(width/3, 34, 54)
+		panelWidth := m.widePanelWidth(width)
 		sessionWidth := maxInt(24, width-panelWidth-1)
 		return lipgloss.JoinHorizontal(
 			lipgloss.Top,
@@ -142,6 +152,32 @@ func (m *Model) renderMainArea(width, height int) string {
 		m.renderSessionPane(width, sessionHeight, false),
 		m.renderActivePanel(width, panelHeight),
 	)
+}
+
+func (m *Model) widePanelWidth(totalWidth int) int {
+	if totalWidth <= 0 {
+		return 34
+	}
+
+	minPanelWidth := 40
+	minSessionWidth := 52
+	desiredWidth := totalWidth * 3 / 8
+
+	if m.ActivePanel == PanelApprovals {
+		minPanelWidth = 44
+		desiredWidth = totalWidth * 2 / 5
+	}
+
+	maxPanelWidth := totalWidth - minSessionWidth - 1
+	if maxPanelWidth < minPanelWidth {
+		return clampInt(totalWidth/3, 34, maxInt(34, totalWidth-25))
+	}
+
+	upperBound := 68
+	if m.ActivePanel == PanelApprovals {
+		upperBound = 76
+	}
+	return clampInt(desiredWidth, minPanelWidth, minInt(upperBound, maxPanelWidth))
 }
 
 func (m *Model) renderTopStatusBar(width int) string {
@@ -216,7 +252,57 @@ func renderStatusColumns(width int, columns ...statusColumn) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
 }
 
-func (m *Model) renderTranscript(width, height int) string {
+func renderPanelHeaderColumns(width int, values ...string) string {
+	if len(values) == 0 || width <= 0 {
+		return ""
+	}
+	separatorCount := maxInt(0, len(values)-1)
+	availableWidth := maxInt(len(values), width-separatorCount)
+	baseWidth := availableWidth / len(values)
+	remainder := availableWidth % len(values)
+	rendered := make([]string, 0, len(values))
+	for index, value := range values {
+		cellWidth := baseWidth
+		if index < remainder {
+			cellWidth++
+		}
+		text := truncatePlain(strings.ToUpper(strings.TrimSpace(value)), maxInt(1, cellWidth))
+		rendered = append(rendered, panelHeaderBarStyle.
+			Width(cellWidth).
+			MaxWidth(cellWidth).
+			Align(lipgloss.Center).
+			Render(fitDisplayWidth(text, cellWidth)))
+	}
+	if len(rendered) == 1 {
+		return rendered[0]
+	}
+	separator := panelHeaderBarStyle.Render("│")
+	return strings.Join(rendered, separator)
+}
+
+func renderPanelSummaryColumns(width int, values ...string) string {
+	if len(values) == 0 || width <= 0 {
+		return ""
+	}
+	baseWidth := width / len(values)
+	remainder := width % len(values)
+	rendered := make([]string, 0, len(values))
+	for index, value := range values {
+		cellWidth := baseWidth
+		if index < remainder {
+			cellWidth++
+		}
+		text := truncatePlain(strings.ToUpper(strings.TrimSpace(value)), maxInt(1, cellWidth))
+		rendered = append(rendered, panelSummaryStyle.
+			Width(cellWidth).
+			MaxWidth(cellWidth).
+			Align(lipgloss.Center).
+			Render(fitDisplayWidth(text, cellWidth)))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+}
+
+func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScrollState) {
 	allLines := m.renderTranscriptLines(width)
 	total := len(allLines)
 	offset := clampInt(m.TranscriptOffset, 0, maxInt(0, total-height))
@@ -229,12 +315,17 @@ func (m *Model) renderTranscript(width, height int) string {
 		window = window[len(window)-height:]
 	}
 	for _, line := range window {
-		lines = append(lines, fitToWidth(line, width))
+		lines = append(lines, fitDisplayWidth(line, width))
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
 	}
-	return strings.Join(lines, "\n")
+
+	return lines, panelScrollState{
+		Offset:  start,
+		Visible: minInt(total, height),
+		Total:   total,
+	}
 }
 
 func (m *Model) renderSessionPane(width, height int, active bool) string {
@@ -244,8 +335,10 @@ func (m *Model) renderSessionPane(width, height int, active bool) string {
 	}
 	bodyWidth := framedInnerWidth(style, width)
 	bodyHeight := framedInnerHeight(style, height)
-	lines := strings.Split(m.renderTranscript(bodyWidth, maxInt(1, bodyHeight)), "\n")
-	return style.Width(bodyWidth).Height(bodyHeight).Render(strings.Join(lines, "\n"))
+	contentWidth := maxInt(1, bodyWidth-2)
+	lines, scroll := m.renderTranscriptWindow(contentWidth, maxInt(1, bodyHeight))
+	rendered := renderScrollableBlock(lines, bodyWidth, scroll)
+	return style.Width(framedRenderWidth(style, width)).Height(framedRenderHeight(style, height)).Render(strings.Join(rendered, "\n"))
 }
 
 func (m *Model) renderTranscriptLines(width int) []string {
@@ -255,6 +348,9 @@ func (m *Model) renderTranscriptLines(width int) []string {
 
 	if m.shouldShowStartupView() {
 		lines := m.renderStartupLines(width)
+		if m.ActivePanel != PanelNone {
+			lines = m.renderCompactStartupLines(width)
+		}
 		m.transcriptCacheWidth = width
 		m.transcriptCacheVersion = m.transcriptVersion
 		m.transcriptCacheLines = lines
@@ -329,6 +425,27 @@ func (m *Model) renderStartupLines(width int) []string {
 		"",
 		"Use /help for full command reference.",
 	)
+	return wrapLinesToWidth(lines, width)
+}
+
+func (m *Model) renderCompactStartupLines(width int) []string {
+	lines := []string{
+		asstStyle.Bold(true).Render(">Cyrene"),
+		titleStyle.Bold(true).Render("terminal workspace"),
+		dimStyle.Render("Startup splash is compressed while the inspector is open."),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("active panel  %s", emptyFallback(string(m.ActivePanel), "none")), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("project       %s", formatProjectPathLabel(m.AppRoot, maxInt(12, width-14))), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("session       %s", emptyFallback(m.ActiveSessionID, "none")), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("model         %s", emptyFallback(m.CurrentModel, "none")), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("provider      %s", m.providerDisplayName(m.CurrentProvider)), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("key source    %s", formatKeySourceLabel(m.CurrentProviderKeySource)), width)),
+		dimStyle.Render(truncatePlain(fmt.Sprintf("pending       %d", len(m.PendingReviews)), width)),
+		"",
+		sectionStyle.Render("next"),
+		"/help  command reference and shortcuts",
+		"/sessions  /review  /model  /provider",
+		"Esc closes the panel and restores the full startup view.",
+	}
 	return wrapLinesToWidth(lines, width)
 }
 
@@ -1062,25 +1179,51 @@ func (m *Model) renderComposer(width int) string {
 			lines = append(lines, noticeStyle.Render(line))
 		}
 	} else {
-		helper := "Enter send | Ctrl+J newline | PgUp/PgDn scroll | F6 copy mode | /help"
+		helper := "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | F6 copy/paste mode | /help"
 		if !m.MouseCapture {
-			helper = "Enter send | Ctrl+J newline | drag select/copy | F6 restore wheel | /help"
+			helper = "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | drag select/copy | right-click paste | F6 restore wheel | /help"
 		}
 		lines = append(lines, dimStyle.Render(helper))
 	}
 
-	if matches := suggestSlashCommands(string(m.Input), 3); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
-		parts := make([]string, 0, len(matches))
-		for _, item := range matches {
-			parts = append(parts, item.Command)
+	if matches := m.composerSlashSuggestions(3); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+		best := matches[0]
+		bestCommand := truncatePlain(best.Command, maxInt(0, contentWidth-8))
+		lines = append(lines, sectionStyle.Render("match  ")+titleStyle.Render(bestCommand))
+
+		bestHintParts := []string{best.Description}
+		if argumentHint := slashArgumentHint(best.Command); argumentHint != "" {
+			bestHintParts = append(bestHintParts, fmt.Sprintf("args %s", argumentHint))
 		}
-		lines = append(lines, sectionStyle.Render("match  ")+dimStyle.Render(truncatePlain(strings.Join(parts, "  |  "), contentWidth-8)))
+		if best.InsertValue != "" && best.InsertValue != best.Command {
+			bestHintParts = append(bestHintParts, fmt.Sprintf("Tab → %s", strings.TrimSpace(best.InsertValue)))
+		}
+		lines = append(lines, dimStyle.Render(truncatePlain(strings.Join(bestHintParts, "  |  "), contentWidth)))
+
+		if len(matches) > 1 {
+			alternates := make([]string, 0, len(matches)-1)
+			for _, item := range matches[1:] {
+				alternates = append(alternates, slashAlternateSummary(item))
+			}
+			lines = append(lines, sectionStyle.Render("also   ")+dimStyle.Render(truncatePlain(strings.Join(alternates, "  |  "), contentWidth-8)))
+		}
 	}
 
 	return style.
-		Width(contentWidth).
+		Width(framedRenderWidth(style, width)).
 		MaxWidth(width).
 		Render(strings.Join(lines, "\n"))
+}
+
+func slashAlternateSummary(item slashCommandSpec) string {
+	command := strings.TrimSpace(item.Command)
+	description := strings.TrimSpace(item.Description)
+	if description == "" {
+		return command
+	}
+	description = strings.ReplaceAll(description, "  |  ", " | ")
+	description = strings.ReplaceAll(description, "  ", " ")
+	return fmt.Sprintf("%s  %s", command, description)
 }
 
 type composerRow struct {
@@ -1123,18 +1266,19 @@ func (m *Model) renderApprovals(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.PendingReviews), m.ApprovalIndex, approvalQueuePageSize)
-	lines := []string{
-		reviewStyle.Bold(true).Render(fmt.Sprintf("approvals  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("↑/↓ select  ←/→ page  Tab mode  j/k preview  a approve  r reject  Esc"),
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "mode tab", "j/k prev", "approve a", "reject r", "esc"),
 	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "approvals", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	bodyLines := []string{}
 
 	if len(m.PendingReviews) == 0 {
-		lines = append(lines, dimStyle.Render("No pending approvals."))
-		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+		bodyLines = append(bodyLines, dimStyle.Render("No pending approvals."))
+		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
 
 	selected := m.PendingReviews[m.ApprovalIndex]
-	lines = append(lines, sectionStyle.Render("queue"))
+	bodyLines = append(bodyLines, sectionStyle.Render("queue"))
 	for index := page.Start; index < page.End; index++ {
 		item := m.PendingReviews[index]
 		prefix := "  "
@@ -1144,12 +1288,12 @@ func (m *Model) renderApprovals(width, height int) string {
 			lineStyle = asstStyle.Bold(true)
 		}
 		line := fmt.Sprintf("%s%s  %s", prefix, actionBadge(item.Action), truncatePlain(item.Path, maxInt(10, bodyWidth-20)))
-		lines = append(lines, lineStyle.Render(line))
+		bodyLines = append(bodyLines, lineStyle.Render(line))
 	}
 
-	lines = append(lines, sectionStyle.Render("detail"))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("%s  |  %s", selected.Action, truncatePlain(selected.Path, maxInt(8, bodyWidth-16)))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("id %s  |  %s", truncatePlain(selected.ID, 14), emptyFallback(selected.CreatedAt, "unknown"))))
+	bodyLines = append(bodyLines, sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("%s  |  %s", selected.Action, truncatePlain(selected.Path, maxInt(8, bodyWidth-16)))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s  |  %s", truncatePlain(selected.ID, 14), emptyFallback(selected.CreatedAt, "unknown"))))
 	previewSource := selected.PreviewSummary
 	if m.ApprovalPreview == ApprovalFull && strings.TrimSpace(selected.PreviewFull) != "" {
 		previewSource = selected.PreviewFull
@@ -1157,31 +1301,38 @@ func (m *Model) renderApprovals(width, height int) string {
 	previewLines := parseApprovalPreviewLines(previewSource)
 	previewWindow := previewWindow(previewLines, m.ApprovalPreviewOffset, approvalPreviewPageLines)
 	addCount, delCount := approvalDiffStats(previewLines)
-	lines = append(lines,
+	bodyLines = append(bodyLines,
 		sectionStyle.Render("preview"),
 		dimStyle.Render(fmt.Sprintf("%s  %d-%d/%d  |  +%d -%d", m.ApprovalPreview, previewWindow.Start+1, previewWindow.End, previewWindow.Total, addCount, delCount)),
 	)
+	previewRendered := make([]string, 0, len(previewWindow.Lines))
 	for _, line := range previewWindow.Lines {
-		lines = append(lines, renderApprovalPreviewLines(line, bodyWidth)...)
+		previewRendered = append(previewRendered, renderApprovalPreviewLines(line, bodyWidth)...)
 	}
-	lines = append(lines, dimStyle.Render("j/k scroll  |  a approve  |  r reject"))
-
-	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+	bodyLines = append(bodyLines, renderScrollableBlock(previewRendered, bodyWidth, panelScrollState{
+		Offset:  previewWindow.Start,
+		Visible: minInt(previewWindow.Total, approvalPreviewPageLines),
+		Total:   previewWindow.Total,
+	})...)
+	bodyLines = append(bodyLines, dimStyle.Render("j/k scroll  |  a approve  |  r reject"))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
 func (m *Model) renderSessions(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	page := pageForSelection(len(m.Sessions), m.SessionIndex, sessionPanelPageSize)
-	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("sessions  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("↑/↓ select  ←/→ page  Enter load  n new  r refresh  Esc close"),
+	page := pageForSelection(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(width, height))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "load ↵", "new n", "refresh r", "esc"),
 	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "sessions", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	bodyLines := []string{}
 	if len(m.Sessions) == 0 {
-		lines = append(lines, dimStyle.Render("No saved sessions."))
-		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+		bodyLines = append(bodyLines, dimStyle.Render("No saved sessions."))
+		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
-	lines = append(lines, sectionStyle.Render("list"))
+	bodyLines = append(bodyLines, sectionStyle.Render("list"))
+	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
 	for index := page.Start; index < page.End; index++ {
 		session := m.Sessions[index]
 		prefix := "  "
@@ -1194,43 +1345,50 @@ func (m *Model) renderSessions(width, height int) string {
 		if session.ID == m.ActiveSessionID {
 			marker = " [current]"
 		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(session.Title, bodyWidth-16), marker)))
+		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(session.Title, bodyWidth-16), marker)))
 		meta := session.UpdatedAt
 		if project := strings.TrimSpace(session.ProjectRoot); project != "" {
 			meta = fmt.Sprintf("%s  |  %s", session.UpdatedAt, formatProjectPathLabel(project, maxInt(12, bodyWidth-24)))
 		}
-		lines = append(lines, dimStyle.Render("   "+truncatePlain(meta, bodyWidth-6)))
+		listLines = append(listLines, dimStyle.Render("   "+truncatePlain(meta, bodyWidth-6)))
 	}
+	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
+		Offset:  maxInt(0, page.CurrentPage-1),
+		Visible: 1,
+		Total:   maxInt(1, page.TotalPages),
+	})...)
 	selected := m.Sessions[clampInt(m.SessionIndex, 0, len(m.Sessions)-1)]
-	lines = append(lines, "", sectionStyle.Render("detail"))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("id %s", selected.ID)))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("updated %s", selected.UpdatedAt)))
+	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s", selected.ID)))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("updated %s", selected.UpdatedAt)))
 	if strings.TrimSpace(selected.ProjectRoot) != "" {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("project %s", truncatePlain(selected.ProjectRoot, bodyWidth-8))))
+		bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("project %s", truncatePlain(selected.ProjectRoot, bodyWidth-8))))
 	} else {
-		lines = append(lines, dimStyle.Render("project none"))
+		bodyLines = append(bodyLines, dimStyle.Render("project none"))
 	}
 	if len(selected.Tags) > 0 {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("tags %s", strings.Join(selected.Tags, ", "))))
+		bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("tags %s", strings.Join(selected.Tags, ", "))))
 	} else {
-		lines = append(lines, dimStyle.Render("tags none"))
+		bodyLines = append(bodyLines, dimStyle.Render("tags none"))
 	}
-	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
 func (m *Model) renderModels(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	page := pageForSelection(len(m.AvailableModels), m.ModelIndex, modelPanelPageSize)
-	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("models  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("↑/↓ select  ←/→ page  Enter switch  r refresh  Esc close"),
+	page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(width, height))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "esc"),
 	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "models", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	bodyLines := []string{}
 	if len(m.AvailableModels) == 0 {
-		lines = append(lines, dimStyle.Render("No models available."))
-		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+		bodyLines = append(bodyLines, dimStyle.Render("No models available."))
+		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
-	lines = append(lines, sectionStyle.Render("list"))
+	bodyLines = append(bodyLines, sectionStyle.Render("list"))
+	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
 	for index := page.Start; index < page.End; index++ {
 		model := m.AvailableModels[index]
 		prefix := "  "
@@ -1243,36 +1401,43 @@ func (m *Model) renderModels(width, height int) string {
 		if model == m.CurrentModel {
 			marker = " [current]"
 		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(model, bodyWidth-20), marker)))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("   family %s", modelFamily(model))))
+		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(model, bodyWidth-20), marker)))
+		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   family %s", modelFamily(model))))
 	}
+	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
+		Offset:  maxInt(0, page.CurrentPage-1),
+		Visible: 1,
+		Total:   maxInt(1, page.TotalPages),
+	})...)
 	selected := m.AvailableModels[clampInt(m.ModelIndex, 0, len(m.AvailableModels)-1)]
-	lines = append(lines, "", sectionStyle.Render("detail"))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("selected %s", selected)))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("family %s", modelFamily(selected))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("provider %s", truncatePlain(emptyFallback(m.CurrentProvider, "none"), bodyWidth))))
-	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("selected %s", selected)))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("family %s", modelFamily(selected))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("provider %s", truncatePlain(emptyFallback(m.CurrentProvider, "none"), bodyWidth))))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
 func (m *Model) renderProviders(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, providerPanelPageSize)
-	lines := []string{
-		asstStyle.Bold(true).Render(fmt.Sprintf("providers  page %d/%d  total %d", page.CurrentPage, page.TotalPages, page.Total)),
-		dimStyle.Render("↑/↓ select  ←/→ page  Enter switch  r refresh  Esc close"),
+	page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(width, height))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "esc"),
 	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "providers", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	bodyLines := []string{}
 	for _, row := range wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth) {
-		lines = append(lines, dimStyle.Render(row))
+		bodyLines = append(bodyLines, dimStyle.Render(row))
 	}
 	for _, row := range wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth) {
-		lines = append(lines, dimStyle.Render(row))
+		bodyLines = append(bodyLines, dimStyle.Render(row))
 	}
 	if len(m.AvailableProviders) == 0 {
-		lines = append(lines, dimStyle.Render("No providers available."))
-		return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+		bodyLines = append(bodyLines, dimStyle.Render("No providers available."))
+		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
-	lines = append(lines, sectionStyle.Render("list"))
+	bodyLines = append(bodyLines, sectionStyle.Render("list"))
+	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*3))
 	for index := page.Start; index < page.End; index++ {
 		provider := m.AvailableProviders[index]
 		prefix := "  "
@@ -1288,26 +1453,33 @@ func (m *Model) renderProviders(width, height int) string {
 		name := m.providerDisplayName(provider)
 		profile := formatProviderProfileLabel(m.providerProfile(provider))
 		source := formatProviderProfileSourceLabel(m.providerProfileSource(provider))
-		lines = append(lines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("   endpoint %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-16)), bodyWidth-4))))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("   profile %s  |  source %s", profile, source)))
+		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)))
+		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   endpoint %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-16)), bodyWidth-4))))
+		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   profile %s  |  source %s", profile, source)))
 	}
+	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
+		Offset:  maxInt(0, page.CurrentPage-1),
+		Visible: 1,
+		Total:   maxInt(1, page.TotalPages),
+	})...)
 	selected := m.AvailableProviders[clampInt(m.ProviderIndex, 0, len(m.AvailableProviders)-1)]
-	lines = append(lines, "", sectionStyle.Render("detail"))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("selected %s", m.providerDisplayName(selected))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("url %s", truncatePlain(selected, bodyWidth-4))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("profile %s  |  source %s", formatProviderProfileLabel(m.providerProfile(selected)), formatProviderProfileSourceLabel(m.providerProfileSource(selected)))))
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("endpoint %s  |  key %s", providerEndpointKind(selected, m.providerProfile(selected)), formatKeySourceLabel(m.CurrentProviderKeySource))))
-	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("selected %s", m.providerDisplayName(selected))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("url %s", truncatePlain(selected, bodyWidth-4))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("profile %s  |  source %s", formatProviderProfileLabel(m.providerProfile(selected)), formatProviderProfileSourceLabel(m.providerProfileSource(selected)))))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("endpoint %s  |  key %s", providerEndpointKind(selected, m.providerProfile(selected)), formatKeySourceLabel(m.CurrentProviderKeySource))))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
 func (m *Model) renderAuthPanel(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	lines := []string{
-		asstStyle.Bold(true).Render("auth"),
-		dimStyle.Render("1/2/3 jump  |  Enter next/connect  |  Tab/↑/↓ step  |  Esc close"),
+	stepLabel := strings.ToUpper(strings.ReplaceAll(string(m.AuthStep), "_", " "))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "1/2/3 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
 	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
+	bodyLines := []string{}
 
 	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider)
 	apiLine := formatAuthFieldLine(2, "API Key", maskSecret(string(m.AuthAPIKey)), m.AuthStep == AuthStepAPIKey)
@@ -1316,24 +1488,24 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	if m.AuthStep == AuthStepConfirm {
 		confirmLine = asstStyle.Bold(true).Render(confirmLine)
 	}
-	lines = append(lines, sectionStyle.Render("fields"), providerLine, apiLine, modelLine, confirmLine)
-	lines = append(lines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
+	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, apiLine, modelLine, confirmLine)
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
 	if strings.TrimSpace(m.Auth.PersistencePath) != "" {
-		lines = append(lines, dimStyle.Render(truncatePlain(m.Auth.PersistencePath, bodyWidth)))
+		bodyLines = append(bodyLines, dimStyle.Render(truncatePlain(m.Auth.PersistencePath, bodyWidth)))
 	}
 
 	if m.AuthStep == AuthStepConfirm {
-		lines = append(lines, "", sectionStyle.Render("detail"), dimStyle.Render("Press Enter to save login and rebuild the transport."))
+		bodyLines = append(bodyLines, "", sectionStyle.Render("detail"), dimStyle.Render("Press Enter to save login and rebuild the transport."))
 	} else {
-		lines = append(lines, "", sectionStyle.Render("editor"))
+		bodyLines = append(bodyLines, "", sectionStyle.Render("editor"))
 		for _, row := range m.authEditorLines(bodyWidth) {
-			lines = append(lines, row)
+			bodyLines = append(bodyLines, row)
 		}
 	}
 	if m.AuthSaving {
-		lines = append(lines, reviewStyle.Render("Saving login..."))
+		bodyLines = append(bodyLines, reviewStyle.Render("Saving login..."))
 	}
-	return panelBoxStyle.Width(bodyWidth).Height(bodyHeight).Render(limitBoxLines(lines, bodyWidth, bodyHeight))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
 func formatAuthFieldLine(index int, label, value string, selected bool) string {
@@ -1917,7 +2089,7 @@ func wrapLinesToWidth(lines []string, width int) []string {
 	wrapped := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if containsANSIEscape(line) {
-			wrapped = append(wrapped, fitToWidth(line, width))
+			wrapped = append(wrapped, fitDisplayWidth(line, width))
 			continue
 		}
 		wrapped = append(wrapped, wrapPlainText(line, width)...)
@@ -1933,12 +2105,12 @@ func limitBoxLines(lines []string, width, height int) string {
 	for _, line := range lines {
 		var wrappedRows []string
 		if containsANSIEscape(line) {
-			wrappedRows = []string{fitToWidth(line, width)}
+			wrappedRows = []string{fitDisplayWidth(line, width)}
 		} else {
 			wrappedRows = wrapPlainText(line, maxInt(1, width))
 		}
 		for _, wrapped := range wrappedRows {
-			limited = append(limited, fitToWidth(wrapped, width))
+			limited = append(limited, fitDisplayWidth(wrapped, width))
 			if len(limited) == height {
 				return strings.Join(limited, "\n")
 			}
@@ -1948,6 +2120,126 @@ func limitBoxLines(lines []string, width, height int) string {
 		limited = append(limited, "")
 	}
 	return strings.Join(limited, "\n")
+}
+
+func expandBoxLines(lines []string, width int) []string {
+	if width <= 0 || len(lines) == 0 {
+		return nil
+	}
+	expanded := make([]string, 0, len(lines))
+	for _, line := range lines {
+		var wrappedRows []string
+		if containsANSIEscape(line) {
+			wrappedRows = []string{fitDisplayWidth(line, width)}
+		} else {
+			wrappedRows = wrapPlainText(line, maxInt(1, width))
+		}
+		for _, row := range wrappedRows {
+			expanded = append(expanded, fitDisplayWidth(row, width))
+		}
+	}
+	return expanded
+}
+
+func renderPanelBox(width, height, bodyWidth, bodyHeight int, headerLines, bodyLines, footerLines []string) string {
+	header := expandBoxLines(headerLines, bodyWidth)
+	footer := expandBoxLines(footerLines, bodyWidth)
+	body := expandBoxLines(bodyLines, bodyWidth)
+
+	if len(footer) > bodyHeight {
+		footer = footer[len(footer)-bodyHeight:]
+		header = nil
+		body = nil
+	} else if len(header)+len(footer) > bodyHeight {
+		availableHeader := maxInt(0, bodyHeight-len(footer))
+		if len(header) > availableHeader {
+			header = header[:availableHeader]
+		}
+		body = nil
+	}
+
+	availableBody := maxInt(0, bodyHeight-len(header)-len(footer))
+	if len(body) > availableBody {
+		body = body[:availableBody]
+	}
+
+	rendered := make([]string, 0, bodyHeight)
+	rendered = append(rendered, header...)
+	rendered = append(rendered, body...)
+	for len(rendered) < bodyHeight-len(footer) {
+		rendered = append(rendered, strings.Repeat(" ", maxInt(1, bodyWidth)))
+	}
+	rendered = append(rendered, footer...)
+	for len(rendered) < bodyHeight {
+		rendered = append(rendered, strings.Repeat(" ", maxInt(1, bodyWidth)))
+	}
+
+	return panelBoxStyle.
+		Width(framedRenderWidth(panelBoxStyle, width)).
+		Height(framedRenderHeight(panelBoxStyle, height)).
+		Render(strings.Join(rendered, "\n"))
+}
+
+type panelScrollState struct {
+	Offset  int
+	Visible int
+	Total   int
+}
+
+func renderScrollableBlock(lines []string, width int, scroll panelScrollState) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	contentWidth := maxInt(1, width-2)
+	thumbStart, thumbSize := scrollbarThumb(scroll, len(lines))
+	rendered := make([]string, 0, len(lines))
+	for index, line := range lines {
+		base := fitDisplayWidth(line, contentWidth)
+		glyph := scrollbarTrackStyle().Render("│")
+		if index >= thumbStart && index < thumbStart+thumbSize {
+			glyph = scrollbarThumbStyle().Render("█")
+		}
+		rendered = append(rendered, base+" "+glyph)
+	}
+	return rendered
+}
+
+func scrollbarThumb(scroll panelScrollState, height int) (int, int) {
+	if height <= 0 || scroll.Total <= 0 || scroll.Visible <= 0 {
+		return 0, 0
+	}
+	visible := minInt(scroll.Visible, scroll.Total)
+	if scroll.Total <= visible {
+		return 0, 1
+	}
+	if visible == 1 {
+		maxOffset := maxInt(1, scroll.Total-visible)
+		offset := clampInt(scroll.Offset, 0, maxOffset)
+		maxStart := maxInt(0, height-1)
+		thumbStart := int(float64(offset) / float64(maxOffset) * float64(maxStart))
+		return clampInt(thumbStart, 0, maxStart), 1
+	}
+	thumbSize := maxInt(1, int(float64(height)*float64(visible)/float64(scroll.Total)))
+	if thumbSize > height {
+		thumbSize = height
+	}
+	maxOffset := maxInt(1, scroll.Total-visible)
+	offset := clampInt(scroll.Offset, 0, maxOffset)
+	maxStart := maxInt(0, height-thumbSize)
+	thumbStart := int(float64(offset) / float64(maxOffset) * float64(maxStart))
+	return clampInt(thumbStart, 0, maxStart), thumbSize
+}
+
+func scrollbarSeparatorStyle() lipgloss.Style {
+	return dimStyle.Copy().Foreground(lipgloss.Color("8"))
+}
+
+func scrollbarTrackStyle() lipgloss.Style {
+	return dimStyle.Copy().Foreground(lipgloss.Color("15"))
+}
+
+func scrollbarThumbStyle() lipgloss.Style {
+	return asstStyle.Copy().Foreground(lipgloss.Color("11")).Bold(true)
 }
 
 func containsANSIEscape(value string) bool {
@@ -1960,6 +2252,14 @@ func framedInnerWidth(style lipgloss.Style, outerWidth int) int {
 
 func framedInnerHeight(style lipgloss.Style, outerHeight int) int {
 	return maxInt(1, outerHeight-style.GetVerticalFrameSize())
+}
+
+func framedRenderWidth(style lipgloss.Style, outerWidth int) int {
+	return maxInt(1, outerWidth-style.GetHorizontalBorderSize())
+}
+
+func framedRenderHeight(style lipgloss.Style, outerHeight int) int {
+	return maxInt(1, outerHeight-style.GetVerticalBorderSize())
 }
 
 func messageStyles(message Message) (string, lipgloss.Style, lipgloss.Style) {
@@ -2042,6 +2342,18 @@ func truncatePlain(value string, width int) string {
 		runes = runes[:len(runes)-1]
 	}
 	return string(runes) + "~"
+}
+
+func fitDisplayWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	truncated := ansi.Truncate(value, width, "")
+	padding := maxInt(0, width-ansi.StringWidth(truncated))
+	if padding == 0 {
+		return truncated
+	}
+	return truncated + strings.Repeat(" ", padding)
 }
 
 func truncateMiddlePlain(value string, width int) string {

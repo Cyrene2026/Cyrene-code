@@ -43,6 +43,9 @@ func TestSlashHelpSetsNotice(t *testing.T) {
 	if !strings.Contains(helpText, "/mcp lsp bootstrap") {
 		t.Fatalf("expected MCP LSP commands in help text, got %q", helpText)
 	}
+	if !strings.Contains(helpText, "/extensions exposure") {
+		t.Fatalf("expected extensions commands in help text, got %q", helpText)
+	}
 }
 
 func TestWheelDownReturnsToLiveTail(t *testing.T) {
@@ -89,6 +92,130 @@ func TestF6TogglesMouseCapture(t *testing.T) {
 	}
 }
 
+func TestPlainAInsertsIntoComposerAtStartup(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+
+	if got := string(model.Input); got != "a" {
+		t.Fatalf("expected plain a to insert at startup, got %q", got)
+	}
+}
+
+func TestPlainAStillInsertsAfterF6Toggle(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyF6})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+
+	if got := string(model.Input); got != "a" {
+		t.Fatalf("expected plain a to insert after f6 toggle, got %q", got)
+	}
+}
+
+func TestCopyModeHelperMentionsRightClickPaste(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+
+	model.Update(tea.KeyMsg{Type: tea.KeyF6})
+	model.Notice = ""
+	view := model.View()
+
+	if !strings.Contains(view, "right-click paste") {
+		t.Fatalf("expected copy mode helper to mention right-click paste, got %q", view)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyF6})
+	model.Update(tea.KeyMsg{Type: tea.KeyF6})
+	if !strings.Contains(model.Notice, "terminal paste is active here") {
+		t.Fatalf("expected copy mode notice to explain terminal paste behavior, got %q", model.Notice)
+	}
+}
+
+func TestRightClickPasteIsBlockedInMouseMode(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonRight,
+		Action: tea.MouseActionPress,
+	})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("pasted text")})
+
+	if got := string(model.Input); got != "" {
+		t.Fatalf("expected right-click paste to be ignored in mouse mode, got %q", got)
+	}
+	if !strings.Contains(model.Notice, "Right-click paste is blocked") {
+		t.Fatalf("expected right-click notice, got %q", model.Notice)
+	}
+}
+
+func TestComposerPasteNormalizesCarriageReturnsAndTabs(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("alpha\r\nbeta\tgamma\rdelta")})
+
+	if got := string(model.Input); got != "alpha\nbeta    gamma\ndelta" {
+		t.Fatalf("expected normalized pasted input, got %q", got)
+	}
+}
+
+func TestComposerSupportsClearAndWordDeleteShortcuts(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("alpha beta gamma")})
+
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlW})
+	if got := string(model.Input); got != "alpha beta " {
+		t.Fatalf("expected ctrl+w to delete previous word, got %q", got)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if got := string(model.Input); got != "" {
+		t.Fatalf("expected ctrl+u to clear composer, got %q", got)
+	}
+	if model.Cursor != 0 {
+		t.Fatalf("expected composer cursor reset, got %d", model.Cursor)
+	}
+}
+
+func TestComposerSupportsHomeEndAndDeleteForward(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("abcd")})
+
+	model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	model.Update(tea.KeyMsg{Type: tea.KeyDelete})
+	if got := string(model.Input); got != "bcd" {
+		t.Fatalf("expected delete to remove rune at cursor, got %q", got)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlK})
+	if got := string(model.Input); got != "bcd" {
+		t.Fatalf("expected ctrl+k at end to keep composer unchanged, got %q", got)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if model.Cursor != 0 {
+		t.Fatalf("expected home to move cursor to start, got %d", model.Cursor)
+	}
+}
+
+func TestAuthEditorSupportsClearShortcut(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepProvider
+	model.AuthProvider = []rune("https://provider.example/v1")
+	model.AuthCursor = len(model.AuthProvider)
+
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+
+	if got := string(model.AuthProvider); got != "" {
+		t.Fatalf("expected ctrl+u to clear auth field, got %q", got)
+	}
+	if model.AuthCursor != 0 {
+		t.Fatalf("expected auth cursor reset, got %d", model.AuthCursor)
+	}
+}
+
 func TestViewUsesTerminalFlowPrefixes(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 100
@@ -109,6 +236,23 @@ func TestViewUsesTerminalFlowPrefixes(t *testing.T) {
 	}
 	if !strings.Contains(view, "tool>") {
 		t.Fatalf("expected terminal flow tool prefix, got %q", view)
+	}
+}
+
+func TestTranscriptShowsScrollbarWhenPanelClosed(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 24
+	model.ActivePanel = app.PanelNone
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("line\n", 20)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("reply\n", 20)},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "█") && !strings.Contains(view, "│") {
+		t.Fatalf("expected transcript scrollbar rail, got %q", view)
 	}
 }
 
@@ -137,6 +281,159 @@ func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
 	}
 	if !strings.Contains(view, "detail") {
 		t.Fatalf("expected detail section, got %q", view)
+	}
+}
+
+func TestStartupSplashCompressesWhenPanelIsOpen(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 180
+	model.Height = 48
+	model.ActivePanel = app.PanelSessions
+
+	view := model.View()
+
+	if strings.Contains(view, "terminal advantages") {
+		t.Fatalf("expected compact startup view when panel is open, got %q", view)
+	}
+	if !strings.Contains(view, "Startup splash is compressed while the inspector is open.") {
+		t.Fatalf("expected compact startup explanation, got %q", view)
+	}
+	if !strings.Contains(view, "active panel  sessions") {
+		t.Fatalf("expected compact startup summary fields, got %q", view)
+	}
+}
+
+func TestSessionsPanelShowsScrollbarWhenPaged(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.ActivePanel = app.PanelSessions
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z"},
+		{ID: "sess-2", Title: "Older session", UpdatedAt: "2026-04-10T00:00:00Z"},
+		{ID: "sess-3", Title: "Third session", UpdatedAt: "2026-04-09T00:00:00Z"},
+		{ID: "sess-4", Title: "Fourth session", UpdatedAt: "2026-04-08T00:00:00Z"},
+		{ID: "sess-5", Title: "Fifth session", UpdatedAt: "2026-04-07T00:00:00Z"},
+		{ID: "sess-6", Title: "Sixth session", UpdatedAt: "2026-04-06T00:00:00Z"},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "█") {
+		t.Fatalf("expected panel scrollbar thumb, got %q", view)
+	}
+}
+
+func TestTallSessionsPanelUsesDynamicPageSize(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 52
+	model.ActivePanel = app.PanelSessions
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "one", UpdatedAt: "2026-04-11T00:00:00Z"},
+		{ID: "sess-2", Title: "two", UpdatedAt: "2026-04-10T00:00:00Z"},
+		{ID: "sess-3", Title: "three", UpdatedAt: "2026-04-09T00:00:00Z"},
+		{ID: "sess-4", Title: "four", UpdatedAt: "2026-04-08T00:00:00Z"},
+		{ID: "sess-5", Title: "five", UpdatedAt: "2026-04-07T00:00:00Z"},
+		{ID: "sess-6", Title: "six", UpdatedAt: "2026-04-06T00:00:00Z"},
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "six") {
+		t.Fatalf("expected tall sessions panel to show more than the old fixed page size, got %q", view)
+	}
+}
+
+func TestTallModelsPanelUsesDynamicPageSize(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 52
+	model.ActivePanel = app.PanelModels
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.AvailableModels = []string{
+		"model-1", "model-2", "model-3", "model-4", "model-5", "model-6",
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "model-6") {
+		t.Fatalf("expected tall models panel to show more than the old fixed page size, got %q", view)
+	}
+}
+
+func TestPanelHeaderShowsControlsBeforePageSummary(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.ActivePanel = app.PanelSessions
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z"},
+	}
+
+	view := model.View()
+	controls := strings.Index(view, "SEL")
+	summary := strings.Index(view, "SESSIONS")
+	if controls < 0 || summary < 0 {
+		t.Fatalf("expected panel header content, got %q", view)
+	}
+	if controls > summary {
+		t.Fatalf("expected controls row before summary row, got %q", view)
+	}
+	for _, segment := range []string{"PAGE", "LOAD", "REFRESH", "ESC", "│"} {
+		if !strings.Contains(view, segment) {
+			t.Fatalf("expected evenly distributed control segment %q, got %q", segment, view)
+		}
+	}
+}
+
+func TestPanelSummaryStaysAtBottomOfSessionsPanel(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 36
+	model.ActivePanel = app.PanelSessions
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.Sessions = []app.BridgeSession{
+		{ID: "s1", Title: "one", UpdatedAt: "2026-04-11T00:00:00Z"},
+		{ID: "s2", Title: "two", UpdatedAt: "2026-04-10T00:00:00Z"},
+		{ID: "s3", Title: "three", UpdatedAt: "2026-04-09T00:00:00Z"},
+	}
+
+	view := model.View()
+	lines := strings.Split(view, "\n")
+	summaryLine := -1
+	bottomBorder := -1
+	for index, line := range lines {
+		if strings.Contains(line, "SESSIONS") && strings.Contains(line, "TOTAL 3") {
+			summaryLine = index
+		}
+		if strings.Contains(line, "┘") && strings.Contains(line, "└") {
+			bottomBorder = index
+			break
+		}
+	}
+
+	if summaryLine < 0 || bottomBorder < 0 {
+		t.Fatalf("expected sessions summary/footer lines, got %q", view)
+	}
+	if bottomBorder-summaryLine != 1 {
+		t.Fatalf("expected sessions summary near panel bottom, got %q", view)
+	}
+}
+
+func TestWidePanelLayoutClosesBothFramesOnSameRow(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 180
+	model.Height = 50
+	model.ActivePanel = app.PanelSessions
+
+	view := model.View()
+
+	if !strings.Contains(view, "┘ └") {
+		t.Fatalf("expected session pane and side panel to close on the same row, got %q", view)
 	}
 }
 
@@ -220,6 +517,139 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	}
 	if !strings.Contains(view, "PROVIDER Newcli") {
 		t.Fatalf("expected provider status to show friendly provider name, got %q", view)
+	}
+}
+
+func TestSlashSuggestionsIncludeExtensionsAndRenderProfessionalHints(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/ext")})
+
+	view := model.View()
+	if !strings.Contains(view, "/extensions") {
+		t.Fatalf("expected extensions suggestion in composer, got %q", view)
+	}
+	if !strings.Contains(view, "match") || !strings.Contains(view, "also") {
+		t.Fatalf("expected richer match/also suggestion rows, got %q", view)
+	}
+	if !strings.Contains(view, "show extensions runtime summary") {
+		t.Fatalf("expected suggestion description in composer, got %q", view)
+	}
+}
+
+func TestTabCompletesExtensionsCommandTemplate(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions expo")})
+	model.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if got := string(model.Input); got != "/extensions exposure " {
+		t.Fatalf("expected tab completion for extensions exposure, got %q", got)
+	}
+}
+
+func TestExtensionsExposureShowsDynamicModeSuggestions(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions exposure ")})
+
+	view := model.View()
+	for _, value := range []string{"hidden", "hinted", "scoped", "full"} {
+		if !strings.Contains(view, value) {
+			t.Fatalf("expected dynamic exposure suggestion %q, got %q", value, view)
+		}
+	}
+}
+
+func TestExtensionsExposurePartialQueryFiltersDynamicModes(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions exposure hi")})
+
+	view := model.View()
+	if !strings.Contains(view, "hidden") {
+		t.Fatalf("expected hidden mode suggestion, got %q", view)
+	}
+	if !strings.Contains(view, "hinted") {
+		t.Fatalf("expected hinted mode suggestion, got %q", view)
+	}
+}
+
+func TestExtensionsTargetSuggestionsUseRuntimeMetadata(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 30
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_runtime_metadata",
+		"appRoot":"/workspace/project-b",
+		"auth":{"mode":"http","credentialSource":"env","provider":"https://provider/v1","model":"gpt-5.4","persistenceLabel":"env","persistencePath":"","httpReady":true,"onboardingAvailable":false},
+		"currentModel":"gpt-5.4",
+		"currentProvider":"https://provider/v1",
+		"currentProviderKeySource":"env",
+		"availableModels":["gpt-5.4"],
+		"availableProviders":["https://provider/v1"],
+		"providerProfiles":{"https://provider/v1":"openai"},
+		"providerProfileSources":{"https://provider/v1":"manual"},
+		"managedSkills":[{"id":"repo-map","label":"Repo Map","exposure":"scoped","source":"project"}],
+		"managedMcpServers":[{"id":"filesystem","label":"Filesystem","exposure":"full","scope":"default","trusted":true}]
+	}`)
+	if err != nil {
+		t.Fatalf("set_runtime_metadata failed: %v", err)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions show ")})
+	view := model.View()
+	if !strings.Contains(view, "skill:repo-map") {
+		t.Fatalf("expected skill target suggestion, got %q", view)
+	}
+	if !strings.Contains(view, "mcp:filesystem") {
+		t.Fatalf("expected mcp target suggestion, got %q", view)
+	}
+	if !strings.Contains(view, "Repo Map") || !strings.Contains(view, "Filesystem") {
+		t.Fatalf("expected target labels in dynamic suggestions, got %q", view)
+	}
+}
+
+func TestTabCompletesDynamicExtensionsTarget(t *testing.T) {
+	model := app.NewModel()
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_runtime_metadata",
+		"managedSkills":[{"id":"repo-map","label":"Repo Map","exposure":"scoped","source":"project"}],
+		"managedMcpServers":[]
+	}`)
+	if err != nil {
+		t.Fatalf("set_runtime_metadata failed: %v", err)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions show repo")})
+	model.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if got := string(model.Input); got != "/extensions show skill:repo-map" {
+		t.Fatalf("expected dynamic target completion, got %q", got)
+	}
+}
+
+func TestExtensionsEnableShowsDynamicTargets(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 30
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_runtime_metadata",
+		"managedSkills":[{"id":"repo-map","label":"Repo Map","exposure":"scoped","source":"project"}],
+		"managedMcpServers":[{"id":"filesystem","label":"Filesystem","exposure":"full","scope":"default","trusted":true}]
+	}`)
+	if err != nil {
+		t.Fatalf("set_runtime_metadata failed: %v", err)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/extensions enable ")})
+	view := model.View()
+	if !strings.Contains(view, "skill:repo-map") || !strings.Contains(view, "mcp:filesystem") {
+		t.Fatalf("expected enable target suggestions, got %q", view)
 	}
 }
 

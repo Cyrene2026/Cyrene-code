@@ -81,13 +81,18 @@ export class McpManager implements McpRuntime {
       health: "online",
       transport: "filesystem",
       aliases: Object.keys(buildFileServerAliases(serverId)),
+      exposure: "full",
+      tags: ["filesystem", "workspace", "core"],
+      hint: "Core workspace file, git, shell, and LSP operations.",
       lsp: ruleConfig.lspServers
         ? {
             configuredCount: ruleConfig.lspServers.length,
             serverIds: ruleConfig.lspServers.map(entry => entry.id),
           }
         : undefined,
-      tools: buildBuiltinToolDescriptors(serverId, ruleConfig),
+      tools: buildBuiltinToolDescriptors(serverId, ruleConfig, {
+        serverExposure: "full",
+      }),
     };
     const toolNames = new Set(descriptor.tools.map(tool => tool.name));
 

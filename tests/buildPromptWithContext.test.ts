@@ -175,4 +175,37 @@ describe("buildPromptWithContext", () => {
     expect(prompt).toContain("Latest actionable user request before this continuation:");
     expect(prompt).toContain("完善下 lsp doctor/list 的一致性和可诊断性");
   });
+
+  test("injects only selected extension summary instead of full skill prompt bodies", () => {
+    const prompt = buildPromptWithContext(
+      "explain this repo",
+      "system",
+      "project",
+      {
+        pins: [],
+        relevantMemories: [],
+        recent: [],
+        latestActionableUserMessage: "",
+        durableSummary: "",
+        pendingDigest: "",
+        summaryFallback: "",
+        reducerMode: "merge_and_digest",
+        summaryRecoveryNeeded: false,
+        interruptedTurn: null,
+      },
+      [
+        "SELECTED EXTENSIONS (request-scoped summary):",
+        "skills:",
+        "- skill repo-map | reason trigger match | scope project | exposure scoped | desc Repo structure helper",
+        "mcp:",
+        "- mcp filesystem | reason always visible | transport filesystem | scope default | trust trusted | exposure full",
+      ].join("\n")
+    );
+
+    expect(prompt).toContain("SELECTED EXTENSIONS (request-scoped summary):");
+    expect(prompt).toContain("skill repo-map");
+    expect(prompt).toContain("mcp filesystem");
+    expect(prompt).not.toContain("ACTIVE SKILLS");
+    expect(prompt).not.toContain("full prompt should not leak here");
+  });
 });

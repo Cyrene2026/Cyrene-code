@@ -66,6 +66,21 @@ type BridgeUsageSummary struct {
 	TotalTokens      int `json:"totalTokens"`
 }
 
+type BridgeManagedSkill struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Exposure string `json:"exposure"`
+	Source   string `json:"source"`
+}
+
+type BridgeManagedMcpServer struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Exposure string `json:"exposure"`
+	Scope    string `json:"scope"`
+	Trusted  bool   `json:"trusted"`
+}
+
 type bridgeSnapshot struct {
 	AppRoot                  string             `json:"appRoot"`
 	Status                   string             `json:"status"`
@@ -82,6 +97,8 @@ type bridgeSnapshot struct {
 	ProviderProfiles         map[string]string  `json:"providerProfiles"`
 	ProviderProfileSources   map[string]string  `json:"providerProfileSources"`
 	ProviderNames            map[string]string  `json:"providerNames"`
+	ManagedSkills            []BridgeManagedSkill     `json:"managedSkills"`
+	ManagedMcpServers        []BridgeManagedMcpServer `json:"managedMcpServers"`
 	UsageSummary             BridgeUsageSummary `json:"usageSummary"`
 	Auth                     BridgeAuthStatus   `json:"auth"`
 }
@@ -104,6 +121,8 @@ type bridgeEvent struct {
 	ProviderProfiles         map[string]string  `json:"providerProfiles,omitempty"`
 	ProviderProfileSources   map[string]string  `json:"providerProfileSources,omitempty"`
 	ProviderNames            map[string]string  `json:"providerNames,omitempty"`
+	ManagedSkills            []BridgeManagedSkill     `json:"managedSkills,omitempty"`
+	ManagedMcpServers        []BridgeManagedMcpServer `json:"managedMcpServers,omitempty"`
 	UsageSummary             BridgeUsageSummary `json:"usageSummary,omitempty"`
 	Auth                     BridgeAuthStatus   `json:"auth,omitempty"`
 	AppRoot                  string             `json:"appRoot,omitempty"`

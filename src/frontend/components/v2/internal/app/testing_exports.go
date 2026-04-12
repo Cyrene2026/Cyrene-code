@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -23,11 +24,25 @@ func ListIndexAtPanelLineForTest(total, selected, pageSize, innerY, dataStartLin
 }
 
 func (m *Model) RenderTranscriptForTest(width, height int) string {
-	return m.renderTranscript(width, height)
+	lines, _ := m.renderTranscriptWindow(width, height)
+	return strings.Join(lines, "\n")
 }
 
 func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style) []string {
 	return renderMarkdownBodyLines(text, width, base)
+}
+
+func SuggestSlashCommandsForTest(input string, limit int) []string {
+	matches := suggestSlashCommands(input, limit)
+	result := make([]string, 0, len(matches))
+	for _, match := range matches {
+		result = append(result, match.Command)
+	}
+	return result
+}
+
+func ApplySlashCompletionForTest(input string) (string, bool) {
+	return applySlashCompletion(input)
 }
 
 func (m *Model) ApplyBridgeEventJSONForTest(payload string) error {

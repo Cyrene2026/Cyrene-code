@@ -48,6 +48,27 @@ Cyrene now uses a **global user config home** by default:
 Project-local `.cyrene/` is still read for backward compatibility, but global
 user scope is the primary home for model/provider metadata and session state.
 
+### CLI inspection and config commands
+
+The `cyrene` entrypoint now exposes a small non-interactive CLI layer before it
+launches the Bubble Tea UI:
+
+```bash
+cyrene --help
+cyrene paths
+cyrene config --json
+cyrene provider list
+cyrene provider name set https://api.openai.com/v1 "OpenAI"
+cyrene provider profile set https://api.openai.com/v1 openai
+```
+
+Notes:
+
+- `cyrene` with no subcommand still launches the terminal UI.
+- `--root` works for both UI launch and non-interactive commands.
+- `provider` also accepts `providers` as an alias.
+- `--json` is available for `paths`, `config`, and `provider list`.
+
 ### HTTP credentials
 
 You can still launch with explicit environment variables:

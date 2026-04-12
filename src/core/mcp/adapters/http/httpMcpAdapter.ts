@@ -86,6 +86,9 @@ export class HttpMcpAdapter implements McpServerAdapter {
       health: server.enabled ? "unknown" : "offline",
       transport: "http",
       aliases: [...server.aliases],
+      exposure: server.exposure ?? "hinted",
+      tags: [...(server.tags ?? [])],
+      hint: server.hint,
       tools: buildRemoteToolDescriptors(server, []),
     };
   }

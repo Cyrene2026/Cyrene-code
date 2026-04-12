@@ -35,7 +35,7 @@ export const buildPromptWithContext = (
   systemPrompt: string,
   projectPrompt: string,
   promptContext: SessionPromptContext,
-  activeSkillsPrompt = ""
+  selectedExtensionsPrompt = ""
 ) => {
   const lowSignalContinuation = isLowSignalContinuationQuery(query);
   const recentLines = promptContext.recent
@@ -120,9 +120,9 @@ export const buildPromptWithContext = (
     systemPrompt || "(none)",
     ".CYRENE.MD POLICY (second priority):",
     projectPrompt || "(none)",
-    activeSkillsPrompt
-      ? `ACTIVE SKILLS (task-scoped guidance):\n${activeSkillsPrompt}`
-      : "ACTIVE SKILLS (task-scoped guidance):\n(none)",
+    selectedExtensionsPrompt
+      ? selectedExtensionsPrompt
+      : "SELECTED EXTENSIONS (request-scoped summary):\n(none)",
     "TASK STATE CONTEXT:",
     "Prefer durable working state and confirmed facts over replaying long transcript history. If something is already listed under COMPLETED, treat it as done unless the current user asks to revisit it or new evidence contradicts it.",
     ...taskStateSections,

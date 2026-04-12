@@ -493,10 +493,17 @@ export const handleMcpCommand = async ({
         `MCP server ${server.id}`,
         `label: ${server.label}`,
         `transport: ${server.transport ?? "unknown"}`,
+        `scope: ${server.scope ?? "default"}`,
+        `trust: ${
+          server.trusted === undefined ? "n/a" : server.trusted ? "trusted" : "untrusted"
+        }`,
+        `exposure: ${server.exposure}`,
         `source: ${server.source}`,
         `health: ${server.health}`,
         `enabled: ${server.enabled ? "true" : "false"}`,
         `aliases: ${formatMcpAliases(server.aliases)}`,
+        `tags: ${server.tags.length > 0 ? server.tags.join(", ") : "(none)"}`,
+        ...(server.hint ? [`hint: ${server.hint}`] : []),
         `lsp: ${
           server.transport === "filesystem"
             ? server.lsp && server.lsp.configuredCount > 0

@@ -4,6 +4,7 @@ import {
   type LoadedSkillsConfig,
   type SkillsConfigPatch,
 } from "./loadSkillsConfig";
+import type { ExtensionExposureMode } from "../extensions/metadata";
 import type {
   SkillDefinition,
   SkillsRuntime,
@@ -21,6 +22,7 @@ const clonePatch = (patch: SkillsConfigPatch): SkillsConfigPatch => ({
   skills: patch.skills.map(skill => ({
     ...skill,
     triggers: skill.triggers ? [...skill.triggers] : undefined,
+    tags: skill.tags ? [...skill.tags] : undefined,
   })),
 });
 
@@ -30,6 +32,8 @@ const mergeSkillDefinition = (existing: SkillDefinition | undefined, enabled: bo
   description: existing?.description,
   prompt: existing?.prompt ?? "",
   triggers: [...(existing?.triggers ?? [])],
+  exposure: existing?.exposure ?? "scoped",
+  tags: [...(existing?.tags ?? [])],
   enabled,
 });
 
@@ -59,6 +63,12 @@ const scoreSkillByTrigger = (queryLower: string, skill: SkillDefinition) => {
   }
   return score;
 };
+
+const canAutoSelectSkill = (skill: SkillDefinition) =>
+  skill.exposure === "scoped" || skill.exposure === "full";
+
+const canSelectSkillByExplicitMention = (skill: SkillDefinition) =>
+  skill.exposure !== "hidden";
 
 const formatMutationMessage = (
   action: string,
@@ -106,7 +116,11 @@ class ManagedSkillsRuntime implements SkillsRuntime {
 
     for (const mention of explicitMentions) {
       const direct = skills.find(skill => skill.id.toLowerCase() === mention);
-      if (direct && !selectedById.has(direct.id)) {
+      if (
+        direct &&
+        canSelectSkillByExplicitMention(direct) &&
+        !selectedById.has(direct.id)
+      ) {
         selectedById.add(direct.id);
         result.push(direct);
       }
@@ -117,7 +131,12 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         skill,
         score: scoreSkillByTrigger(queryLower, skill),
       }))
-      .filter(item => item.score > 0 && !selectedById.has(item.skill.id))
+      .filter(
+        item =>
+          item.score > 0 &&
+          canAutoSelectSkill(item.skill) &&
+          !selectedById.has(item.skill.id)
+      )
       .sort((left, right) =>
         left.score === right.score
           ? left.skill.id.localeCompare(right.skill.id)
@@ -186,6 +205,11 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         existingPatch?.triggers && existingPatch.triggers.length > 0
           ? [...existingPatch.triggers]
           : [...merged.triggers],
+      exposure: existingPatch?.exposure ?? merged.exposure,
+      tags:
+        existingPatch?.tags && existingPatch.tags.length > 0
+          ? [...existingPatch.tags]
+          : [...merged.tags],
       enabled,
     };
     patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
@@ -201,6 +225,62 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         normalizedId,
         saved.path
       ),
+      skillId: normalizedId,
+      configPath: saved.path,
+    };
+  }
+
+  async setSkillExposure(
+    skillId: string,
+    exposure: ExtensionExposureMode
+  ): Promise<SkillsRuntimeMutationResult> {
+    const normalizedId = skillId.trim();
+    if (!normalizedId) {
+      return {
+        ok: false,
+        message: "Skill id is required.",
+      };
+    }
+
+    const current = this.getConfig();
+    const target = current.skills.find(skill => skill.id === normalizedId);
+    if (!target) {
+      return {
+        ok: false,
+        message: `Skill not found: ${normalizedId}`,
+      };
+    }
+
+    const patch = clonePatch(current.projectPatch);
+    patch.removeSkillIds = patch.removeSkillIds.filter(id => id !== normalizedId);
+
+    const existingPatch = patch.skills.find(skill => skill.id === normalizedId);
+    const merged = mergeSkillDefinition(target, target.enabled);
+    const nextPatchEntry = {
+      id: normalizedId,
+      label: existingPatch?.label ?? merged.label,
+      description: existingPatch?.description ?? merged.description,
+      prompt: existingPatch?.prompt ?? merged.prompt,
+      triggers:
+        existingPatch?.triggers && existingPatch.triggers.length > 0
+          ? [...existingPatch.triggers]
+          : [...merged.triggers],
+      exposure,
+      tags:
+        existingPatch?.tags && existingPatch.tags.length > 0
+          ? [...existingPatch.tags]
+          : [...merged.tags],
+      enabled: existingPatch?.enabled ?? merged.enabled,
+    };
+    patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
+    patch.skills.push(nextPatchEntry);
+
+    const saved = await saveProjectSkillsConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: `Skill exposure updated: ${normalizedId}\nexposure: ${exposure}\nconfig: ${saved.path}`,
       skillId: normalizedId,
       configPath: saved.path,
     };

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -22,6 +23,7 @@ type AuthStep string
 type slashCommandSpec struct {
 	Command     string
 	Description string
+	InsertValue string
 }
 
 const (
@@ -48,12 +50,10 @@ const (
 	AuthStepConfirm  AuthStep = "confirm"
 
 	scrollStep               = 8
-	sessionPanelPageSize     = 4
-	modelPanelPageSize       = 4
-	providerPanelPageSize    = 4
 	approvalQueuePageSize    = 5
 	approvalPreviewPageLines = 20
 	mouseDoubleClickWindow   = 400 * time.Millisecond
+	rightClickPasteWindow    = 400 * time.Millisecond
 	statusSpinnerInterval    = 120 * time.Millisecond
 )
 
@@ -103,6 +103,15 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/skills remove <id>", Description: "remove one skill via project remove_skills override"},
 	{Command: "/skills use <id>", Description: "use one skill for the current session only"},
 	{Command: "/skills reload", Description: "reload skills config"},
+	{Command: "/extensions", Description: "show extensions runtime summary"},
+	{Command: "/extensions list", Description: "list managed skills and MCP servers"},
+	{Command: "/extensions skills", Description: "list managed skills with scope/exposure"},
+	{Command: "/extensions mcp", Description: "list managed MCP servers with trust/scope/exposure"},
+	{Command: "/extensions show <id|skill:<id>|mcp:<id>>", Description: "inspect one managed skill or MCP server"},
+	{Command: "/extensions resolve <query>", Description: "preview which extensions would be selected for a query"},
+	{Command: "/extensions enable <id|skill:<id>|mcp:<id>>", Description: "enable one managed skill or MCP server"},
+	{Command: "/extensions disable <id|skill:<id>|mcp:<id>>", Description: "disable one managed skill or MCP server"},
+	{Command: "/extensions exposure <hidden|hinted|scoped|full> <id|skill:<id>|mcp:<id>>", Description: "set exposure policy for one managed skill or MCP server"},
 	{Command: "/mcp", Description: "show MCP runtime summary"},
 	{Command: "/mcp servers", Description: "list registered MCP servers"},
 	{Command: "/mcp server <id>", Description: "inspect one MCP server"},
@@ -130,6 +139,12 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/reject all", Description: "reject all pending operations"},
 	{Command: "/clear", Description: "clear transcript"},
 	{Command: "/quit", Description: "quit bubble tea frontend"},
+}
+
+func init() {
+	for index := range slashCommandCatalog {
+		slashCommandCatalog[index].InsertValue = slashInsertValue(slashCommandCatalog[index].Command)
+	}
 }
 
 type Message struct {
@@ -177,6 +192,8 @@ type Model struct {
 	ProviderProfiles         map[string]string
 	ProviderProfileSources   map[string]string
 	ProviderNames            map[string]string
+	ManagedSkills            []BridgeManagedSkill
+	ManagedMcpServers        []BridgeManagedMcpServer
 	UsageSummary             BridgeUsageSummary
 	CurrentModel             string
 	CurrentProvider          string
@@ -184,15 +201,16 @@ type Model struct {
 	Auth                     BridgeAuthStatus
 	AppRoot                  string
 
-	AuthStep     AuthStep
-	AuthProvider []rune
-	AuthAPIKey   []rune
-	AuthModel    []rune
-	AuthCursor   int
-	AuthSaving   bool
-	LastClickAt  time.Time
-	LastClickIdx int
-	LastClickPan Panel
+	AuthStep         AuthStep
+	AuthProvider     []rune
+	AuthAPIKey       []rune
+	AuthModel        []rune
+	AuthCursor       int
+	AuthSaving       bool
+	LastClickAt      time.Time
+	LastClickIdx     int
+	LastClickPan     Panel
+	IgnorePasteUntil time.Time
 
 	bridge *bridgeClient
 }
@@ -291,9 +309,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return typed, typed.withStatusSpinner(cmd)
 			}
 			return nextModel, cmd
+		case tea.MouseButtonRight:
+			if m.MouseCapture {
+				m.IgnorePasteUntil = time.Now().Add(rightClickPasteWindow)
+				m.setNotice("Right-click paste is blocked in mouse mode. Press F6 for terminal paste.", false)
+			}
 		}
 		return m, m.withStatusSpinner(nil)
 	case tea.KeyMsg:
+		if msg := value; msg.Type == tea.KeyRunes && m.shouldSuppressPaste(msg.Runes) {
+			return m, m.withStatusSpinner(nil)
+		}
 		nextModel, cmd := m.handleKey(value)
 		if typed, ok := nextModel.(*Model); ok {
 			return typed, typed.withStatusSpinner(cmd)
@@ -433,6 +459,8 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.ProviderProfiles = cloneStringMap(snapshot.ProviderProfiles)
 	m.ProviderProfileSources = cloneStringMap(snapshot.ProviderProfileSources)
 	m.ProviderNames = cloneStringMap(snapshot.ProviderNames)
+	m.ManagedSkills = cloneManagedSkills(snapshot.ManagedSkills)
+	m.ManagedMcpServers = cloneManagedMcpServers(snapshot.ManagedMcpServers)
 	m.UsageSummary = snapshot.UsageSummary
 	m.CurrentModel = snapshot.CurrentModel
 	m.CurrentProvider = snapshot.CurrentProvider
@@ -453,6 +481,8 @@ func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
 	m.ProviderProfiles = cloneStringMap(event.ProviderProfiles)
 	m.ProviderProfileSources = cloneStringMap(event.ProviderProfileSources)
 	m.ProviderNames = cloneStringMap(event.ProviderNames)
+	m.ManagedSkills = cloneManagedSkills(event.ManagedSkills)
+	m.ManagedMcpServers = cloneManagedMcpServers(event.ManagedMcpServers)
 	m.CurrentModel = event.CurrentModel
 	m.CurrentProvider = event.CurrentProvider
 	m.CurrentProviderKeySource = event.CurrentProviderKeySource
@@ -549,11 +579,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyF6:
 		m.MouseCapture = !m.MouseCapture
+		m.IgnorePasteUntil = time.Time{}
 		if m.MouseCapture {
 			m.setNotice("Mouse capture enabled. Wheel scrolls the in-app view.", false)
 			return m, tea.EnableMouseCellMotion
 		}
-		m.setNotice("Copy mode enabled. Drag to select text; press F6 to restore in-app wheel scrolling.", false)
+		m.setNotice("Copy mode enabled. Drag to select text; terminal paste is active here. Press F6 to restore in-app wheel scrolling.", false)
 		return m, tea.DisableMouse
 	}
 
@@ -567,11 +598,29 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
 		return m, m.submitInput()
+	case tea.KeyHome:
+		m.Cursor = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.Cursor = len(m.Input)
+		return m, nil
 	case tea.KeyCtrlJ:
 		m.insertRunes([]rune{'\n'})
 		return m, nil
+	case tea.KeyCtrlU:
+		m.clearComposerInput()
+		return m, nil
+	case tea.KeyCtrlK:
+		m.deleteComposerToEnd()
+		return m, nil
+	case tea.KeyCtrlW:
+		m.deleteComposerWordBackward()
+		return m, nil
 	case tea.KeyBackspace:
 		m.deleteBackward()
+		return m, nil
+	case tea.KeyDelete, tea.KeyCtrlD:
+		m.deleteForward()
 		return m, nil
 	case tea.KeyLeft:
 		if m.Cursor > 0 {
@@ -594,11 +643,13 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clampTranscriptOffset()
 		return m, nil
 	case tea.KeyEscape:
-		m.Input = m.Input[:0]
-		m.Cursor = 0
+		m.clearComposerInput()
 		return m, nil
 	case tea.KeySpace:
 		m.insertRunes([]rune{' '})
+		return m, nil
+	case tea.KeyTab:
+		m.applySlashCompletion()
 		return m, nil
 	case tea.KeyRunes:
 		m.insertRunes(msg.Runes)
@@ -658,18 +709,18 @@ func (m *Model) transcriptViewportMetrics() (int, int) {
 	contentAreaHeight := maxInt(1, bodyHeight)
 
 	if m.ActivePanel == PanelNone {
-		return framedInnerWidth(activeFrameStyle, contentWidth), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
+		return maxInt(1, framedInnerWidth(activeFrameStyle, contentWidth)-2), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
 	}
 
 	if contentWidth >= 96 {
-		panelWidth := clampInt(contentWidth/3, 34, 54)
+		panelWidth := m.widePanelWidth(contentWidth)
 		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
-		return framedInnerWidth(activeFrameStyle, sessionWidth), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
+		return maxInt(1, framedInnerWidth(activeFrameStyle, sessionWidth)-2), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
 	}
 
 	panelHeight := clampInt(contentAreaHeight/2, 10, 16)
 	sessionHeight := maxInt(4, contentAreaHeight-panelHeight-1)
-	return framedInnerWidth(activeFrameStyle, contentWidth), maxInt(1, framedInnerHeight(activeFrameStyle, sessionHeight))
+	return maxInt(1, framedInnerWidth(activeFrameStyle, contentWidth)-2), maxInt(1, framedInnerHeight(activeFrameStyle, sessionHeight))
 }
 
 func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -734,15 +785,14 @@ func (m *Model) panelListIndexAtMouse(mouseX, mouseY int) (int, bool) {
 
 	switch m.ActivePanel {
 	case PanelSessions:
-		return listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, sessionPanelPageSize, innerY, 2)
+		return listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSize(), innerY, 2)
 	case PanelModels:
-		return listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, modelPanelPageSize, innerY, 2)
+		return listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSize(), innerY, 2)
 	case PanelProviders:
 		bodyWidth := framedInnerWidth(panelBoxStyle, panelWidth)
 		dataStartLine := 2 +
-			len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
-			len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
-		return listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, providerPanelPageSize, innerY, dataStartLine)
+			providerPanelCommandRows(bodyWidth)
+		return listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSize(), innerY, dataStartLine)
 	default:
 		return 0, false
 	}
@@ -765,7 +815,7 @@ func (m *Model) activePanelRect() (int, int, int, int, bool) {
 	panelTop := 1 + lipgloss.Height(header) + 1 + 1
 	panelLeft := 1
 	if contentWidth >= 96 {
-		panelWidth := clampInt(contentWidth/3, 34, 54)
+		panelWidth := m.widePanelWidth(contentWidth)
 		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
 		panelLeft += sessionWidth + 1
 		return panelLeft, panelTop, panelWidth, contentAreaHeight, true
@@ -790,6 +840,62 @@ func (m *Model) panelHeight() int {
 	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
 	return maxInt(1, bodyHeight)
+}
+
+func (m *Model) sessionPanelPageSize() int {
+	_, _, panelWidth, panelHeight, ok := m.activePanelRect()
+	if !ok {
+		return 1
+	}
+	return m.sessionPanelPageSizeForDimensions(panelWidth, panelHeight)
+}
+
+func (m *Model) sessionPanelPageSizeForDimensions(width, height int) int {
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	return dynamicPanelPageSize(bodyHeight, 9, 2)
+}
+
+func (m *Model) modelPanelPageSize() int {
+	_, _, panelWidth, panelHeight, ok := m.activePanelRect()
+	if !ok {
+		return 1
+	}
+	return m.modelPanelPageSizeForDimensions(panelWidth, panelHeight)
+}
+
+func (m *Model) modelPanelPageSizeForDimensions(width, height int) int {
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	return dynamicPanelPageSize(bodyHeight, 8, 2)
+}
+
+func (m *Model) providerPanelPageSize() int {
+	_, _, panelWidth, panelHeight, ok := m.activePanelRect()
+	if !ok {
+		return 1
+	}
+	return m.providerPanelPageSizeForDimensions(panelWidth, panelHeight)
+}
+
+func (m *Model) providerPanelPageSizeForDimensions(width, height int) int {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	return dynamicPanelPageSize(bodyHeight, 9+providerPanelCommandRows(bodyWidth), 3)
+}
+
+func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
+	if rowsPerItem <= 0 {
+		return 1
+	}
+	usableRows := bodyHeight - reservedRows - rowsPerItem
+	if usableRows < rowsPerItem {
+		return 1
+	}
+	return maxInt(1, usableRows/rowsPerItem)
+}
+
+func providerPanelCommandRows(bodyWidth int) int {
+	return len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
+		len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
 }
 
 func listIndexAtPanelLine(total, selected, pageSize, innerY, dataStartLine int) (int, bool) {
@@ -912,12 +1018,12 @@ func (m *Model) handleSessionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyLeft:
 		if len(m.Sessions) > 0 {
-			m.SessionIndex = movePagedSelection(m.SessionIndex, len(m.Sessions), sessionPanelPageSize, "left")
+			m.SessionIndex = movePagedSelection(m.SessionIndex, len(m.Sessions), m.sessionPanelPageSize(), "left")
 		}
 		return m, nil
 	case tea.KeyRight:
 		if len(m.Sessions) > 0 {
-			m.SessionIndex = movePagedSelection(m.SessionIndex, len(m.Sessions), sessionPanelPageSize, "right")
+			m.SessionIndex = movePagedSelection(m.SessionIndex, len(m.Sessions), m.sessionPanelPageSize(), "right")
 		}
 		return m, nil
 	case tea.KeyEnter:
@@ -958,12 +1064,12 @@ func (m *Model) handleModelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyLeft:
 		if len(m.AvailableModels) > 0 {
-			m.ModelIndex = movePagedSelection(m.ModelIndex, len(m.AvailableModels), modelPanelPageSize, "left")
+			m.ModelIndex = movePagedSelection(m.ModelIndex, len(m.AvailableModels), m.modelPanelPageSize(), "left")
 		}
 		return m, nil
 	case tea.KeyRight:
 		if len(m.AvailableModels) > 0 {
-			m.ModelIndex = movePagedSelection(m.ModelIndex, len(m.AvailableModels), modelPanelPageSize, "right")
+			m.ModelIndex = movePagedSelection(m.ModelIndex, len(m.AvailableModels), m.modelPanelPageSize(), "right")
 		}
 		return m, nil
 	case tea.KeyEnter:
@@ -1000,12 +1106,12 @@ func (m *Model) handleProviderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyLeft:
 		if len(m.AvailableProviders) > 0 {
-			m.ProviderIndex = movePagedSelection(m.ProviderIndex, len(m.AvailableProviders), providerPanelPageSize, "left")
+			m.ProviderIndex = movePagedSelection(m.ProviderIndex, len(m.AvailableProviders), m.providerPanelPageSize(), "left")
 		}
 		return m, nil
 	case tea.KeyRight:
 		if len(m.AvailableProviders) > 0 {
-			m.ProviderIndex = movePagedSelection(m.ProviderIndex, len(m.AvailableProviders), providerPanelPageSize, "right")
+			m.ProviderIndex = movePagedSelection(m.ProviderIndex, len(m.AvailableProviders), m.providerPanelPageSize(), "right")
 		}
 		return m, nil
 	case tea.KeyEnter:
@@ -1068,8 +1174,26 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.advanceAuthStepOnEnter()
 		return m, nil
+	case tea.KeyHome:
+		m.AuthCursor = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.AuthCursor = m.currentAuthFieldLength()
+		return m, nil
+	case tea.KeyCtrlU:
+		m.clearAuthField()
+		return m, nil
+	case tea.KeyCtrlK:
+		m.deleteAuthToEnd()
+		return m, nil
+	case tea.KeyCtrlW:
+		m.deleteAuthWordBackward()
+		return m, nil
 	case tea.KeyBackspace:
 		m.deleteAuthBackward()
+		return m, nil
+	case tea.KeyDelete, tea.KeyCtrlD:
+		m.deleteAuthForward()
 		return m, nil
 	case tea.KeyLeft:
 		if m.AuthCursor > 0 {
@@ -1548,6 +1672,21 @@ func (m *Model) insertAuthRunes(values []rune) {
 	m.AuthCursor = cursor + len(values)
 }
 
+func (m *Model) deleteAuthForward() {
+	field := m.currentAuthField()
+	if field == nil {
+		return
+	}
+	cursor := clampInt(m.AuthCursor, 0, len(*field))
+	if cursor >= len(*field) {
+		return
+	}
+	next := make([]rune, 0, len(*field)-1)
+	next = append(next, (*field)[:cursor]...)
+	next = append(next, (*field)[cursor+1:]...)
+	*field = next
+}
+
 func (m *Model) deleteAuthBackward() {
 	field := m.currentAuthField()
 	if field == nil || m.AuthCursor <= 0 || len(*field) == 0 {
@@ -1561,9 +1700,51 @@ func (m *Model) deleteAuthBackward() {
 	m.AuthCursor = cursor - 1
 }
 
+func (m *Model) deleteAuthWordBackward() {
+	field := m.currentAuthField()
+	if field == nil {
+		return
+	}
+	next, cursor := deleteWordBackwardRunes(*field, m.AuthCursor)
+	*field = next
+	m.AuthCursor = cursor
+}
+
+func (m *Model) deleteAuthToEnd() {
+	field := m.currentAuthField()
+	if field == nil {
+		return
+	}
+	cursor := clampInt(m.AuthCursor, 0, len(*field))
+	*field = append([]rune{}, (*field)[:cursor]...)
+}
+
+func (m *Model) clearAuthField() {
+	field := m.currentAuthField()
+	if field == nil {
+		return
+	}
+	*field = (*field)[:0]
+	m.AuthCursor = 0
+}
+
 func (m *Model) setNotice(text string, isError bool) {
 	m.Notice = strings.TrimSpace(text)
 	m.NoticeIsError = isError
+}
+
+func (m *Model) shouldSuppressPaste(values []rune) bool {
+	if !m.MouseCapture || len(values) == 0 {
+		return false
+	}
+	if m.IgnorePasteUntil.IsZero() {
+		return false
+	}
+	if time.Now().After(m.IgnorePasteUntil) {
+		m.IgnorePasteUntil = time.Time{}
+		return false
+	}
+	return true
 }
 
 func (m *Model) invalidateTranscriptCache() {
@@ -1574,6 +1755,7 @@ func (m *Model) invalidateTranscriptCache() {
 }
 
 func (m *Model) insertRunes(values []rune) {
+	values = normalizeComposerRunes(values)
 	if len(values) == 0 {
 		return
 	}
@@ -1590,6 +1772,76 @@ func (m *Model) insertRunes(values []rune) {
 	next = append(next, m.Input[m.Cursor:]...)
 	m.Input = next
 	m.Cursor += len(values)
+}
+
+func (m *Model) deleteForward() {
+	if m.Cursor < 0 || m.Cursor >= len(m.Input) || len(m.Input) == 0 {
+		return
+	}
+	next := make([]rune, 0, len(m.Input)-1)
+	next = append(next, m.Input[:m.Cursor]...)
+	next = append(next, m.Input[m.Cursor+1:]...)
+	m.Input = next
+}
+
+func (m *Model) deleteComposerWordBackward() {
+	m.Input, m.Cursor = deleteWordBackwardRunes(m.Input, m.Cursor)
+}
+
+func (m *Model) deleteComposerToEnd() {
+	cursor := clampInt(m.Cursor, 0, len(m.Input))
+	m.Input = append([]rune{}, m.Input[:cursor]...)
+}
+
+func (m *Model) clearComposerInput() {
+	m.Input = m.Input[:0]
+	m.Cursor = 0
+}
+
+func normalizeComposerRunes(values []rune) []rune {
+	if len(values) == 0 {
+		return nil
+	}
+
+	normalized := make([]rune, 0, len(values))
+	for index := 0; index < len(values); index++ {
+		r := values[index]
+		switch r {
+		case '\r':
+			if index+1 < len(values) && values[index+1] == '\n' {
+				continue
+			}
+			normalized = append(normalized, '\n')
+		case '\t':
+			normalized = append(normalized, ' ', ' ', ' ', ' ')
+		case '\n':
+			normalized = append(normalized, '\n')
+		default:
+			if unicode.IsControl(r) {
+				continue
+			}
+			normalized = append(normalized, r)
+		}
+	}
+	return normalized
+}
+
+func deleteWordBackwardRunes(values []rune, cursor int) ([]rune, int) {
+	if len(values) == 0 || cursor <= 0 {
+		return values, clampInt(cursor, 0, len(values))
+	}
+	cursor = clampInt(cursor, 0, len(values))
+	start := cursor
+	for start > 0 && unicode.IsSpace(values[start-1]) {
+		start--
+	}
+	for start > 0 && !unicode.IsSpace(values[start-1]) {
+		start--
+	}
+	next := make([]rune, 0, len(values)-(cursor-start))
+	next = append(next, values[:start]...)
+	next = append(next, values[cursor:]...)
+	return next, start
 }
 
 func (m *Model) deleteBackward() {
@@ -1649,6 +1901,24 @@ func cloneStrings(items []string) []string {
 		return nil
 	}
 	cloned := make([]string, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneManagedSkills(items []BridgeManagedSkill) []BridgeManagedSkill {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]BridgeManagedSkill, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneManagedMcpServers(items []BridgeManagedMcpServer) []BridgeManagedMcpServer {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]BridgeManagedMcpServer, len(items))
 	copy(cloned, items)
 	return cloned
 }
@@ -1846,6 +2116,321 @@ func slashHelpText() string {
 	return strings.Join(lines, "\n")
 }
 
+func slashInsertValue(command string) string {
+	switch command {
+	case "/provider <url>":
+		return "/provider "
+	case "/provider profile <openai|gemini|anthropic|custom> [url]":
+		return "/provider profile "
+	case "/provider profile clear [url]":
+		return "/provider profile clear "
+	case "/provider name <display_name>":
+		return "/provider name "
+	case "/provider name clear [url]":
+		return "/provider name clear "
+	case "/model <name>":
+		return "/model "
+	case "/system <text>":
+		return "/system "
+	case "/resume <id>", "/load <id>":
+		return "/resume "
+	case "/search-session <query>":
+		return "/search-session "
+	case "/search-session #<tag> [query]":
+		return "/search-session #"
+	case "/tag add <tag>":
+		return "/tag add "
+	case "/tag remove <tag>":
+		return "/tag remove "
+	case "/pin <note>":
+		return "/pin "
+	case "/unpin <index>":
+		return "/unpin "
+	case "/skills enable <id>":
+		return "/skills enable "
+	case "/skills disable <id>":
+		return "/skills disable "
+	case "/skills remove <id>":
+		return "/skills remove "
+	case "/skills use <id>":
+		return "/skills use "
+	case "/skills show <id>":
+		return "/skills show "
+	case "/extensions show <id|skill:<id>|mcp:<id>>":
+		return "/extensions show "
+	case "/extensions resolve <query>":
+		return "/extensions resolve "
+	case "/extensions enable <id|skill:<id>|mcp:<id>>":
+		return "/extensions enable "
+	case "/extensions disable <id|skill:<id>|mcp:<id>>":
+		return "/extensions disable "
+	case "/extensions exposure <hidden|hinted|scoped|full> <id|skill:<id>|mcp:<id>>":
+		return "/extensions exposure "
+	case "/mcp server <id>":
+		return "/mcp server "
+	case "/mcp tools <server>":
+		return "/mcp tools "
+	case "/mcp add stdio <id> <command...>":
+		return "/mcp add stdio "
+	case "/mcp add http <id> <url>":
+		return "/mcp add http "
+	case "/mcp add filesystem <id> [workspace]":
+		return "/mcp add filesystem "
+	case "/mcp lsp list [filesystem-server]":
+		return "/mcp lsp list "
+	case "/mcp lsp add <filesystem-server> <preset>|<lsp-id> ...":
+		return "/mcp lsp add "
+	case "/mcp lsp remove <filesystem-server> <lsp-id>":
+		return "/mcp lsp remove "
+	case "/mcp lsp doctor <filesystem-server> <path> [--lsp <lsp-id>]":
+		return "/mcp lsp doctor "
+	case "/mcp remove <id>":
+		return "/mcp remove "
+	case "/mcp enable <id>":
+		return "/mcp enable "
+	case "/mcp disable <id>":
+		return "/mcp disable "
+	case "/review <id>":
+		return "/review "
+	case "/approve [id]":
+		return "/approve "
+	case "/reject [id]":
+		return "/reject "
+	default:
+		return command
+	}
+}
+
+func slashArgumentHint(command string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ""
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) <= 1 {
+		return ""
+	}
+	return strings.Join(fields[1:], " ")
+}
+
+func compactSlashCommand(command string) string {
+	compact := strings.ToLower(command)
+	if index := strings.Index(compact, " <"); index >= 0 {
+		compact = compact[:index]
+	}
+	if index := strings.Index(compact, " ["); index >= 0 {
+		compact = compact[:index]
+	}
+	return compact
+}
+
+func applySlashCompletion(input string) (string, bool) {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "/") {
+		return input, false
+	}
+	matches := suggestSlashCommands(trimmed, 1)
+	if len(matches) == 0 {
+		return input, false
+	}
+	best := matches[0]
+	insertValue := best.InsertValue
+	if insertValue == "" {
+		insertValue = best.Command
+	}
+	if trimmed == insertValue || trimmed == best.Command {
+		return input, false
+	}
+	return insertValue, true
+}
+
+func extensionExposureModes() []slashCommandSpec {
+	return []slashCommandSpec{
+		{Command: "hidden", Description: "hide from auto-selection and explicit surfacing", InsertValue: "hidden "},
+		{Command: "hinted", Description: "available only through explicit mention or direct enablement", InsertValue: "hinted "},
+		{Command: "scoped", Description: "eligible for query-scoped selection when it matches", InsertValue: "scoped "},
+		{Command: "full", Description: "always visible to the runtime selection layer", InsertValue: "full "},
+	}
+}
+
+func scoreSlashCandidate(query string, candidate string) int {
+	if query == "" {
+		return 100
+	}
+	switch {
+	case candidate == query:
+		return 1000
+	case strings.HasPrefix(candidate, query):
+		return 800
+	case strings.Contains(candidate, query):
+		return 300
+	default:
+		return -1
+	}
+}
+
+func limitSlashSpecs(items []slashCommandSpec, limit int) []slashCommandSpec {
+	if len(items) == 0 || limit <= 0 {
+		return nil
+	}
+	if len(items) <= limit {
+		return items
+	}
+	return items[:limit]
+}
+
+func (m *Model) extensionTargetSuggestions(prefix string, rawQuery string, limit int) []slashCommandSpec {
+	query := strings.TrimSpace(strings.ToLower(rawQuery))
+	type scored struct {
+		item  slashCommandSpec
+		score int
+	}
+	results := make([]scored, 0, len(m.ManagedSkills)+len(m.ManagedMcpServers))
+
+	for _, skill := range m.ManagedSkills {
+		command := fmt.Sprintf("skill:%s", skill.ID)
+		score := scoreSlashCandidate(query, strings.ToLower(command))
+		if labelScore := scoreSlashCandidate(query, strings.ToLower(skill.Label)); labelScore > score {
+			score = labelScore - 50
+		}
+		if score < 0 && query != "" {
+			continue
+		}
+		results = append(results, scored{
+			item: slashCommandSpec{
+				Command:     command,
+				Description: fmt.Sprintf("skill  %s  |  exposure %s  |  scope %s", skill.Label, skill.Exposure, skill.Source),
+				InsertValue: prefix + command,
+			},
+			score: score,
+		})
+	}
+
+	for _, server := range m.ManagedMcpServers {
+		command := fmt.Sprintf("mcp:%s", server.ID)
+		score := scoreSlashCandidate(query, strings.ToLower(command))
+		if labelScore := scoreSlashCandidate(query, strings.ToLower(server.Label)); labelScore > score {
+			score = labelScore - 50
+		}
+		if score < 0 && query != "" {
+			continue
+		}
+		trust := "untrusted"
+		if server.Trusted {
+			trust = "trusted"
+		}
+		results = append(results, scored{
+			item: slashCommandSpec{
+				Command:     command,
+				Description: fmt.Sprintf("mcp  %s  |  exposure %s  |  scope %s  |  %s", server.Label, server.Exposure, server.Scope, trust),
+				InsertValue: prefix + command,
+			},
+			score: score,
+		})
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].score != results[j].score {
+			return results[i].score > results[j].score
+		}
+		return results[i].item.Command < results[j].item.Command
+	})
+
+	items := make([]slashCommandSpec, 0, minInt(limit, len(results)))
+	for _, item := range results {
+		items = append(items, item.item)
+		if len(items) == limit {
+			break
+		}
+	}
+	return items
+}
+
+func (m *Model) dynamicSlashSuggestions(input string, limit int) []slashCommandSpec {
+	trimmed := strings.TrimSpace(strings.ToLower(input))
+	switch {
+	case trimmed == "/extensions show" || strings.HasPrefix(trimmed, "/extensions show "):
+		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions show"))
+		return m.extensionTargetSuggestions("/extensions show ", query, limit)
+	case trimmed == "/extensions enable" || strings.HasPrefix(trimmed, "/extensions enable "):
+		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions enable"))
+		return m.extensionTargetSuggestions("/extensions enable ", query, limit)
+	case trimmed == "/extensions disable" || strings.HasPrefix(trimmed, "/extensions disable "):
+		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions disable"))
+		return m.extensionTargetSuggestions("/extensions disable ", query, limit)
+	case trimmed == "/extensions exposure" || strings.HasPrefix(trimmed, "/extensions exposure "):
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "/extensions exposure"))
+		if rest == "" {
+			modes := extensionExposureModes()
+			for index := range modes {
+				modes[index].InsertValue = "/extensions exposure " + modes[index].InsertValue
+			}
+			return limitSlashSpecs(modes, limit)
+		}
+
+		fields := strings.Fields(rest)
+		if len(fields) == 1 && !strings.HasSuffix(trimmed, " ") {
+			query := fields[0]
+			filtered := make([]slashCommandSpec, 0, 4)
+			for _, mode := range extensionExposureModes() {
+				if scoreSlashCandidate(query, strings.ToLower(mode.Command)) < 0 {
+					continue
+				}
+				mode.InsertValue = "/extensions exposure " + mode.InsertValue
+				filtered = append(filtered, mode)
+			}
+			return limitSlashSpecs(filtered, limit)
+		}
+
+		mode := fields[0]
+		targetQuery := ""
+		if len(fields) > 1 {
+			targetQuery = strings.Join(fields[1:], " ")
+		}
+		validMode := false
+		for _, candidate := range extensionExposureModes() {
+			if candidate.Command == mode {
+				validMode = true
+				break
+			}
+		}
+		if !validMode {
+			return nil
+		}
+		return m.extensionTargetSuggestions("/extensions exposure "+mode+" ", targetQuery, limit)
+	}
+	return nil
+}
+
+func (m *Model) composerSlashSuggestions(limit int) []slashCommandSpec {
+	if dynamic := m.dynamicSlashSuggestions(string(m.Input), limit); len(dynamic) > 0 {
+		return dynamic
+	}
+	return suggestSlashCommands(string(m.Input), limit)
+}
+
+func (m *Model) applySlashCompletion() bool {
+	matches := m.composerSlashSuggestions(1)
+	if len(matches) == 0 {
+		if completed, ok := applySlashCompletion(string(m.Input)); ok {
+			m.Input = []rune(completed)
+			m.Cursor = len(m.Input)
+			return true
+		}
+		return false
+	}
+	insertValue := matches[0].InsertValue
+	if insertValue == "" {
+		insertValue = matches[0].Command
+	}
+	if insertValue == "" || insertValue == string(m.Input) {
+		return false
+	}
+	m.Input = []rune(insertValue)
+	m.Cursor = len(m.Input)
+	return true
+}
+
 func suggestSlashCommands(input string, limit int) []slashCommandSpec {
 	trimmed := strings.TrimSpace(strings.ToLower(input))
 	if !strings.HasPrefix(trimmed, "/") {
@@ -1868,13 +2453,7 @@ func suggestSlashCommands(input string, limit int) []slashCommandSpec {
 	results := make([]scoredCommand, 0, len(slashCommandCatalog))
 	for _, item := range slashCommandCatalog {
 		normalized := strings.ToLower(item.Command)
-		compact := normalized
-		if index := strings.Index(compact, " <"); index >= 0 {
-			compact = compact[:index]
-		}
-		if index := strings.Index(compact, " ["); index >= 0 {
-			compact = compact[:index]
-		}
+		compact := compactSlashCommand(item.Command)
 
 		score := -1
 		switch {

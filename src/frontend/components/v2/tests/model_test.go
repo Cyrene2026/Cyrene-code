@@ -159,6 +159,16 @@ func TestComposerPasteNormalizesCarriageReturnsAndTabs(t *testing.T) {
 	}
 }
 
+func TestComposerPasteStripsWindowsFormattingRunes(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a', '\ufeff', '\u200b', '\u00a0', 'b'}})
+
+	if got := string(model.Input); got != "a b" {
+		t.Fatalf("expected windows formatting runes normalized, got %q", got)
+	}
+}
+
 func TestComposerSupportsClearAndWordDeleteShortcuts(t *testing.T) {
 	model := app.NewModel()
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("alpha beta gamma")})
@@ -1078,6 +1088,19 @@ func TestAuthAltDigitStillSwitchesField(t *testing.T) {
 	}
 	if model.AuthCursor != len(model.AuthModel) {
 		t.Fatalf("expected cursor at model field end, got %d", model.AuthCursor)
+	}
+}
+
+func TestAuthControlRunesAreIgnored(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+	model.AuthCursor = 0
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s', 'k', 0x16, 0x03, '-', '1'}})
+
+	if got := string(model.AuthAPIKey); got != "sk-1" {
+		t.Fatalf("expected control runes ignored in auth input, got %q", got)
 	}
 }
 

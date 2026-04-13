@@ -414,6 +414,22 @@ describe("createAuthRuntime", () => {
     );
   });
 
+  test("getSavedApiKey resolves provider aliases when switching providers", async () => {
+    const appRoot = await createTempRoot();
+    const store = createMemoryApiKeyStore();
+    await store.save("gemini-key", "CYRENE_GEMINI_API_KEY");
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: store,
+    });
+
+    expect(await runtime.getSavedApiKey("gemini")).toBe("gemini-key");
+    expect(await runtime.getSavedApiKey("https://generativelanguage.googleapis.com/v1beta")).toBe(
+      "gemini-key"
+    );
+  });
+
   test("saveLogin persists manual model mode for providers without /models", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();

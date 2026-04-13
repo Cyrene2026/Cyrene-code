@@ -73,7 +73,7 @@ type BridgeCommand =
   | { type: "set_model"; value: string }
   | { type: "set_provider"; value: string }
   | { type: "refresh_models" }
-  | { type: "get_login_defaults" }
+  | { type: "get_login_defaults"; providerBaseUrl?: string }
   | { type: "list_provider_types" }
   | { type: "set_provider_type"; providerType: string; value?: string }
   | { type: "clear_provider_type"; value?: string }
@@ -498,6 +498,7 @@ const toBridgeAuthStatus = (status: AuthStatus | null): BridgeAuthStatus => ({
 });
 
 class BubbleTeaBridge {
+  private static readonly WINDOWS_RUNTIME_METADATA_DEBOUNCE_MS = 80;
   private appRoot = resolve(parseRootArg() ?? process.cwd());
   private config: CyreneConfig | null = null;
   private promptPolicy: PromptPolicy | null = null;
@@ -535,6 +536,8 @@ class BubbleTeaBridge {
   private suspended: SuspendedRun | null = null;
   private commandChain: Promise<void> = Promise.resolve();
   private runtimeMetadataDirty = true;
+  private runtimeMetadataRefreshPromise: Promise<void> | null = null;
+  private runtimeMetadataRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingAppendItems: BridgeItem[] = [];
   private appendFlushScheduled = false;
 
@@ -596,7 +599,7 @@ class BubbleTeaBridge {
         await this.refreshModels();
         return;
       case "get_login_defaults":
-        await this.emitAuthDefaults();
+        await this.emitAuthDefaults(command.providerBaseUrl);
         return;
       case "list_provider_types":
         await this.listProviderTypes();
@@ -772,6 +775,46 @@ class BubbleTeaBridge {
     if (!force && !this.runtimeMetadataDirty) {
       return;
     }
+    if (force && this.runtimeMetadataRefreshTimer) {
+      clearTimeout(this.runtimeMetadataRefreshTimer);
+      this.runtimeMetadataRefreshTimer = null;
+      this.runtimeMetadataRefreshPromise = null;
+    }
+    const debounceMs =
+      !force && process.platform === "win32"
+        ? BubbleTeaBridge.WINDOWS_RUNTIME_METADATA_DEBOUNCE_MS
+        : 0;
+    if (debounceMs <= 0) {
+      if (this.runtimeMetadataRefreshTimer) {
+        clearTimeout(this.runtimeMetadataRefreshTimer);
+        this.runtimeMetadataRefreshTimer = null;
+      }
+      if (this.runtimeMetadataRefreshPromise) {
+        return await this.runtimeMetadataRefreshPromise;
+      }
+      this.runtimeMetadataRefreshPromise = this.performRuntimeMetadataRefresh().finally(() => {
+        this.runtimeMetadataRefreshPromise = null;
+      });
+      return await this.runtimeMetadataRefreshPromise;
+    }
+    if (this.runtimeMetadataRefreshPromise) {
+      return await this.runtimeMetadataRefreshPromise;
+    }
+    this.runtimeMetadataRefreshPromise = new Promise((resolve, reject) => {
+      this.runtimeMetadataRefreshTimer = setTimeout(() => {
+        this.runtimeMetadataRefreshTimer = null;
+        this.performRuntimeMetadataRefresh()
+          .then(resolve)
+          .catch(reject)
+          .finally(() => {
+            this.runtimeMetadataRefreshPromise = null;
+          });
+      }, debounceMs);
+    });
+    return await this.runtimeMetadataRefreshPromise;
+  }
+
+  private async performRuntimeMetadataRefresh() {
     this.authStatus = this.authRuntime ? await this.authRuntime.getStatus() : null;
     this.availableModels = [];
     this.availableProviders = [];
@@ -1026,14 +1069,21 @@ class BubbleTeaBridge {
     }
   }
 
-  private async emitAuthDefaults() {
+  private async emitAuthDefaults(targetProviderBaseUrl?: string) {
     await this.ensureRuntime();
+    const requestedProvider = targetProviderBaseUrl?.trim() ?? "";
     const providerBaseUrl =
-      this.transport?.getProvider() ?? this.authStatus?.provider ?? "";
-    const normalizedProvider =
-      providerBaseUrl && providerBaseUrl !== "local-core" && providerBaseUrl !== "none"
-        ? providerBaseUrl
-        : "";
+      requestedProvider || this.transport?.getProvider() || this.authStatus?.provider || "";
+    const normalizedProvider = (() => {
+      if (!providerBaseUrl || providerBaseUrl === "local-core" || providerBaseUrl === "none") {
+        return "";
+      }
+      try {
+        return normalizeProviderBaseUrl(providerBaseUrl);
+      } catch {
+        return providerBaseUrl;
+      }
+    })();
     const apiKey = normalizedProvider
       ? (await this.authRuntime?.getSavedApiKey(normalizedProvider)) ?? ""
       : "";

@@ -294,7 +294,7 @@ type PreparedPendingReview = {
   guard?: PendingApprovalGuard;
 };
 
-type ShellFlavor = "pwsh" | "sh";
+type ShellFlavor = "cmd" | "pwsh" | "sh";
 
 type ShellAuditResult = {
   ok: boolean;
@@ -1115,8 +1115,72 @@ const tokenizeCommand = (raw: string) =>
     match[1] ?? match[2] ?? match[0] ?? ""
   );
 
-const getShellFlavor = (): ShellFlavor =>
-  process.platform === "win32" ? "pwsh" : "sh";
+const WINDOWS_PWSH_ONLY_COMMANDS = new Set([
+  "get-childitem",
+  "get-content",
+  "get-location",
+  "write-output",
+  "remove-item",
+  "move-item",
+  "copy-item",
+  "new-item",
+  "set-content",
+  "add-content",
+  "out-file",
+  "invoke-webrequest",
+  "invoke-restmethod",
+  "iwr",
+  "irm",
+]);
+
+const WINDOWS_CMD_PREFERRED_COMMANDS = new Set([
+  "dir",
+  "type",
+  "where",
+  "echo",
+  "cd",
+  "git",
+  "python",
+  "py",
+  "node",
+  "npm",
+  "pnpm",
+  "yarn",
+  "bun",
+  "go",
+  "cargo",
+  "java",
+  "javac",
+  "rustc",
+  "pip",
+  "pip3",
+]);
+
+const resolveShellFlavorForCommand = (command: string): ShellFlavor => {
+  if (process.platform !== "win32") {
+    return "sh";
+  }
+  const tokenized = tokenizeSafeShellCommand(command);
+  if (!tokenized.ok) {
+    return "pwsh";
+  }
+  const commandName = (tokenized.tokens[0] ?? "").toLowerCase();
+  if (!commandName) {
+    return "pwsh";
+  }
+  if (WINDOWS_PWSH_ONLY_COMMANDS.has(commandName)) {
+    return "pwsh";
+  }
+  if (WINDOWS_CMD_PREFERRED_COMMANDS.has(commandName)) {
+    return "cmd";
+  }
+  return "pwsh";
+};
+
+const getShellFlavor = (command?: string): ShellFlavor =>
+  process.platform === "win32"
+    ? resolveShellFlavorForCommand(command ?? "")
+    : "sh";
 
 const getPersistentShellFlavor = async (): Promise<PersistentShellFlavor> => {
   if (process.platform === "win32") {
@@ -2757,6 +2821,8 @@ export class FileMcpService {
   private undoHistory: UndoEntry[] = [];
   private suppressUndoRecording = false;
   private shellSession: ActiveShellSession | null = null;
+  private ptyFactoryPromise: Promise<PtyFactory> | null = null;
+  private persistentShellFlavorPromise: Promise<PersistentShellFlavor> | null = null;
   private tsServerClient: TsServerClientLike | null;
   private lspManager: LspManagerLike | null;
   private readonly workspaceRootAbsolute: string;
@@ -2772,6 +2838,9 @@ export class FileMcpService {
     );
     this.tsServerClient = options.tsServerClient ?? null;
     this.lspManager = options.lspManager ?? null;
+    if (process.platform === "win32") {
+      this.prewarmPersistentShellRuntime();
+    }
   }
 
   private toWorkspaceRelativePath(inputPath: string) {
@@ -3859,7 +3928,7 @@ export class FileMcpService {
   }
 
   private auditShellRequest(request: ShellToolRequest): ShellAuditResult {
-    const shell = getShellFlavor();
+    const shell = getShellFlavor(request.command);
     const tokenized = tokenizeSafeShellCommand(request.command);
     if (!tokenized.ok) {
       return {
@@ -4503,42 +4572,55 @@ export class FileMcpService {
     if (this.options.ptyFactory) {
       return this.options.ptyFactory;
     }
+    this.ptyFactoryPromise ??= (async () => {
+      try {
+        const module = await import("node-pty");
+        return options => {
+          const handle = module.spawn(options.file, options.args, {
+            cwd: options.cwd,
+            env: options.env,
+            name: options.name,
+            cols: options.cols,
+            rows: options.rows,
+          });
+          return {
+            write: data => handle.write(data),
+            kill: signal => handle.kill(signal),
+            onData: listener => {
+              const disposable = handle.onData(listener);
+              return { dispose: () => disposable.dispose() };
+            },
+            onExit: listener => {
+              const disposable = handle.onExit(event =>
+                listener({
+                  exitCode: event.exitCode,
+                  signal: event.signal,
+                })
+              );
+              return { dispose: () => disposable.dispose() };
+            },
+          } satisfies PtyProcess;
+        };
+      } catch (error) {
+        this.ptyFactoryPromise = null;
+        throw new Error(
+          `Persistent shell support requires node-pty. ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    })();
+    return await this.ptyFactoryPromise;
+  }
 
-    try {
-      const module = await import("node-pty");
-      return options => {
-        const handle = module.spawn(options.file, options.args, {
-          cwd: options.cwd,
-          env: options.env,
-          name: options.name,
-          cols: options.cols,
-          rows: options.rows,
-        });
-        return {
-          write: data => handle.write(data),
-          kill: signal => handle.kill(signal),
-          onData: listener => {
-            const disposable = handle.onData(listener);
-            return { dispose: () => disposable.dispose() };
-          },
-          onExit: listener => {
-            const disposable = handle.onExit(event =>
-              listener({
-                exitCode: event.exitCode,
-                signal: event.signal,
-              })
-            );
-            return { dispose: () => disposable.dispose() };
-          },
-        } satisfies PtyProcess;
-      };
-    } catch (error) {
-      throw new Error(
-        `Persistent shell support requires node-pty. ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
+  private prewarmPersistentShellRuntime() {
+    this.persistentShellFlavorPromise ??= getPersistentShellFlavor();
+    void this.loadPtyFactory().catch(() => undefined);
+  }
+
+  private async resolvePersistentShellFlavor() {
+    this.persistentShellFlavorPromise ??= getPersistentShellFlavor();
+    return await this.persistentShellFlavorPromise;
   }
 
   dispose() {
@@ -4580,23 +4662,30 @@ export class FileMcpService {
   }
 
   private async openPersistentShell(request: OpenShellToolRequest) {
+    const requestedCwd = request.cwd
+      ? this.resolvePath(request.cwd)
+      : resolve(this.rules.workspaceRoot);
     const existingSession = this.shellSession;
     if (existingSession) {
+      if (
+        existingSession.alive &&
+        !existingSession.exited &&
+        existingSession.cwd === requestedCwd
+      ) {
+        return { session: existingSession, reused: true as const };
+      }
       throw new Error(
         `Persistent shell session already exists (${getShellSessionStatus(existingSession)}). Use close_shell before opening another session.`
       );
     }
 
-    const shell = await getPersistentShellFlavor();
+    const shell = await this.resolvePersistentShellFlavor();
     const program = getPersistentShellProgram(shell);
-    const cwd = request.cwd
-      ? this.resolvePath(request.cwd)
-      : resolve(this.rules.workspaceRoot);
     const ptyFactory = await this.loadPtyFactory();
     const handle = await ptyFactory({
       file: program,
       args: this.buildShellSpawnArgs(shell),
-      cwd,
+      cwd: requestedCwd,
       env: this.buildPtyEnvironment(),
       name: "xterm-256color",
       cols: 120,
@@ -4606,7 +4695,7 @@ export class FileMcpService {
     const session: ActiveShellSession = {
       shell,
       program,
-      cwd,
+      cwd: requestedCwd,
       busy: false,
       alive: true,
       exited: false,
@@ -4645,14 +4734,14 @@ export class FileMcpService {
 
     this.shellSession = session;
     await this.waitForShellSettle();
-    return session;
+    return { session, reused: false as const };
   }
 
   private async executeOpenShell(request: OpenShellToolRequest): Promise<string> {
-    const session = await this.openPersistentShell(request);
+    const { session, reused } = await this.openPersistentShell(request);
     const { output, truncated } = this.flushUnreadShellOutput(session);
     return [
-      "status: opened",
+      `status: ${reused ? "reused" : "opened"}`,
       `program: ${session.program}`,
       this.formatShellSessionState(session, output, truncated),
     ].join("\n");
@@ -4692,6 +4781,13 @@ export class FileMcpService {
     };
   }
 
+  private async executeShellInputBlock(
+    session: ActiveShellSession,
+    inputs: string[]
+  ): Promise<{ status: "completed" | "running"; output: string; truncated: boolean }> {
+    return await this.executeSingleShellInput(session, inputs.join("\n"));
+  }
+
   private async executeWriteShell(request: WriteShellToolRequest): Promise<string> {
     const session = this.getActiveShellSession();
     if (session.busy) {
@@ -4706,28 +4802,17 @@ export class FileMcpService {
     }
 
     const inputs = splitShellInputBlock(request.input);
-    const transcriptLines: string[] = [];
-    let truncated = false;
-    let status: "completed" | "running" = "completed";
-
-    for (const input of inputs) {
-      const result = await this.executeSingleShellInput(session, input);
-      transcriptLines.push(`$ ${input}`);
-      transcriptLines.push(result.output.trim() ? result.output : "(no new output)");
-      truncated = truncated || result.truncated;
-      status = result.status;
-      if (result.status === "running") {
-        break;
-      }
-    }
+    const result = await this.executeShellInputBlock(session, inputs);
+    const transcriptLines = inputs.map(input => `$ ${input}`);
+    transcriptLines.push(result.output.trim() ? result.output : "(no new output)");
 
     return [
-      `status: ${status}`,
+      `status: ${result.status}`,
       `input: ${request.input}`,
       this.formatShellSessionState(
         session,
         transcriptLines.join("\n"),
-        truncated
+        result.truncated
       ),
     ].join("\n");
   }
@@ -5566,11 +5651,18 @@ export class FileMcpService {
       }
     }
 
-    const program = audit.shell === "pwsh" ? "pwsh" : "/bin/sh";
+    const program =
+      audit.shell === "pwsh"
+        ? "pwsh"
+        : audit.shell === "cmd"
+          ? "cmd.exe"
+          : "/bin/sh";
     const args =
       audit.shell === "pwsh"
         ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", request.command]
-        : ["-lc", request.command];
+        : audit.shell === "cmd"
+          ? ["/d", "/s", "/c", request.command]
+          : ["-lc", request.command];
 
     const timeoutMs = getCommandTimeoutMs(request);
 
@@ -7959,21 +8051,29 @@ export class FileMcpService {
     }
 
     if (request.action === "open_shell") {
-      if (this.shellSession) {
-        return {
-          ok: false,
-          message: `open_shell blocked: persistent shell session already exists (${getShellSessionStatus(this.shellSession)}). Use close_shell first.`,
-        };
-      }
+      let requestedCwd = resolve(this.rules.workspaceRoot);
       if (request.cwd) {
         try {
-          this.resolvePath(request.cwd);
+          requestedCwd = this.resolvePath(request.cwd);
         } catch (error) {
           return {
             ok: false,
             message: error instanceof Error ? error.message : String(error),
           };
         }
+      }
+      if (
+        this.shellSession &&
+        !(
+          this.shellSession.alive &&
+          !this.shellSession.exited &&
+          this.shellSession.cwd === requestedCwd
+        )
+      ) {
+        return {
+          ok: false,
+          message: `open_shell blocked: persistent shell session already exists (${getShellSessionStatus(this.shellSession)}). Use close_shell first.`,
+        };
       }
     }
 

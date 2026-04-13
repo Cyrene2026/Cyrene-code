@@ -1383,8 +1383,7 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				Model:           model,
 			})
 		}
-		m.advanceAuthStepOnEnter()
-		return m, nil
+		return m, m.advanceAuthStepOnEnter()
 	case tea.KeyHome:
 		m.AuthCursor = 0
 		return m, nil
@@ -1440,7 +1439,7 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		m.insertAuthRunes(msg.Runes)
+		m.insertAuthRunes(filterAuthInputRunes(msg.Runes))
 		return m, nil
 	default:
 		return m, nil
@@ -2006,21 +2005,28 @@ func (m *Model) moveAuthStep(delta int) {
 	m.AuthCursor = m.currentAuthFieldLength()
 }
 
-func (m *Model) advanceAuthStepOnEnter() {
+func (m *Model) advanceAuthStepOnEnter() tea.Cmd {
 	switch m.AuthStep {
 	case AuthStepProvider:
 		m.AuthStep = AuthStepProviderType
 		m.AuthCursor = len(m.AuthProviderType)
+		provider := strings.TrimSpace(string(m.AuthProvider))
+		if provider != "" && m.bridge != nil && m.BridgeReady {
+			return sendBridgeCommand(m.bridge, bridgeCommand{
+				Type:            "get_login_defaults",
+				ProviderBaseURL: provider,
+			})
+		}
 	case AuthStepProviderType:
 		if len(m.AuthAPIKey) > 0 {
 			if len(m.AuthModel) > 0 {
 				m.AuthStep = AuthStepConfirm
 				m.AuthCursor = 0
-				return
+				return nil
 			}
 			m.AuthStep = AuthStepModel
 			m.AuthCursor = len(m.AuthModel)
-			return
+			return nil
 		}
 		m.AuthStep = AuthStepAPIKey
 		m.AuthCursor = len(m.AuthAPIKey)
@@ -2028,7 +2034,7 @@ func (m *Model) advanceAuthStepOnEnter() {
 		if len(m.AuthModel) > 0 {
 			m.AuthStep = AuthStepConfirm
 			m.AuthCursor = 0
-			return
+			return nil
 		}
 		m.AuthStep = AuthStepModel
 		m.AuthCursor = len(m.AuthModel)
@@ -2038,6 +2044,7 @@ func (m *Model) advanceAuthStepOnEnter() {
 	default:
 		m.moveAuthStep(1)
 	}
+	return nil
 }
 
 func (m *Model) currentAuthFieldLength() int {
@@ -2082,6 +2089,20 @@ func (m *Model) insertAuthRunes(values []rune) {
 	next = append(next, (*field)[cursor:]...)
 	*field = next
 	m.AuthCursor = cursor + len(values)
+}
+
+func filterAuthInputRunes(values []rune) []rune {
+	filtered := values[:0]
+	for _, value := range values {
+		if isWindowsIgnoredInputRune(value) {
+			continue
+		}
+		if unicode.IsControl(value) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func (m *Model) deleteAuthForward() {
@@ -2248,7 +2269,12 @@ func normalizeComposerRunes(values []rune) []rune {
 			normalized = append(normalized, ' ', ' ', ' ', ' ')
 		case '\n':
 			normalized = append(normalized, '\n')
+		case '\u00a0':
+			normalized = append(normalized, ' ')
 		default:
+			if isWindowsIgnoredInputRune(r) {
+				continue
+			}
 			if unicode.IsControl(r) {
 				continue
 			}
@@ -2256,6 +2282,15 @@ func normalizeComposerRunes(values []rune) []rune {
 		}
 	}
 	return normalized
+}
+
+func isWindowsIgnoredInputRune(value rune) bool {
+	switch value {
+	case 0, '\ufeff', '\u200b', '\u200c', '\u200d', '\u2060':
+		return true
+	default:
+		return false
+	}
 }
 
 func deleteWordBackwardRunes(values []rune, cursor int) ([]rune, int) {

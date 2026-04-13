@@ -180,8 +180,8 @@ const createFakePersistentShellFactory = () => {
       .split(/\r?\n/)
       .map(line => line.trim())
       .filter(Boolean);
-    return (
-      lines.find(
+    return lines
+      .filter(
         line =>
           line !== "& {" &&
           line !== "{" &&
@@ -194,8 +194,8 @@ const createFakePersistentShellFactory = () => {
           !line.includes("__CYRENE_STATUS__") &&
           !line.includes("__CYRENE_CWD__") &&
           !line.startsWith("Write-Output")
-      ) ?? ""
-    );
+      )
+      .join("\n");
   };
 
   const emitMarkers = (commandId: string, exitCode: number) => {
@@ -231,35 +231,34 @@ const createFakePersistentShellFactory = () => {
         if (!input) {
           return;
         }
+        const lines = input.split("\n");
+        for (const line of lines) {
+          if (line === "cd subdir") {
+            state.cwd = join(state.cwd, "subdir");
+            emit("changed directory\n");
+            continue;
+          }
 
-        if (input === "cd subdir") {
-          state.cwd = join(state.cwd, "subdir");
-          emit("changed directory\n");
-          emitMarkers(commandId, 0);
-          return;
+          if (line === ". .venv/bin/activate" || line === ".\\.venv\\Scripts\\Activate.ps1") {
+            state.env.VIRTUAL_ENV = join(state.cwd, ".venv");
+            emit("venv activated\n");
+            continue;
+          }
+
+          if (line === "python --version") {
+            emit(
+              `${state.env.VIRTUAL_ENV ? "Python 3.12.0 (venv)" : "Python 3.12.0 (system)"}\n`
+            );
+            continue;
+          }
+
+          if (line === "long_running") {
+            emit("still running\n");
+            return;
+          }
+
+          emit(`ran ${line}\n`);
         }
-
-        if (input === ". .venv/bin/activate" || input === ".\\.venv\\Scripts\\Activate.ps1") {
-          state.env.VIRTUAL_ENV = join(state.cwd, ".venv");
-          emit("venv activated\n");
-          emitMarkers(commandId, 0);
-          return;
-        }
-
-        if (input === "python --version") {
-          emit(
-            `${state.env.VIRTUAL_ENV ? "Python 3.12.0 (venv)" : "Python 3.12.0 (system)"}\n`
-          );
-          emitMarkers(commandId, 0);
-          return;
-        }
-
-        if (input === "long_running") {
-          emit("still running\n");
-          return;
-        }
-
-        emit(`ran ${input}\n`);
         emitMarkers(commandId, 0);
       },
       kill(signal?: string) {
@@ -3250,6 +3249,28 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("command: Get-ChildItem test_files");
   });
 
+  test("run_shell prefers cmd.exe for low-risk windows-compatible commands", async () => {
+    const { root, service } = await createRelaxedReviewService({
+      shellRunner: async (request, cwd, shell) => {
+        expect(request.command).toBe("git status");
+        expect(cwd).toBe(root);
+        expect(shell).toBe(process.platform === "win32" ? "cmd" : "sh");
+        return "ok";
+      },
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "git status",
+    });
+
+    expect(queued.ok).toBe(true);
+    const approved = await service.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain(`shell: ${process.platform === "win32" ? "cmd" : "sh"}`);
+  });
+
   test("run_shell blocks pipes and chaining before review", async () => {
     const { service } = await createService();
 
@@ -3330,8 +3351,10 @@ describe("FileMcpService", () => {
         action: "open_shell",
         path: ".",
       });
-      expect(secondOpen.ok).toBe(false);
-      expect(secondOpen.message).toContain("already exists");
+      expect(secondOpen.ok).toBe(true);
+      expect(secondOpen.pending).toBeUndefined();
+      expect(secondOpen.message).toContain("status: reused");
+      expect(fakePty.state.writes).toHaveLength(0);
       if (process.platform === "win32") {
         expect(fakePty.state.openFile).toBe("pwsh");
       } else {
@@ -3576,6 +3599,7 @@ describe("FileMcpService", () => {
       expect(result.message).toContain("changed directory");
       expect(result.message).toContain("Python 3.12.0 (system)");
       expect(result.message).toContain("cwd: subdir");
+      expect(fakePty.state.writes).toHaveLength(1);
     } finally {
       await cleanup();
     }

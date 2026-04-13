@@ -17,6 +17,60 @@ const createWorkspace = async () => {
   return { root, cyreneHome };
 };
 
+const createFakeDiagnosticLspServer = async (root: string) => {
+  const scriptPath = join(root, "fake-diagnostic-lsp.cjs");
+  await writeFile(
+    scriptPath,
+    [
+      "let inputBuffer = '';",
+      "const send = message => {",
+      "  const payload = JSON.stringify({ jsonrpc: '2.0', ...message });",
+      "  process.stdout.write(`Content-Length: ${Buffer.byteLength(payload, 'utf8')}\\r\\n\\r\\n${payload}`);",
+      "};",
+      "const handle = payload => {",
+      "  const parsed = JSON.parse(payload);",
+      "  if (parsed.method === 'initialize') {",
+      "    send({ id: parsed.id ?? null, result: { capabilities: { diagnosticProvider: {} } } });",
+      "    return;",
+      "  }",
+      "  if (parsed.method === 'textDocument/diagnostic') {",
+      "    send({ id: parsed.id ?? null, result: { kind: 'full', items: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, severity: 2, source: 'fake-lsp', code: 'W1', message: 'demo warning' }] } });",
+      "    return;",
+      "  }",
+      "  if (parsed.method === 'shutdown') {",
+      "    send({ id: parsed.id ?? null, result: null });",
+      "    return;",
+      "  }",
+      "  if (typeof parsed.id !== 'undefined') {",
+      "    send({ id: parsed.id, result: null });",
+      "  }",
+      "};",
+      "const pump = () => {",
+      "  while (true) {",
+      "    const separatorIndex = inputBuffer.indexOf('\\r\\n\\r\\n');",
+      "    if (separatorIndex < 0) return;",
+      "    const header = inputBuffer.slice(0, separatorIndex);",
+      "    const match = /Content-Length:\\s*(\\d+)/i.exec(header);",
+      "    if (!match) return;",
+      "    const length = Number(match[1]);",
+      "    const start = separatorIndex + 4;",
+      "    if (inputBuffer.length < start + length) return;",
+      "    const payload = inputBuffer.slice(start, start + length);",
+      "    inputBuffer = inputBuffer.slice(start + length);",
+      "    handle(payload);",
+      "  }",
+      "};",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => {",
+      "  inputBuffer += chunk;",
+      "  pump();",
+      "});",
+    ].join("\n"),
+    "utf8"
+  );
+  return scriptPath;
+};
+
 const getAvailablePort = () =>
   new Promise<number>((resolvePort, rejectPort) => {
     const probe = createServer();
@@ -706,6 +760,98 @@ describe("createMcpRuntime", () => {
     expect(result?.message).toContain("reason: multiple_matching_servers");
     expect(result?.message).toContain("matched: ts, deno");
     expect(result?.message).toContain("hint: re-run with serverId to disambiguate");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp runs diagnostics and reports the diagnostic count for a healthy server", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const fakeLspScript = await createFakeDiagnosticLspServer(root);
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "demo.ts"), "export const demo = 1;\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: fake",
+        `        command: "${process.execPath.replace(/\\/g, "\\\\")}"`,
+        `        args: ["${fakeLspScript.replace(/\\/g, "\\\\")}"]`,
+        "        file_patterns: [\"**/*.ts\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "src/demo.ts", {
+      lspServerId: "fake",
+    });
+
+    expect(result?.ok).toBe(true);
+    expect(result?.status).toBe("ready");
+    expect(result?.message).toContain("selected: fake");
+    expect(result?.message).toContain("diagnostics: 1");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp reports invalid serverId as a parameter error and suggests the path-matching server", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await mkdir(join(root, "app"), { recursive: true });
+    await writeFile(join(root, "app", "main.py"), "print('hi')\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: rust",
+        "        command: rust-analyzer",
+        "        file_patterns: [\"**/*.rs\"]",
+        "      - id: python",
+        "        command: pyright-langserver",
+        "        args: [\"--stdio\"]",
+        "        file_patterns: [\"**/*.py\"]",
+        "      - id: go",
+        "        command: gopls",
+        "        file_patterns: [\"**/*.go\"]",
+        "      - id: cpp",
+        "        command: clangd",
+        "        file_patterns: [\"**/*.cpp\", \"**/*.cc\", \"**/*.cxx\", \"**/*.h\", \"**/*.hpp\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "app/main.py", {
+      lspServerId: "true",
+    });
+
+    expect(result?.ok).toBe(false);
+    expect(result?.status).toBe("config_error");
+    expect(result?.reason).toBe("server_not_configured");
+    expect(result?.message).toContain("requested_lsp: true");
+    expect(result?.message).toContain("reason: server_not_configured");
+    expect(result?.message).toContain("configured: rust, python, go, cpp");
+    expect(result?.message).toContain("relative_path: app/main.py");
+    expect(result?.message).toContain("suggestion: did you mean 'python'?");
 
     runtime.dispose();
   });

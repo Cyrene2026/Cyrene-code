@@ -61,3 +61,14 @@ func (m *Model) ApplyBridgeEventJSONForTest(payload string) error {
 	m.handleBridgeEvent(event)
 	return nil
 }
+
+func (m *Model) TranscriptMessageCacheCountForTest() int {
+	return len(m.transcriptMessageCache)
+}
+
+func (m *Model) TranscriptMessageCacheWidthForTest(index int) int {
+	if index < 0 || index >= len(m.transcriptMessageCache) {
+		return 0
+	}
+	return m.transcriptMessageCache[index].width
+}

@@ -1319,6 +1319,7 @@ class ManagedMcpRuntime implements McpRuntime {
         serverId: options?.lspServerId,
       });
       await session.probe(resolvedPath);
+      const diagnostics = await session.diagnostics(resolvedPath);
 
       return {
         ok: true,
@@ -1337,6 +1338,7 @@ class ManagedMcpRuntime implements McpRuntime {
           `matched: ${inspection.matchedServerIds.length > 0 ? inspection.matchedServerIds.join(", ") : "(none)"}`,
           `selected: ${inspection.selectedServerId ?? "(none)"}`,
           `resolved_root: ${inspection.resolvedRoot ?? "(none)"}`,
+          `diagnostics: ${diagnostics.length}`,
           "status: ready",
           "hint: lsp_* tools can use this file now; pass serverId only when multiple servers could match",
         ].join("\n"),

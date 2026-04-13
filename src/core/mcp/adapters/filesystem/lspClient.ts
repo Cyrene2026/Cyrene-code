@@ -1676,6 +1676,41 @@ const resolveSessionRoot = async (
 const formatConfiguredServerIds = (configs: LspServerConfig[]) =>
   configs.length > 0 ? configs.map(config => config.id).join(", ") : "(none)";
 
+const scoreServerIdCandidate = (input: string, candidate: string) => {
+  const normalizedInput = input.trim().toLowerCase();
+  const normalizedCandidate = candidate.trim().toLowerCase();
+  if (!normalizedInput || !normalizedCandidate) {
+    return 0;
+  }
+  if (normalizedInput === normalizedCandidate) {
+    return 100;
+  }
+  if (normalizedCandidate.startsWith(normalizedInput) || normalizedInput.startsWith(normalizedCandidate)) {
+    return 70;
+  }
+  if (normalizedCandidate.includes(normalizedInput) || normalizedInput.includes(normalizedCandidate)) {
+    return 55;
+  }
+  const inputChars = new Set(normalizedInput);
+  let overlap = 0;
+  for (const char of normalizedCandidate) {
+    if (inputChars.has(char)) {
+      overlap += 1;
+    }
+  }
+  return overlap;
+};
+
+const selectClosestServerId = (input: string, configs: LspServerConfig[]) => {
+  const ranked = configs
+    .map(config => ({
+      id: config.id,
+      score: scoreServerIdCandidate(input, config.id),
+    }))
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
+  return ranked[0] && ranked[0].score >= 2 ? ranked[0].id : null;
+};
+
 const formatRelativeWorkspacePath = (workspaceRoot: string, filePath: string) => {
   const relativePath = normalizePathForGlob(relative(workspaceRoot, filePath));
   if (!relativePath || relativePath === "") {
@@ -1721,6 +1756,31 @@ const formatLspSelectionHints = (
   configs: LspServerConfig[]
 ) => configs.map(config => `- ${config.id}: ${formatLspServerSelectionHint(workspaceRoot, config)}`);
 
+const findLikelyServerForPath = (
+  filePath: string,
+  workspaceRoot: string,
+  configs: LspServerConfig[]
+) => {
+  const matches = configs.filter(config => fileMatchesServer(filePath, workspaceRoot, config));
+  if (matches.length === 1) {
+    return matches[0]?.id ?? null;
+  }
+  const extension = extname(filePath).toLowerCase();
+  if (!extension) {
+    return null;
+  }
+  for (const config of configs) {
+    if (
+      config.filePatterns.some(pattern =>
+        pattern.toLowerCase().includes(extension)
+      )
+    ) {
+      return config.id;
+    }
+  }
+  return null;
+};
+
 export class LspManager implements LspManagerLike {
   private readonly sessions = new Map<string, LspWorkspaceLike>();
 
@@ -1744,15 +1804,21 @@ export class LspManager implements LspManagerLike {
     ]);
   }
 
-  private buildServerNotFoundError(serverId: string) {
+  private buildServerNotFoundError(serverId: string, filePath?: string) {
+    const likelyServer = filePath
+      ? findLikelyServerForPath(filePath, this.workspaceRoot, this.configs)
+      : null;
+    const closest = likelyServer || selectClosestServerId(serverId, this.configs);
     return new LspConfigError("server_not_configured", [
-      `LSP config error: serverId '${serverId}' is not configured.`,
+      `LSP parameter error: serverId '${serverId}' is not configured.`,
       "reason: server_not_configured",
       `configured: ${formatConfiguredServerIds(this.configs)}`,
+      ...(filePath ? [`relative_path: ${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}`] : []),
+      ...(closest ? [`suggestion: did you mean '${closest}'?`] : []),
       ...(this.configs.length > 0
         ? ["match_hints:", ...formatLspSelectionHints(this.workspaceRoot, this.configs)]
         : []),
-      "hint: re-run with a configured serverId or add the missing lsp_servers entry",
+      "hint: re-run with one of the configured serverId values",
     ]);
   }
 
@@ -1768,11 +1834,15 @@ export class LspManager implements LspManagerLike {
   }
 
   private buildPathMismatchError(config: LspServerConfig, filePath: string) {
+    const likelyServer = findLikelyServerForPath(filePath, this.workspaceRoot, this.configs);
     return new LspConfigError("path_mismatch", [
-      `LSP config error: serverId '${config.id}' does not match path '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
+      `LSP parameter error: serverId '${config.id}' does not match path '${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}'.`,
       "reason: path_mismatch",
       `workspace: ${this.workspaceRoot}`,
       `relative_path: ${formatRelativeWorkspacePath(this.workspaceRoot, filePath)}`,
+      ...(likelyServer && likelyServer !== config.id
+        ? [`suggestion: use serverId '${likelyServer}' for this path.`]
+        : []),
       `match_hint: ${formatLspServerSelectionHint(this.workspaceRoot, config)}`,
       `server_workspace: ${resolve(this.workspaceRoot, config.workspaceRoot ?? ".")}`,
       "hint: use a different serverId or adjust file_patterns/workspace_root",
@@ -1837,7 +1907,7 @@ export class LspManager implements LspManagerLike {
     if (explicitServerId) {
       const config = this.getServerConfigForId(explicitServerId);
       if (!config) {
-        throw this.buildServerNotFoundError(explicitServerId);
+        throw this.buildServerNotFoundError(explicitServerId, filePath);
       }
       if (!fileMatchesServer(filePath, this.workspaceRoot, config)) {
         throw this.buildPathMismatchError(config, filePath);

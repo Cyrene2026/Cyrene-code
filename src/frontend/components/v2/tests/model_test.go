@@ -284,6 +284,56 @@ func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
 	}
 }
 
+func TestSlashPlanShowOpensPlanPanel(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/plan show")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if model.ActivePanel != app.PanelPlans {
+		t.Fatalf("expected plan panel to open, got %q", model.ActivePanel)
+	}
+}
+
+func TestSlashPlanCreateWithoutTaskShowsUsage(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/plan create")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if model.ActivePanel != app.PanelPlans {
+		t.Fatalf("expected plan panel to open, got %q", model.ActivePanel)
+	}
+	if !strings.Contains(model.Notice, "Usage: /plan create <task>") {
+		t.Fatalf("expected usage notice, got %q", model.Notice)
+	}
+}
+
+func TestPlanPanelRendersEvidencePathsAndToolResult(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 44
+	model.ActivePanel = app.PanelPlans
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_execution_plan","executionPlan":{"capturedAt":"2026-04-13T00:00:00Z","sourcePreview":"refactor task","summary":"Refactor reducer flow","objective":"refactor reducer flow","steps":[{"id":"step-1","title":"Patch reducer transitions","details":"Update state handling and tests","status":"in_progress","evidence":["Tool read_file: inspected src/core/session/stateReducer.ts","Tool apply_patch: updated reducer branch"],"filePaths":["src/core/session/stateReducer.ts","tests/stateReducer.test.ts"],"recentToolResult":"Patched file: src/core/session/stateReducer.ts"}]}}`); err != nil {
+		t.Fatalf("apply set_execution_plan: %v", err)
+	}
+
+	view := model.View()
+	for _, snippet := range []string{
+		"Patch reducer transitions",
+		"src/core/session/stateReducer.ts",
+		"tests/stateReducer.test.ts",
+		"Patched file: src/core/session/stateReducer.ts",
+		"Tool apply_patch: updated reducer branch",
+	} {
+		if !strings.Contains(view, snippet) {
+			t.Fatalf("expected plan panel to contain %q, got %q", snippet, view)
+		}
+	}
+}
+
 func TestStartupSplashCompressesWhenPanelIsOpen(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 180
@@ -361,6 +411,92 @@ func TestTallModelsPanelUsesDynamicPageSize(t *testing.T) {
 
 	if !strings.Contains(view, "model-6") {
 		t.Fatalf("expected tall models panel to show more than the old fixed page size, got %q", view)
+	}
+}
+
+func TestTranscriptRenderKeepsHistoryAcrossLiveUpdates(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: "describe the issue"},
+		{Role: "assistant", Kind: "transcript", Text: "checking render path"},
+	}
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_live_text","liveText":"streaming response chunk"}`); err != nil {
+		t.Fatalf("apply set_live_text: %v", err)
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "describe the issue") {
+		t.Fatalf("expected existing transcript history, got %q", view)
+	}
+	if !strings.Contains(view, "streaming response chunk") {
+		t.Fatalf("expected live transcript tail, got %q", view)
+	}
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_live_text","liveText":"streaming response chunk updated"}`); err != nil {
+		t.Fatalf("apply second set_live_text: %v", err)
+	}
+
+	view = model.View()
+	if !strings.Contains(view, "checking render path") {
+		t.Fatalf("expected cached history to remain visible, got %q", view)
+	}
+	if !strings.Contains(view, "streaming response chunk updated") {
+		t.Fatalf("expected latest live transcript text, got %q", view)
+	}
+}
+
+func TestStartupSplashReturnsAfterLiveTextClears(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_live_text","liveText":"temporary reply"}`); err != nil {
+		t.Fatalf("apply set_live_text: %v", err)
+	}
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"set_live_text","liveText":""}`); err != nil {
+		t.Fatalf("clear set_live_text: %v", err)
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "fast paths") {
+		t.Fatalf("expected startup splash after live text clears, got %q", view)
+	}
+}
+
+func TestTranscriptMessageCacheExtendsAcrossAppendItems(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("A", 200)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("B", 200)},
+	}
+
+	_ = model.View()
+	if got := model.TranscriptMessageCacheCountForTest(); got != 2 {
+		t.Fatalf("expected 2 cached messages after initial render, got %d", got)
+	}
+	initialWidth := model.TranscriptMessageCacheWidthForTest(0)
+	if initialWidth == 0 {
+		t.Fatalf("expected first cached message to record render width")
+	}
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"append_items","items":[{"role":"system","kind":"system_hint","text":"extra note"}]}`); err != nil {
+		t.Fatalf("apply append_items: %v", err)
+	}
+
+	_ = model.View()
+	if got := model.TranscriptMessageCacheCountForTest(); got != 3 {
+		t.Fatalf("expected cache to extend for appended message, got %d", got)
+	}
+	if got := model.TranscriptMessageCacheWidthForTest(0); got != initialWidth {
+		t.Fatalf("expected existing cached message width to be preserved, got %d want %d", got, initialWidth)
+	}
+	if got := model.TranscriptMessageCacheWidthForTest(2); got == 0 {
+		t.Fatalf("expected appended message to populate cache width")
 	}
 }
 

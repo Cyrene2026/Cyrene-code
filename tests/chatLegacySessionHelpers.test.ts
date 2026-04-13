@@ -14,6 +14,7 @@ const createSession = (assistantText: string): SessionRecord => ({
   summary: "",
   pendingDigest: "",
   pendingChoice: null,
+  executionPlan: null,
   lastStateUpdate: null,
   inFlightTurn: null,
   focus: [],

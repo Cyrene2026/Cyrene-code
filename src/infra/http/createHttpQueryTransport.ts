@@ -3051,7 +3051,10 @@ export const createHttpQueryTransport = (
         provider: normalizedProvider,
         vendor,
         keySource,
-        type: family === "glm" ? undefined : resolveTypeForProvider(normalizedProvider, family, format),
+        type:
+          family === "glm"
+            ? undefined
+            : (resolveTypeForProvider(normalizedProvider, family, format) ?? undefined),
         format,
       };
     },

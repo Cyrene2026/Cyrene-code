@@ -1,5 +1,6 @@
 import type { SessionMessage } from "./types";
 import type { SessionInFlightTurn } from "./types";
+import type { SessionExecutionPlan } from "./types";
 import type { ReducerMode } from "./stateReducer";
 import {
   WORKING_STATE_SECTION_ORDER,
@@ -77,6 +78,7 @@ export type SessionPromptContext = {
   latestActionableUserMessage: string;
   durableSummary: string;
   pendingDigest: string;
+  executionPlan: SessionExecutionPlan | null;
   summaryFallback: string;
   reducerMode: ReducerMode;
   summaryRecoveryNeeded: boolean;
@@ -1131,6 +1133,7 @@ export const getPromptContextFromMemoryIndex = (
     durableSummary: string;
     summaryFallback: string;
     pendingDigest: string;
+    executionPlan?: SessionExecutionPlan | null;
     latestActionableUserMessage?: string;
     reducerMode?: ReducerMode;
     summaryRecoveryNeeded?: boolean;
@@ -1204,6 +1207,7 @@ export const getPromptContextFromMemoryIndex = (
     latestActionableUserMessage: options.latestActionableUserMessage ?? "",
     durableSummary: options.durableSummary,
     pendingDigest: options.pendingDigest,
+    executionPlan: options.executionPlan ?? null,
     summaryFallback: options.summaryFallback,
     reducerMode: options.reducerMode ?? "disabled",
     summaryRecoveryNeeded: options.summaryRecoveryNeeded ?? false,

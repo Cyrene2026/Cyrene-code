@@ -85,12 +85,33 @@ type BridgeManagedMcpServer struct {
 	Trusted  bool   `json:"trusted"`
 }
 
+type BridgePlanStep struct {
+	ID               string   `json:"id"`
+	Title            string   `json:"title"`
+	Details          string   `json:"details"`
+	Status           string   `json:"status"`
+	Evidence         []string `json:"evidence"`
+	FilePaths        []string `json:"filePaths"`
+	RecentToolResult string   `json:"recentToolResult"`
+}
+
+type BridgeExecutionPlan struct {
+	CapturedAt      string           `json:"capturedAt"`
+	SourcePreview   string           `json:"sourcePreview"`
+	Summary         string           `json:"summary"`
+	Objective       string           `json:"objective"`
+	AcceptedAt      string           `json:"acceptedAt"`
+	AcceptedSummary string           `json:"acceptedSummary"`
+	Steps           []BridgePlanStep `json:"steps"`
+}
+
 type bridgeSnapshot struct {
 	AppRoot                  string                       `json:"appRoot"`
 	Status                   string                       `json:"status"`
 	ActiveSessionID          string                       `json:"activeSessionId"`
 	Items                    []Message                    `json:"items"`
 	LiveText                 string                       `json:"liveText"`
+	ExecutionPlan            *BridgeExecutionPlan         `json:"executionPlan"`
 	PendingReviews           []BridgeReview               `json:"pendingReviews"`
 	Sessions                 []BridgeSession              `json:"sessions"`
 	CurrentModel             string                       `json:"currentModel"`
@@ -116,6 +137,7 @@ type bridgeEvent struct {
 	Message                  string                       `json:"message,omitempty"`
 	Status                   string                       `json:"status,omitempty"`
 	LiveText                 string                       `json:"liveText,omitempty"`
+	ExecutionPlan            *BridgeExecutionPlan         `json:"executionPlan,omitempty"`
 	Items                    []Message                    `json:"items,omitempty"`
 	Sessions                 []BridgeSession              `json:"sessions,omitempty"`
 	ActiveSessionID          string                       `json:"activeSessionId,omitempty"`

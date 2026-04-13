@@ -25,6 +25,32 @@ export type SessionPendingChoice = {
   options: SessionPendingChoiceOption[];
 };
 
+export type SessionExecutionPlanStepStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "blocked";
+
+export type SessionExecutionPlanStep = {
+  id: string;
+  title: string;
+  details: string;
+  status: SessionExecutionPlanStepStatus;
+  evidence: string[];
+  filePaths: string[];
+  recentToolResult: string;
+};
+
+export type SessionExecutionPlan = {
+  capturedAt: string;
+  sourcePreview: string;
+  summary: string;
+  objective: string;
+  acceptedAt: string;
+  acceptedSummary: string;
+  steps: SessionExecutionPlanStep[];
+};
+
 export type SessionStateUpdateDiagnosticCode =
   | "disabled"
   | "missing_tag"
@@ -52,6 +78,7 @@ export type SessionRecord = {
   summary: string;
   pendingDigest: string;
   pendingChoice: SessionPendingChoice | null;
+  executionPlan: SessionExecutionPlan | null;
   lastStateUpdate: SessionStateUpdateDiagnostic | null;
   inFlightTurn: SessionInFlightTurn | null;
   focus: string[];

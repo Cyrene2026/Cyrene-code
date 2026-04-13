@@ -19,8 +19,10 @@ import {
   deriveReducerMode,
   sanitizeStoredWorkingState,
 } from "../../core/session/stateReducer";
+import { applyExecutionPlanToWorkingState } from "../../core/session/executionPlan";
 import type { SessionStore } from "../../core/session/store";
 import type {
+  SessionExecutionPlan,
   SessionInFlightTurn,
   SessionListItem,
   SessionMessage,
@@ -83,6 +85,26 @@ const pendingChoiceSchema: z.ZodType<SessionPendingChoice> = z.object({
   ),
 });
 
+const executionPlanSchema = z.object({
+  capturedAt: z.string(),
+  sourcePreview: z.string(),
+  summary: z.string(),
+  objective: z.string(),
+  acceptedAt: z.string().optional(),
+  acceptedSummary: z.string().optional(),
+  steps: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      details: z.string(),
+      status: z.enum(["pending", "in_progress", "completed", "blocked"]),
+      evidence: z.array(z.string()).optional(),
+      filePaths: z.array(z.string()).optional(),
+      recentToolResult: z.string().optional(),
+    })
+  ),
+});
+
 const stateUpdateDiagnosticSchema: z.ZodType<SessionStateUpdateDiagnostic> = z.object({
   code: z.enum([
     "disabled",
@@ -111,6 +133,7 @@ const sessionSchema = z.object({
   summary: z.string().optional(),
   pendingDigest: z.string().optional(),
   pendingChoice: pendingChoiceSchema.nullable().optional(),
+  executionPlan: executionPlanSchema.nullable().optional(),
   lastStateUpdate: stateUpdateDiagnosticSchema.nullable().optional(),
   inFlightTurn: inFlightTurnSchema.nullable().optional(),
   focus: z.array(z.string()).optional(),
@@ -129,12 +152,14 @@ const sessionListCacheSchema = z.object({
   summaryLength: z.number().int().nonnegative(),
   pendingDigestLength: z.number().int().nonnegative(),
   hasPendingChoice: z.boolean(),
+  hasExecutionPlan: z.boolean().optional(),
   hasLastStateUpdate: z.boolean(),
   hasInFlightTurn: z.boolean(),
   focusCount: z.number().int().nonnegative(),
 });
 
 type SessionListCacheRecord = z.infer<typeof sessionListCacheSchema>;
+type StoredExecutionPlan = z.infer<typeof executionPlanSchema> | SessionExecutionPlan | null | undefined;
 
 const memoryEntrySchema: z.ZodType<SessionMemoryEntry> = z.object({
   id: z.string(),
@@ -198,6 +223,7 @@ const isEmptyPlaceholderSession = (session: SessionRecord) => {
     summary.length === 0 &&
     pendingDigest.length === 0 &&
     session.pendingChoice == null &&
+    session.executionPlan == null &&
     session.lastStateUpdate == null &&
     session.inFlightTurn == null &&
     focus.length === 0 &&
@@ -211,6 +237,7 @@ const isEmptyPlaceholderSessionListCache = (session: SessionListCacheRecord) =>
   session.summaryLength === 0 &&
   session.pendingDigestLength === 0 &&
   !session.hasPendingChoice &&
+  !(session.hasExecutionPlan ?? false) &&
   !session.hasLastStateUpdate &&
   !session.hasInFlightTurn &&
   session.focusCount === 0 &&
@@ -232,6 +259,25 @@ const normalizeTagSet = (tags: string[]) =>
         .filter(Boolean)
     )
   );
+
+const normalizeExecutionPlan = (
+  plan: StoredExecutionPlan
+): SessionExecutionPlan | null => {
+  if (!plan) {
+    return null;
+  }
+  return {
+    ...plan,
+    acceptedAt: plan.acceptedAt ?? "",
+    acceptedSummary: plan.acceptedSummary ?? "",
+    steps: plan.steps.map(step => ({
+      ...step,
+      evidence: step.evidence ?? [],
+      filePaths: step.filePaths ?? [],
+      recentToolResult: step.recentToolResult ?? "",
+    })),
+  };
+};
 
 const fileNameFor = (id: string) => `${id}.json`;
 const indexFileNameFor = (id: string) => `${id}.index.json`;
@@ -295,6 +341,7 @@ export const createFileSessionStore = (
     summaryLength: session.summary.trim().length,
     pendingDigestLength: session.pendingDigest.trim().length,
     hasPendingChoice: session.pendingChoice != null,
+    hasExecutionPlan: session.executionPlan != null,
     hasLastStateUpdate: session.lastStateUpdate != null,
     hasInFlightTurn: session.inFlightTurn != null,
     focusCount: session.focus.length,
@@ -312,6 +359,7 @@ export const createFileSessionStore = (
         summary: normalized.summary ?? "",
         pendingDigest: normalized.pendingDigest ?? "",
         pendingChoice: normalized.pendingChoice ?? null,
+        executionPlan: normalizeExecutionPlan(normalized.executionPlan ?? null),
         lastStateUpdate: normalized.lastStateUpdate ?? null,
         inFlightTurn: normalized.inFlightTurn ?? null,
         focus: normalized.focus ?? [],
@@ -493,6 +541,7 @@ export const createFileSessionStore = (
         summary: "",
         pendingDigest: "",
         pendingChoice: null,
+        executionPlan: null,
         lastStateUpdate: null,
         inFlightTurn: null,
         focus: [],
@@ -705,6 +754,39 @@ export const createFileSessionStore = (
       await writeSession(next);
       return next;
     },
+    updateExecutionPlan: async (id, executionPlan) => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      const normalizedPlan = executionPlan
+        ? {
+            ...executionPlan,
+            acceptedAt: executionPlan.acceptedAt ?? "",
+            acceptedSummary: executionPlan.acceptedSummary ?? "",
+            steps: executionPlan.steps.map(step => ({
+              ...step,
+              evidence: [...step.evidence],
+              filePaths: [...step.filePaths],
+              recentToolResult: step.recentToolResult ?? "",
+            })),
+          }
+        : null;
+      const linkedState = applyExecutionPlanToWorkingState({
+        summary: loaded.session.summary,
+        pendingDigest: loaded.session.pendingDigest,
+        plan: normalizedPlan,
+      });
+      const next: SessionRecord = {
+        ...loaded.session,
+        executionPlan: normalizedPlan,
+        summary: linkedState.summary,
+        pendingDigest: linkedState.pendingDigest,
+        updatedAt: new Date().toISOString(),
+      };
+      await writeSession(next);
+      return next;
+    },
     addFocus: async (id, note) => {
       const normalized = note.replace(/\s+/g, " ").trim();
       if (!normalized) {
@@ -829,6 +911,7 @@ export const createFileSessionStore = (
           durableSummary,
           summaryFallback,
           pendingDigest,
+          executionPlan: loaded.session.executionPlan,
           latestActionableUserMessage,
           reducerMode: deriveReducerMode({
             enabled: true,

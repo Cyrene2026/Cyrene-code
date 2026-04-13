@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -171,6 +172,9 @@ func (m *Model) widePanelWidth(totalWidth int) int {
 	if m.ActivePanel == PanelApprovals {
 		minPanelWidth = 44
 		desiredWidth = totalWidth * 2 / 5
+	} else if m.ActivePanel == PanelPlans {
+		minPanelWidth = 46
+		desiredWidth = totalWidth * 2 / 5
 	}
 
 	maxPanelWidth := totalWidth - minSessionWidth - 1
@@ -181,6 +185,8 @@ func (m *Model) widePanelWidth(totalWidth int) int {
 	upperBound := 68
 	if m.ActivePanel == PanelApprovals {
 		upperBound = 76
+	} else if m.ActivePanel == PanelPlans {
+		upperBound = 78
 	}
 	return clampInt(desiredWidth, minPanelWidth, minInt(upperBound, maxPanelWidth))
 }
@@ -440,18 +446,9 @@ func (m *Model) renderTranscriptLines(width int) []string {
 		return lines
 	}
 
-	items := make([]Message, 0, len(m.Items)+1)
-	items = append(items, m.Items...)
-	if strings.TrimSpace(m.LiveText) != "" {
-		items = append(items, Message{Role: "assistant", Kind: "transcript", Text: m.LiveText})
-	}
-
-	lines := make([]string, 0, len(items)*3)
-	for index, item := range items {
-		lines = append(lines, renderMessageLines(item, width)...)
-		if index < len(items)-1 && item.Kind == "transcript" && items[index+1].Kind != "transcript" {
-			lines = append(lines, "")
-		}
+	lines := append([]string(nil), m.renderStaticTranscriptLines(width)...)
+	if liveLines := m.renderLiveTranscriptLines(width); len(liveLines) > 0 {
+		lines = append(lines, liveLines...)
 	}
 	if len(lines) == 0 {
 		lines = append(lines, dimStyle.Render("No transcript yet."))
@@ -460,6 +457,65 @@ func (m *Model) renderTranscriptLines(width int) []string {
 	m.transcriptCacheWidth = width
 	m.transcriptCacheVersion = m.transcriptVersion
 	m.transcriptCacheLines = lines
+	return lines
+}
+
+func (m *Model) renderStaticTranscriptLines(width int) []string {
+	if m.transcriptStaticCacheWidth == width && m.transcriptStaticCacheLines != nil {
+		return m.transcriptStaticCacheLines
+	}
+
+	m.syncTranscriptMessageCache()
+	lines := make([]string, 0, len(m.Items)*3)
+	for index, item := range m.Items {
+		lines = append(lines, m.renderCachedMessageLines(index, item, width)...)
+		if index < len(m.Items)-1 && item.Kind == "transcript" && m.Items[index+1].Kind != "transcript" {
+			lines = append(lines, "")
+		}
+	}
+
+	m.transcriptStaticCacheWidth = width
+	m.transcriptStaticCacheLines = lines
+	return lines
+}
+
+func (m *Model) syncTranscriptMessageCache() {
+	switch {
+	case len(m.transcriptMessageCache) < len(m.Items):
+		m.extendTranscriptMessageCache(len(m.Items) - len(m.transcriptMessageCache))
+	case len(m.transcriptMessageCache) > len(m.Items):
+		m.transcriptMessageCache = m.transcriptMessageCache[:len(m.Items)]
+	}
+}
+
+func (m *Model) renderCachedMessageLines(index int, item Message, width int) []string {
+	if index < 0 || index >= len(m.transcriptMessageCache) {
+		return renderMessageLines(item, width)
+	}
+
+	entry := &m.transcriptMessageCache[index]
+	if entry.width == width && entry.lines != nil && entry.message == item {
+		return entry.lines
+	}
+
+	entry.width = width
+	entry.message = item
+	entry.lines = renderMessageLines(item, width)
+	return entry.lines
+}
+
+func (m *Model) renderLiveTranscriptLines(width int) []string {
+	if strings.TrimSpace(m.LiveText) == "" {
+		return nil
+	}
+	if m.transcriptLiveCacheWidth == width && m.transcriptLiveCacheText == m.LiveText && m.transcriptLiveCacheLines != nil {
+		return m.transcriptLiveCacheLines
+	}
+
+	lines := renderMessageLines(Message{Role: "assistant", Kind: "transcript", Text: m.LiveText}, width)
+	m.transcriptLiveCacheWidth = width
+	m.transcriptLiveCacheText = m.LiveText
+	m.transcriptLiveCacheLines = lines
 	return lines
 }
 
@@ -1206,6 +1262,8 @@ func (m *Model) renderActivePanel(width, height int) string {
 	switch m.ActivePanel {
 	case PanelApprovals:
 		return m.renderApprovals(width, height)
+	case PanelPlans:
+		return m.renderPlans(width, height)
 	case PanelSessions:
 		return m.renderSessions(width, height)
 	case PanelModels:
@@ -1393,6 +1451,125 @@ func (m *Model) renderApprovals(width, height int) string {
 		Total:   previewWindow.Total,
 	})...)
 	bodyLines = append(bodyLines, dimStyle.Render("j/k scroll  |  a approve  |  r reject"))
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
+}
+
+func planStepStatusLabel(status string) string {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "completed":
+		return "done"
+	case "in_progress":
+		return "active"
+	case "blocked":
+		return "blocked"
+	default:
+		return "pending"
+	}
+}
+
+func (m *Model) renderPlans(width, height int) string {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	page := pageForSelection(len(m.ExecutionPlan.Steps), m.PlanIndex, m.planPanelPageSizeForDimensions(width, height))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "run ↵/r", "done d", "accept a", "clear c", "esc"),
+	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "plans", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("steps %d", page.Total))}
+	bodyLines := []string{}
+
+	if len(m.ExecutionPlan.Steps) == 0 {
+		bodyLines = append(bodyLines,
+			sectionStyle.Render("execution plan"),
+			dimStyle.Render("No active execution plan."),
+			dimStyle.Render("Use /plan create <task> to build one, then /plan run to execute it."),
+		)
+		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
+	}
+
+	bodyLines = append(bodyLines, sectionStyle.Render("overview"))
+	if strings.TrimSpace(m.ExecutionPlan.Summary) != "" {
+		for _, row := range wrapPlainText(m.ExecutionPlan.Summary, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
+	if strings.TrimSpace(m.ExecutionPlan.Objective) != "" {
+		for _, row := range wrapPlainText("objective "+m.ExecutionPlan.Objective, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
+	if strings.TrimSpace(m.ExecutionPlan.AcceptedAt) != "" {
+		acceptedLabel := "accepted " + m.ExecutionPlan.AcceptedAt
+		if strings.TrimSpace(m.ExecutionPlan.AcceptedSummary) != "" {
+			acceptedLabel += "  |  " + m.ExecutionPlan.AcceptedSummary
+		}
+		for _, row := range wrapPlainText(acceptedLabel, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
+
+	bodyLines = append(bodyLines, sectionStyle.Render("steps"))
+	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
+	for index := page.Start; index < page.End; index++ {
+		step := m.ExecutionPlan.Steps[index]
+		prefix := "  "
+		style := lipgloss.NewStyle()
+		if index == m.PlanIndex {
+			prefix = "> "
+			style = asstStyle.Bold(true)
+		}
+		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s  %s", prefix, planStepStatusLabel(step.Status), truncatePlain(step.Title, maxInt(12, bodyWidth-16)))))
+		metaParts := []string{}
+		if len(step.FilePaths) > 0 {
+			metaParts = append(metaParts, fmt.Sprintf("%d path(s)", len(step.FilePaths)))
+		}
+		if len(step.Evidence) > 0 {
+			metaParts = append(metaParts, fmt.Sprintf("%d evidence", len(step.Evidence)))
+		}
+		if strings.TrimSpace(step.RecentToolResult) != "" {
+			metaParts = append(metaParts, truncatePlain(step.RecentToolResult, maxInt(8, bodyWidth-12)))
+		}
+		meta := strings.Join(metaParts, "  |  ")
+		if meta == "" {
+			meta = emptyFallback(strings.TrimSpace(step.Details), "no details")
+		}
+		listLines = append(listLines, dimStyle.Render("   "+truncatePlain(meta, maxInt(8, bodyWidth-6))))
+	}
+	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
+		Offset:  maxInt(0, page.CurrentPage-1),
+		Visible: 1,
+		Total:   maxInt(1, page.TotalPages),
+	})...)
+
+	selected := m.ExecutionPlan.Steps[clampInt(m.PlanIndex, 0, len(m.ExecutionPlan.Steps)-1)]
+	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s  |  status %s", selected.ID, planStepStatusLabel(selected.Status))))
+	if strings.TrimSpace(selected.Details) != "" {
+		for _, row := range wrapPlainText(selected.Details, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
+	if len(selected.FilePaths) > 0 {
+		bodyLines = append(bodyLines, sectionStyle.Render("paths"))
+		for _, path := range selected.FilePaths {
+			for _, row := range wrapPlainText(path, bodyWidth) {
+				bodyLines = append(bodyLines, dimStyle.Render(row))
+			}
+		}
+	}
+	if strings.TrimSpace(selected.RecentToolResult) != "" {
+		bodyLines = append(bodyLines, sectionStyle.Render("latest tool"))
+		for _, row := range wrapPlainText(selected.RecentToolResult, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
+	if len(selected.Evidence) > 0 {
+		bodyLines = append(bodyLines, sectionStyle.Render("evidence"))
+		for _, item := range selected.Evidence {
+			for _, row := range wrapPlainText(item, bodyWidth) {
+				bodyLines = append(bodyLines, dimStyle.Render(row))
+			}
+		}
+	}
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
@@ -2592,7 +2769,7 @@ func wrapPlainText(value string, width int) []string {
 		var current []rune
 		currentWidth := 0
 		for _, r := range segment {
-			rw := lipgloss.Width(string(r))
+			rw := runeDisplayWidth(r)
 			if currentWidth+rw > width && len(current) > 0 {
 				lines = append(lines, string(current))
 				current = current[:0]
@@ -2610,6 +2787,19 @@ func wrapPlainText(value string, width int) []string {
 		return []string{""}
 	}
 	return lines
+}
+
+func runeDisplayWidth(r rune) int {
+	switch {
+	case r == '\t':
+		return 4
+	case r < 32 || (r >= 0x7f && r < 0xa0):
+		return 0
+	case r <= unicode.MaxASCII:
+		return 1
+	default:
+		return lipgloss.Width(string(r))
+	}
 }
 
 func minInt(left, right int) int {

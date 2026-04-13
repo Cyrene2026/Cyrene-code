@@ -1,4 +1,5 @@
 import type { SessionPromptContext } from "./memoryIndex";
+import { formatExecutionPlan } from "./executionPlan";
 import { buildStateReducerPrompt } from "./stateReducer";
 import {
   normalizeWorkingStateSummary,
@@ -83,6 +84,9 @@ export const buildPromptWithContext = (
 
   const durableSummarySection = `Working state (durable reducer):\n${durableSummary}`;
   const pendingDigestSection = `Pending turn digest (last completed turn not yet merged):\n${pendingDigest}`;
+  const executionPlanSection = `Active execution plan:\n${formatExecutionPlan(
+    promptContext.executionPlan
+  )}`;
   const interruptedTurnSection = promptContext.interruptedTurn
     ? `Interrupted prior turn snapshot:\n- user: ${clipPromptLine(promptContext.interruptedTurn.userText)}${
         promptContext.interruptedTurn.assistantText.trim()
@@ -102,6 +106,7 @@ export const buildPromptWithContext = (
   const taskStateSections = lowSignalContinuation
     ? [
         recencyGuardLine,
+        executionPlanSection,
         pendingDigestSection,
         interruptedTurnSection,
         latestActionableUserRequestSection,
@@ -109,6 +114,7 @@ export const buildPromptWithContext = (
         durableSummarySection,
       ].filter(Boolean)
     : [
+        executionPlanSection,
         durableSummarySection,
         pendingDigestSection,
         interruptedTurnSection,

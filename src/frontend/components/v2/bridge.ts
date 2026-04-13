@@ -13,6 +13,10 @@ import {
   type ExtensionManager,
 } from "../../../core/extensions";
 import { buildPromptWithContext } from "../../../core/session/buildPromptWithContext";
+import {
+  formatExecutionPlan,
+  parseAssistantPlanUpdate,
+} from "../../../core/session/executionPlan";
 import { runQuerySession, type RunQuerySessionResult } from "../../../core/query/runQuerySession";
 import {
   PROVIDER_ENDPOINT_KINDS,
@@ -34,6 +38,7 @@ import {
 import { extractPendingChoiceFromAssistantText } from "../../../core/session/pendingChoice";
 import type { SessionStore } from "../../../core/session/store";
 import type {
+  SessionExecutionPlan,
   SessionListItem,
   SessionRecord,
   SessionStateUpdateDiagnostic,
@@ -175,12 +180,15 @@ type BridgeManagedMcpServer = {
   trusted: boolean;
 };
 
+type BridgeExecutionPlan = SessionExecutionPlan;
+
 type BridgeSnapshot = {
   appRoot: string;
   status: BridgeStatus;
   activeSessionId: string | null;
   items: BridgeItem[];
   liveText: string;
+  executionPlan: BridgeExecutionPlan | null;
   pendingReviews: BridgeReview[];
   sessions: BridgeSession[];
   currentModel: string;
@@ -204,6 +212,7 @@ type BridgeEvent =
   | { type: "init"; snapshot: BridgeSnapshot }
   | { type: "set_status"; status: BridgeStatus }
   | { type: "set_live_text"; liveText: string }
+  | { type: "set_execution_plan"; executionPlan: BridgeExecutionPlan | null }
   | { type: "append_items"; items: BridgeItem[] }
   | { type: "replace_items"; items: BridgeItem[] }
   | { type: "set_sessions"; sessions: BridgeSession[]; activeSessionId?: string | null }
@@ -277,6 +286,9 @@ const FILE_MUTATION_ACTIONS = new Set([
   "apply_patch",
 ]);
 
+const EXECUTION_PLAN_FILE_PATH_PATTERN =
+  /(?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+\.[A-Za-z0-9_-]+/g;
+
 const parseRootArg = () => {
   for (let index = 0; index < process.argv.length; index += 1) {
     const token = process.argv[index]?.trim();
@@ -298,6 +310,57 @@ const firstLine = (value: string, fallback = "") =>
     .split(/\r?\n/)
     .map(line => line.trim())
     .find(Boolean) ?? fallback;
+
+const clipBridgeLine = (value: string, max = 180) => {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+};
+
+const normalizeTrackedPath = (value: string) =>
+  value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\.\//, "");
+
+const collectTrackedPaths = (toolInput: unknown, message: string) => {
+  const collected = new Set<string>();
+  const record =
+    toolInput && typeof toolInput === "object"
+      ? (toolInput as Record<string, unknown>)
+      : null;
+  const pushPath = (candidate: string | undefined) => {
+    if (!candidate) {
+      return;
+    }
+    const normalized = normalizeTrackedPath(candidate);
+    if (normalized) {
+      collected.add(normalized);
+    }
+  };
+
+  if (record) {
+    if (typeof record.path === "string") {
+      pushPath(record.path);
+    }
+    if (Array.isArray(record.paths)) {
+      for (const item of record.paths) {
+        if (typeof item === "string") {
+          pushPath(item);
+        }
+      }
+    }
+  }
+
+  for (const match of message.match(EXECUTION_PLAN_FILE_PATH_PATTERN) ?? []) {
+    pushPath(match);
+  }
+
+  return [...collected].slice(0, 8);
+};
 
 const trimWhitespaceOnlyEdges = (value: string) => {
   const lines = value.split(/\r?\n/);
@@ -450,6 +513,7 @@ class BubbleTeaBridge {
   private activeSessionId: string | null = null;
   private items: BridgeItem[] = [];
   private liveText = "";
+  private executionPlan: SessionExecutionPlan | null = null;
   private status: BridgeStatus = "preparing";
   private pendingReviews: BridgeReview[] = [];
   private sessions: BridgeSession[] = [];
@@ -606,6 +670,7 @@ class BubbleTeaBridge {
     this.suspended = null;
     this.items = [DEFAULT_EMPTY_STATE];
     this.liveText = "";
+    this.executionPlan = null;
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshRuntimeMetadata();
@@ -790,6 +855,7 @@ class BubbleTeaBridge {
       activeSessionId: this.activeSessionId,
       items: this.items,
       liveText: this.liveText,
+      executionPlan: this.executionPlan,
       pendingReviews: this.pendingReviews,
       sessions: this.sessions,
       currentModel: this.transport?.getModel() ?? this.authStatus?.model ?? "",
@@ -870,6 +936,13 @@ class BubbleTeaBridge {
     this.emit({
       type: "set_live_text",
       liveText: this.liveText,
+    });
+  }
+
+  private emitExecutionPlan() {
+    this.emit({
+      type: "set_execution_plan",
+      executionPlan: this.executionPlan,
     });
   }
 
@@ -1036,6 +1109,7 @@ class BubbleTeaBridge {
       lines.push("summary chars: 0");
       lines.push("pending digest chars: 0");
       lines.push("pending choice: (none)");
+      lines.push("execution plan: (none)");
       lines.push("last state update: (none)");
       lines.push("in-flight turn: no");
       lines.push("note: no active session loaded yet.");
@@ -1048,6 +1122,11 @@ class BubbleTeaBridge {
       session.pendingChoice
         ? `pending choice: ${session.pendingChoice.options.length} options`
         : "pending choice: (none)"
+    );
+    lines.push(
+      session.executionPlan
+        ? `execution plan: ${session.executionPlan.steps.length} steps`
+        : "execution plan: (none)"
     );
     if (session.lastStateUpdate) {
       lines.push(
@@ -1151,6 +1230,266 @@ class BubbleTeaBridge {
     this.emitSessions();
   }
 
+  private findLatestMeaningfulUserTask(session: SessionRecord | null) {
+    if (!session) {
+      return "";
+    }
+    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+      const message = session.messages[index];
+      if (message?.role !== "user") {
+        continue;
+      }
+      const normalized = message.text.replace(/\s+/g, " ").trim();
+      if (normalized && !normalized.startsWith("/plan")) {
+        return normalized;
+      }
+    }
+    return "";
+  }
+
+  private formatPlanStatusMessage(plan: SessionExecutionPlan | null) {
+    if (!plan) {
+      return "Execution plan:\n(none)";
+    }
+    return `Execution plan:\n${formatExecutionPlan(plan)}`;
+  }
+
+  private clearPlanAcceptance(plan: SessionExecutionPlan): SessionExecutionPlan {
+    if (!plan.acceptedAt && !plan.acceptedSummary) {
+      return plan;
+    }
+    return {
+      ...plan,
+      acceptedAt: "",
+      acceptedSummary: "",
+    };
+  }
+
+  private async updateExecutionPlanWith(
+    session: SessionRecord,
+    updater: (plan: SessionExecutionPlan) => SessionExecutionPlan | null
+  ) {
+    if (!session.executionPlan) {
+      return { ok: false, message: "No active execution plan." as const };
+    }
+    const nextPlan = updater(session.executionPlan);
+    const next = await this.sessionStore!.updateExecutionPlan(session.id, nextPlan);
+    if (this.activeSessionId === next.id) {
+      this.executionPlan = next.executionPlan;
+      this.emitExecutionPlan();
+    }
+    return { ok: true, session: next };
+  }
+
+  private parsePlanStepDraft(raw: string) {
+    const normalized = raw.trim();
+    if (!normalized) {
+      return null;
+    }
+    const splitIndex = normalized.indexOf("::");
+    if (splitIndex < 0) {
+      return {
+        title: normalized,
+        details: "",
+      };
+    }
+    return {
+      title: normalized.slice(0, splitIndex).trim(),
+      details: normalized.slice(splitIndex + 2).trim(),
+    };
+  }
+
+  private activePlanStep(plan: SessionExecutionPlan | null) {
+    if (!plan) {
+      return null;
+    }
+    return (
+      plan.steps.find(step => step.status === "in_progress") ??
+      plan.steps.find(step => step.status === "pending") ??
+      plan.steps[0] ??
+      null
+    );
+  }
+
+  private async recordExecutionPlanToolActivity(input: {
+    sessionId: string;
+    toolName: string;
+    toolInput: unknown;
+    message: string;
+    pending?: boolean;
+  }) {
+    const session = await this.sessionStore?.loadSession(input.sessionId);
+    if (!session?.executionPlan) {
+      return;
+    }
+    const target = this.activePlanStep(session.executionPlan);
+    if (!target) {
+      return;
+    }
+
+    const toolRecord =
+      input.toolInput && typeof input.toolInput === "object"
+        ? (input.toolInput as Record<string, unknown>)
+        : null;
+    const action =
+      typeof toolRecord?.action === "string" && toolRecord.action.trim()
+        ? toolRecord.action.trim()
+        : input.toolName;
+    const summaryLine = clipBridgeLine(firstLine(input.message, input.toolName));
+    const evidenceLine = clipBridgeLine(
+      input.pending
+        ? `Pending tool action ${action}: ${summaryLine}`
+        : `Tool ${action}: ${summaryLine}`
+    );
+    const filePaths = collectTrackedPaths(input.toolInput, input.message);
+
+    const nextPlan: SessionExecutionPlan = {
+      ...this.clearPlanAcceptance(session.executionPlan),
+      capturedAt: new Date().toISOString(),
+      steps: session.executionPlan.steps.map(step => {
+        if (step.id !== target.id) {
+          return { ...step };
+        }
+        const nextEvidence = [...step.evidence];
+        if (evidenceLine && !nextEvidence.includes(evidenceLine)) {
+          nextEvidence.push(evidenceLine);
+        }
+        const nextPaths = [...step.filePaths];
+        for (const path of filePaths) {
+          if (!nextPaths.includes(path)) {
+            nextPaths.push(path);
+          }
+        }
+        return {
+          ...step,
+          evidence: nextEvidence.slice(-6),
+          filePaths: nextPaths.slice(0, 8),
+          recentToolResult: summaryLine,
+        };
+      }),
+    };
+    const updated = await this.sessionStore!.updateExecutionPlan(input.sessionId, nextPlan);
+    if (this.activeSessionId === input.sessionId) {
+      this.executionPlan = updated.executionPlan;
+      this.emitExecutionPlan()
+    }
+  }
+
+  private extractVisibleAssistantText(rawText: string) {
+    const parsedPlan = parseAssistantPlanUpdate(rawText);
+    return parseAssistantStateUpdate(parsedPlan.visibleText).visibleText;
+  }
+
+  private findExecutionPlanStep(
+    plan: SessionExecutionPlan | null,
+    selector?: string
+  ) {
+    if (!plan || plan.steps.length === 0) {
+      return null;
+    }
+    const normalizedSelector = selector?.trim().toLowerCase() ?? "";
+    if (!normalizedSelector) {
+      return (
+        plan.steps.find(step => step.status === "in_progress") ??
+        plan.steps.find(step => step.status === "pending") ??
+        plan.steps[0] ??
+        null
+      );
+    }
+    const numeric = Number(normalizedSelector);
+    if (Number.isInteger(numeric) && numeric >= 1 && numeric <= plan.steps.length) {
+      return plan.steps[numeric - 1] ?? null;
+    }
+    return (
+      plan.steps.find(step => step.id.trim().toLowerCase() === normalizedSelector) ?? null
+    );
+  }
+
+  private async setExecutionPlanStepStatus(
+    session: SessionRecord,
+    stepSelector: string,
+    status: SessionExecutionPlan["steps"][number]["status"]
+  ) {
+    if (!session.executionPlan) {
+      return { ok: false, message: "No active execution plan." };
+    }
+    const target = this.findExecutionPlanStep(session.executionPlan, stepSelector);
+    if (!target) {
+      return { ok: false, message: "Plan step not found." };
+    }
+
+    const nextPlan: SessionExecutionPlan = {
+      ...session.executionPlan,
+      capturedAt: new Date().toISOString(),
+      steps: session.executionPlan.steps.map(step => {
+        if (step.id === target.id) {
+          return { ...step, status };
+        }
+        if (status === "in_progress" && step.status === "in_progress") {
+          return { ...step, status: "pending" };
+        }
+        return { ...step };
+      }),
+    };
+    const next = await this.sessionStore!.updateExecutionPlan(session.id, nextPlan);
+    if (this.activeSessionId === next.id) {
+      this.executionPlan = next.executionPlan;
+      this.emitExecutionPlan();
+    }
+    return {
+      ok: true,
+      message: `Updated plan step ${target.id} to ${status}.`,
+      session: next,
+    };
+  }
+
+  private buildPlanCreationPrompt(task: string, plan: SessionExecutionPlan | null) {
+    const lines = [
+      "Create or refresh the execution plan for this task.",
+      "Return a short visible summary for the user, then include a machine-readable <cyrene_plan> JSON block.",
+      "The JSON must match: {\"version\":1,\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      "Keep 3-7 concrete steps. Mark already-finished work as completed. Use in_progress only for the active step.",
+      "Preserve evidence, filePaths, and recentToolResult for existing steps when still relevant.",
+      "If an execution plan already exists, refine it instead of restarting unless the task changed materially.",
+      plan ? `Current plan snapshot:\n${formatExecutionPlan(plan)}` : "Current plan snapshot:\n(none)",
+      `Task:\n${task}`,
+    ];
+    return lines.join("\n\n");
+  }
+
+  private buildPlanRevisionPrompt(plan: SessionExecutionPlan, instruction: string) {
+    const lines = [
+      "Revise the active execution plan.",
+      "Return a short visible summary for the user, then include a machine-readable <cyrene_plan> JSON block.",
+      "The JSON must match: {\"version\":1,\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      "Preserve evidence, filePaths, and recentToolResult unless the revision makes them obsolete.",
+      "If the plan changes materially, clear acceptedAt and acceptedSummary.",
+      `Current plan snapshot:\n${formatExecutionPlan(plan)}`,
+      `Revision request:\n${instruction}`,
+    ];
+    return lines.join("\n\n");
+  }
+
+  private buildPlanExecutionPrompt(plan: SessionExecutionPlan, stepId?: string) {
+    const target = this.findExecutionPlanStep(plan, stepId);
+    if (!target) {
+      return null;
+    }
+    const lines = [
+      "Continue by executing the active execution plan.",
+      `Focus on step ${target.id}: ${target.title}`,
+      target.details ? `Step details: ${target.details}` : "",
+      "Do the work instead of only restating the plan.",
+      "If the step status changes, include an updated <cyrene_plan> JSON block in the final assistant message.",
+      "Preserve evidence, filePaths, and recentToolResult from the existing plan unless new information supersedes them.",
+      `Current plan snapshot:\n${formatExecutionPlan(plan)}`,
+    ].filter(Boolean);
+    return {
+      target,
+      prompt: lines.join("\n\n"),
+    };
+  }
+
   private async executeSlashCommand(rawText: string) {
     await this.ensureRuntime();
     const query = rawText.trim();
@@ -1169,6 +1508,381 @@ class BubbleTeaBridge {
         "Cancel is not wired in v2 bridge mode yet.",
         { kind: "error" }
       );
+      return;
+    }
+
+    if (query === "/plan show") {
+      const session = this.activeSessionId
+        ? await this.sessionStore!.loadSession(this.activeSessionId)
+        : null;
+      await this.pushSystemMessage(
+        this.formatPlanStatusMessage(session?.executionPlan ?? null)
+      );
+      return;
+    }
+
+    if (query === "/plan clear") {
+      const session = this.activeSessionId
+        ? await this.sessionStore!.loadSession(this.activeSessionId)
+        : null;
+      if (!session) {
+        await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+        return;
+      }
+      await this.sessionStore!.updateExecutionPlan(session.id, null);
+      if (this.activeSessionId === session.id) {
+        this.executionPlan = null;
+        this.emitExecutionPlan();
+      }
+      await this.pushSystemMessage("Execution plan cleared.");
+      return;
+    }
+
+    if (query === "/plan" || query.startsWith("/plan ")) {
+      if (query === "/plan accept" || query.startsWith("/plan accept ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan.", { kind: "error" });
+          return;
+        }
+        const note = query === "/plan accept" ? "" : query.slice("/plan accept ".length).trim();
+        const acceptedPlan: SessionExecutionPlan = {
+          ...session.executionPlan,
+          acceptedAt: new Date().toISOString(),
+          acceptedSummary: note,
+        };
+        const updated = await this.sessionStore!.updateExecutionPlan(session.id, acceptedPlan);
+        if (this.activeSessionId === updated.id) {
+          this.executionPlan = updated.executionPlan;
+          this.emitExecutionPlan();
+        }
+        await this.pushSystemMessage(
+          note ? `Execution plan accepted: ${note}` : "Execution plan accepted."
+        );
+        return;
+      }
+
+      if (query === "/plan reopen") {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan.", { kind: "error" });
+          return;
+        }
+        const updated = await this.updateExecutionPlanWith(session, plan => ({
+          ...plan,
+          acceptedAt: "",
+          acceptedSummary: "",
+        }));
+        await this.pushSystemMessage(
+          updated.ok ? "Execution plan reopened." : (updated.message ?? "Failed to reopen execution plan."),
+          updated.ok ? undefined : { kind: "error" }
+        );
+        return;
+      }
+
+      if (query === "/plan run" || query.startsWith("/plan run ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan. Use /plan create <task> first.", {
+            kind: "error",
+          });
+          return;
+        }
+        const selector = query === "/plan run" ? "" : query.slice("/plan run ".length).trim();
+        const target = this.findExecutionPlanStep(session.executionPlan, selector);
+        if (!target) {
+          await this.pushSystemMessage("Plan step not found.", { kind: "error" });
+          return;
+        }
+        await this.setExecutionPlanStepStatus(session, target.id, "in_progress");
+        const refreshed = await this.sessionStore!.loadSession(session.id);
+        if (!refreshed?.executionPlan) {
+          await this.pushSystemMessage("Execution plan was not available after refresh.", {
+            kind: "error",
+          });
+          return;
+        }
+        const executionPrompt = this.buildPlanExecutionPrompt(refreshed.executionPlan, target.id);
+        if (!executionPrompt) {
+          await this.pushSystemMessage("Plan step not found.", { kind: "error" });
+          return;
+        }
+        await this.submitPrepared({
+          userText:
+            selector && selector !== target.id
+              ? `/plan run ${selector}`
+              : `/plan run ${target.id}`,
+          promptText: executionPrompt.prompt,
+          originalTask: refreshed.executionPlan.objective || target.title,
+        });
+        return;
+      }
+
+      if (query.startsWith("/plan done ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session) {
+          await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+          return;
+        }
+        const selector = query.slice("/plan done ".length).trim();
+        if (!selector) {
+          await this.pushSystemMessage("Usage: /plan done <step-id|index>", { kind: "error" });
+          return;
+        }
+        const result = await this.setExecutionPlanStepStatus(session, selector, "completed");
+        await this.pushSystemMessage(
+          result.message,
+          result.ok ? undefined : { kind: "error" }
+        );
+        return;
+      }
+
+      if (query === "/plan done") {
+        await this.pushSystemMessage("Usage: /plan done <step-id|index>", { kind: "error" });
+        return;
+      }
+
+      if (query.startsWith("/plan status ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session) {
+          await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+          return;
+        }
+        const raw = query.slice("/plan status ".length).trim();
+        const firstSpace = raw.indexOf(" ");
+        const selector = firstSpace < 0 ? "" : raw.slice(0, firstSpace).trim();
+        const nextStatus = firstSpace < 0 ? "" : raw.slice(firstSpace + 1).trim();
+        if (!selector || !["pending", "in_progress", "completed", "blocked"].includes(nextStatus)) {
+          await this.pushSystemMessage("Usage: /plan status <step-id|index> <pending|in_progress|completed|blocked>", {
+            kind: "error",
+          });
+          return;
+        }
+        const result = await this.setExecutionPlanStepStatus(
+          session,
+          selector,
+          nextStatus as SessionExecutionPlan["steps"][number]["status"]
+        );
+        await this.pushSystemMessage(result.message, result.ok ? undefined : { kind: "error" });
+        return;
+      }
+
+      if (query.startsWith("/plan remove ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session) {
+          await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+          return;
+        }
+        const selector = query.slice("/plan remove ".length).trim();
+        if (!selector) {
+          await this.pushSystemMessage("Usage: /plan remove <step-id|index>", { kind: "error" });
+          return;
+        }
+        const target = this.findExecutionPlanStep(session.executionPlan, selector);
+        if (!target) {
+          await this.pushSystemMessage("Plan step not found.", { kind: "error" });
+          return;
+        }
+        await this.updateExecutionPlanWith(session, plan => ({
+          ...this.clearPlanAcceptance(plan),
+          capturedAt: new Date().toISOString(),
+          steps: plan.steps.filter(step => step.id !== target.id),
+        }));
+        await this.pushSystemMessage(`Removed plan step ${target.id}.`);
+        return;
+      }
+
+      if (query.startsWith("/plan summary ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session) {
+          await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+          return;
+        }
+        const value = query.slice("/plan summary ".length).trim();
+        if (!value || !session.executionPlan) {
+          await this.pushSystemMessage("Usage: /plan summary <text>", { kind: "error" });
+          return;
+        }
+        await this.updateExecutionPlanWith(session, plan => ({
+          ...this.clearPlanAcceptance(plan),
+          capturedAt: new Date().toISOString(),
+          summary: value,
+        }));
+        await this.pushSystemMessage("Execution plan summary updated.");
+        return;
+      }
+
+      if (query.startsWith("/plan objective ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session) {
+          await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
+          return;
+        }
+        const value = query.slice("/plan objective ".length).trim();
+        if (!value || !session.executionPlan) {
+          await this.pushSystemMessage("Usage: /plan objective <text>", { kind: "error" });
+          return;
+        }
+        await this.updateExecutionPlanWith(session, plan => ({
+          ...this.clearPlanAcceptance(plan),
+          capturedAt: new Date().toISOString(),
+          objective: value,
+        }));
+        await this.pushSystemMessage("Execution plan objective updated.");
+        return;
+      }
+
+      if (query.startsWith("/plan add ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan. Use /plan create <task> first.", {
+            kind: "error",
+          });
+          return;
+        }
+        const draft = this.parsePlanStepDraft(query.slice("/plan add ".length));
+        if (!draft?.title) {
+          await this.pushSystemMessage("Usage: /plan add <title> [:: details]", { kind: "error" });
+          return;
+        }
+        const nextId = `step-${session.executionPlan.steps.length + 1}`;
+        await this.updateExecutionPlanWith(session, plan => ({
+          ...this.clearPlanAcceptance(plan),
+          capturedAt: new Date().toISOString(),
+          steps: [
+            ...plan.steps,
+            {
+              id: nextId,
+              title: draft.title,
+              details: draft.details,
+              status: "pending",
+              evidence: [],
+              filePaths: [],
+              recentToolResult: "",
+            },
+          ],
+        }));
+        await this.pushSystemMessage(`Added plan step ${nextId}.`);
+        return;
+      }
+
+      if (query.startsWith("/plan update ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan. Use /plan create <task> first.", {
+            kind: "error",
+          });
+          return;
+        }
+        const raw = query.slice("/plan update ".length).trim();
+        const firstSpace = raw.indexOf(" ");
+        const selector = firstSpace < 0 ? "" : raw.slice(0, firstSpace).trim();
+        const draft = firstSpace < 0 ? null : this.parsePlanStepDraft(raw.slice(firstSpace + 1));
+        if (!selector || !draft?.title) {
+          await this.pushSystemMessage("Usage: /plan update <step-id|index> <title> [:: details]", {
+            kind: "error",
+          });
+          return;
+        }
+        const target = this.findExecutionPlanStep(session.executionPlan, selector);
+        if (!target) {
+          await this.pushSystemMessage("Plan step not found.", { kind: "error" });
+          return;
+        }
+        await this.updateExecutionPlanWith(session, plan => ({
+          ...this.clearPlanAcceptance(plan),
+          capturedAt: new Date().toISOString(),
+          steps: plan.steps.map(step =>
+            step.id === target.id
+              ? {
+                  ...step,
+                  title: draft.title,
+                  details: draft.details,
+                }
+              : step
+          ),
+        }));
+        await this.pushSystemMessage(`Updated plan step ${target.id}.`);
+        return;
+      }
+
+      if (query.startsWith("/plan revise ")) {
+        const session = this.activeSessionId
+          ? await this.sessionStore!.loadSession(this.activeSessionId)
+          : null;
+        const instruction = query.slice("/plan revise ".length).trim();
+        if (!session?.executionPlan) {
+          await this.pushSystemMessage("No active execution plan. Use /plan create <task> first.", {
+            kind: "error",
+          });
+          return;
+        }
+        if (!instruction) {
+          await this.pushSystemMessage("Usage: /plan revise <instruction>", { kind: "error" });
+          return;
+        }
+        await this.submitPrepared({
+          userText: `/plan revise ${instruction}`,
+          promptText: this.buildPlanRevisionPrompt(session.executionPlan, instruction),
+          originalTask: session.executionPlan.objective || instruction,
+        });
+        return;
+      }
+
+      if (query === "/plan" || query === "/plan create") {
+        await this.pushSystemMessage("Usage: /plan create <task>", { kind: "error" });
+        return;
+      }
+
+      if (!query.startsWith("/plan create ")) {
+        await this.pushSystemMessage(
+          "Unknown /plan subcommand. Use /plan create, revise, summary, objective, add, update, remove, status, run, done, accept, reopen, show, or clear.",
+          { kind: "error" }
+        );
+        return;
+      }
+
+      const rawTask = query.slice("/plan create ".length).trim();
+      const session = this.activeSessionId
+        ? await this.sessionStore!.loadSession(this.activeSessionId)
+        : null;
+      const task =
+        rawTask ||
+        session?.executionPlan?.objective ||
+        this.findLatestMeaningfulUserTask(session) ||
+        "";
+      if (!task) {
+        await this.pushSystemMessage(
+          "Usage: /plan create <task>. No prior actionable task was found in this session.",
+          { kind: "error" }
+        );
+        return;
+      }
+      await this.submitPrepared({
+        userText: `/plan create ${rawTask}`,
+        promptText: this.buildPlanCreationPrompt(task, session?.executionPlan ?? null),
+        originalTask: task,
+      });
       return;
     }
 
@@ -1270,12 +1984,12 @@ class BubbleTeaBridge {
             kind: message.role === "system" ? "system_hint" : "transcript",
             text:
               message.role === "assistant"
-                ? parseAssistantStateUpdate(message.text).visibleText
+                ? this.extractVisibleAssistantText(message.text)
                 : message.text,
           }))
         : [DEFAULT_EMPTY_STATE];
     this.liveText = record.inFlightTurn
-      ? parseAssistantStateUpdate(record.inFlightTurn.assistantText).visibleText
+      ? this.extractVisibleAssistantText(record.inFlightTurn.assistantText)
       : "";
   }
 
@@ -1302,6 +2016,7 @@ class BubbleTeaBridge {
 
     this.activeSessionId = record.id;
     this.suspended = null;
+    this.executionPlan = record.executionPlan;
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     this.hydrateTranscript(record);
@@ -1328,6 +2043,7 @@ class BubbleTeaBridge {
     this.activeSessionId = created.id;
     this.items = [DEFAULT_EMPTY_STATE];
     this.liveText = "";
+    this.executionPlan = created.executionPlan;
     await this.refreshSessions();
     return created;
   }
@@ -1348,6 +2064,7 @@ class BubbleTeaBridge {
     this.suspended = null;
     this.items = [DEFAULT_EMPTY_STATE];
     this.liveText = "";
+    this.executionPlan = created.executionPlan;
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
@@ -1357,8 +2074,21 @@ class BubbleTeaBridge {
   }
 
   private async submit(rawText: string) {
-    const text = rawText.trim();
-    if (!text) {
+    await this.submitPrepared({
+      userText: rawText,
+      promptText: rawText,
+      originalTask: rawText,
+    });
+  }
+
+  private async submitPrepared(input: {
+    userText: string;
+    promptText: string;
+    originalTask?: string;
+  }) {
+    const userText = input.userText.trim();
+    const promptText = input.promptText.trim();
+    if (!userText || !promptText) {
       return;
     }
     if (this.status === "requesting" || this.status === "streaming") {
@@ -1371,20 +2101,20 @@ class BubbleTeaBridge {
     }
 
     await this.ensureRuntime();
-    const session = await this.ensureActiveSession(text);
-    const promptContext = await this.sessionStore!.getPromptContext(session.id, text);
+    const session = await this.ensureActiveSession(userText);
+    const promptContext = await this.sessionStore!.getPromptContext(session.id, promptText);
     const manualSkillIds = this.getSessionSkillUseIds(session.id);
-    const selectedExtensions = this.extensionManager?.resolveForQuery(text, {
+    const selectedExtensions = this.extensionManager?.resolveForQuery(promptText, {
       manualSkillIds,
     });
     const activeSkills =
       selectedExtensions?.skills.map(entry => entry.item) ??
       [
         ...this.resolveSessionSkillUseDefinitions(session.id),
-        ...(this.skillsRuntime?.resolveForQuery(text) ?? []),
+        ...(this.skillsRuntime?.resolveForQuery(promptText) ?? []),
       ].filter((skill, index, all) => all.findIndex(item => item.id === skill.id) === index);
     const prompt = buildPromptWithContext(
-      text,
+      promptText,
       this.runtimeSystemPrompt,
       this.promptPolicy!.projectPrompt,
       promptContext,
@@ -1408,11 +2138,11 @@ class BubbleTeaBridge {
     const startedAt = new Date().toISOString();
     await this.sessionStore!.appendMessage(session.id, {
       role: "user",
-      text,
+      text: userText,
       createdAt: startedAt,
     });
     await this.sessionStore!.updateInFlightTurn(session.id, {
-      userText: text,
+      userText,
       assistantText: "",
       startedAt,
       updatedAt: startedAt,
@@ -1423,7 +2153,7 @@ class BubbleTeaBridge {
     this.suspended = null;
     this.status = "preparing";
     this.emitStatus();
-    this.pushItem({ role: "user", kind: "transcript", text });
+    this.pushItem({ role: "user", kind: "transcript", text: userText });
     await this.refreshSessions();
     await this.refreshRuntimeMetadata();
 
@@ -1431,7 +2161,7 @@ class BubbleTeaBridge {
     try {
       const result = await runQuerySession({
         query: prompt,
-        originalTask: text,
+        originalTask: input.originalTask?.trim() || userText,
         queryMaxToolSteps: this.config!.queryMaxToolSteps,
         transport: this.transport!,
         onState: next => {
@@ -1443,7 +2173,7 @@ class BubbleTeaBridge {
         },
         onTextDelta: delta => {
           assistantBufferRef.current += delta;
-          this.liveText = parseAssistantStateUpdate(assistantBufferRef.current).visibleText;
+          this.liveText = this.extractVisibleAssistantText(assistantBufferRef.current);
           this.status = "streaming";
           this.emitStatus();
           this.emitLiveText();
@@ -1472,6 +2202,13 @@ class BubbleTeaBridge {
             this.status = "awaiting_review";
             this.emitPendingReviews();
             this.emitStatus();
+            await this.recordExecutionPlanToolActivity({
+              sessionId: session.id,
+              toolName,
+              toolInput: input,
+              message: `Approval required ${pending.id} | ${detail}`,
+              pending: true,
+            });
             return {
               message: `Approval required ${pending.id} | ${detail}`,
               reviewMode: "block" as const,
@@ -1483,6 +2220,12 @@ class BubbleTeaBridge {
             role: "system",
             kind: result.ok ? formatted.kind : "error",
             text: formatted.text,
+          });
+          await this.recordExecutionPlanToolActivity({
+            sessionId: session.id,
+            toolName,
+            toolInput: input,
+            message: result.message,
           });
           return { message: result.message };
         },
@@ -1499,7 +2242,7 @@ class BubbleTeaBridge {
 
       await this.consumeRunResult({
         sessionId: session.id,
-        userText: text,
+        userText,
         startedAt,
         assistantBufferRef,
         result,
@@ -1565,7 +2308,8 @@ class BubbleTeaBridge {
   }
 
   private async applyAssistantStateUpdate(sessionId: string, rawAssistantText: string) {
-    const parsed = parseAssistantStateUpdate(rawAssistantText);
+    const parsedPlan = parseAssistantPlanUpdate(rawAssistantText);
+    const parsed = parseAssistantStateUpdate(parsedPlan.visibleText);
     const visibleAssistantText = parsed.visibleText.trim();
     const updatedAt = new Date().toISOString();
     const nextPendingChoice = extractPendingChoiceFromAssistantText(
@@ -1580,6 +2324,17 @@ class BubbleTeaBridge {
         text: visibleAssistantText,
         createdAt: updatedAt,
       });
+    }
+
+    if (parsedPlan.plan) {
+      const updatedPlanSession = await this.sessionStore!.updateExecutionPlan(sessionId, {
+        ...parsedPlan.plan,
+        capturedAt: updatedAt,
+      });
+      if (this.activeSessionId === sessionId) {
+        this.executionPlan = updatedPlanSession.executionPlan;
+        this.emitExecutionPlan();
+      }
     }
 
     const latest = await this.sessionStore!.loadSession(sessionId);

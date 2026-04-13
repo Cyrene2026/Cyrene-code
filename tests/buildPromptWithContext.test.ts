@@ -39,6 +39,34 @@ describe("buildPromptWithContext", () => {
         "REMAINING:",
         "- verify approval flow",
       ].join("\n"),
+      executionPlan: {
+        capturedAt: "2026-01-01T00:00:00.000Z",
+        sourcePreview: "finish oauth follow-up",
+        summary: "Close the oauth follow-up cleanly",
+        objective: "finish oauth follow-up",
+        acceptedAt: "",
+        acceptedSummary: "",
+        steps: [
+          {
+            id: "step-1",
+            title: "verify approval flow",
+            details: "confirm approval UI still works",
+            status: "in_progress",
+            evidence: ["Tool review_status: approval preview inspected"],
+            filePaths: ["src/app.ts"],
+            recentToolResult: "Reviewed src/app.ts",
+          },
+          {
+            id: "step-2",
+            title: "finalize oauth notes",
+            details: "capture remaining polish",
+            status: "pending",
+            evidence: [],
+            filePaths: [],
+            recentToolResult: "",
+          },
+        ],
+      },
       latestActionableUserMessage: "finish the oauth follow-up without reopening old files",
       summaryFallback: "",
       reducerMode: "merge_and_digest",
@@ -47,6 +75,8 @@ describe("buildPromptWithContext", () => {
     });
 
     expect(prompt).toContain("TASK STATE CONTEXT:");
+    expect(prompt).toContain("Active execution plan:");
+    expect(prompt).toContain("1. [in_progress] verify approval flow");
     expect(prompt).toContain("Working state (durable reducer):");
     expect(prompt).toContain("OBJECTIVE:\n- finish oauth follow-up");
     expect(prompt).toContain("Pending turn digest (last completed turn not yet merged):");
@@ -95,6 +125,7 @@ describe("buildPromptWithContext", () => {
       latestActionableUserMessage: "continue oauth",
       durableSummary: "",
       pendingDigest: "",
+      executionPlan: null,
       summaryFallback: [
         "OBJECTIVE:",
         "- continue oauth work",
@@ -155,6 +186,7 @@ describe("buildPromptWithContext", () => {
         "REMAINING:",
         "- verify rename preview",
       ].join("\n"),
+      executionPlan: null,
       summaryFallback: "",
       reducerMode: "merge_and_digest",
       summaryRecoveryNeeded: false,
@@ -188,6 +220,7 @@ describe("buildPromptWithContext", () => {
         latestActionableUserMessage: "",
         durableSummary: "",
         pendingDigest: "",
+        executionPlan: null,
         summaryFallback: "",
         reducerMode: "merge_and_digest",
         summaryRecoveryNeeded: false,

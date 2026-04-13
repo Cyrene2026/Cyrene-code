@@ -677,4 +677,60 @@ describe("session memory index", () => {
 
     await expect(stat(unexpectedPath)).rejects.toBeTruthy();
   });
+
+  test("prompt context carries execution plan and linked working state", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("plan task");
+    await store.appendMessage(session.id, {
+      role: "user",
+      text: "refactor the reducer flow",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    await store.updateExecutionPlan(session.id, {
+      capturedAt: "2026-01-01T00:00:05.000Z",
+      sourcePreview: "refactor the reducer flow",
+      summary: "Refactor the reducer flow in three steps",
+      objective: "refactor the reducer flow",
+      acceptedAt: "",
+      acceptedSummary: "",
+      steps: [
+        {
+          id: "step-1",
+          title: "inspect reducer entry points",
+          details: "",
+          status: "completed",
+          evidence: [],
+          filePaths: ["src/core/session/stateReducer.ts"],
+          recentToolResult: "Read state reducer",
+        },
+        {
+          id: "step-2",
+          title: "patch reducer transitions",
+          details: "",
+          status: "in_progress",
+          evidence: [],
+          filePaths: ["src/core/session/stateReducer.ts"],
+          recentToolResult: "",
+        },
+        {
+          id: "step-3",
+          title: "run reducer tests",
+          details: "",
+          status: "pending",
+          evidence: [],
+          filePaths: ["tests/stateReducer.test.ts"],
+          recentToolResult: "",
+        },
+      ],
+    });
+
+    const context = await store.getPromptContext(session.id, "continue");
+    expect(context.executionPlan?.steps).toHaveLength(3);
+    expect(context.executionPlan?.steps[1]?.title).toBe("patch reducer transitions");
+    expect(context.durableSummary).toContain("OBJECTIVE:\n- refactor the reducer flow");
+    expect(context.pendingDigest).toContain(
+      "NEXT BEST ACTIONS:\n- Continue with active plan step: patch reducer transitions"
+    );
+  });
 });

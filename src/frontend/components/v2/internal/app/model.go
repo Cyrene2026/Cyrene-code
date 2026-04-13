@@ -36,6 +36,7 @@ const (
 
 	PanelNone      Panel = "none"
 	PanelApprovals Panel = "approvals"
+	PanelPlans     Panel = "plans"
 	PanelSessions  Panel = "sessions"
 	PanelModels    Panel = "models"
 	PanelProviders Panel = "providers"
@@ -44,11 +45,11 @@ const (
 	ApprovalSummary ApprovalPreviewMode = "summary"
 	ApprovalFull    ApprovalPreviewMode = "full"
 
-	AuthStepProvider AuthStep = "provider"
+	AuthStepProvider     AuthStep = "provider"
 	AuthStepProviderType AuthStep = "provider_type"
-	AuthStepAPIKey   AuthStep = "api_key"
-	AuthStepModel    AuthStep = "model"
-	AuthStepConfirm  AuthStep = "confirm"
+	AuthStepAPIKey       AuthStep = "api_key"
+	AuthStepModel        AuthStep = "model"
+	AuthStepConfirm      AuthStep = "confirm"
 
 	scrollStep               = 8
 	approvalQueuePageSize    = 5
@@ -90,6 +91,20 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/system <text>", Description: "set system prompt for this runtime"},
 	{Command: "/system reset", Description: "restore default system prompt"},
 	{Command: "/state", Description: "show reducer/session state diagnostics"},
+	{Command: "/plan create <task>", Description: "create or refresh an execution plan"},
+	{Command: "/plan revise <instruction>", Description: "ask AI to revise the active execution plan"},
+	{Command: "/plan show", Description: "show the active execution plan"},
+	{Command: "/plan summary <text>", Description: "manually set plan summary"},
+	{Command: "/plan objective <text>", Description: "manually set plan objective"},
+	{Command: "/plan add <title> [:: details]", Description: "manually add a plan step"},
+	{Command: "/plan update <step> <title> [:: details]", Description: "manually edit one plan step"},
+	{Command: "/plan remove <step>", Description: "remove one plan step"},
+	{Command: "/plan status <step> <pending|in_progress|completed|blocked>", Description: "manually set one plan step status"},
+	{Command: "/plan run [step]", Description: "execute the next or selected plan step"},
+	{Command: "/plan done <step>", Description: "mark one plan step completed"},
+	{Command: "/plan accept [notes]", Description: "accept the current execution plan"},
+	{Command: "/plan reopen", Description: "reopen an accepted plan for more work"},
+	{Command: "/plan clear", Description: "clear the active execution plan"},
 	{Command: "/sessions", Description: "open sessions panel"},
 	{Command: "/resume", Description: "open session resume picker"},
 	{Command: "/resume <id>", Description: "resume a session by id"},
@@ -163,38 +178,72 @@ type Message struct {
 	Text string `json:"text"`
 }
 
+type ExecutionPlanStep struct {
+	ID               string
+	Title            string
+	Details          string
+	Status           string
+	Evidence         []string
+	FilePaths        []string
+	RecentToolResult string
+}
+
+type ExecutionPlan struct {
+	CapturedAt      string
+	SourcePreview   string
+	Summary         string
+	Objective       string
+	AcceptedAt      string
+	AcceptedSummary string
+	Steps           []ExecutionPlanStep
+}
+
+type transcriptMessageCacheEntry struct {
+	width   int
+	message Message
+	lines   []string
+}
+
 type Model struct {
-	Width                  int
-	Height                 int
-	Status                 Status
-	Items                  []Message
-	LiveText               string
-	Input                  []rune
-	Cursor                 int
-	TranscriptOffset       int
-	ShouldQuit             bool
-	BridgeReady            bool
-	Notice                 string
-	NoticeIsError          bool
-	MouseCapture           bool
-	SpinnerFrame           int
-	spinnerTickPending     bool
-	QuitWithSummary        bool
-	transcriptCacheWidth   int
-	transcriptCacheVersion int
-	transcriptCacheLines   []string
-	transcriptVersion      int
+	Width                      int
+	Height                     int
+	Status                     Status
+	Items                      []Message
+	LiveText                   string
+	Input                      []rune
+	Cursor                     int
+	TranscriptOffset           int
+	ShouldQuit                 bool
+	BridgeReady                bool
+	Notice                     string
+	NoticeIsError              bool
+	MouseCapture               bool
+	SpinnerFrame               int
+	spinnerTickPending         bool
+	QuitWithSummary            bool
+	transcriptCacheWidth       int
+	transcriptCacheVersion     int
+	transcriptCacheLines       []string
+	transcriptStaticCacheWidth int
+	transcriptStaticCacheLines []string
+	transcriptLiveCacheWidth   int
+	transcriptLiveCacheText    string
+	transcriptLiveCacheLines   []string
+	transcriptMessageCache     []transcriptMessageCacheEntry
+	transcriptVersion          int
 
 	ActivePanel Panel
 
 	ApprovalIndex         int
 	ApprovalPreview       ApprovalPreviewMode
 	ApprovalPreviewOffset int
+	PlanIndex             int
 	SessionIndex          int
 	ModelIndex            int
 	ProviderIndex         int
 
 	ActiveSessionID          string
+	ExecutionPlan            ExecutionPlan
 	Sessions                 []BridgeSession
 	PendingReviews           []BridgeReview
 	AvailableModels          []string
@@ -357,7 +406,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.BridgeReady = true
 		if m.LiveText != event.LiveText {
 			m.LiveText = event.LiveText
-			m.invalidateTranscriptCache()
+			m.invalidateTranscriptRenderCache()
 			m.clampTranscriptOffset()
 		}
 	case "append_items":
@@ -367,8 +416,10 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		}
 		if isDefaultEmptyState(m.Items) {
 			m.Items = cloneMessages(event.Items)
+			m.resetTranscriptMessageCache()
 		} else {
 			m.Items = append(m.Items, event.Items...)
+			m.extendTranscriptMessageCache(len(event.Items))
 		}
 		m.invalidateTranscriptCache()
 		m.clampTranscriptOffset()
@@ -378,6 +429,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		if len(m.Items) == 0 {
 			m.Items = []Message{}
 		}
+		m.resetTranscriptMessageCache()
 		m.invalidateTranscriptCache()
 		m.clampTranscriptOffset()
 	case "set_sessions":
@@ -389,6 +441,10 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.BridgeReady = true
 		m.PendingReviews = cloneReviews(event.PendingReviews)
 		m.normalizePendingReviewsState()
+	case "set_execution_plan":
+		m.BridgeReady = true
+		m.ExecutionPlan = cloneExecutionPlan(event.ExecutionPlan)
+		m.normalizeExecutionPlanState()
 	case "set_runtime_metadata":
 		m.BridgeReady = true
 		m.applyRuntimeMetadata(event)
@@ -471,6 +527,8 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.BridgeReady = true
 	m.Items = cloneMessages(snapshot.Items)
 	m.LiveText = snapshot.LiveText
+	m.ExecutionPlan = cloneExecutionPlan(snapshot.ExecutionPlan)
+	m.resetTranscriptMessageCache()
 	m.PendingReviews = cloneReviews(snapshot.PendingReviews)
 	m.Sessions = cloneSessions(snapshot.Sessions)
 	m.ActiveSessionID = snapshot.ActiveSessionID
@@ -523,6 +581,7 @@ func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
 
 func (m *Model) normalizeBridgeSelections() {
 	m.normalizePendingReviewsState()
+	m.normalizeExecutionPlanState()
 	m.normalizeRuntimeMetadataState()
 	m.SessionIndex = clampInt(findSelectionIndex(m.Sessions, m.ActiveSessionID, m.SessionIndex), 0, maxInt(0, len(m.Sessions)-1))
 	m.clampTranscriptOffset()
@@ -534,6 +593,10 @@ func (m *Model) normalizePendingReviewsState() {
 	if len(m.PendingReviews) == 0 && m.ActivePanel == PanelApprovals {
 		m.ActivePanel = PanelNone
 	}
+}
+
+func (m *Model) normalizeExecutionPlanState() {
+	m.PlanIndex = clampInt(m.PlanIndex, 0, maxInt(0, len(m.ExecutionPlan.Steps)-1))
 }
 
 func (m *Model) normalizeRuntimeMetadataState() {
@@ -696,6 +759,10 @@ func (m *Model) handleWheelScroll(direction int) {
 	switch m.ActivePanel {
 	case PanelApprovals:
 		m.scrollApprovalPreview(direction * scrollStep)
+	case PanelPlans:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), direction)
+		}
 	case PanelSessions:
 		if len(m.Sessions) > 0 {
 			m.SessionIndex = cycleIndex(m.SessionIndex, len(m.Sessions), direction)
@@ -777,6 +844,13 @@ func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	m.LastClickAt = now
 
 	switch m.ActivePanel {
+	case PanelPlans:
+		m.PlanIndex = index
+		if doubleClick && index >= 0 && index < len(m.ExecutionPlan.Steps) {
+			m.Status = StatusPreparing
+			m.setNotice("Running selected execution plan step...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: fmt.Sprintf("/plan run %d", index+1)})
+		}
 	case PanelSessions:
 		m.SessionIndex = index
 		if doubleClick && index >= 0 && index < len(m.Sessions) {
@@ -817,6 +891,10 @@ func (m *Model) panelListIndexAtMouse(mouseX, mouseY int) (int, bool) {
 	}
 
 	switch m.ActivePanel {
+	case PanelPlans:
+		bodyWidth := framedInnerWidth(panelBoxStyle, panelWidth)
+		dataStartLine := 2 + planPanelOverviewRows(bodyWidth, m.ExecutionPlan)
+		return listIndexAtPanelLine(len(m.ExecutionPlan.Steps), m.PlanIndex, m.planPanelPageSize(), innerY, dataStartLine)
 	case PanelSessions:
 		return listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSize(), innerY, 2)
 	case PanelModels:
@@ -915,6 +993,31 @@ func (m *Model) providerPanelPageSizeForDimensions(width, height int) int {
 	return dynamicPanelPageSize(bodyHeight, 10+providerPanelCommandRows(bodyWidth), 3)
 }
 
+func (m *Model) planPanelPageSize() int {
+	_, _, panelWidth, panelHeight, ok := m.activePanelRect()
+	if !ok {
+		return 1
+	}
+	return m.planPanelPageSizeForDimensions(panelWidth, panelHeight)
+}
+
+func (m *Model) planPanelPageSizeForDimensions(width, height int) int {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	return dynamicPanelPageSize(bodyHeight, 12+planPanelOverviewRows(bodyWidth, m.ExecutionPlan), 2)
+}
+
+func planPanelOverviewRows(bodyWidth int, plan ExecutionPlan) int {
+	rows := 0
+	if strings.TrimSpace(plan.Summary) != "" {
+		rows += len(wrapPlainText(plan.Summary, bodyWidth))
+	}
+	if strings.TrimSpace(plan.Objective) != "" {
+		rows += len(wrapPlainText("objective "+plan.Objective, bodyWidth))
+	}
+	return rows
+}
+
 func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
 	if rowsPerItem <= 0 {
 		return 1
@@ -960,6 +1063,8 @@ func (m *Model) handlePanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.ActivePanel {
 	case PanelApprovals:
 		return m.handleApprovalKey(msg)
+	case PanelPlans:
+		return m.handlePlanKey(msg)
 	case PanelSessions:
 		return m.handleSessionKey(msg)
 	case PanelModels:
@@ -1036,6 +1141,67 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "k":
 			m.scrollApprovalPreview(-approvalPreviewPageLines)
 			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) handlePlanKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyUp:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), -1)
+		}
+		return m, nil
+	case tea.KeyDown:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), 1)
+		}
+		return m, nil
+	case tea.KeyLeft:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = movePagedSelection(m.PlanIndex, len(m.ExecutionPlan.Steps), m.planPanelPageSize(), "left")
+		}
+		return m, nil
+	case tea.KeyRight:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = movePagedSelection(m.PlanIndex, len(m.ExecutionPlan.Steps), m.planPanelPageSize(), "right")
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if len(m.ExecutionPlan.Steps) == 0 {
+			return m, nil
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Running selected execution plan step...", false)
+		return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: fmt.Sprintf("/plan run %d", m.PlanIndex+1)})
+	case tea.KeyRunes:
+		if len(msg.Runes) != 1 {
+			return m, nil
+		}
+		switch strings.ToLower(string(msg.Runes)) {
+		case "r":
+			if len(m.ExecutionPlan.Steps) == 0 {
+				return m, nil
+			}
+			m.Status = StatusPreparing
+			m.setNotice("Running selected execution plan step...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: fmt.Sprintf("/plan run %d", m.PlanIndex+1)})
+		case "d":
+			if len(m.ExecutionPlan.Steps) == 0 {
+				return m, nil
+			}
+			m.Status = StatusPreparing
+			m.setNotice("Marking selected plan step completed...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: fmt.Sprintf("/plan done %d", m.PlanIndex+1)})
+		case "c":
+			m.Status = StatusPreparing
+			m.setNotice("Clearing execution plan...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: "/plan clear"})
+		case "a":
+			m.Status = StatusPreparing
+			m.setNotice("Accepting execution plan...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: "/plan accept"})
 		}
 	}
 	return m, nil
@@ -1341,6 +1507,7 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 	case query == "/clear":
 		m.Items = []Message{}
 		m.LiveText = ""
+		m.resetTranscriptMessageCache()
 		m.invalidateTranscriptCache()
 		m.TranscriptOffset = 0
 		m.setNotice("Transcript cleared.", false)
@@ -1349,6 +1516,96 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Creating a new session...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "new_session"})
+	case query == "/plan show":
+		m.ActivePanel = PanelPlans
+		m.setNotice("Plan panel opened.", false)
+		return true, nil
+	case query == "/plan", query == "/plan create":
+		m.ActivePanel = PanelPlans
+		m.setNotice("Usage: /plan create <task>", true)
+		return true, nil
+	case query == "/plan clear":
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Clearing execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case query == "/plan reopen":
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Reopening execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case query == "/plan run":
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Running next execution plan step...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case query == "/plan done":
+		m.setNotice("Usage: /plan done <step-id|index>", true)
+		return true, nil
+	case strings.HasPrefix(query, "/plan done "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Marking plan step completed...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan run "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Running selected execution plan step...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan create "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Building execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan revise "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Revising execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan summary "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Updating plan summary...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan objective "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Updating plan objective...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan add "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Adding plan step...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan update "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Updating plan step...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan remove "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Removing plan step...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan status "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Updating plan step status...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case query == "/plan accept":
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Accepting execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan accept "):
+		m.ActivePanel = PanelPlans
+		m.Status = StatusPreparing
+		m.setNotice("Accepting execution plan...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
+	case strings.HasPrefix(query, "/plan "):
+		m.ActivePanel = PanelPlans
+		m.setNotice("Unknown /plan subcommand. Use /plan create, revise, summary, objective, add, update, remove, status, run, done, accept, reopen, show, or clear.", true)
+		return true, nil
 	case query == "/sessions" || query == "/resume":
 		m.ActivePanel = PanelSessions
 		m.setNotice("Sessions panel opened.", false)
@@ -1904,9 +2161,29 @@ func (m *Model) shouldSuppressPaste(values []rune) bool {
 
 func (m *Model) invalidateTranscriptCache() {
 	m.transcriptVersion++
+	m.invalidateTranscriptRenderCache()
+	m.transcriptStaticCacheWidth = 0
+	m.transcriptStaticCacheLines = nil
+}
+
+func (m *Model) invalidateTranscriptRenderCache() {
 	m.transcriptCacheWidth = 0
 	m.transcriptCacheVersion = 0
 	m.transcriptCacheLines = nil
+	m.transcriptLiveCacheWidth = 0
+	m.transcriptLiveCacheText = ""
+	m.transcriptLiveCacheLines = nil
+}
+
+func (m *Model) resetTranscriptMessageCache() {
+	m.transcriptMessageCache = nil
+}
+
+func (m *Model) extendTranscriptMessageCache(count int) {
+	if count <= 0 {
+		return
+	}
+	m.transcriptMessageCache = append(m.transcriptMessageCache, make([]transcriptMessageCacheEntry, count)...)
 }
 
 func (m *Model) insertRunes(values []rune) {
@@ -2047,6 +2324,36 @@ func cloneSessions(items []BridgeSession) []BridgeSession {
 			continue
 		}
 		cloned[index].Tags = append([]string(nil), items[index].Tags...)
+	}
+	return cloned
+}
+
+func cloneExecutionPlan(plan *BridgeExecutionPlan) ExecutionPlan {
+	if plan == nil {
+		return ExecutionPlan{}
+	}
+	cloned := ExecutionPlan{
+		CapturedAt:      plan.CapturedAt,
+		SourcePreview:   plan.SourcePreview,
+		Summary:         plan.Summary,
+		Objective:       plan.Objective,
+		AcceptedAt:      plan.AcceptedAt,
+		AcceptedSummary: plan.AcceptedSummary,
+	}
+	if len(plan.Steps) == 0 {
+		return cloned
+	}
+	cloned.Steps = make([]ExecutionPlanStep, len(plan.Steps))
+	for index, step := range plan.Steps {
+		cloned.Steps[index] = ExecutionPlanStep{
+			ID:               step.ID,
+			Title:            step.Title,
+			Details:          step.Details,
+			Status:           step.Status,
+			Evidence:         append([]string(nil), step.Evidence...),
+			FilePaths:        append([]string(nil), step.FilePaths...),
+			RecentToolResult: step.RecentToolResult,
+		}
 	}
 	return cloned
 }
@@ -2329,6 +2636,24 @@ func slashInsertValue(command string) string {
 		return "/system "
 	case "/resume <id>", "/load <id>":
 		return "/resume "
+	case "/plan create <task>":
+		return "/plan create "
+	case "/plan revise <instruction>":
+		return "/plan revise "
+	case "/plan summary <text>":
+		return "/plan summary "
+	case "/plan objective <text>":
+		return "/plan objective "
+	case "/plan add <title> [:: details]":
+		return "/plan add "
+	case "/plan update <step> <title> [:: details]":
+		return "/plan update "
+	case "/plan remove <step>":
+		return "/plan remove "
+	case "/plan status <step> <pending|in_progress|completed|blocked>":
+		return "/plan status "
+	case "/plan accept [notes]":
+		return "/plan accept "
 	case "/search-session <query>":
 		return "/search-session "
 	case "/search-session #<tag> [query]":

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import {
   applyParsedStateUpdate,
   buildFallbackPendingDigest,
@@ -296,6 +296,67 @@ describe("stateReducer", () => {
 
     expect(parsed.visibleText).toBe(raw);
     expect(parsed.hasStateTag).toBe(false);
+    expect(parsed.parseStatus).toBe("missing_tag");
+  });
+
+  test("parseAssistantStateUpdate invokes incomplete-tag callback for unterminated state blocks", () => {
+    const raw = [
+      "Visible answer",
+      CYRENE_STATE_UPDATE_START_TAG,
+      '{"version":1,"mode":"digest_only"',
+    ].join("\n");
+    const onIncompleteTag = mock(() => {});
+
+    const parsed = parseAssistantStateUpdate(raw, { onIncompleteTag });
+
+    expect(parsed.parseStatus).toBe("incomplete_tag");
+    expect(onIncompleteTag).toHaveBeenCalledTimes(1);
+    expect(onIncompleteTag).toHaveBeenCalledWith({
+      rawAssistantText: raw,
+      visibleText: "Visible answer",
+    });
+  });
+
+  test("parseAssistantStateUpdate trims trailing partial reducer tags during streaming", () => {
+    const visibleAnswer = "Visible answer";
+
+    for (let length = 1; length < CYRENE_STATE_UPDATE_START_TAG.length; length += 1) {
+      const raw = `${visibleAnswer}${CYRENE_STATE_UPDATE_START_TAG.slice(0, length)}`;
+      const parsed = parseAssistantStateUpdate(raw);
+
+      expect(parsed.visibleText).toBe(visibleAnswer);
+      expect(parsed.hasStateTag).toBe(false);
+      expect(parsed.isComplete).toBe(false);
+      expect(parsed.parseStatus).toBe("missing_tag");
+    }
+  });
+
+  test("parseAssistantStateUpdate treats truncated closing reducer tags as incomplete", () => {
+    const raw = [
+      "Visible answer",
+      `${CYRENE_STATE_UPDATE_START_TAG}{"version":1,"mode":"digest_only"}${CYRENE_STATE_UPDATE_END_TAG.slice(0, -3)}`,
+    ].join("\n");
+
+    const parsed = parseAssistantStateUpdate(raw);
+
+    expect(parsed.visibleText).toBe("Visible answer");
+    expect(parsed.hasStateTag).toBe(true);
+    expect(parsed.isComplete).toBe(false);
+    expect(parsed.parseStatus).toBe("incomplete_tag");
+  });
+
+  test("parseAssistantStateUpdate leaves damaged reducer tags visible when the start tag is corrupted", () => {
+    const corruptedStartTag = "<cyrene_state_updXte>";
+    const raw = [
+      "Visible answer",
+      `${corruptedStartTag}{"version":1,"mode":"digest_only"}${CYRENE_STATE_UPDATE_END_TAG}`,
+    ].join("\n");
+
+    const parsed = parseAssistantStateUpdate(raw);
+
+    expect(parsed.visibleText).toBe(raw);
+    expect(parsed.hasStateTag).toBe(false);
+    expect(parsed.isComplete).toBe(false);
     expect(parsed.parseStatus).toBe("missing_tag");
   });
 });

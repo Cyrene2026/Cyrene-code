@@ -45,6 +45,13 @@ export type ParsedAssistantStateUpdate = {
     | "valid";
 };
 
+type ParseAssistantStateUpdateOptions = {
+  onIncompleteTag?: (details: {
+    rawAssistantText: string;
+    visibleText: string;
+  }) => void;
+};
+
 type BuildReducerPromptOptions = {
   mode: ReducerMode;
   durableSummary: string;
@@ -1161,7 +1168,8 @@ export const buildStateReducerPrompt = ({
 };
 
 export const parseAssistantStateUpdate = (
-  rawAssistantText: string
+  rawAssistantText: string,
+  options: ParseAssistantStateUpdateOptions = {}
 ): ParsedAssistantStateUpdate => {
   const startIndex = findLastProtocolStateTagIndex(rawAssistantText);
   if (startIndex < 0) {
@@ -1182,6 +1190,10 @@ export const parseAssistantStateUpdate = (
   );
 
   if (endIndex < 0) {
+    options.onIncompleteTag?.({
+      rawAssistantText,
+      visibleText,
+    });
     return {
       visibleText,
       update: null,

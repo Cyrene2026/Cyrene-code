@@ -2473,10 +2473,23 @@ class BubbleTeaBridge {
     };
   }
 
+  private warnIncompleteStateUpdate(sessionId: string, rawAssistantText: string, visibleText: string) {
+    console.warn("parseAssistantStateUpdate returned incomplete_tag", {
+      sessionId,
+      assistantTextLength: rawAssistantText.length,
+      visibleTextLength: visibleText.trim().length,
+      trailingPreview: clipBridgeLine(rawAssistantText.slice(-240), 240),
+    });
+  }
+
   private async applyAssistantStateUpdate(sessionId: string, rawAssistantText: string) {
     const parsedPlan = parseAssistantPlanUpdate(rawAssistantText);
     const parsedSkill = parseAssistantSkillUpdate(parsedPlan.visibleText);
-    const parsed = parseAssistantStateUpdate(parsedSkill.visibleText);
+    const parsed = parseAssistantStateUpdate(parsedSkill.visibleText, {
+      onIncompleteTag: ({ rawAssistantText: stateText, visibleText }) => {
+        this.warnIncompleteStateUpdate(sessionId, stateText, visibleText);
+      },
+    });
     const visibleAssistantText = parsed.visibleText.trim();
     const updatedAt = new Date().toISOString();
     const nextPendingChoice = extractPendingChoiceFromAssistantText(

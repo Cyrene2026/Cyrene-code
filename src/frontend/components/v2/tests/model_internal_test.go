@@ -50,19 +50,31 @@ func TestSyncProcessAppRoot(t *testing.T) {
 }
 
 func TestListIndexAtPanelLine(t *testing.T) {
-	index, ok := app.ListIndexAtPanelLineForTest(8, 0, 4, 2, 2)
+	index, ok := app.ListIndexAtPanelLineForTest(8, 0, 4, 2, 2, 2)
 	if !ok || index != 0 {
 		t.Fatalf("expected first visible item, got ok=%t index=%d", ok, index)
 	}
 
-	index, ok = app.ListIndexAtPanelLineForTest(8, 0, 4, 5, 2)
+	index, ok = app.ListIndexAtPanelLineForTest(8, 0, 4, 2, 5, 2)
 	if !ok || index != 1 {
 		t.Fatalf("expected second visible item, got ok=%t index=%d", ok, index)
 	}
 
-	_, ok = app.ListIndexAtPanelLineForTest(8, 0, 4, 10, 2)
+	_, ok = app.ListIndexAtPanelLineForTest(8, 0, 4, 2, 10, 2)
 	if ok {
 		t.Fatalf("expected click outside visible item rows to be ignored")
+	}
+}
+
+func TestListIndexAtPanelLineSupportsThreeLineRows(t *testing.T) {
+	index, ok := app.ListIndexAtPanelLineForTest(8, 0, 4, 3, 4, 2)
+	if !ok || index != 0 {
+		t.Fatalf("expected first three-line item, got ok=%t index=%d", ok, index)
+	}
+
+	index, ok = app.ListIndexAtPanelLineForTest(8, 0, 4, 3, 7, 2)
+	if !ok || index != 1 {
+		t.Fatalf("expected second three-line item, got ok=%t index=%d", ok, index)
 	}
 }
 
@@ -103,11 +115,17 @@ func TestClampTranscriptOffsetPreventsOverscrollAccumulation(t *testing.T) {
 		{Role: "user", Kind: "transcript", Text: "nine"},
 		{Role: "assistant", Kind: "transcript", Text: "ten"},
 	}
+	x, y, ok := model.TranscriptMousePointForTest()
+	if !ok {
+		t.Fatalf("expected transcript mouse point")
+	}
 
 	for range 20 {
 		model.Update(tea.MouseMsg{
 			Button: tea.MouseButtonWheelUp,
 			Action: tea.MouseActionPress,
+			X:      x,
+			Y:      y,
 		})
 	}
 	maxOffset := model.TranscriptOffset
@@ -118,6 +136,8 @@ func TestClampTranscriptOffsetPreventsOverscrollAccumulation(t *testing.T) {
 	model.Update(tea.MouseMsg{
 		Button: tea.MouseButtonWheelDown,
 		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
 	})
 	if model.TranscriptOffset != max(0, maxOffset-8) {
 		t.Fatalf("expected single down scroll to reduce from clamped max offset, got %d from %d", model.TranscriptOffset, maxOffset)

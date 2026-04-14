@@ -19,8 +19,8 @@ func SyncProcessAppRootForTest(appRoot string) error {
 	return syncProcessAppRoot(appRoot)
 }
 
-func ListIndexAtPanelLineForTest(total, selected, pageSize, innerY, dataStartLine int) (int, bool) {
-	return listIndexAtPanelLine(total, selected, pageSize, innerY, dataStartLine)
+func ListIndexAtPanelLineForTest(total, selected, pageSize, rowsPerItem, innerY, dataStartLine int) (int, bool) {
+	return listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataStartLine)
 }
 
 func (m *Model) RenderTranscriptForTest(width, height int) string {

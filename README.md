@@ -235,6 +235,12 @@ entire transcript back into every prompt:
 2. **`pendingDigest`** - the most recent turn digest that has not been merged yet
 3. **memory index** - richer archived evidence that can be retrieved on demand
 
+Bubble Tea UI notes:
+
+- Mouse-aware wheel routing is enabled by default for the transcript and inspector panels.
+- Safe pickers such as sessions/models/providers support click-to-select and double-click to load or switch.
+- Press `F6` to temporarily hand mouse control back to the terminal for text selection and paste.
+
 This keeps prompts smaller while still preserving continuity. The durable summary
 is intentionally structured into sections such as:
 

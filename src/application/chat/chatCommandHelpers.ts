@@ -148,6 +148,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { command: "/unpin <index>", description: "remove a pin" },
   { command: "/skills", description: "show skills runtime summary" },
   { command: "/skills list", description: "list available skills" },
+  { command: "/skills create <task>", description: "ask AI to generate and save a new skill" },
   { command: "/skills show <id>", description: "show one skill details" },
   { command: "/skills enable <id>", description: "enable one skill in project config" },
   {
@@ -402,6 +403,8 @@ const getSlashInsertValue = (command: string) => {
       return "/skills enable ";
     case "/skills disable <id>":
       return "/skills disable ";
+    case "/skills create <task>":
+      return "/skills create ";
     case "/skills remove <id>":
       return "/skills remove ";
     case "/skills use <id>":

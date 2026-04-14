@@ -394,6 +394,23 @@ func renderPanelSummaryColumns(width int, values ...string) string {
 func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScrollState) {
 	allLines := m.renderTranscriptLines(width)
 	total := len(allLines)
+	if m.shouldShowStartupView() && m.TranscriptOffset == 0 {
+		end := minInt(total, height)
+		window := allLines[:end]
+		lines := make([]string, 0, height)
+		for _, line := range window {
+			lines = append(lines, fitDisplayWidth(line, width))
+		}
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
+		return lines, panelScrollState{
+			Offset:  0,
+			Visible: minInt(total, height),
+			Total:   total,
+		}
+	}
+
 	offset := clampInt(m.TranscriptOffset, 0, maxInt(0, total-height))
 	end := maxInt(0, total-offset)
 	start := maxInt(0, end-height)
@@ -553,7 +570,7 @@ func (m *Model) renderStartupLines(width int) []string {
 		"• Continue work  - use /sessions, /review, /model, or /provider.",
 		"",
 		sectionStyle.Render("terminal advantages"),
-		"• Keyboard-first panels for sessions, approvals, providers, and models.",
+		"• Keyboard-first flow with mouse-aware panels and safe picker clicks.",
 		"• Dense transcript + inspector layout when a panel is open.",
 		"• One-screen workflow without leaving the terminal.",
 		"",
@@ -1315,14 +1332,14 @@ func (m *Model) renderComposer(width int) string {
 			lines = append(lines, noticeStyle.Render(line))
 		}
 	} else {
-		helper := "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | F6 copy/paste mode | /help"
+		helper := "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | wheel pane | click select | dbl-click load/switch | F6 copy mode | /help"
 		if !m.MouseCapture {
-			helper = "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | drag select/copy | right-click paste | F6 restore wheel | /help"
+			helper = "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | drag select/copy | right-click paste | F6 app mouse | /help"
 		}
 		lines = append(lines, dimStyle.Render(helper))
 	}
 
-	if matches := m.composerSlashSuggestions(3); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+	if matches := m.composerSlashSuggestions(4); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
 		best := matches[0]
 		bestCommand := truncatePlain(best.Command, maxInt(0, contentWidth-8))
 		lines = append(lines, sectionStyle.Render("match  ")+titleStyle.Render(bestCommand))
@@ -1341,7 +1358,14 @@ func (m *Model) renderComposer(width int) string {
 			for _, item := range matches[1:] {
 				alternates = append(alternates, slashAlternateSummary(item))
 			}
-			lines = append(lines, sectionStyle.Render("also   ")+dimStyle.Render(truncatePlain(strings.Join(alternates, "  |  "), contentWidth-8)))
+			wrappedAlternates := wrapPlainText(strings.Join(alternates, "  |  "), maxInt(1, contentWidth-8))
+			for index, row := range wrappedAlternates {
+				if index == 0 {
+					lines = append(lines, sectionStyle.Render("also   ")+dimStyle.Render(row))
+					continue
+				}
+				lines = append(lines, dimStyle.Render("       "+row))
+			}
 		}
 	}
 
@@ -1748,7 +1772,7 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	stepLabel := strings.ToUpper(strings.ReplaceAll(string(m.AuthStep), "_", " "))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "1/2/3/4 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
+		renderPanelHeaderColumns(bodyWidth, "Alt+1/2/3/4 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
 	bodyLines := []string{}

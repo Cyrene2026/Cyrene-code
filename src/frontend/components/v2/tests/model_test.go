@@ -50,11 +50,19 @@ func TestSlashHelpSetsNotice(t *testing.T) {
 
 func TestWheelDownReturnsToLiveTail(t *testing.T) {
 	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
 	model.TranscriptOffset = 10
+	x, y, ok := model.TranscriptMousePointForTest()
+	if !ok {
+		t.Fatalf("expected transcript mouse point")
+	}
 
 	model.Update(tea.MouseMsg{
 		Button: tea.MouseButtonWheelDown,
 		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
 	})
 
 	if model.TranscriptOffset != 2 {
@@ -471,7 +479,7 @@ func TestStartupSplashReturnsAfterLiveTextClears(t *testing.T) {
 	}
 
 	view := model.View()
-	if !strings.Contains(view, "fast paths") {
+	if !strings.Contains(view, "terminal workspace") {
 		t.Fatalf("expected startup splash after live text clears, got %q", view)
 	}
 }
@@ -969,15 +977,23 @@ func TestComposerShowsSmartCommandMatches(t *testing.T) {
 
 func TestWheelScrollMovesSessionSelectionWhenPanelOpen(t *testing.T) {
 	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
 	model.ActivePanel = app.PanelSessions
 	model.Sessions = []app.BridgeSession{
 		{ID: "s1", Title: "one"},
 		{ID: "s2", Title: "two"},
 	}
+	x, y, ok := model.PanelItemMousePointForTest(0, 0)
+	if !ok {
+		t.Fatalf("expected session panel mouse point")
+	}
 
 	model.Update(tea.MouseMsg{
 		Button: tea.MouseButtonWheelDown,
 		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
 	})
 
 	if model.SessionIndex != 1 {
@@ -987,6 +1003,8 @@ func TestWheelScrollMovesSessionSelectionWhenPanelOpen(t *testing.T) {
 
 func TestWheelScrollMovesApprovalPreviewWhenPanelOpen(t *testing.T) {
 	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
 	model.ActivePanel = app.PanelApprovals
 	model.PendingReviews = []app.BridgeReview{{
 		ID:          "r-1",
@@ -994,14 +1012,226 @@ func TestWheelScrollMovesApprovalPreviewWhenPanelOpen(t *testing.T) {
 		Path:        "a.txt",
 		PreviewFull: "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22",
 	}}
+	x, y, ok := model.ApprovalPreviewMousePointForTest()
+	if !ok {
+		t.Fatalf("expected approval preview mouse point")
+	}
 
 	model.Update(tea.MouseMsg{
 		Button: tea.MouseButtonWheelDown,
 		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
 	})
 
 	if model.ApprovalPreviewOffset != 2 {
 		t.Fatalf("expected approval preview offset 2, got %d", model.ApprovalPreviewOffset)
+	}
+}
+
+func TestWheelOverTranscriptStillScrollsWhenPanelIsOpen(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.ActivePanel = app.PanelSessions
+	model.TranscriptOffset = 10
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("line\n", 20)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("reply\n", 20)},
+	}
+	x, y, ok := model.TranscriptMousePointForTest()
+	if !ok {
+		t.Fatalf("expected transcript mouse point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	})
+
+	if model.TranscriptOffset != 2 {
+		t.Fatalf("expected transcript offset 2 with panel open, got %d", model.TranscriptOffset)
+	}
+}
+
+func TestWheelOverComposerDoesNothing(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 28
+	model.TranscriptOffset = 10
+	x, y, ok := model.ComposerMousePointForTest()
+	if !ok {
+		t.Fatalf("expected composer mouse point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	})
+
+	if model.TranscriptOffset != 10 {
+		t.Fatalf("expected composer wheel to leave transcript offset unchanged, got %d", model.TranscriptOffset)
+	}
+}
+
+func TestApprovalQueueWheelMovesSelection(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.ActivePanel = app.PanelApprovals
+	model.PendingReviews = []app.BridgeReview{
+		{ID: "r-1", Action: "edit_file", Path: "a.txt"},
+		{ID: "r-2", Action: "run_command", Path: "."},
+	}
+	x, y, ok := model.PanelItemMousePointForTest(0, 0)
+	if !ok {
+		t.Fatalf("expected approval queue mouse point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	})
+
+	if model.ApprovalIndex != 1 {
+		t.Fatalf("expected approval index 1, got %d", model.ApprovalIndex)
+	}
+}
+
+func TestProviderMouseClickMapsThirdVisualRowToSameItem(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 60
+	model.ActivePanel = app.PanelProviders
+	model.ProviderIndex = 1
+	model.AvailableProviders = []string{
+		"https://api.one.example/v1",
+		"https://api.two.example/v1",
+	}
+	x, y, ok := model.PanelItemMousePointForTest(1, 2)
+	if !ok {
+		t.Fatalf("expected provider panel mouse point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	})
+
+	if model.ProviderIndex != 1 {
+		t.Fatalf("expected provider index 1, got %d", model.ProviderIndex)
+	}
+}
+
+func TestSessionPickerDoubleClickLoadsSelectedSession(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 40
+	model.Status = app.StatusIdle
+	model.ActivePanel = app.PanelSessions
+	model.Sessions = []app.BridgeSession{
+		{ID: "s1", Title: "one"},
+		{ID: "s2", Title: "two"},
+	}
+	x, y, ok := model.PanelItemMousePointForTest(1, 0)
+	if !ok {
+		t.Fatalf("expected session panel mouse point")
+	}
+	msg := tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	}
+
+	model.Update(msg)
+	model.Update(msg)
+
+	if model.SessionIndex != 1 {
+		t.Fatalf("expected session index 1, got %d", model.SessionIndex)
+	}
+	if model.Status != app.StatusPreparing {
+		t.Fatalf("expected preparing status after double click, got %q", model.Status)
+	}
+	if !strings.Contains(model.Notice, "Loading selected session") {
+		t.Fatalf("expected load notice after double click, got %q", model.Notice)
+	}
+}
+
+func TestSessionPickerReleaseAfterPressDoesNotLoseSelection(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 40
+	model.ActivePanel = app.PanelSessions
+	model.Sessions = []app.BridgeSession{
+		{ID: "s1", Title: "one"},
+		{ID: "s2", Title: "two"},
+	}
+	x, y, ok := model.PanelItemMousePointForTest(1, 0)
+	if !ok {
+		t.Fatalf("expected session panel mouse point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		X:      x,
+		Y:      y,
+	})
+
+	if model.SessionIndex != 1 {
+		t.Fatalf("expected session index 1 after release path, got %d", model.SessionIndex)
+	}
+}
+
+func TestPlanMouseDoubleClickOnlySelectsStep(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 40
+	model.Status = app.StatusIdle
+	model.ActivePanel = app.PanelPlans
+	model.ExecutionPlan = app.ExecutionPlan{
+		Summary: "Ship mouse support",
+		Steps: []app.ExecutionPlanStep{
+			{ID: "step-1", Title: "Patch mouse handlers", Status: "pending"},
+			{ID: "step-2", Title: "Add tests", Status: "pending"},
+		},
+	}
+	x, y, ok := model.PanelItemMousePointForTest(1, 0)
+	if !ok {
+		t.Fatalf("expected plan panel mouse point")
+	}
+	msg := tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      x,
+		Y:      y,
+	}
+
+	model.Update(msg)
+	model.Update(msg)
+
+	if model.PlanIndex != 1 {
+		t.Fatalf("expected plan index 1, got %d", model.PlanIndex)
+	}
+	if model.Status != app.StatusIdle {
+		t.Fatalf("expected plan double click to avoid execution, got %q", model.Status)
+	}
+	if strings.Contains(model.Notice, "Running selected execution plan step") {
+		t.Fatalf("expected no run notice on plan double click, got %q", model.Notice)
 	}
 }
 
@@ -1088,6 +1318,19 @@ func TestAuthAltDigitStillSwitchesField(t *testing.T) {
 	}
 	if model.AuthCursor != len(model.AuthModel) {
 		t.Fatalf("expected cursor at model field end, got %d", model.AuthCursor)
+	}
+}
+
+func TestAuthPanelHeaderMentionsAltDigitJump(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 150
+	model.Height = 36
+	model.ActivePanel = app.PanelAuth
+
+	view := model.View()
+
+	if !strings.Contains(view, "ALT+1/2/3/4") {
+		t.Fatalf("expected auth header to mention alt digit jump, got %q", view)
 	}
 }
 

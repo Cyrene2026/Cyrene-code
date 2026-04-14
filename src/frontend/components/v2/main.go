@@ -10,8 +10,13 @@ import (
 
 func main() {
 	model := app.NewModel()
+	options := []tea.ProgramOption{}
+	if model.MouseCapture {
+		options = append(options, tea.WithMouseCellMotion())
+	}
 	program := tea.NewProgram(
 		model,
+		options...,
 	)
 
 	finalModel, err := program.Run()

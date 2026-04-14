@@ -1,16 +1,21 @@
 import {
-  loadSkillsConfig,
-  saveProjectSkillsConfig,
-  type LoadedSkillsConfig,
-  type SkillsConfigPatch,
-} from "./loadSkillsConfig";
-import type { ExtensionExposureMode } from "../extensions/metadata";
+  defaultSkillExposureMode,
+  normalizeExtensionExposureMode,
+} from "../extensions/metadata";
 import type {
+  SkillCreationInput,
   SkillDefinition,
   SkillsRuntime,
   SkillsRuntimeMutationResult,
   SkillsRuntimeSummary,
 } from "./types";
+import type { ExtensionExposureMode } from "../extensions/metadata";
+import {
+  loadSkillsConfig,
+  saveGlobalSkillsConfig,
+  type LoadedSkillsConfig,
+  type SkillsConfigPatch,
+} from "./loadSkillsConfig";
 
 type CreateSkillsRuntimeContext = {
   cwd?: string;
@@ -75,6 +80,48 @@ const formatMutationMessage = (
   skillId: string,
   configPath: string
 ) => `${action}: ${skillId}\nconfig: ${configPath}`;
+
+const normalizeSkillId = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[._-]+|[._-]+$/g, "");
+
+const normalizeStringArray = (values: string[] | undefined) =>
+  Array.from(
+    new Set(
+      (values ?? [])
+        .map(value => value.trim())
+        .filter(Boolean)
+    )
+  );
+
+const normalizeSkillCreationInput = (input: SkillCreationInput) => {
+  const id = normalizeSkillId(input.id);
+  const label = input.label.trim();
+  const description = input.description?.trim() || undefined;
+  const prompt = input.prompt.trim();
+  const triggers = normalizeStringArray(input.triggers);
+  const tags = normalizeStringArray(input.tags);
+  const exposure =
+    normalizeExtensionExposureMode(input.exposure) ?? defaultSkillExposureMode();
+  const enabled = input.enabled ?? true;
+
+  return {
+    id,
+    label,
+    description,
+    prompt,
+    triggers,
+    tags,
+    exposure,
+    enabled,
+  };
+};
+
+const isProjectSkill = (skill: SkillDefinition) => skill.source === "project";
 
 class ManagedSkillsRuntime implements SkillsRuntime {
   private config: LoadedSkillsConfig | null = null;
@@ -170,6 +217,79 @@ class ManagedSkillsRuntime implements SkillsRuntime {
     };
   }
 
+  async createSkill(input: SkillCreationInput): Promise<SkillsRuntimeMutationResult> {
+    const normalized = normalizeSkillCreationInput(input);
+    if (!normalized.id) {
+      return {
+        ok: false,
+        message: "Skill id is required.",
+      };
+    }
+    if (!normalized.label) {
+      return {
+        ok: false,
+        message: `Skill label is required: ${normalized.id}`,
+      };
+    }
+    if (!normalized.prompt) {
+      return {
+        ok: false,
+        message: `Skill prompt is required: ${normalized.id}`,
+      };
+    }
+    if (normalized.triggers.length === 0) {
+      return {
+        ok: false,
+        message: `Skill triggers are required: ${normalized.id}`,
+      };
+    }
+
+    const current = this.getConfig();
+    if (current.skills.some(skill => skill.id === normalized.id)) {
+      return {
+        ok: false,
+        message: `Skill already exists: ${normalized.id}`,
+      };
+    }
+
+    const globalSkills = current.skills.filter(skill => skill.source === "global");
+    const patch: SkillsConfigPatch = {
+      removeSkillIds: [],
+      skills: globalSkills
+        .filter(skill => skill.id !== normalized.id)
+        .map(skill => ({
+          id: skill.id,
+          label: skill.label,
+          description: skill.description,
+          prompt: skill.prompt,
+          triggers: [...skill.triggers],
+          exposure: skill.exposure,
+          tags: [...skill.tags],
+          enabled: skill.enabled,
+        })),
+    };
+    patch.skills.push({
+      id: normalized.id,
+      label: normalized.label,
+      description: normalized.description,
+      prompt: normalized.prompt,
+      triggers: normalized.triggers,
+      exposure: normalized.exposure,
+      tags: normalized.tags,
+      enabled: normalized.enabled,
+    });
+
+    const saved = await saveGlobalSkillsConfig(this.appRoot, patch, this.context);
+    await this.load();
+
+    return {
+      ok: true,
+      message: formatMutationMessage("Skill created", normalized.id, saved.path),
+      skillId: normalized.id,
+      configPath: saved.path,
+    };
+  }
+
   async setSkillEnabled(
     skillId: string,
     enabled: boolean
@@ -190,8 +310,14 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         message: `Skill not found: ${normalizedId}`,
       };
     }
+    if (isProjectSkill(target)) {
+      return {
+        ok: false,
+        message: `Skill is defined in project config and cannot be changed via global skills config: ${normalizedId}`,
+      };
+    }
 
-    const patch = clonePatch(current.projectPatch);
+    const patch = clonePatch(current.globalPatch);
     patch.removeSkillIds = patch.removeSkillIds.filter(id => id !== normalizedId);
 
     const existingPatch = patch.skills.find(skill => skill.id === normalizedId);
@@ -215,7 +341,7 @@ class ManagedSkillsRuntime implements SkillsRuntime {
     patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
     patch.skills.push(nextPatchEntry);
 
-    const saved = await saveProjectSkillsConfig(this.appRoot, patch, this.context);
+    const saved = await saveGlobalSkillsConfig(this.appRoot, patch, this.context);
     await this.load();
 
     return {
@@ -250,8 +376,14 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         message: `Skill not found: ${normalizedId}`,
       };
     }
+    if (isProjectSkill(target)) {
+      return {
+        ok: false,
+        message: `Skill is defined in project config and cannot be changed via global skills config: ${normalizedId}`,
+      };
+    }
 
-    const patch = clonePatch(current.projectPatch);
+    const patch = clonePatch(current.globalPatch);
     patch.removeSkillIds = patch.removeSkillIds.filter(id => id !== normalizedId);
 
     const existingPatch = patch.skills.find(skill => skill.id === normalizedId);
@@ -275,7 +407,7 @@ class ManagedSkillsRuntime implements SkillsRuntime {
     patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
     patch.skills.push(nextPatchEntry);
 
-    const saved = await saveProjectSkillsConfig(this.appRoot, patch, this.context);
+    const saved = await saveGlobalSkillsConfig(this.appRoot, patch, this.context);
     await this.load();
 
     return {
@@ -303,14 +435,20 @@ class ManagedSkillsRuntime implements SkillsRuntime {
         message: `Skill not found: ${normalizedId}`,
       };
     }
+    if (isProjectSkill(target)) {
+      return {
+        ok: false,
+        message: `Skill is defined in project config and cannot be removed via global skills config: ${normalizedId}`,
+      };
+    }
 
-    const patch = clonePatch(current.projectPatch);
+    const patch = clonePatch(current.globalPatch);
     patch.removeSkillIds = Array.from(
       new Set([...patch.removeSkillIds, normalizedId])
     );
     patch.skills = patch.skills.filter(skill => skill.id !== normalizedId);
 
-    const saved = await saveProjectSkillsConfig(this.appRoot, patch, this.context);
+    const saved = await saveGlobalSkillsConfig(this.appRoot, patch, this.context);
     await this.load();
 
     return {

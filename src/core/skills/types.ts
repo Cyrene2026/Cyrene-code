@@ -29,11 +29,23 @@ export type SkillsRuntimeMutationResult = {
   configPath?: string;
 };
 
+export type SkillCreationInput = {
+  id: string;
+  label: string;
+  description?: string;
+  prompt: string;
+  triggers: string[];
+  enabled?: boolean;
+  exposure?: ExtensionExposureMode;
+  tags?: string[];
+};
+
 export interface SkillsRuntime {
   listSkills(): SkillDefinition[];
   resolveForQuery(query: string): SkillDefinition[];
   describeRuntime?(): SkillsRuntimeSummary;
   reloadConfig?(): Promise<SkillsRuntimeMutationResult>;
+  createSkill?(input: SkillCreationInput): Promise<SkillsRuntimeMutationResult>;
   setSkillEnabled?(
     skillId: string,
     enabled: boolean

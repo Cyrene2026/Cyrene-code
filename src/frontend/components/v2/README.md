@@ -12,6 +12,7 @@ Current scope:
 - approval queue render + approve/reject actions
 - model/provider picker panels
 - HTTP auth panel wired to the existing auth runtime
+- mouse-aware transcript/panel wheel routing plus click/double-click picker support
 - `PgUp` / `PgDn` transcript scroll support
 - terminal resize handling via `tea.WindowSizeMsg`
 
@@ -19,6 +20,7 @@ Runtime notes:
 
 - v2 still depends on `bun` at runtime because the business logic remains in the TypeScript bridge.
 - session/config path resolution follows the existing CLI logic: use global `~/.cyrene` by default, or honor explicit `CYRENE_HOME` if set.
+- mouse capture starts enabled; press `F6` to switch to terminal copy/paste mode, then press `F6` again to restore in-app mouse scrolling and picker clicks.
 
 Commands:
 

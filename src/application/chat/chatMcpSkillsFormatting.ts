@@ -255,7 +255,7 @@ export const formatSkillsRuntimeSummary = (
       ? ["config:", ...summary.configPaths.map(path => `- ${path}`)]
       : ["config: built-in default"]),
     `editable: ${summary.editableConfigPath}`,
-    "commands: /skills list | /skills show <id> | /skills enable <id> | /skills disable <id> | /skills remove <id> | /skills use <id> | /skills reload",
+    "commands: /skills list | /skills create <task> | /skills show <id> | /skills enable <id> | /skills disable <id> | /skills remove <id> | /skills use <id> | /skills reload",
   ].join("\n");
 
 export const formatManagedSkillLine = (skill: ManagedSkill) => formatSkillLine(skill);

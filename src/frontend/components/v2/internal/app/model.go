@@ -56,6 +56,8 @@ const (
 	approvalPreviewPageLines = 20
 	mouseDoubleClickWindow   = 400 * time.Millisecond
 	rightClickPasteWindow    = 400 * time.Millisecond
+	mouseReleaseWindow       = 500 * time.Millisecond
+	mouseActivationDedup     = 150 * time.Millisecond
 	statusSpinnerInterval    = 120 * time.Millisecond
 )
 
@@ -122,6 +124,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/unpin <index>", Description: "remove a pin"},
 	{Command: "/skills", Description: "show skills runtime summary"},
 	{Command: "/skills list", Description: "list available skills"},
+	{Command: "/skills create <task>", Description: "ask AI to generate and save a new skill"},
 	{Command: "/skills show <id>", Description: "show one skill details"},
 	{Command: "/skills enable <id>", Description: "enable one skill in project config"},
 	{Command: "/skills disable <id>", Description: "disable one skill in project config"},
@@ -263,17 +266,26 @@ type Model struct {
 	Auth                     BridgeAuthStatus
 	AppRoot                  string
 
-	AuthStep         AuthStep
-	AuthProvider     []rune
-	AuthProviderType []rune
-	AuthAPIKey       []rune
-	AuthModel        []rune
-	AuthCursor       int
-	AuthSaving       bool
-	LastClickAt      time.Time
-	LastClickIdx     int
-	LastClickPan     Panel
-	IgnorePasteUntil time.Time
+	AuthStep          AuthStep
+	AuthProvider      []rune
+	AuthProviderType  []rune
+	AuthAPIKey        []rune
+	AuthModel         []rune
+	AuthCursor        int
+	AuthSaving        bool
+	LastClickAt       time.Time
+	LastClickIdx      int
+	LastClickPan      Panel
+	LastMousePressAt  time.Time
+	LastMousePressX   int
+	LastMousePressY   int
+	LastMousePressBtn tea.MouseButton
+	LastMousePressReg mouseRegion
+	LastMousePressIdx int
+	LastMouseActAt    time.Time
+	LastMouseActReg   mouseRegion
+	LastMouseActIdx   int
+	IgnorePasteUntil  time.Time
 
 	bridge *bridgeClient
 }
@@ -360,24 +372,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampTranscriptOffset()
 		return m, m.withStatusSpinner(nil)
 	case tea.MouseMsg:
-		if value.Action != tea.MouseActionPress {
-			return m, m.withStatusSpinner(nil)
+		hit := m.mouseHitAt(value.X, value.Y)
+		if value.Action == tea.MouseActionPress && value.Button != tea.MouseButtonWheelUp && value.Button != tea.MouseButtonWheelDown && value.Button != tea.MouseButtonWheelLeft && value.Button != tea.MouseButtonWheelRight {
+			m.rememberMousePress(value, hit)
 		}
 		switch value.Button {
 		case tea.MouseButtonWheelUp:
-			m.handleWheelScroll(-1)
+			if value.Action != tea.MouseActionPress {
+				return m, m.withStatusSpinner(nil)
+			}
+			m.handleWheelScroll(-1, hit)
 		case tea.MouseButtonWheelDown:
-			m.handleWheelScroll(1)
+			if value.Action != tea.MouseActionPress {
+				return m, m.withStatusSpinner(nil)
+			}
+			m.handleWheelScroll(1, hit)
 		case tea.MouseButtonLeft:
-			nextModel, cmd := m.handleMouseLeftClick(value)
+			if !m.shouldHandleMouseLeft(value, hit) {
+				return m, m.withStatusSpinner(nil)
+			}
+			nextModel, cmd := m.handleMouseLeftClick(hit)
 			if typed, ok := nextModel.(*Model); ok {
 				return typed, typed.withStatusSpinner(cmd)
 			}
 			return nextModel, cmd
 		case tea.MouseButtonRight:
+			if value.Action != tea.MouseActionPress {
+				return m, m.withStatusSpinner(nil)
+			}
 			if m.MouseCapture {
 				m.IgnorePasteUntil = time.Now().Add(rightClickPasteWindow)
 				m.setNotice("Right-click paste is blocked in mouse mode. Press F6 for terminal paste.", false)
+			}
+		default:
+			if value.Action == tea.MouseActionRelease && m.shouldHandleMouseLeft(value, hit) {
+				nextModel, cmd := m.handleMouseLeftClick(hit)
+				if typed, ok := nextModel.(*Model); ok {
+					return typed, typed.withStatusSpinner(cmd)
+				}
+				return nextModel, cmd
 			}
 		}
 		return m, m.withStatusSpinner(nil)
@@ -677,10 +710,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.MouseCapture = !m.MouseCapture
 		m.IgnorePasteUntil = time.Time{}
 		if m.MouseCapture {
-			m.setNotice("Mouse capture enabled. Wheel scrolls the in-app view.", false)
+			m.setNotice("Mouse capture enabled. Wheel targets the hovered pane and picker clicks are active again.", false)
 			return m, tea.EnableMouseCellMotion
 		}
-		m.setNotice("Copy mode enabled. Drag to select text; terminal paste is active here. Press F6 to restore in-app wheel scrolling.", false)
+		m.setNotice("Copy mode enabled. Drag to select text; terminal paste is active here. Press F6 to restore in-app mouse scrolling.", false)
 		return m, tea.DisableMouse
 	}
 
@@ -755,27 +788,9 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m *Model) handleWheelScroll(direction int) {
-	switch m.ActivePanel {
-	case PanelApprovals:
-		m.scrollApprovalPreview(direction * scrollStep)
-	case PanelPlans:
-		if len(m.ExecutionPlan.Steps) > 0 {
-			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), direction)
-		}
-	case PanelSessions:
-		if len(m.Sessions) > 0 {
-			m.SessionIndex = cycleIndex(m.SessionIndex, len(m.Sessions), direction)
-		}
-	case PanelModels:
-		if len(m.AvailableModels) > 0 {
-			m.ModelIndex = cycleIndex(m.ModelIndex, len(m.AvailableModels), direction)
-		}
-	case PanelProviders:
-		if len(m.AvailableProviders) > 0 {
-			m.ProviderIndex = cycleIndex(m.ProviderIndex, len(m.AvailableProviders), direction)
-		}
-	default:
+func (m *Model) handleWheelScroll(direction int, hit mouseHit) {
+	switch hit.Region {
+	case mouseRegionTranscript:
 		if direction < 0 {
 			m.TranscriptOffset += scrollStep
 			m.clampTranscriptOffset()
@@ -786,6 +801,29 @@ func (m *Model) handleWheelScroll(direction int) {
 			m.TranscriptOffset = 0
 		}
 		m.clampTranscriptOffset()
+	case mouseRegionApprovalQueue:
+		if len(m.PendingReviews) > 0 {
+			m.ApprovalIndex = cycleIndex(m.ApprovalIndex, len(m.PendingReviews), direction)
+			m.ApprovalPreviewOffset = 0
+		}
+	case mouseRegionApprovalPreview:
+		m.scrollApprovalPreview(direction * scrollStep)
+	case mouseRegionPlanList:
+		if len(m.ExecutionPlan.Steps) > 0 {
+			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), direction)
+		}
+	case mouseRegionSessionList:
+		if len(m.Sessions) > 0 {
+			m.SessionIndex = cycleIndex(m.SessionIndex, len(m.Sessions), direction)
+		}
+	case mouseRegionModelList:
+		if len(m.AvailableModels) > 0 {
+			m.ModelIndex = cycleIndex(m.ModelIndex, len(m.AvailableModels), direction)
+		}
+	case mouseRegionProviderList:
+		if len(m.AvailableProviders) > 0 {
+			m.ProviderIndex = cycleIndex(m.ProviderIndex, len(m.AvailableProviders), direction)
+		}
 	}
 }
 
@@ -823,13 +861,13 @@ func (m *Model) transcriptViewportMetrics() (int, int) {
 	return maxInt(1, framedInnerWidth(activeFrameStyle, contentWidth)-2), maxInt(1, framedInnerHeight(activeFrameStyle, sessionHeight))
 }
 
-func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleMouseLeftClick(hit mouseHit) (tea.Model, tea.Cmd) {
 	if m.ActivePanel == PanelNone {
 		return m, nil
 	}
 
-	index, ok := m.panelListIndexAtMouse(msg.X, msg.Y)
-	if !ok {
+	index := hit.Index
+	if index < 0 {
 		return m, nil
 	}
 
@@ -843,114 +881,99 @@ func (m *Model) handleMouseLeftClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	m.LastClickIdx = index
 	m.LastClickAt = now
 
-	switch m.ActivePanel {
-	case PanelPlans:
+	switch hit.Region {
+	case mouseRegionApprovalQueue:
+		m.ApprovalIndex = index
+		m.ApprovalPreviewOffset = 0
+	case mouseRegionPlanList:
 		m.PlanIndex = index
-		if doubleClick && index >= 0 && index < len(m.ExecutionPlan.Steps) {
-			m.Status = StatusPreparing
-			m.setNotice("Running selected execution plan step...", false)
-			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: fmt.Sprintf("/plan run %d", index+1)})
-		}
-	case PanelSessions:
+	case mouseRegionSessionList:
 		m.SessionIndex = index
 		if doubleClick && index >= 0 && index < len(m.Sessions) {
 			m.Status = StatusPreparing
 			m.setNotice("Loading selected session...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "load_session", ID: m.Sessions[index].ID})
 		}
-	case PanelModels:
+	case mouseRegionModelList:
 		m.ModelIndex = index
 		if doubleClick && index >= 0 && index < len(m.AvailableModels) {
 			m.Status = StatusPreparing
 			m.setNotice("Switching model...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_model", Value: m.AvailableModels[index]})
 		}
-	case PanelProviders:
+	case mouseRegionProviderList:
 		m.ProviderIndex = index
 		if doubleClick && index >= 0 && index < len(m.AvailableProviders) {
 			m.Status = StatusPreparing
 			m.setNotice("Switching provider...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider", Value: m.AvailableProviders[index]})
 		}
+	default:
+		return m, nil
 	}
 
 	return m, nil
 }
 
-func (m *Model) panelListIndexAtMouse(mouseX, mouseY int) (int, bool) {
-	panelLeft, panelTop, panelWidth, _, ok := m.activePanelRect()
-	if !ok {
-		return 0, false
-	}
-	if mouseX < panelLeft || mouseX >= panelLeft+panelWidth {
-		return 0, false
-	}
-	innerY := mouseY - panelTop - 1
-	if innerY < 0 {
-		return 0, false
-	}
+func (m *Model) rememberMousePress(msg tea.MouseMsg, hit mouseHit) {
+	m.LastMousePressAt = time.Now()
+	m.LastMousePressX = msg.X
+	m.LastMousePressY = msg.Y
+	m.LastMousePressBtn = msg.Button
+	m.LastMousePressReg = hit.Region
+	m.LastMousePressIdx = hit.Index
+}
 
-	switch m.ActivePanel {
-	case PanelPlans:
-		bodyWidth := framedInnerWidth(panelBoxStyle, panelWidth)
-		dataStartLine := 2 + planPanelOverviewRows(bodyWidth, m.ExecutionPlan)
-		return listIndexAtPanelLine(len(m.ExecutionPlan.Steps), m.PlanIndex, m.planPanelPageSize(), innerY, dataStartLine)
-	case PanelSessions:
-		return listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSize(), innerY, 2)
-	case PanelModels:
-		return listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSize(), innerY, 2)
-	case PanelProviders:
-		bodyWidth := framedInnerWidth(panelBoxStyle, panelWidth)
-		dataStartLine := 2 +
-			providerPanelCommandRows(bodyWidth)
-		return listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSize(), innerY, dataStartLine)
+func (m *Model) shouldHandleMouseLeft(msg tea.MouseMsg, hit mouseHit) bool {
+	now := time.Now()
+	switch {
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		m.markMouseActivation(now, hit)
+		return true
+	case msg.Action == tea.MouseActionRelease:
+		if m.LastMousePressBtn != tea.MouseButtonLeft || now.Sub(m.LastMousePressAt) > mouseReleaseWindow {
+			return false
+		}
+		if hit.Region != m.LastMousePressReg || hit.Index != m.LastMousePressIdx {
+			return false
+		}
+		if m.isDuplicateMouseActivation(now, hit) {
+			return false
+		}
+		m.markMouseActivation(now, hit)
+		return true
 	default:
-		return 0, false
+		return false
 	}
+}
+
+func (m *Model) isDuplicateMouseActivation(now time.Time, hit mouseHit) bool {
+	return hit.Region == m.LastMouseActReg &&
+		hit.Index == m.LastMouseActIdx &&
+		!m.LastMouseActAt.IsZero() &&
+		now.Sub(m.LastMouseActAt) <= mouseActivationDedup
+}
+
+func (m *Model) markMouseActivation(now time.Time, hit mouseHit) {
+	m.LastMouseActAt = now
+	m.LastMouseActReg = hit.Region
+	m.LastMouseActIdx = hit.Index
 }
 
 func (m *Model) activePanelRect() (int, int, int, int, bool) {
-	if m.ActivePanel == PanelNone {
+	layout := m.mouseLayout()
+	if !layout.HasPanel {
 		return 0, 0, 0, 0, false
 	}
-	width := maxInt(50, m.Width)
-	height := maxInt(18, m.Height)
-	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
-	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
-	header := m.renderTopStatusBar(contentWidth)
-	composer := m.renderComposer(contentWidth)
-	footer := m.renderBottomStatusBar(contentWidth)
-	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
-	bodyHeight := maxInt(5, contentHeight-fixedHeight)
-	contentAreaHeight := maxInt(1, bodyHeight)
-	panelTop := 1 + lipgloss.Height(header) + 1 + 1
-	panelLeft := 1
-	if contentWidth >= 96 {
-		panelWidth := m.widePanelWidth(contentWidth)
-		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
-		panelLeft += sessionWidth + 1
-		return panelLeft, panelTop, panelWidth, contentAreaHeight, true
-	}
-	panelHeight := clampInt(contentAreaHeight/2, 10, 16)
-	sessionHeight := maxInt(4, contentAreaHeight-panelHeight-1)
-	panelTop += sessionHeight
-	return panelLeft, panelTop, contentWidth, panelHeight, true
+	return layout.Panel.Left, layout.Panel.Top, layout.Panel.Width, layout.Panel.Height, true
 }
 
 func (m *Model) panelHeight() int {
-	if m.ActivePanel == PanelNone {
+	_, _, _, panelHeight, ok := m.activePanelRect()
+	if !ok {
 		return 0
 	}
-	width := maxInt(50, m.Width)
-	height := maxInt(18, m.Height)
-	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
-	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
-	header := m.renderTopStatusBar(contentWidth)
-	composer := m.renderComposer(contentWidth)
-	footer := m.renderBottomStatusBar(contentWidth)
-	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
-	bodyHeight := maxInt(5, contentHeight-fixedHeight)
-	return maxInt(1, bodyHeight)
+	return panelHeight
 }
 
 func (m *Model) sessionPanelPageSize() int {
@@ -1038,12 +1061,15 @@ func providerPanelCommandRows(bodyWidth int) int {
 		len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
 }
 
-func listIndexAtPanelLine(total, selected, pageSize, innerY, dataStartLine int) (int, bool) {
+func listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataStartLine int) (int, bool) {
 	if total <= 0 || innerY < dataStartLine {
 		return 0, false
 	}
+	if rowsPerItem <= 0 {
+		return 0, false
+	}
 	row := innerY - dataStartLine
-	indexInPage := row / 2
+	indexInPage := row / rowsPerItem
 	page := pageForSelection(total, selected, pageSize)
 	index := page.Start + indexInPage
 	if index < page.Start || index >= page.End {
@@ -2705,6 +2731,8 @@ func slashInsertValue(command string) string {
 		return "/skills enable "
 	case "/skills disable <id>":
 		return "/skills disable "
+	case "/skills create <task>":
+		return "/skills create "
 	case "/skills remove <id>":
 		return "/skills remove "
 	case "/skills use <id>":

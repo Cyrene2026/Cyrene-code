@@ -7,7 +7,14 @@ import { createAuthRuntime, type AuthRuntime } from "../../../infra/auth/authRun
 import type { AuthStatus } from "../../../infra/auth/types";
 import { createFileSessionStore } from "../../../infra/session/createFileSessionStore";
 import { createMcpRuntime, type McpRuntime, type PendingReviewItem } from "../../../core/mcp";
-import { createSkillsRuntime, type SkillDefinition, type SkillsRuntime } from "../../../core/skills";
+import {
+  chooseSkillCreationTask,
+  createSkillsRuntime,
+  detectStableSkillPattern,
+  parseAssistantSkillUpdate,
+  type SkillDefinition,
+  type SkillsRuntime,
+} from "../../../core/skills";
 import {
   createExtensionManager,
   type ExtensionManager,
@@ -533,6 +540,7 @@ class BubbleTeaBridge {
   private usageBySession: Record<string, BridgeUsageSummary> = {};
   private stateUpdateCount = 0;
   private sessionSkillUseIds = new Map<string, string[]>();
+  private skillSuggestionFingerprintBySession = new Map<string, string>();
   private suspended: SuspendedRun | null = null;
   private commandChain: Promise<void> = Promise.resolve();
   private runtimeMetadataDirty = true;
@@ -1297,6 +1305,31 @@ class BubbleTeaBridge {
     return "";
   }
 
+  private findPreferredSkillCreationTask(session: SessionRecord | null) {
+    return chooseSkillCreationTask(
+      session?.summary ?? "",
+      this.findLatestMeaningfulUserTask(session)
+    );
+  }
+
+  private async maybeSuggestSkillCreation(sessionId: string, summary: string) {
+    const suggestion = detectStableSkillPattern(summary);
+    if (!suggestion) {
+      return;
+    }
+    if (this.skillSuggestionFingerprintBySession.get(sessionId) === suggestion.fingerprint) {
+      return;
+    }
+    this.skillSuggestionFingerprintBySession.set(sessionId, suggestion.fingerprint);
+    await this.pushSystemMessage(
+      [
+        `Summary suggests a repeatable workflow around: ${suggestion.phrase}`,
+        ...suggestion.sampleLines.map(line => `- ${line}`),
+        "Use `skill create` to turn the current session summary into a reusable global skill.",
+      ].join("\n")
+    );
+  }
+
   private formatPlanStatusMessage(plan: SessionExecutionPlan | null) {
     if (!plan) {
       return "Execution plan:\n(none)";
@@ -1427,7 +1460,8 @@ class BubbleTeaBridge {
 
   private extractVisibleAssistantText(rawText: string) {
     const parsedPlan = parseAssistantPlanUpdate(rawText);
-    return parseAssistantStateUpdate(parsedPlan.visibleText).visibleText;
+    const parsedSkill = parseAssistantSkillUpdate(parsedPlan.visibleText);
+    return parseAssistantStateUpdate(parsedSkill.visibleText).visibleText;
   }
 
   private findExecutionPlanStep(
@@ -1516,6 +1550,42 @@ class BubbleTeaBridge {
       "If the plan changes materially, clear acceptedAt and acceptedSummary.",
       `Current plan snapshot:\n${formatExecutionPlan(plan)}`,
       `Revision request:\n${instruction}`,
+    ];
+    return lines.join("\n\n");
+  }
+
+  private formatExistingSkillsForPrompt() {
+    const skills = this.skillsRuntime?.listSkills() ?? [];
+    if (skills.length === 0) {
+      return "(none)";
+    }
+    return skills
+      .slice(0, 20)
+      .map(skill =>
+        [
+          `- ${skill.id}`,
+          skill.label !== skill.id ? `label ${skill.label}` : "",
+          skill.triggers.length > 0
+            ? `triggers ${skill.triggers.slice(0, 4).join(", ")}`
+            : "triggers (none)",
+        ]
+          .filter(Boolean)
+          .join(" | ")
+      )
+      .join("\n");
+  }
+
+  private buildSkillCreationPrompt(task: string) {
+    const lines = [
+      "Generate one focused reusable Cyrene skill for the described task.",
+      "Return a short visible summary for the user, then include a machine-readable <cyrene_skill> JSON block.",
+      "The JSON must match: {\"version\":1,\"id\":\"...\",\"label\":\"...\",\"description\":\"...\",\"prompt\":\"...\",\"triggers\":[\"...\"],\"tags\":[\"...\"],\"exposure\":\"hidden|hinted|scoped|full\",\"enabled\":true}.",
+      "Keep the skill concise and operational. The prompt should be short, specific, and reusable.",
+      "Use 2-6 meaningful triggers. Avoid vague or overly generic triggers unless they are necessary.",
+      "Prefer exposure \"scoped\". enabled should usually stay true.",
+      "Do not duplicate an existing skill id or create a near-duplicate of an existing skill.",
+      `Existing skills:\n${this.formatExistingSkillsForPrompt()}`,
+      `Task:\n${task}`,
     ];
     return lines.join("\n\n");
   }
@@ -1936,6 +2006,39 @@ class BubbleTeaBridge {
       return;
     }
 
+    if (
+      query === "/skills create" ||
+      query === "/skill create" ||
+      query.startsWith("/skills create ") ||
+      query.startsWith("/skill create ")
+    ) {
+      const createPrefix = query.startsWith("/skill create ")
+        ? "/skill create "
+        : query === "/skill create"
+          ? "/skill create"
+          : query.startsWith("/skills create ")
+            ? "/skills create "
+            : "/skills create";
+      const rawTask = query.slice(createPrefix.length).trim();
+      const session = this.activeSessionId
+        ? await this.sessionStore!.loadSession(this.activeSessionId)
+        : null;
+      const task = rawTask || this.findPreferredSkillCreationTask(session) || "";
+      if (!task) {
+        await this.pushSystemMessage(
+          "Usage: /skills create <task>. No usable session summary or prior actionable task was found in this session.",
+          { kind: "error" }
+        );
+        return;
+      }
+      await this.submitPrepared({
+        userText: query,
+        promptText: this.buildSkillCreationPrompt(task),
+        originalTask: task,
+      });
+      return;
+    }
+
     const sessionHandled = await handleSessionCommand({
       query,
       sessionStore: this.sessionStore!,
@@ -2124,6 +2227,19 @@ class BubbleTeaBridge {
   }
 
   private async submit(rawText: string) {
+    const normalized = rawText.trim();
+    const bareSkillCreate = normalized.match(/^skills?\s+create(?:\s+([\s\S]+))?$/i);
+    if (bareSkillCreate) {
+      const task = bareSkillCreate[1]?.trim() ?? "";
+      const canonicalPrefix = /^skills\s+/i.test(normalized)
+        ? "/skills create"
+        : "/skill create";
+      await this.executeSlashCommand(
+        task ? `${canonicalPrefix} ${task}` : canonicalPrefix
+      );
+      return;
+    }
+
     await this.submitPrepared({
       userText: rawText,
       promptText: rawText,
@@ -2359,7 +2475,8 @@ class BubbleTeaBridge {
 
   private async applyAssistantStateUpdate(sessionId: string, rawAssistantText: string) {
     const parsedPlan = parseAssistantPlanUpdate(rawAssistantText);
-    const parsed = parseAssistantStateUpdate(parsedPlan.visibleText);
+    const parsedSkill = parseAssistantSkillUpdate(parsedPlan.visibleText);
+    const parsed = parseAssistantStateUpdate(parsedSkill.visibleText);
     const visibleAssistantText = parsed.visibleText.trim();
     const updatedAt = new Date().toISOString();
     const nextPendingChoice = extractPendingChoiceFromAssistantText(
@@ -2384,6 +2501,32 @@ class BubbleTeaBridge {
       if (this.activeSessionId === sessionId) {
         this.executionPlan = updatedPlanSession.executionPlan;
         this.emitExecutionPlan();
+      }
+    }
+
+    if (parsedSkill.skill) {
+      if (!this.skillsRuntime?.createSkill) {
+        await this.pushSystemMessage(
+          "Skill payload was generated, but skills runtime creation is unavailable in this build.",
+          { kind: "error" }
+        );
+      } else {
+        const result = await this.skillsRuntime.createSkill(parsedSkill.skill);
+        await this.pushSystemMessage(result.message, {
+          kind: result.ok ? "system_hint" : "error",
+        });
+      }
+    } else if (parsedSkill.hasSkillTag) {
+      const message =
+        parsedSkill.parseStatus === "incomplete_tag"
+          ? "Assistant reply started a <cyrene_skill> block, but it did not complete before the turn ended."
+          : parsedSkill.parseStatus === "empty_payload"
+            ? "Assistant reply included an empty <cyrene_skill> payload."
+            : parsedSkill.parseStatus === "invalid_payload"
+              ? "Assistant reply included a <cyrene_skill> block, but the JSON payload was invalid."
+              : "";
+      if (message) {
+        await this.pushSystemMessage(message, { kind: "error" });
       }
     }
 
@@ -2505,6 +2648,7 @@ class BubbleTeaBridge {
         pendingDigest: nextPendingDigest,
         lastStateUpdate: diagnostic,
       });
+      await this.maybeSuggestSkillCreation(sessionId, nextSummary);
     }
 
     await this.sessionStore!.updatePendingChoice(sessionId, nextPendingChoice);

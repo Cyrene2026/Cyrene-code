@@ -43,6 +43,7 @@ export type LoadedSkillsConfig = {
   skills: SkillDefinition[];
   configPaths: string[];
   editableConfigPath: string;
+  globalPatch: SkillsConfigPatch;
   projectPatch: SkillsConfigPatch;
   origins: Record<
     string,
@@ -187,10 +188,16 @@ const getProjectConfigCandidates = (projectDir: string) => [
   join(projectDir, "skills.yml"),
 ];
 
+const getGlobalConfigCandidates = (globalDir: string) => [
+  join(globalDir, "skills.yaml"),
+  join(globalDir, "skills.yml"),
+];
+
 const resolveEditableConfigPath = (
-  projectDir: string,
-  projectFiles: LoadedPatchFile[]
-) => projectFiles[0]?.path ?? getProjectConfigCandidates(projectDir)[0]!;
+  baseDir: string,
+  files: LoadedPatchFile[],
+  candidates: (dir: string) => string[]
+) => files[0]?.path ?? candidates(baseDir)[0]!;
 
 const serializeSkillEntry = (skill: SkillConfigEntry) => ({
   id: skill.id,
@@ -223,7 +230,38 @@ export const saveProjectSkillsConfig = async (
   const projectFiles = (
     await Promise.all(getProjectConfigCandidates(projectDir).map(path => loadPatchFile(path)))
   ).filter((entry): entry is LoadedPatchFile => Boolean(entry));
-  const editableConfigPath = resolveEditableConfigPath(projectDir, projectFiles);
+  const editableConfigPath = resolveEditableConfigPath(
+    projectDir,
+    projectFiles,
+    getProjectConfigCandidates
+  );
+
+  await mkdir(dirname(editableConfigPath), { recursive: true });
+  await writeFile(editableConfigPath, serializePatch(patch), "utf8");
+
+  return {
+    path: editableConfigPath,
+  };
+};
+
+export const saveGlobalSkillsConfig = async (
+  appRoot: string,
+  patch: SkillsConfigPatch,
+  context?: SkillsConfigLoadContext
+) => {
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const globalDir = getCyreneConfigDir({
+    cwd: resolvedAppRoot,
+    env: context?.env,
+  });
+  const globalFiles = (
+    await Promise.all(getGlobalConfigCandidates(globalDir).map(path => loadPatchFile(path)))
+  ).filter((entry): entry is LoadedPatchFile => Boolean(entry));
+  const editableConfigPath = resolveEditableConfigPath(
+    globalDir,
+    globalFiles,
+    getGlobalConfigCandidates
+  );
 
   await mkdir(dirname(editableConfigPath), { recursive: true });
   await writeFile(editableConfigPath, serializePatch(patch), "utf8");
@@ -243,10 +281,7 @@ export const loadSkillsConfig = async (
     env: context?.env,
   });
   const projectDir = getLegacyProjectCyreneDir(resolvedAppRoot);
-  const globalCandidates = [
-    join(globalDir, "skills.yaml"),
-    join(globalDir, "skills.yml"),
-  ];
+  const globalCandidates = getGlobalConfigCandidates(globalDir);
   const projectCandidates = getProjectConfigCandidates(projectDir);
 
   const globalFiles = (
@@ -319,6 +354,11 @@ export const loadSkillsConfig = async (
     }
   }
 
+  for (const skillId of globalPatch.removeSkillIds) {
+    skillMap.delete(skillId);
+    origins.delete(skillId);
+  }
+
   for (const file of projectFiles) {
     for (const skill of file.patch.skills) {
       const base = skillMap.get(skill.id);
@@ -358,7 +398,12 @@ export const loadSkillsConfig = async (
   return {
     skills,
     configPaths: [...globalFiles, ...projectFiles].map(file => file.path),
-    editableConfigPath: resolveEditableConfigPath(projectDir, projectFiles),
+    editableConfigPath: resolveEditableConfigPath(
+      globalDir,
+      globalFiles,
+      getGlobalConfigCandidates
+    ),
+    globalPatch,
     projectPatch,
     origins: Object.fromEntries(origins.entries()),
   };

@@ -28,6 +28,22 @@ const asWorkingStateHeading = (
   return null;
 };
 
+const isWorkingStateHeadingLine = (line: string) =>
+  asWorkingStateHeading(line) !== null;
+
+const hasAnyWorkingStateHeadings = (text: string): boolean => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  for (const line of trimmed.split(/\r?\n/)) {
+    if (isWorkingStateHeadingLine(line)) {
+      return true;
+    }
+  }
+  return false;
+};
+
 const trimBlankEdges = (lines: string[]) => {
   let start = 0;
   let end = lines.length;
@@ -138,18 +154,11 @@ export const parseWorkingStateSummary = (text: string): WorkingStateSectionMap =
     return {};
   }
 
-  const entries = WORKING_STATE_SECTION_ORDER.map(
-    section =>
-      [
-        section,
-        trimBlankEdges(sections.get(section) ?? []).map(line => line.trimEnd()),
-      ] as const
-  ).filter((entry): entry is readonly [WorkingStateSectionName, string[]] => {
-    const [, lines] = entry;
-    return lines.length > 0;
-  });
-
-  return Object.fromEntries(entries) as WorkingStateSectionMap;
+  // Preserve all detected sections (including empty ones) so callers can distinguish
+  // "no sections detected" from "sections detected but all empty"
+  return Object.fromEntries(
+    WORKING_STATE_SECTION_ORDER.map(section => [section, sections.get(section) ?? []])
+  ) as WorkingStateSectionMap;
 };
 
 export const normalizeWorkingStateSummary = (text: string) => {
@@ -159,12 +168,16 @@ export const normalizeWorkingStateSummary = (text: string) => {
   }
 
   const parsed = parseWorkingStateSummary(trimmed);
-  if (Object.keys(parsed).length === 0) {
+  // Only treat as LEGACY if no section headings were detected at all
+  // (vs detected but all empty - which is a valid empty working state)
+  if (!hasAnyWorkingStateHeadings(trimmed)) {
     return formatLegacyWorkingState(trimmed);
   }
 
   return WORKING_STATE_SECTION_ORDER.map(section => {
-    const body = renderSectionBody(parsed[section] ?? []);
+    const body = renderSectionBody(
+      trimBlankEdges(parsed[section] ?? []).map(line => line.trimEnd())
+    );
     return `${section}:\n${body}`;
   }).join("\n\n");
 };
@@ -186,18 +199,30 @@ export const repairWorkingStateSummary = (
   }
 
   const parsed = parseWorkingStateSummary(trimmed);
-  if (Object.keys(parsed).length > 0) {
+  // Check if any sections have content (after the fix, all sections exist in parsed)
+  const hasAnyContent = WORKING_STATE_SECTION_ORDER.some(
+    section => (parsed[section]?.length ?? 0) > 0
+  );
+  if (hasAnyContent) {
     return normalizeWorkingStateSummary(trimmed);
   }
 
   const sourceLines = [trimmed, fallbackText]
     .filter(Boolean)
     .flatMap(chunk => chunk.split(/\r?\n/))
+    .filter(line => !isWorkingStateHeadingLine(line))  // Skip section headings
     .map(normalizeLooseBullet)
     .filter(line => line && line !== "(none)");
 
   if (sourceLines.length === 0) {
-    return normalizeWorkingStateSummary(trimmed);
+    // If trimmed had section headings but no content after filtering, return normalized empty sections
+    // If trimmed was truly empty, return (none)
+    if (hasAnyWorkingStateHeadings(trimmed)) {
+      return WORKING_STATE_SECTION_ORDER.map(section => {
+        return `${section}:\n- (none)`;
+      }).join("\n\n");
+    }
+    return "(none)";
   }
 
   const sections = Object.fromEntries(

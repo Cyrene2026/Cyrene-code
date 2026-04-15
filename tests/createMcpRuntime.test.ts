@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,6 +8,15 @@ import { createMcpRuntime } from "../src/core/mcp";
 
 const tempRoots: string[] = [];
 const cleanupTasks: Array<() => Promise<void>> = [];
+
+type FakeLspChildProcess = EventEmitter & {
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  stdin: {
+    write: (chunk: string | Buffer, encoding?: BufferEncoding) => boolean;
+  };
+  kill: () => boolean;
+};
 
 const createWorkspace = async () => {
   const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-runtime-"));
@@ -70,6 +80,122 @@ const createFakeDiagnosticLspServer = async (root: string) => {
     "utf8"
   );
   return scriptPath;
+};
+
+const sendLspFrame = (
+  child: FakeLspChildProcess,
+  message: Record<string, unknown>
+) => {
+  const payload = JSON.stringify({
+    jsonrpc: "2.0",
+    ...message,
+  });
+  child.stdout.emit(
+    "data",
+    Buffer.from(
+      `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`,
+      "utf8"
+    )
+  );
+};
+
+const createFakeDiagnosticLspSpawn = () => {
+  const spawnProcess = () => {
+    const child = new EventEmitter() as FakeLspChildProcess;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+
+    let inputBuffer = "";
+
+    const pump = () => {
+      while (true) {
+        const separatorIndex = inputBuffer.indexOf("\r\n\r\n");
+        if (separatorIndex < 0) {
+          return;
+        }
+        const header = inputBuffer.slice(0, separatorIndex);
+        const lengthMatch = /Content-Length:\s*(\d+)/i.exec(header);
+        if (!lengthMatch) {
+          return;
+        }
+        const contentLength = Number(lengthMatch[1]);
+        const frameStart = separatorIndex + 4;
+        if (inputBuffer.length < frameStart + contentLength) {
+          return;
+        }
+        const payload = inputBuffer.slice(frameStart, frameStart + contentLength);
+        inputBuffer = inputBuffer.slice(frameStart + contentLength);
+        const parsed = JSON.parse(payload) as {
+          id?: number | string | null;
+          method?: string;
+        };
+        if (parsed.method === "initialize") {
+          sendLspFrame(child, {
+            id: parsed.id ?? null,
+            result: {
+              capabilities: {
+                diagnosticProvider: {},
+              },
+            },
+          });
+          continue;
+        }
+        if (parsed.method === "textDocument/diagnostic") {
+          sendLspFrame(child, {
+            id: parsed.id ?? null,
+            result: {
+              kind: "full",
+              items: [
+                {
+                  range: {
+                    start: { line: 0, character: 0 },
+                    end: { line: 0, character: 5 },
+                  },
+                  severity: 2,
+                  source: "fake-lsp",
+                  code: "W1",
+                  message: "demo warning",
+                },
+              ],
+            },
+          });
+          continue;
+        }
+        if (parsed.method === "shutdown") {
+          sendLspFrame(child, {
+            id: parsed.id ?? null,
+            result: null,
+          });
+          continue;
+        }
+        if (typeof parsed.id !== "undefined") {
+          sendLspFrame(child, {
+            id: parsed.id,
+            result: null,
+          });
+        }
+      }
+    };
+
+    child.stdin = {
+      write: chunk => {
+        inputBuffer += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+        pump();
+        return true;
+      },
+    };
+
+    child.kill = () => {
+      child.emit("exit", null, "SIGTERM");
+      return true;
+    };
+
+    return child as any;
+  };
+
+  return {
+    spawnProcess,
+  };
 };
 
 const getAvailablePort = () =>
@@ -767,7 +893,7 @@ describe("createMcpRuntime", () => {
 
   test("doctorLsp runs diagnostics and reports the diagnostic count for a healthy server", async () => {
     const { root, cyreneHome } = await createWorkspace();
-    const fakeLspScript = await createFakeDiagnosticLspServer(root);
+    const fake = createFakeDiagnosticLspSpawn();
     await mkdir(join(root, "src"), { recursive: true });
     await writeFile(join(root, "src", "demo.ts"), "export const demo = 1;\n", "utf8");
     await writeFile(
@@ -779,8 +905,8 @@ describe("createMcpRuntime", () => {
         "    workspace_root: .",
         "    lsp_servers:",
         "      - id: fake",
-        `        command: "${process.execPath.replace(/\\/g, "\\\\")}"`,
-        `        args: ["${fakeLspScript.replace(/\\/g, "\\\\")}"]`,
+        '        command: "fake-lsp"',
+        "        args: []",
         "        file_patterns: [\"**/*.ts\"]",
       ].join("\n"),
       "utf8"
@@ -791,6 +917,7 @@ describe("createMcpRuntime", () => {
         ...process.env,
         CYRENE_HOME: cyreneHome,
       },
+      spawnProcess: fake.spawnProcess as any,
     });
 
     const result = await runtime.doctorLsp?.("repo", "src/demo.ts", {

@@ -45,6 +45,7 @@ type CreateMcpRuntimeContext = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   dnsLookup?: DnsLookupFn;
+  spawnProcess?: typeof import("node:child_process").spawn;
 };
 
 type InitializableMcpAdapter = McpServerAdapter & {
@@ -1258,6 +1259,7 @@ class ManagedMcpRuntime implements McpRuntime {
       cloneLspServerConfig(entry)
     ), {
       env: this.context?.env,
+      spawnProcess: this.context?.spawnProcess,
     });
 
     const baseLines = [

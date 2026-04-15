@@ -3,6 +3,8 @@ package app
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -168,6 +170,8 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/clear", Description: "clear transcript"},
 	{Command: "/quit", Description: "quit bubble tea frontend"},
 }
+
+var readClipboardText = defaultClipboardTextReader
 
 func init() {
 	for index := range slashCommandCatalog {
@@ -715,12 +719,35 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.setNotice("Copy mode enabled. Drag to select text; terminal paste is active here. Press F6 to restore in-app mouse scrolling.", false)
 		return m, tea.DisableMouse
+	case tea.KeyCtrlV:
+		return m.handleClipboardPaste()
 	}
 
 	if m.ActivePanel != PanelNone {
 		return m.handlePanelKey(msg)
 	}
 	return m.handleComposerKey(msg)
+}
+
+func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
+	text, err := readClipboardText()
+	if err != nil {
+		m.setNotice(fmt.Sprintf("Clipboard paste failed: %v. Press F6 for terminal paste.", err), true)
+		return m, nil
+	}
+	if text == "" {
+		return m, nil
+	}
+
+	switch m.ActivePanel {
+	case PanelNone:
+		m.insertRunes([]rune(text))
+	case PanelAuth:
+		m.insertAuthRunes(filterAuthInputRunes([]rune(text)))
+	default:
+		m.setNotice("Clipboard paste is only available in text input fields.", false)
+	}
+	return m, nil
 }
 
 func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2308,6 +2335,26 @@ func normalizeComposerRunes(values []rune) []rune {
 		}
 	}
 	return normalized
+}
+
+func defaultClipboardTextReader() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		command := exec.Command(
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"$text = Get-Clipboard -Raw; if ($null -ne $text) { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Out.Write($text) }",
+		)
+		output, err := command.Output()
+		if err != nil {
+			return "", err
+		}
+		return string(output), nil
+	default:
+		return "", fmt.Errorf("unsupported platform %s", runtime.GOOS)
+	}
 }
 
 func isWindowsIgnoredInputRune(value rune) bool {

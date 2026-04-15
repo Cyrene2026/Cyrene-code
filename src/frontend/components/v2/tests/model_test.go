@@ -121,6 +121,20 @@ func TestPlainAStillInsertsAfterF6Toggle(t *testing.T) {
 	}
 }
 
+func TestCtrlVPastesIntoComposerWithoutF6Toggle(t *testing.T) {
+	restore := app.SetClipboardReaderForTest(func() (string, error) {
+		return "alpha\r\nbeta", nil
+	})
+	defer restore()
+
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+
+	if got := string(model.Input); got != "alpha\nbeta" {
+		t.Fatalf("expected ctrl+v to paste into composer, got %q", got)
+	}
+}
+
 func TestCopyModeHelperMentionsRightClickPaste(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
@@ -1301,6 +1315,24 @@ func TestAuthDigitsInsertIntoFieldWithoutAlt(t *testing.T) {
 	}
 	if model.AuthStep != app.AuthStepAPIKey {
 		t.Fatalf("expected auth step to stay on api key, got %q", model.AuthStep)
+	}
+}
+
+func TestCtrlVPastesIntoAuthField(t *testing.T) {
+	restore := app.SetClipboardReaderForTest(func() (string, error) {
+		return "sk-\ufeffabc123", nil
+	})
+	defer restore()
+
+	model := app.NewModel()
+	model.ActivePanel = app.PanelAuth
+	model.AuthStep = app.AuthStepAPIKey
+	model.AuthCursor = 0
+
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+
+	if got := string(model.AuthAPIKey); got != "sk-abc123" {
+		t.Fatalf("expected ctrl+v to paste into api key field, got %q", got)
 	}
 }
 

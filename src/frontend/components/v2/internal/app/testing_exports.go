@@ -72,3 +72,15 @@ func (m *Model) TranscriptMessageCacheWidthForTest(index int) int {
 	}
 	return m.transcriptMessageCache[index].width
 }
+
+func SetClipboardReaderForTest(reader func() (string, error)) func() {
+	previous := readClipboardText
+	if reader == nil {
+		readClipboardText = defaultClipboardTextReader
+	} else {
+		readClipboardText = reader
+	}
+	return func() {
+		readClipboardText = previous
+	}
+}

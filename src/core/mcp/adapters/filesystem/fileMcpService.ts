@@ -1910,10 +1910,6 @@ const normalizeFromRecord = (
     "dir",
     "directory",
   ]);
-
-  const content = pickString(record, ["content", "value", "data"]);
-  const find = pickString(record, ["find", "from", "old", "before"]);
-  const replace = pickString(record, ["replace", "new", "after"]);
   const cwd = pickString(record, ["cwd", "working_directory", "workdir"]);
   const rawArgs = pickStringArray(record, ["args", "argv", "arguments"]);
   const explicitPaths = pickStringArray(record, [
@@ -1924,6 +1920,37 @@ const normalizeFromRecord = (
   ]);
   const rawCommand = pickString(record, ["command", "cmd", "program", "executable"]);
   const shellInput = pickString(record, ["input", "text", "line"]);
+  const structuralContent = pickString(record, [
+    "content",
+    "contents",
+    "value",
+    "data",
+    "body",
+    "code",
+    "fileContent",
+    "file_content",
+  ]);
+  const find = pickString(record, [
+    "find",
+    "from",
+    "old",
+    "before",
+    "oldText",
+    "old_text",
+    "search",
+    "searchText",
+    "search_text",
+  ]);
+  const replace = pickString(record, [
+    "replace",
+    "new",
+    "after",
+    "newText",
+    "new_text",
+    "replacement",
+    "replacementText",
+    "replacement_text",
+  ]);
 
   if (action === "run_command" || ["command", "exec"].includes(toolName)) {
     const tokens = rawCommand ? tokenizeCommand(rawCommand) : [];
@@ -2037,7 +2064,7 @@ const normalizeFromRecord = (
       action = "search_text";
     } else if (path && find && typeof replace === "string") {
       action = "edit_file";
-    } else if (path && typeof content === "string") {
+    } else if (path && typeof structuralContent === "string") {
       action = "write_file";
     } else if (path) {
       action = "read_file";
@@ -2047,6 +2074,11 @@ const normalizeFromRecord = (
   if (!action) {
     return null;
   }
+
+  const content =
+    action === "create_file" || action === "write_file"
+      ? structuralContent ?? pickString(record, ["text"])
+      : structuralContent;
 
   return buildNormalizedFileRequest(
     action as FileAction,

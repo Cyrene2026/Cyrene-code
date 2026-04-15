@@ -2,6 +2,8 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FileMcpService } from "../src/core/mcp";
+import { parseStreamChunk } from "../src/core/query/streamProtocol";
 import {
   FILE_TOOL,
   TOOL_USAGE_SYSTEM_PROMPT,
@@ -12,6 +14,7 @@ import { resetConfiguredAppRoot, setConfiguredAppRoot } from "../src/infra/confi
 
 const originalFetch = globalThis.fetch;
 const tempRoots: string[] = [];
+const tempServices: FileMcpService[] = [];
 
 const createTransport = (
   options: {
@@ -50,8 +53,41 @@ const createWorkspace = async () => {
   };
 };
 
+const createRelaxedFileService = (root: string) => {
+  const service = new FileMcpService({
+    workspaceRoot: root,
+    maxReadBytes: 1024 * 1024,
+    requireReview: [
+      "delete_file",
+      "copy_path",
+      "move_path",
+      "run_command",
+      "run_shell",
+      "open_shell",
+      "write_shell",
+    ],
+  });
+  tempServices.push(service);
+  return service;
+};
+
+const collectParsedStreamEvents = async (
+  transport: ReturnType<typeof createTransport>,
+  query: string
+) => {
+  const streamUrl = await transport.requestStreamUrl(query);
+  const events: ReturnType<typeof parseStreamChunk>[number][] = [];
+  for await (const chunk of transport.stream(streamUrl)) {
+    events.push(...parseStreamChunk(chunk));
+  }
+  return events;
+};
+
 afterEach(async () => {
   resetConfiguredAppRoot();
+  for (const service of tempServices.splice(0)) {
+    service.dispose();
+  }
   await Promise.all(
     tempRoots.splice(0).map(path =>
       rm(path, { recursive: true, force: true }).catch(() => undefined)
@@ -249,6 +285,8 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_log, use `maxResults` to limit how many commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_show, use `revision`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_blame, provide a file path");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For write_file, provide `content` with the full desired file body");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For edit_file and apply_patch, provide both `find` and `replace`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use apply_patch for targeted patches");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not put shell syntax");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("When a persistent shell may already exist, call shell_status before opening another one");
@@ -2763,6 +2801,317 @@ describe("createHttpQueryTransport streaming usage", () => {
       }),
       JSON.stringify({ type: "done" }),
     ]);
+  });
+
+  test("openai chat stream recovers write_file calls that use `code` instead of `content`", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const service = createRelaxedFileService(root);
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"{\\"action\\":\\"write_file\\",\\"path\\":\\"src/main.cpp\\",\\"code\\":\\"#include <iostream>\\\\nint main() { return 0; }\\\\n\\"}"}}]}}]}',
+              "",
+              'data: {"choices":[{"finish_reason":"tool_calls"}]}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "write a small cpp file");
+    const toolEvent = parsedEvents.find(event => event.type === "tool_call");
+
+    expect(toolEvent).toEqual({
+      type: "tool_call",
+      toolName: "file",
+      input: {
+        action: "write_file",
+        path: "src/main.cpp",
+        code: "#include <iostream>\nint main() { return 0; }\n",
+      },
+    });
+
+    const result = await service.handleToolCall(toolEvent!.toolName, toolEvent!.input);
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(await readFile(join(root, "src", "main.cpp"), "utf8")).toContain(
+      "int main() { return 0; }"
+    );
+  });
+
+  test("openai responses stream recovers write_file calls that use `body` instead of `content`", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const service = createRelaxedFileService(root);
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_item.added","item_id":"fc_1","item":{"type":"function_call","name":"file"}}',
+              "",
+              'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"action\\":\\"write_file\\",\\"path\\":\\"notes.txt\\",\\"body\\":\\"hello from responses\\\\n\\"}"}',
+              "",
+              'data: {"type":"response.completed","response":{"status":"completed"}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const formatResult = await transport.setProviderFormat?.(
+      "https://example.test/v1",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "write a note");
+    const toolEvent = parsedEvents.find(event => event.type === "tool_call");
+
+    expect(toolEvent).toEqual({
+      type: "tool_call",
+      toolName: "file",
+      input: {
+        action: "write_file",
+        path: "notes.txt",
+        body: "hello from responses\n",
+      },
+    });
+
+    const result = await service.handleToolCall(toolEvent!.toolName, toolEvent!.input);
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(await readFile(join(root, "notes.txt"), "utf8")).toBe(
+      "hello from responses\n"
+    );
+  });
+
+  test("anthropic stream recovers edit_file calls that use oldText/newText aliases", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const service = createRelaxedFileService(root);
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "lib.rs"), "fn greet() {}\n", "utf8");
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_start',
+              'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"file","input":{}}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"action\\":\\"edit_file\\",\\"path\\":\\"src/lib.rs\\",\\"oldText\\":\\"greet\\","}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"newText\\":\\"welcome\\"}"}}',
+              "",
+              'event: content_block_stop',
+              'data: {"type":"content_block_stop","index":0}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.anthropic.com",
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+        CYRENE_MODEL: "claude-3-7-sonnet-latest",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "rename greet to welcome");
+    const toolEvent = parsedEvents.find(event => event.type === "tool_call");
+
+    expect(toolEvent).toEqual({
+      type: "tool_call",
+      toolName: "file",
+      input: {
+        action: "edit_file",
+        path: "src/lib.rs",
+        oldText: "greet",
+        newText: "welcome",
+      },
+    });
+
+    const result = await service.handleToolCall(toolEvent!.toolName, toolEvent!.input);
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(await readFile(join(root, "src", "lib.rs"), "utf8")).toBe(
+      "fn welcome() {}\n"
+    );
+  });
+
+  test("gemini stream recovers create_file calls that use `contents` instead of `content`", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const service = createRelaxedFileService(root);
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gemini-2.5-flash",
+        "last_used_model: gemini-2.5-flash",
+        "provider_base_url: https://generativelanguage.googleapis.com/v1beta",
+        "models:",
+        "  - gemini-2.5-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"file","args":{"action":"create_file","path":"src/app.py","contents":"print(\\"gemini\\")\\n"}}}]}}]}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://generativelanguage.googleapis.com/v1beta",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+        CYRENE_MODEL: "gemini-2.5-flash",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "create a small python file");
+    const toolEvent = parsedEvents.find(event => event.type === "tool_call");
+
+    expect(toolEvent).toEqual({
+      type: "tool_call",
+      toolName: "file",
+      input: {
+        action: "create_file",
+        path: "src/app.py",
+        contents: 'print("gemini")\n',
+      },
+    });
+
+    const result = await service.handleToolCall(toolEvent!.toolName, toolEvent!.input);
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(await readFile(join(root, "src", "app.py"), "utf8")).toBe(
+      'print("gemini")\n'
+    );
   });
 
 });

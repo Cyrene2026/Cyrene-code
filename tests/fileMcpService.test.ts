@@ -1100,6 +1100,43 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("Invalid tool input");
   });
 
+  test("write_file accepts common model content aliases", async () => {
+    const { root, service } = await createRelaxedReviewService();
+
+    const result = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "src/main.cpp",
+      code: "#include <iostream>\nint main() { std::cout << \"ok\"; }\n",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] write_file src/main.cpp");
+    expect(await readFile(join(root, "src", "main.cpp"), "utf8")).toContain(
+      'std::cout << "ok";'
+    );
+  });
+
+  test("edit_file accepts oldText/newText aliases", async () => {
+    const { root, service } = await createRelaxedReviewService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "lib.rs"), "fn greet() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "edit_file",
+      path: "src/lib.rs",
+      oldText: "greet",
+      newText: "welcome",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("[tool result] edit_file src/lib.rs");
+    expect(await readFile(join(root, "src", "lib.rs"), "utf8")).toBe(
+      "fn welcome() {}\n"
+    );
+  });
+
   test("search_text accepts placeholder-heavy payloads by defaulting path and query", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "docs"), { recursive: true });

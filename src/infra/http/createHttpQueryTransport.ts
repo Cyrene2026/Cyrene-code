@@ -426,6 +426,8 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Use write_file for full overwrite writes.",
   "- Use edit_file for targeted replacement.",
   "- Use apply_patch for targeted patches on one file using `find` and `replace`.",
+  "- For write_file, provide `content` with the full desired file body.",
+  "- For edit_file and apply_patch, provide both `find` and `replace`.",
   "- Use copy_path or move_path for path relocation instead of trying to emulate them with read/write/delete steps.",
   "- Use run_command only for direct program execution such as `node --version`.",
   "- `args` is only for run_command. Do not put search terms for find_files or search_text into args.",

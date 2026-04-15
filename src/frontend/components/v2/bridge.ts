@@ -1531,7 +1531,8 @@ class BubbleTeaBridge {
     const lines = [
       "Create or refresh the execution plan for this task.",
       "Return a short visible summary for the user, then include a machine-readable <cyrene_plan> JSON block.",
-      "The JSON must match: {\"version\":1,\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      "The JSON must match: {\"version\":1,\"projectRoot\":\"...\",\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      `Set projectRoot to the current workspace root: ${this.appRoot}.`,
       "Keep 3-7 concrete steps. Mark already-finished work as completed. Use in_progress only for the active step.",
       "Preserve evidence, filePaths, and recentToolResult for existing steps when still relevant.",
       "If an execution plan already exists, refine it instead of restarting unless the task changed materially.",
@@ -1545,7 +1546,8 @@ class BubbleTeaBridge {
     const lines = [
       "Revise the active execution plan.",
       "Return a short visible summary for the user, then include a machine-readable <cyrene_plan> JSON block.",
-      "The JSON must match: {\"version\":1,\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      "The JSON must match: {\"version\":1,\"projectRoot\":\"...\",\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}.",
+      `Keep projectRoot aligned with the current workspace root: ${this.appRoot}.`,
       "Preserve evidence, filePaths, and recentToolResult unless the revision makes them obsolete.",
       "If the plan changes materially, clear acceptedAt and acceptedSummary.",
       `Current plan snapshot:\n${formatExecutionPlan(plan)}`,
@@ -2511,6 +2513,7 @@ class BubbleTeaBridge {
     if (parsedPlan.plan) {
       const updatedPlanSession = await this.sessionStore!.updateExecutionPlan(sessionId, {
         ...parsedPlan.plan,
+        projectRoot: parsedPlan.plan.projectRoot || this.appRoot,
         capturedAt: updatedAt,
       });
       if (this.activeSessionId === sessionId) {

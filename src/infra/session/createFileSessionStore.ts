@@ -19,7 +19,10 @@ import {
   deriveReducerMode,
   sanitizeStoredWorkingState,
 } from "../../core/session/stateReducer";
-import { applyExecutionPlanToWorkingState } from "../../core/session/executionPlan";
+import {
+  applyExecutionPlanToWorkingState,
+  stripExecutionPlanFromWorkingState,
+} from "../../core/session/executionPlan";
 import type { SessionStore } from "../../core/session/store";
 import type {
   SessionExecutionPlan,
@@ -88,6 +91,7 @@ const pendingChoiceSchema: z.ZodType<SessionPendingChoice> = z.object({
 const executionPlanSchema = z.object({
   capturedAt: z.string(),
   sourcePreview: z.string(),
+  projectRoot: z.string().optional(),
   summary: z.string(),
   objective: z.string(),
   acceptedAt: z.string().optional(),
@@ -268,6 +272,7 @@ const normalizeExecutionPlan = (
   }
   return {
     ...plan,
+    projectRoot: plan.projectRoot ?? "",
     acceptedAt: plan.acceptedAt ?? "",
     acceptedSummary: plan.acceptedSummary ?? "",
     steps: plan.steps.map(step => ({
@@ -478,6 +483,30 @@ export const createFileSessionStore = (
     await writeMemoryIndex(index);
     await writeSession(nextSession);
     return nextSession;
+  };
+
+  const clearExecutionPlanFromSession = async (
+    session: SessionRecord,
+    index: SessionMemoryIndex
+  ) => {
+    if (!session.executionPlan) {
+      return session;
+    }
+    const strippedState = stripExecutionPlanFromWorkingState({
+      summary: session.summary,
+      pendingDigest: session.pendingDigest,
+      plan: session.executionPlan,
+    });
+    return persistWithIndex(
+      {
+        ...session,
+        executionPlan: null,
+        summary: strippedState.summary,
+        pendingDigest: strippedState.pendingDigest,
+        updatedAt: new Date().toISOString(),
+      },
+      index
+    );
   };
 
   const scoreSessionQuery = (session: SessionRecord, normalizedQuery: string) => {
@@ -762,6 +791,7 @@ export const createFileSessionStore = (
       const normalizedPlan = executionPlan
         ? {
             ...executionPlan,
+            projectRoot: executionPlan.projectRoot ?? loaded.session.projectRoot ?? "",
             acceptedAt: executionPlan.acceptedAt ?? "",
             acceptedSummary: executionPlan.acceptedSummary ?? "",
             steps: executionPlan.steps.map(step => ({
@@ -772,6 +802,24 @@ export const createFileSessionStore = (
             })),
           }
         : null;
+      if (normalizedPlan) {
+        await ensureDir();
+        const files = await readdir(resolvedSessionDir, { withFileTypes: true });
+        for (const file of files) {
+          if (!file.isFile() || !isSessionDataFile(file.name)) {
+            continue;
+          }
+          const otherId = file.name.replace(/\.json$/, "");
+          if (otherId === id) {
+            continue;
+          }
+          const otherLoaded = await ensureSessionWithIndex(otherId);
+          if (!otherLoaded?.session.executionPlan) {
+            continue;
+          }
+          await clearExecutionPlanFromSession(otherLoaded.session, otherLoaded.index);
+        }
+      }
       const linkedState = applyExecutionPlanToWorkingState({
         summary: loaded.session.summary,
         pendingDigest: loaded.session.pendingDigest,

@@ -98,6 +98,7 @@ type BridgePlanStep struct {
 type BridgeExecutionPlan struct {
 	CapturedAt      string           `json:"capturedAt"`
 	SourcePreview   string           `json:"sourcePreview"`
+	ProjectRoot     string           `json:"projectRoot"`
 	Summary         string           `json:"summary"`
 	Objective       string           `json:"objective"`
 	AcceptedAt      string           `json:"acceptedAt"`

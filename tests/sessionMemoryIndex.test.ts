@@ -679,7 +679,7 @@ describe("session memory index", () => {
   });
 
   test("prompt context carries execution plan and linked working state", async () => {
-    const { store } = await createStore();
+    const { root, store } = await createStore();
     const session = await store.createSession("plan task");
     await store.appendMessage(session.id, {
       role: "user",
@@ -690,6 +690,7 @@ describe("session memory index", () => {
     await store.updateExecutionPlan(session.id, {
       capturedAt: "2026-01-01T00:00:05.000Z",
       sourcePreview: "refactor the reducer flow",
+      projectRoot: root,
       summary: "Refactor the reducer flow in three steps",
       objective: "refactor the reducer flow",
       acceptedAt: "",
@@ -732,5 +733,62 @@ describe("session memory index", () => {
     expect(context.pendingDigest).toContain(
       "NEXT BEST ACTIONS:\n- Continue with active plan step: patch reducer transitions"
     );
+  });
+
+  test("only one session can retain an execution plan at a time", async () => {
+    const { root, store } = await createStore();
+    const alpha = await store.createSession("alpha task");
+    const beta = await store.createSession("beta task");
+
+    await store.updateExecutionPlan(alpha.id, {
+      capturedAt: "2026-01-01T00:00:05.000Z",
+      sourcePreview: "alpha",
+      projectRoot: root,
+      summary: "Alpha plan",
+      objective: "alpha objective",
+      acceptedAt: "",
+      acceptedSummary: "",
+      steps: [
+        {
+          id: "step-1",
+          title: "alpha step",
+          details: "",
+          status: "in_progress",
+          evidence: [],
+          filePaths: [],
+          recentToolResult: "",
+        },
+      ],
+    });
+
+    await store.updateExecutionPlan(beta.id, {
+      capturedAt: "2026-01-01T00:00:06.000Z",
+      sourcePreview: "beta",
+      projectRoot: root,
+      summary: "Beta plan",
+      objective: "beta objective",
+      acceptedAt: "",
+      acceptedSummary: "",
+      steps: [
+        {
+          id: "step-1",
+          title: "beta step",
+          details: "",
+          status: "in_progress",
+          evidence: [],
+          filePaths: [],
+          recentToolResult: "",
+        },
+      ],
+    });
+
+    const alphaAfter = await store.loadSession(alpha.id);
+    const betaAfter = await store.loadSession(beta.id);
+
+    expect(alphaAfter?.executionPlan).toBeNull();
+    expect(alphaAfter?.summary).not.toContain("Remaining plan step:");
+    expect(alphaAfter?.pendingDigest).not.toContain("Continue with active plan step:");
+    expect(betaAfter?.executionPlan?.projectRoot).toBe(root);
+    expect(betaAfter?.executionPlan?.summary).toBe("Beta plan");
   });
 });

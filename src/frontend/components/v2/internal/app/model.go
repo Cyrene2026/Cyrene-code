@@ -198,6 +198,7 @@ type ExecutionPlanStep struct {
 type ExecutionPlan struct {
 	CapturedAt      string
 	SourcePreview   string
+	ProjectRoot     string
 	Summary         string
 	Objective       string
 	AcceptedAt      string
@@ -1061,6 +1062,9 @@ func planPanelOverviewRows(bodyWidth int, plan ExecutionPlan) int {
 	rows := 0
 	if strings.TrimSpace(plan.Summary) != "" {
 		rows += len(wrapPlainText(plan.Summary, bodyWidth))
+	}
+	if strings.TrimSpace(plan.ProjectRoot) != "" {
+		rows += len(wrapPlainText("project "+plan.ProjectRoot, bodyWidth))
 	}
 	if strings.TrimSpace(plan.Objective) != "" {
 		rows += len(wrapPlainText("objective "+plan.Objective, bodyWidth))
@@ -2443,6 +2447,7 @@ func cloneExecutionPlan(plan *BridgeExecutionPlan) ExecutionPlan {
 	cloned := ExecutionPlan{
 		CapturedAt:      plan.CapturedAt,
 		SourcePreview:   plan.SourcePreview,
+		ProjectRoot:     plan.ProjectRoot,
 		Summary:         plan.Summary,
 		Objective:       plan.Objective,
 		AcceptedAt:      plan.AcceptedAt,

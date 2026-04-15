@@ -43,6 +43,7 @@ describe("buildPromptWithContext", () => {
       executionPlan: {
         capturedAt: "2026-01-01T00:00:00.000Z",
         sourcePreview: "finish oauth follow-up",
+        projectRoot: "/workspace/oauth",
         summary: "Close the oauth follow-up cleanly",
         objective: "finish oauth follow-up",
         acceptedAt: "",

@@ -44,6 +44,7 @@ export type SessionExecutionPlanStep = {
 export type SessionExecutionPlan = {
   capturedAt: string;
   sourcePreview: string;
+  projectRoot: string;
   summary: string;
   objective: string;
   acceptedAt: string;

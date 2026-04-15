@@ -20,7 +20,7 @@ const EXECUTION_PLAN_PROTOCOL = [
   "EXECUTION PLAN PROTOCOL:",
   "Create or refresh an execution plan whenever the task is multi-step, needs coordination, or progress should persist across turns.",
   "When you create or revise the plan, or when a step changes status, return normal visible user-facing text first, then exactly one machine-readable plan block.",
-  `Plan block format: ${CYRENE_PLAN_START_TAG}{\"version\":1,\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}${CYRENE_PLAN_END_TAG}`,
+  `Plan block format: ${CYRENE_PLAN_START_TAG}{\"version\":1,\"projectRoot\":\"...\",\"summary\":\"...\",\"objective\":\"...\",\"acceptedAt\":\"\",\"acceptedSummary\":\"\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"details\":\"...\",\"status\":\"pending|in_progress|completed|blocked\",\"evidence\":[\"...\"],\"filePaths\":[\"...\"],\"recentToolResult\":\"...\"}]}${CYRENE_PLAN_END_TAG}`,
   "Use 3-7 concrete steps when planning. Keep at most one in_progress step at a time.",
   "Do the work instead of only restating the plan. When a step finishes, mark it completed yourself. When blocked, mark it blocked and explain the blocker in details.",
   "If all planned work is done, mark the remaining finished steps completed and say clearly that the task is complete.",

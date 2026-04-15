@@ -504,7 +504,11 @@ const isSafeFactFragment = (line: string) => {
 
   const startCommandMatch = line.match(START_COMMAND_LABEL_SIGNAL);
   if (startCommandMatch?.[2]) {
-    const [, label, rawCommand] = startCommandMatch;
+    const label = startCommandMatch[1];
+    const rawCommand = startCommandMatch[2];
+    if (typeof label !== "string" || typeof rawCommand !== "string") {
+      return null;
+    }
     const command = wrapFactLiteral(rawCommand);
     if (command) {
       return /^(?:运行命令|run command)$/iu.test(label)
@@ -515,7 +519,11 @@ const isSafeFactFragment = (line: string) => {
 
   const startupFactMatch = line.match(START_COMMAND_FACT_SIGNAL);
   if (startupFactMatch) {
-    const [, subject, command] = startupFactMatch;
+    const subject = startupFactMatch[1];
+    const command = startupFactMatch[2];
+    if (typeof subject !== "string" || typeof command !== "string") {
+      return null;
+    }
     const normalizedSubject = wrapFactLiteral(subject);
     const normalizedCommand = wrapFactLiteral(command);
     if (normalizedSubject && normalizedCommand) {
@@ -525,7 +533,16 @@ const isSafeFactFragment = (line: string) => {
 
   const scriptCommandMatch = line.match(SCRIPT_COMMAND_FACT_SIGNAL);
   if (scriptCommandMatch) {
-    const [, subject, scriptName, command] = scriptCommandMatch;
+    const subject = scriptCommandMatch[1];
+    const scriptName = scriptCommandMatch[2];
+    const command = scriptCommandMatch[3];
+    if (
+      typeof subject !== "string" ||
+      typeof scriptName !== "string" ||
+      typeof command !== "string"
+    ) {
+      return null;
+    }
     const normalizedSubject = wrapFactLiteral(subject);
     const normalizedScript = wrapFactLiteral(scriptName);
     const normalizedCommand = wrapFactLiteral(command);
@@ -544,7 +561,11 @@ const isSafeFactFragment = (line: string) => {
 
   const bootstrapChainFactMatch = line.match(BOOTSTRAP_CHAIN_FACT_SIGNAL);
   if (bootstrapChainFactMatch) {
-    const [, subject, chain] = bootstrapChainFactMatch;
+    const subject = bootstrapChainFactMatch[1];
+    const chain = bootstrapChainFactMatch[2];
+    if (typeof subject !== "string" || typeof chain !== "string") {
+      return null;
+    }
     const normalizedSubject = wrapFactLiteral(subject);
     const normalizedChain = wrapChainFactLiteral(chain);
     if (normalizedSubject && normalizedChain) {

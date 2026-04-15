@@ -1516,6 +1516,11 @@ func (m *Model) renderPlans(width, height int) string {
 			bodyLines = append(bodyLines, dimStyle.Render(row))
 		}
 	}
+	if strings.TrimSpace(m.ExecutionPlan.ProjectRoot) != "" {
+		for _, row := range wrapPlainText("project "+m.ExecutionPlan.ProjectRoot, bodyWidth) {
+			bodyLines = append(bodyLines, dimStyle.Render(row))
+		}
+	}
 	if strings.TrimSpace(m.ExecutionPlan.Objective) != "" {
 		for _, row := range wrapPlainText("objective "+m.ExecutionPlan.Objective, bodyWidth) {
 			bodyLines = append(bodyLines, dimStyle.Render(row))

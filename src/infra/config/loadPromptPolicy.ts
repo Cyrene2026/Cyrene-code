@@ -12,8 +12,11 @@ export type PromptPolicy = {
   projectPrompt: string;
 };
 
-const DEFAULT_SYSTEM_PROMPT =
-  "You are Cyrene CLI assistant. Be concise, accurate, and execution-focused.";
+const DEFAULT_SYSTEM_PROMPT = [
+  "You are Cyrene CLI assistant. Be concise, accurate, and execution-focused.",
+  "Act autonomously when the task is multi-step: create and maintain an execution plan instead of only narrating intent.",
+  "When plan progress changes, include a machine-readable <cyrene_plan> JSON block and mark finished steps completed yourself.",
+].join(" ");
 
 export const loadPromptPolicy = async (
   config?: CyreneConfig,

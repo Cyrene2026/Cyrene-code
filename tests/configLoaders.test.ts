@@ -12,6 +12,7 @@ import {
   resetConfiguredAppRoot,
 } from "../src/infra/config/appRoot";
 import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
+import { loadPromptPolicy } from "../src/infra/config/loadPromptPolicy";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../src/shared/runtimeDefaults";
 
 const tempRoots: string[] = [];
@@ -61,6 +62,17 @@ describe("config loaders", () => {
     expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
     expect(config.autoSummaryRefresh).toBe(true);
     expect(config.requestTemperature).toBe(0.2);
+  });
+
+  test("loadPromptPolicy default system prompt enables autonomous execution plans", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-prompt-default-"));
+    tempRoots.push(root);
+
+    const promptPolicy = await loadPromptPolicy(undefined, root);
+
+    expect(promptPolicy.systemPrompt).toContain("execution plan");
+    expect(promptPolicy.systemPrompt).toContain("<cyrene_plan>");
+    expect(promptPolicy.systemPrompt).toContain("mark finished steps completed yourself");
   });
 
   test("loadCyreneConfig clamps invalid request_temperature into 0..2", async () => {

@@ -1600,7 +1600,9 @@ class BubbleTeaBridge {
       `Focus on step ${target.id}: ${target.title}`,
       target.details ? `Step details: ${target.details}` : "",
       "Do the work instead of only restating the plan.",
-      "If the step status changes, include an updated <cyrene_plan> JSON block in the final assistant message.",
+      "Before finishing the turn, update the active plan if this step progressed.",
+      "If the step is finished, mark it completed yourself in an updated <cyrene_plan> JSON block.",
+      "If the step is still active, keep it in_progress. If it is blocked, mark it blocked and explain why in details.",
       "Preserve evidence, filePaths, and recentToolResult from the existing plan unless new information supersedes them.",
       `Current plan snapshot:\n${formatExecutionPlan(plan)}`,
     ].filter(Boolean);

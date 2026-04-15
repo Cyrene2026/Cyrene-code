@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildPromptWithContext } from "../src/core/session/buildPromptWithContext";
+import { CYRENE_PLAN_START_TAG } from "../src/core/session/executionPlan";
 import { CYRENE_STATE_UPDATE_START_TAG } from "../src/core/session/stateReducer";
 
 describe("buildPromptWithContext", () => {
@@ -75,6 +76,9 @@ describe("buildPromptWithContext", () => {
     });
 
     expect(prompt).toContain("TASK STATE CONTEXT:");
+    expect(prompt).toContain("EXECUTION PLAN PROTOCOL:");
+    expect(prompt).toContain(CYRENE_PLAN_START_TAG);
+    expect(prompt).toContain("When a step finishes, mark it completed yourself.");
     expect(prompt).toContain("Active execution plan:");
     expect(prompt).toContain("1. [in_progress] verify approval flow");
     expect(prompt).toContain("Working state (durable reducer):");
@@ -145,6 +149,8 @@ describe("buildPromptWithContext", () => {
 
     expect(prompt).toContain("Working state (durable reducer):\n(missing)");
     expect(prompt).toContain("Pending turn digest (last completed turn not yet merged):\n(none)");
+    expect(prompt).toContain("EXECUTION PLAN PROTOCOL:");
+    expect(prompt).toContain("If all planned work is done, mark the remaining finished steps completed");
     expect(prompt).toContain(
       "The current user query is low-information. Continue from the most recent unresolved context first"
     );

@@ -61,6 +61,7 @@ const createFakeDiagnosticLspServer = async (root: string) => {
       "  }",
       "};",
       "process.stdin.setEncoding('utf8');",
+      "process.stdin.resume();",
       "process.stdin.on('data', chunk => {",
       "  inputBuffer += chunk;",
       "  pump();",

@@ -44,6 +44,24 @@ const hasAnyWorkingStateHeadings = (text: string): boolean => {
   return false;
 };
 
+const hasLeadingWorkingStateContent = (text: string): boolean => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  for (const line of trimmed.split(/\r?\n/)) {
+    if (isWorkingStateHeadingLine(line)) {
+      return false;
+    }
+    if (line.trim()) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 const trimBlankEdges = (lines: string[]) => {
   let start = 0;
   let end = lines.length;
@@ -93,6 +111,23 @@ const clipSectionLine = (text: string, max = 220) => {
   return `${normalized.slice(0, max)}...`;
 };
 
+const createWorkingStateSectionBuckets = () =>
+  Object.fromEntries(
+    WORKING_STATE_SECTION_ORDER.map(section => [section, [] as string[]])
+  ) as Record<WorkingStateSectionName, string[]>;
+
+const hasAnyWorkingStateSectionContent = (sections: WorkingStateSectionMap) =>
+  WORKING_STATE_SECTION_ORDER.some(section => (sections[section]?.length ?? 0) > 0);
+
+const renderBulletWorkingState = (sections: WorkingStateSectionMap) =>
+  WORKING_STATE_SECTION_ORDER.map(section => {
+    const lines = sections[section] ?? [];
+    if (lines.length === 0) {
+      return `${section}:\n- (none)`;
+    }
+    return `${section}:\n${lines.map(line => `- ${line}`).join("\n")}`;
+  }).join("\n\n");
+
 const normalizeLooseBullet = (line: string) =>
   line
     .trim()
@@ -125,6 +160,9 @@ const ACTION_SIGNAL =
 export const parseWorkingStateSummary = (text: string): WorkingStateSectionMap => {
   const trimmed = text.trim();
   if (!trimmed) {
+    return {};
+  }
+  if (hasLeadingWorkingStateContent(trimmed)) {
     return {};
   }
 
@@ -168,9 +206,7 @@ export const normalizeWorkingStateSummary = (text: string) => {
   }
 
   const parsed = parseWorkingStateSummary(trimmed);
-  // Only treat as LEGACY if no section headings were detected at all
-  // (vs detected but all empty - which is a valid empty working state)
-  if (!hasAnyWorkingStateHeadings(trimmed)) {
+  if (Object.keys(parsed).length === 0) {
     return formatLegacyWorkingState(trimmed);
   }
 
@@ -200,34 +236,14 @@ export const repairWorkingStateSummary = (
 
   const parsed = parseWorkingStateSummary(trimmed);
   // Check if any sections have content (after the fix, all sections exist in parsed)
-  const hasAnyContent = WORKING_STATE_SECTION_ORDER.some(
-    section => (parsed[section]?.length ?? 0) > 0
-  );
+  const hasAnyContent = hasAnyWorkingStateSectionContent(parsed);
   if (hasAnyContent) {
     return normalizeWorkingStateSummary(trimmed);
   }
 
-  const sourceLines = [trimmed, fallbackText]
-    .filter(Boolean)
-    .flatMap(chunk => chunk.split(/\r?\n/))
-    .filter(line => !isWorkingStateHeadingLine(line))  // Skip section headings
-    .map(normalizeLooseBullet)
-    .filter(line => line && line !== "(none)");
-
-  if (sourceLines.length === 0) {
-    // If trimmed had section headings but no content after filtering, return normalized empty sections
-    // If trimmed was truly empty, return (none)
-    if (hasAnyWorkingStateHeadings(trimmed)) {
-      return WORKING_STATE_SECTION_ORDER.map(section => {
-        return `${section}:\n- (none)`;
-      }).join("\n\n");
-    }
-    return "(none)";
-  }
-
-  const sections = Object.fromEntries(
-    WORKING_STATE_SECTION_ORDER.map(section => [section, [] as string[]])
-  ) as Record<WorkingStateSectionName, string[]>;
+  const fallbackTrimmed = fallbackText.trim();
+  const fallbackParsed = parseWorkingStateSummary(fallbackTrimmed);
+  const sections = createWorkingStateSectionBuckets();
   const knownPaths = new Set<string>();
 
   const pushUnique = (section: WorkingStateSectionName, value: string) => {
@@ -240,6 +256,42 @@ export const repairWorkingStateSummary = (
       bucket.push(normalized);
     }
   };
+
+  const mergeStructuredSections = (sectionMap: WorkingStateSectionMap) => {
+    for (const section of WORKING_STATE_SECTION_ORDER) {
+      for (const line of trimBlankEdges(sectionMap[section] ?? [])) {
+        const normalized = normalizeLooseBullet(line);
+        if (!normalized || normalized === "(none)") {
+          continue;
+        }
+        pushUnique(section, normalized);
+      }
+    }
+  };
+
+  mergeStructuredSections(parsed);
+  mergeStructuredSections(fallbackParsed);
+
+  const sourceLines = [
+    Object.keys(parsed).length === 0 ? trimmed : "",
+    Object.keys(fallbackParsed).length === 0 ? fallbackTrimmed : "",
+  ]
+    .filter(Boolean)
+    .flatMap(chunk => chunk.split(/\r?\n/))
+    .filter(line => !isWorkingStateHeadingLine(line))
+    .map(normalizeLooseBullet)
+    .filter(line => line && line !== "(none)");
+
+  if (sourceLines.length === 0) {
+    if (
+      hasAnyWorkingStateSectionContent(sections) ||
+      hasAnyWorkingStateHeadings(trimmed) ||
+      hasAnyWorkingStateHeadings(fallbackTrimmed)
+    ) {
+      return renderBulletWorkingState(sections);
+    }
+    return "(none)";
+  }
 
   for (const line of sourceLines) {
     for (const path of collectPathCandidates(line)) {
@@ -296,11 +348,5 @@ export const repairWorkingStateSummary = (
     pushUnique("KNOWN PATHS", path);
   }
 
-  return WORKING_STATE_SECTION_ORDER.map(section => {
-    const lines = sections[section];
-    if (lines.length === 0) {
-      return `${section}:\n- (none)`;
-    }
-    return `${section}:\n${lines.map(line => `- ${line}`).join("\n")}`;
-  }).join("\n\n");
+  return renderBulletWorkingState(sections);
 };

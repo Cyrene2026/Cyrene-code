@@ -30,6 +30,12 @@ describe("stateReducer", () => {
     expect(prompt).toContain(
       "Hard rules: COMPLETED and REMAINING must stay mutually exclusive."
     );
+    expect(prompt).toContain(
+      "Cold-start rule: if durable context is still sparse, leave summaryPatch empty"
+    );
+    expect(prompt).toContain(
+      "Cold-start priority: during early exploration, first capture the startup mechanism, launch command, entrypoint files, and bootstrap chain"
+    );
   });
 
   test("applyParsedStateUpdate strips chatter, user-echo facts, fake failures, and completed/remaining overlap", () => {
@@ -283,6 +289,148 @@ describe("stateReducer", () => {
     expect(sanitized.pendingDigest).toContain("REMAINING:\n- (none)");
     expect(sanitized.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
     expect(sanitized.pendingDigest).not.toContain("创建了 FastAPI 应用");
+  });
+
+  test("sanitizeStoredWorkingState keeps sparse cold-start state in pendingDigest only", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: [
+        "OBJECTIVE:",
+        "- 查看项目启动机制",
+        "",
+        "KNOWN PATHS:",
+        "- package.json",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- 查看项目启动机制",
+        "",
+        "CONFIRMED FACTS:",
+        "- 入口文件是 main.py",
+        "",
+        "KNOWN PATHS:",
+        "- package.json",
+        "- main.py",
+      ].join("\n"),
+      allowedPaths: ["package.json", "main.py"],
+    });
+
+    expect(sanitized.summary).toBe("");
+    expect(sanitized.pendingDigest).toContain("OBJECTIVE:\n- 查看项目启动机制");
+    expect(sanitized.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 入口文件是 main.py"
+    );
+    expect(sanitized.pendingDigest).toContain("KNOWN PATHS:\n- package.json\n- main.py");
+  });
+
+  test("sanitizeStoredWorkingState preserves startup command and script facts in pendingDigest", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: "",
+      pendingDigest: [
+        "CONFIRMED FACTS:",
+        "- package.json 使用 bun run dev 启动项目",
+        "- package.json 的 dev 脚本使用 bun run src/main.ts",
+        "",
+        "KNOWN PATHS:",
+        "- package.json",
+        "- src/main.ts",
+      ].join("\n"),
+      allowedPaths: ["package.json", "src/main.ts"],
+    });
+
+    expect(sanitized.summary).toBe("");
+    expect(sanitized.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- `package.json` 使用 `bun run dev` 启动项目"
+    );
+    expect(sanitized.pendingDigest).toContain(
+      "- `package.json` 的 `dev` 脚本使用 `bun run src/main.ts`"
+    );
+    expect(sanitized.pendingDigest).toContain("KNOWN PATHS:\n- package.json\n- src/main.ts");
+  });
+
+  test("sanitizeStoredWorkingState preserves launch-command and run-command labels in pendingDigest", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: "",
+      pendingDigest: [
+        "CONFIRMED FACTS:",
+        "- 启动命令：bun run dev",
+        "- 运行命令：node ./bin/cyrene.js",
+      ].join("\n"),
+    });
+
+    expect(sanitized.summary).toBe("");
+    expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:");
+    expect(sanitized.pendingDigest).toContain("- 启动命令是 `bun run dev`");
+    expect(sanitized.pendingDigest).toContain("- 运行命令是 `node ./bin/cyrene.js`");
+  });
+
+  test("sanitizeStoredWorkingState preserves bootstrap-chain labels in pendingDigest", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: "",
+      pendingDigest: [
+        "CONFIRMED FACTS:",
+        "- bootstrap chain: package.json -> src/bootstrap-entry.ts -> src/entrypoints/cli.tsx",
+        "- package.json 的 bootstrap chain 是 src/bootstrap-entry.ts -> src/entrypoints/cli.tsx",
+        "",
+        "KNOWN PATHS:",
+        "- package.json",
+        "- src/bootstrap-entry.ts",
+        "- src/entrypoints/cli.tsx",
+      ].join("\n"),
+      allowedPaths: [
+        "package.json",
+        "src/bootstrap-entry.ts",
+        "src/entrypoints/cli.tsx",
+      ],
+    });
+
+    expect(sanitized.summary).toBe("");
+    expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:");
+    expect(sanitized.pendingDigest).toContain(
+      "- bootstrap chain 是 `package.json -> src/bootstrap-entry.ts -> src/entrypoints/cli.tsx`"
+    );
+    expect(sanitized.pendingDigest).toContain(
+      "- `package.json` 的 bootstrap chain 是 `src/bootstrap-entry.ts -> src/entrypoints/cli.tsx`"
+    );
+    expect(sanitized.pendingDigest).toContain(
+      "KNOWN PATHS:\n- package.json\n- src/bootstrap-entry.ts"
+    );
+  });
+
+  test("applyParsedStateUpdate keeps sparse rebuilt state in pendingDigest until durable baseline exists", () => {
+    const applied = applyParsedStateUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      update: {
+        version: 1,
+        mode: "full_rebuild_and_digest",
+        summaryPatch: {
+          OBJECTIVE: {
+            op: "replace",
+            set: ["查看项目启动机制"],
+          },
+          "CONFIRMED FACTS": {
+            op: "merge",
+            add: ["入口文件是 main.py"],
+          },
+          "KNOWN PATHS": {
+            op: "merge",
+            add: ["main.py"],
+          },
+        },
+        nextPendingDigest: {
+          OBJECTIVE: ["查看项目启动机制"],
+          "CONFIRMED FACTS": ["入口文件是 main.py"],
+          "KNOWN PATHS": ["main.py"],
+        },
+      },
+    });
+
+    expect(applied.summary).toBe("");
+    expect(applied.pendingDigest).toContain("OBJECTIVE:\n- 查看项目启动机制");
+    expect(applied.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 入口文件是 main.py"
+    );
+    expect(applied.pendingDigest).toContain("KNOWN PATHS:\n- main.py");
   });
 
   test("parseAssistantStateUpdate ignores literal state tags inside inline code spans", () => {

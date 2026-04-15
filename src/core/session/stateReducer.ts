@@ -218,10 +218,10 @@ const EXECUTABLE_TASK_SIGNAL =
   /\b(?:analyze|check|debug|diagnose|fix|optimize|implement|build|create|write|edit|update|inspect|read|review|summarize|explain|verify|run|test|resume|continue|finish|refactor|split|trace|investigate|clarify|confirm|locate|trace|add|patch|wire|connect|integrate)\b|(?:看一下|看下|看看|查看|读取|阅读|读一下|分析|检查|排查|修复|优化|实现|构建|创建|写入?|编辑|更新|审查|总结|解释|验证|运行|测试|恢复|继续|完成|重构|拆分|追踪|调查|澄清|确认|定位|走查|梳理|补齐|补上|补充|补一个|接上|接通|联调)/iu;
 
 const STABLE_FACT_SIGNAL =
-  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态)/iu;
+  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|path|endpoint|route|version|setting|config|file|directory|workspace|session|state|entrypoint|bootstrap|startup|launch command|run command)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|路径|接口|路由|版本|文件|目录|工作区|会话|状态|入口|启动命令|运行命令|启动链|启动链路|启动流程|bootstrap|启动机制)/iu;
 
 const STRICT_FACT_PREDICATE_SIGNAL =
-  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|does not exist|doesn't exist|not present|absent|missing from)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|不存在|未找到|项目中没有|仓库中没有)/iu;
+  /\b(?:is|are|was|were|has|have|uses?|supports?|contains?|includes?|returns?|exposes?|depends?|configured|stored|persisted|confirmed|verified|located|does not exist|doesn't exist|not present|absent|missing from|bootstrap|startup|launch command|run command)\b|(?:是|位于|包含|使用|支持|返回|暴露|依赖|配置|已配置|已确认|已验证|不存在|未找到|项目中没有|仓库中没有|入口|启动命令|运行命令|启动链|启动链路|启动流程|bootstrap|启动机制)/iu;
 
 const COMPLETED_SECTION_SIGNAL =
   /\b(?:done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved|answered|added|removed|renamed|stored|persisted|recorded|marked|recovered|handled|captured|merged|rebuilt|synced)\b|(?:完成|已写|已创建|已更新|已实现|已修复|已批准|已解决|已回答|已添加|已删除|已重命名|已存储|已记录|已标记|已恢复|已处理|已合并|已重建|已同步|已确认|已[^，,。；;\s]{0,6}(?:实现|完成|创建|更新|确认|修复)|(?:创建|完成|实现|配置|确认|更新|修复|回答|编写)了|标记为)/iu;
@@ -287,6 +287,24 @@ const ENDPOINT_LABEL_SIGNAL =
 const ENTRYPOINT_LABEL_SIGNAL =
   /^(?:(?:启动)?入口(?:文件)?|主入口)\s*[：:]\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)$/u;
 
+const START_COMMAND_LABEL_SIGNAL =
+  /^(启动命令|运行命令|launch command|run command)(?:\s*[：:]\s*|\s*是\s+)(.+)$/iu;
+
+const START_COMMAND_FACT_SIGNAL =
+  /^(.+?)\s+(?:使用|通过)\s+(.+?)\s+启动(?:项目|应用|服务|程序)?$/iu;
+
+const SCRIPT_COMMAND_FACT_SIGNAL =
+  /^(.+?)\s+(?:的|中的)\s+`?([A-Za-z0-9_-]+)`?\s+脚本(?:使用|运行|指向)\s+(.+)$/u;
+
+const BOOTSTRAP_CHAIN_LABEL_SIGNAL =
+  /^(?:bootstrap chain|bootstrap flow|启动链|启动链路|启动流程)(?:\s*[：:]\s*|\s*是\s+)(.+)$/iu;
+
+const BOOTSTRAP_CHAIN_FACT_SIGNAL =
+  /^(.+?)\s+(?:的\s+)?(?:bootstrap chain|bootstrap flow|启动链|启动链路|启动流程)\s*(?:是|为|:|：)\s*(.+)$/iu;
+
+const STARTUP_FACT_LABEL_SIGNAL =
+  /^(?:启动命令|运行命令|launch command|run command|bootstrap chain|bootstrap flow|启动链|启动链路|启动流程)(?:\s*[：:]\s*|\s*是\s+).+$/iu;
+
 const PATH_ABSENCE_FACT_SIGNAL =
   /^`?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`?\s*(?:[：:]\s*)?(?:不存在|未找到|does not exist|doesn't exist|is missing|missing|not found|is not present)$/iu;
 
@@ -316,6 +334,23 @@ const sanitizeCandidatePrefix = (value: string) =>
 
 const trimTrailingPunctuation = (value: string) =>
   value.replace(/[\s,，;；。.!！?？]+$/u, "").trim();
+
+const wrapFactLiteral = (value: string) => {
+  const normalized = trimTrailingPunctuation(
+    value.replace(/[`"'“”‘’]/g, "").replace(/\s+/g, " ")
+  );
+  return normalized ? `\`${normalized}\`` : "";
+};
+
+const wrapChainFactLiteral = (value: string) => {
+  const normalized = trimTrailingPunctuation(
+    value
+      .replace(/[`"'“”‘’]/g, "")
+      .replace(/\s*(?:->|→)\s*/g, " -> ")
+      .replace(/\s+/g, " ")
+  );
+  return normalized ? `\`${normalized}\`` : "";
+};
 
 const canonicalizeCandidate = (line: string) => {
   const rawCandidate = normalizeLooseLine(line);
@@ -396,11 +431,12 @@ const isExecutableTaskLine = (line: string) =>
 
 const isStableFactLine = (line: string) =>
   !QUESTION_OR_OPTION_SIGNAL.test(line) &&
-  !isExecutableTaskLine(line) &&
   !REAL_FAILURE_SIGNAL.test(line) &&
-  (STABLE_FACT_SIGNAL.test(line) ||
-    collectPathCandidates(line).length > 0 ||
-    /`[^`]+`/.test(line));
+  (STARTUP_FACT_LABEL_SIGNAL.test(line) ||
+    (!isExecutableTaskLine(line) &&
+      (STABLE_FACT_SIGNAL.test(line) ||
+        collectPathCandidates(line).length > 0 ||
+        /`[^`]+`/.test(line))));
 
 const isRealFailureLine = (line: string) =>
   REAL_FAILURE_SIGNAL.test(line) &&
@@ -463,6 +499,56 @@ const isSafeFactFragment = (line: string) => {
     const [, path] = entrypointMatch;
     if (path?.trim()) {
       return `入口文件是 \`${path.trim()}\``;
+    }
+  }
+
+  const startCommandMatch = line.match(START_COMMAND_LABEL_SIGNAL);
+  if (startCommandMatch?.[2]) {
+    const [, label, rawCommand] = startCommandMatch;
+    const command = wrapFactLiteral(rawCommand);
+    if (command) {
+      return /^(?:运行命令|run command)$/iu.test(label)
+        ? `运行命令是 ${command}`
+        : `启动命令是 ${command}`;
+    }
+  }
+
+  const startupFactMatch = line.match(START_COMMAND_FACT_SIGNAL);
+  if (startupFactMatch) {
+    const [, subject, command] = startupFactMatch;
+    const normalizedSubject = wrapFactLiteral(subject);
+    const normalizedCommand = wrapFactLiteral(command);
+    if (normalizedSubject && normalizedCommand) {
+      return `${normalizedSubject} 使用 ${normalizedCommand} 启动项目`;
+    }
+  }
+
+  const scriptCommandMatch = line.match(SCRIPT_COMMAND_FACT_SIGNAL);
+  if (scriptCommandMatch) {
+    const [, subject, scriptName, command] = scriptCommandMatch;
+    const normalizedSubject = wrapFactLiteral(subject);
+    const normalizedScript = wrapFactLiteral(scriptName);
+    const normalizedCommand = wrapFactLiteral(command);
+    if (normalizedSubject && normalizedScript && normalizedCommand) {
+      return `${normalizedSubject} 的 ${normalizedScript} 脚本使用 ${normalizedCommand}`;
+    }
+  }
+
+  const bootstrapChainMatch = line.match(BOOTSTRAP_CHAIN_LABEL_SIGNAL);
+  if (bootstrapChainMatch?.[1]) {
+    const chain = wrapChainFactLiteral(bootstrapChainMatch[1]);
+    if (chain) {
+      return `bootstrap chain 是 ${chain}`;
+    }
+  }
+
+  const bootstrapChainFactMatch = line.match(BOOTSTRAP_CHAIN_FACT_SIGNAL);
+  if (bootstrapChainFactMatch) {
+    const [, subject, chain] = bootstrapChainFactMatch;
+    const normalizedSubject = wrapFactLiteral(subject);
+    const normalizedChain = wrapChainFactLiteral(chain);
+    if (normalizedSubject && normalizedChain) {
+      return `${normalizedSubject} 的 bootstrap chain 是 ${normalizedChain}`;
     }
   }
 
@@ -721,6 +807,52 @@ const finalizeSectionMap = (
 const hasMeaningfulSectionContent = (sections: WorkingStateSectionMap) =>
   WORKING_STATE_SECTION_ORDER.some(section => (sections[section]?.length ?? 0) > 0);
 
+const hasDurableSummaryBaseline = (sections: WorkingStateSectionMap) => {
+  const objectiveCount = sections.OBJECTIVE?.length ?? 0;
+  const factCount = sections["CONFIRMED FACTS"]?.length ?? 0;
+  const pathCount = sections["KNOWN PATHS"]?.length ?? 0;
+  const remainingCount = sections.REMAINING?.length ?? 0;
+  const nextActionCount = sections["NEXT BEST ACTIONS"]?.length ?? 0;
+  const constraintCount = sections.CONSTRAINTS?.length ?? 0;
+  const completedCount = sections.COMPLETED?.length ?? 0;
+  const failureCount = sections["RECENT FAILURES"]?.length ?? 0;
+  const progressCount =
+    remainingCount + nextActionCount + constraintCount + completedCount + failureCount;
+
+  if (factCount >= 2) {
+    return true;
+  }
+
+  if (pathCount >= 2 && (factCount >= 1 || objectiveCount >= 1 || progressCount >= 1)) {
+    return true;
+  }
+
+  if (
+    objectiveCount >= 1 &&
+    (factCount >= 1 || pathCount >= 2) &&
+    (remainingCount >= 1 || nextActionCount >= 1 || completedCount >= 1)
+  ) {
+    return true;
+  }
+
+  if (objectiveCount >= 1 && remainingCount + nextActionCount + completedCount >= 2) {
+    return true;
+  }
+
+  return false;
+};
+
+const renderDurableSummary = (sections: WorkingStateSectionMap) => {
+  const finalized = finalizeSectionMap(sections, false);
+  if (
+    !hasMeaningfulSectionContent(finalized) ||
+    !hasDurableSummaryBaseline(finalized)
+  ) {
+    return "";
+  }
+  return renderSectionMap(finalized, { preserveEmpty: true });
+};
+
 const renderSectionMap = (
   sections: WorkingStateSectionMap,
   options?: {
@@ -834,9 +966,7 @@ export const sanitizeStoredWorkingState = (params: {
     : createEmptySectionMap();
 
   return {
-    summary: hasMeaningfulSectionContent(summarySections)
-      ? renderSectionMap(summarySections, { preserveEmpty: true })
-      : "",
+    summary: renderDurableSummary(summarySections),
     pendingDigest: hasMeaningfulSectionContent(pendingSections)
       ? renderSectionMap(pendingSections, { pending: true })
       : "",
@@ -1040,9 +1170,7 @@ export const applyLocalFallbackStateUpdate = (params: {
   assistantText: string;
 }) => {
   const normalizedSummary = params.durableSummary.trim()
-    ? renderSectionMap(parseStructuredStateText(params.durableSummary), {
-        preserveEmpty: true,
-      })
+    ? renderDurableSummary(parseStructuredStateText(params.durableSummary))
     : "";
   const normalizedPendingDigest = params.pendingDigest.trim()
     ? renderSectionMap(parseStructuredStateText(params.pendingDigest), {
@@ -1151,6 +1279,8 @@ export const buildStateReducerPrompt = ({
     recoveryLine,
     "Use only these section names: OBJECTIVE, CONFIRMED FACTS, CONSTRAINTS, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, NEXT BEST ACTIONS.",
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
+    "Cold-start rule: if durable context is still sparse, leave summaryPatch empty and rely on nextPendingDigest instead of fabricating a full durable summary from one weak clue.",
+    "Cold-start priority: during early exploration, first capture the startup mechanism, launch command, entrypoint files, and bootstrap chain in CONFIRMED FACTS and KNOWN PATHS, then record the next action needed to confirm unresolved startup flow.",
     "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
     "Hard rules: never copy the user's raw request into CONFIRMED FACTS. CONFIRMED FACTS only stores stable, durable facts.",
     "Hard rules: CONFIRMED FACTS must be complete factual statements. Do not emit bare identifiers, headings, search metadata, or incomplete conditional fragments.",
@@ -1240,9 +1370,7 @@ export const applyParsedStateUpdate = (params: {
   update: CyreneStateUpdate | null;
 }) => {
   const normalizedSummary = params.durableSummary.trim()
-    ? renderSectionMap(parseStructuredStateText(params.durableSummary), {
-        preserveEmpty: true,
-      })
+    ? renderDurableSummary(parseStructuredStateText(params.durableSummary))
     : "";
 
   if (!params.update) {
@@ -1300,7 +1428,7 @@ export const applyParsedStateUpdate = (params: {
     );
   }
 
-  const summary = renderSectionMap(baseSections, { preserveEmpty: true });
+  const summary = renderDurableSummary(baseSections);
   return {
     summary,
     pendingDigest: nextPendingDigest,

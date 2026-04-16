@@ -1,7 +1,11 @@
 import { resolve } from "node:path";
 import * as readline from "node:readline";
 import { setConfiguredAppRoot } from "../../../infra/config/appRoot";
-import { loadCyreneConfig, type CyreneConfig } from "../../../infra/config/loadCyreneConfig";
+import {
+  ensureProjectCyreneConfig,
+  loadCyreneConfig,
+  type CyreneConfig,
+} from "../../../infra/config/loadCyreneConfig";
 import { loadPromptPolicy, type PromptPolicy } from "../../../infra/config/loadPromptPolicy";
 import { createAuthRuntime, type AuthRuntime } from "../../../infra/auth/authRuntime";
 import type { AuthStatus } from "../../../infra/auth/types";
@@ -695,8 +699,14 @@ class BubbleTeaBridge {
     process.chdir(this.appRoot);
     setConfiguredAppRoot(this.appRoot);
 
+    await ensureProjectCyreneConfig(this.appRoot, {
+      cwd: this.appRoot,
+      env: process.env,
+    });
     this.config = await loadCyreneConfig(this.appRoot);
-    this.promptPolicy = await loadPromptPolicy(this.config, this.appRoot);
+    this.promptPolicy = await loadPromptPolicy(this.config, this.appRoot, {
+      env: process.env,
+    });
     this.defaultSystemPrompt = this.promptPolicy.systemPrompt;
     this.runtimeSystemPrompt = this.promptPolicy.systemPrompt;
     this.authRuntime = createAuthRuntime({
@@ -2854,24 +2864,85 @@ class BubbleTeaBridge {
 
   private async setProvider(nextProvider: string) {
     await this.ensureRuntime();
+    if (!this.authRuntime || !this.transport) {
+      this.emitError("Provider runtime unavailable.");
+      return;
+    }
     const provider = nextProvider.trim();
     if (!provider) {
       this.emitError("Provider is required.");
       return;
     }
-
-    const result = await this.transport!.setProvider(provider);
-    if (result.ok) {
-      await this.authRuntime?.syncSelection({
-        providerBaseUrl: this.transport!.getProvider(),
-        model: this.transport!.getModel(),
-      });
-      this.markRuntimeMetadataDirty();
-      await this.refreshRuntimeMetadata();
+    let normalizedProvider: string;
+    try {
+      normalizedProvider = normalizeProviderBaseUrl(provider);
+    } catch (error) {
+      this.status = "error";
+      await this.pushRuntimeResult(
+        error instanceof Error ? error.message : String(error),
+        false
+      );
+      return;
     }
 
-    this.status = result.ok ? "idle" : "error";
-    await this.pushRuntimeResult(result.message, result.ok);
+    const previousProvider = this.transport.getProvider();
+    const previousModel = this.transport.getModel();
+    if (previousProvider === normalizedProvider) {
+      this.status = "idle";
+      await this.pushRuntimeResult(
+        `Provider already active: ${normalizedProvider}`,
+        true
+      );
+      return;
+    }
+
+    const restorePreviousSelection = async () => {
+      await this.authRuntime?.syncSelection({
+        providerBaseUrl:
+          previousProvider && previousProvider !== "none" && previousProvider !== "local-core"
+            ? previousProvider
+            : undefined,
+        model: previousModel,
+      });
+    };
+
+    await this.authRuntime.syncSelection({
+      providerBaseUrl: normalizedProvider,
+      model: previousModel,
+    });
+
+    const nextTransport = await this.authRuntime.buildTransport();
+    if (nextTransport.getProvider() === "local-core" || nextTransport.getProvider() === "none") {
+      await restorePreviousSelection();
+      this.status = "error";
+      await this.pushRuntimeResult(
+        "Missing API key for selected provider. Set CYRENE_API_KEY (or provider-specific key).",
+        false
+      );
+      return;
+    }
+
+    const refreshResult = await nextTransport.refreshModels();
+    if (!refreshResult.ok) {
+      await restorePreviousSelection();
+      this.status = "error";
+      await this.pushRuntimeResult(refreshResult.message, false);
+      return;
+    }
+
+    this.transport = nextTransport;
+    await this.authRuntime.syncSelection({
+      providerBaseUrl: this.transport.getProvider(),
+      model: this.transport.getModel(),
+    });
+    this.markRuntimeMetadataDirty();
+    await this.refreshRuntimeMetadata();
+
+    this.status = "idle";
+    await this.pushRuntimeResult(
+      `Provider switched to: ${this.transport.getProvider()}\nCurrent model: ${this.transport.getModel()}`,
+      true
+    );
   }
 
   private async refreshModels() {

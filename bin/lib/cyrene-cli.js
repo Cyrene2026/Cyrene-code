@@ -194,6 +194,61 @@ const readFirstExistingFile = async (paths, runtime) => {
   return null;
 };
 
+const parseCyreneConfigContent = content => {
+  if (!content?.trim()) {
+    return {};
+  }
+
+  const map = new Map();
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const index = line.indexOf(":");
+    if (index <= 0) {
+      continue;
+    }
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim();
+    map.set(key, parseConfigValue(value));
+  }
+
+  const parsed = {};
+  const pinRaw = map.get("pin_max_count");
+  if (typeof pinRaw === "number" && pinRaw > 0) {
+    parsed.pinMaxCount = Math.floor(pinRaw);
+  }
+
+  const queryMaxToolStepsRaw = map.get("query_max_tool_steps");
+  if (typeof queryMaxToolStepsRaw === "number" && queryMaxToolStepsRaw > 0) {
+    parsed.queryMaxToolSteps = Math.floor(queryMaxToolStepsRaw);
+  }
+
+  const autoSummaryRefreshRaw = map.get("auto_summary_refresh");
+  if (typeof autoSummaryRefreshRaw === "boolean") {
+    parsed.autoSummaryRefresh = autoSummaryRefreshRaw;
+  }
+
+  const requestTemperatureRaw = map.get("request_temperature");
+  if (
+    typeof requestTemperatureRaw === "number" &&
+    Number.isFinite(requestTemperatureRaw)
+  ) {
+    parsed.requestTemperature = Math.min(2, Math.max(0, requestTemperatureRaw));
+  }
+
+  const systemPromptRaw = map.get("system_prompt");
+  if (
+    typeof systemPromptRaw === "string" &&
+    trimNonEmpty(systemPromptRaw)
+  ) {
+    parsed.systemPrompt = systemPromptRaw.trim();
+  }
+
+  return parsed;
+};
+
 const normalizeProviderAlias = value => {
   const trimmed = trimNonEmpty(value);
   if (!trimmed) {
@@ -301,62 +356,15 @@ const getConfigPaths = runtime => {
 
 const loadCyreneConfig = async runtime => {
   const paths = getConfigPaths(runtime);
-  const loaded = await readFirstExistingFile(
-    [paths.configFile, paths.legacyConfigFile],
-    runtime
-  );
-  if (!loaded) {
-    return {
-      path: null,
-      config: { ...DEFAULT_CONFIG },
-    };
-  }
-
-  const map = new Map();
-  for (const rawLine of loaded.content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-    const index = line.indexOf(":");
-    if (index <= 0) {
-      continue;
-    }
-    const key = line.slice(0, index).trim();
-    const value = line.slice(index + 1).trim();
-    map.set(key, parseConfigValue(value));
-  }
-
-  const pinRaw = map.get("pin_max_count");
-  const queryMaxToolStepsRaw = map.get("query_max_tool_steps");
-  const autoSummaryRefreshRaw = map.get("auto_summary_refresh");
-  const requestTemperatureRaw = map.get("request_temperature");
-  const systemPromptRaw = map.get("system_prompt");
+  const globalConfig = await readFirstExistingFile([paths.configFile], runtime);
+  const projectConfig = await readFirstExistingFile([paths.legacyConfigFile], runtime);
 
   return {
-    path: loaded.path,
+    path: projectConfig?.path ?? globalConfig?.path ?? null,
     config: {
-      pinMaxCount:
-        typeof pinRaw === "number" && pinRaw > 0
-          ? Math.floor(pinRaw)
-          : DEFAULT_CONFIG.pinMaxCount,
-      queryMaxToolSteps:
-        typeof queryMaxToolStepsRaw === "number" && queryMaxToolStepsRaw > 0
-          ? Math.floor(queryMaxToolStepsRaw)
-          : DEFAULT_CONFIG.queryMaxToolSteps,
-      autoSummaryRefresh:
-        typeof autoSummaryRefreshRaw === "boolean"
-          ? autoSummaryRefreshRaw
-          : DEFAULT_CONFIG.autoSummaryRefresh,
-      requestTemperature:
-        typeof requestTemperatureRaw === "number" &&
-        Number.isFinite(requestTemperatureRaw)
-          ? Math.min(2, Math.max(0, requestTemperatureRaw))
-          : DEFAULT_CONFIG.requestTemperature,
-      systemPrompt:
-        typeof systemPromptRaw === "string" && trimNonEmpty(systemPromptRaw)
-          ? systemPromptRaw.trim()
-          : undefined,
+      ...DEFAULT_CONFIG,
+      ...parseCyreneConfigContent(globalConfig?.content ?? ""),
+      ...parseCyreneConfigContent(projectConfig?.content ?? ""),
     },
   };
 };
@@ -364,7 +372,7 @@ const loadCyreneConfig = async runtime => {
 const loadPromptPolicy = async (configResult, runtime) => {
   const paths = getConfigPaths(runtime);
   const loadedProjectPrompt = await readFirstExistingFile(
-    [paths.globalPromptFile, paths.legacyPromptFile],
+    [paths.legacyPromptFile, paths.globalPromptFile],
     runtime
   );
   const envPrompt = trimNonEmpty(runtime.env.CYRENE_SYSTEM_PROMPT);

@@ -98,6 +98,80 @@ const createLspService = async (serverId = "rust") => {
   return { root, service, lspManager };
 };
 
+const createCrossFileRenameLspService = async (serverId = "rust") => {
+  const root = await mkdtemp(join(tmpdir(), "cyrene-mcp-test-"));
+  tempRoots.push(root);
+  const lspManager = createFakeLspManager(root, serverId);
+  const originalGetSession = lspManager.getSession.bind(lspManager);
+  const originalGetSessionForServer = lspManager.getSessionForServer.bind(lspManager);
+  const toUri = (filePath: string) => pathToFileURL(filePath).href;
+
+  const buildRenameEdit = (newName: string): LspWorkspaceEdit => ({
+    changes: {
+      [toUri(join(root, "src", "demo.rs"))]: [
+        {
+          range: {
+            start: { line: 0, character: 3 },
+            end: { line: 0, character: 8 },
+          },
+          newText: newName,
+        },
+        {
+          range: {
+            start: { line: 4, character: 2 },
+            end: { line: 4, character: 7 },
+          },
+          newText: newName,
+        },
+      ],
+      [toUri(join(root, "src", "helper.rs"))]: [
+        {
+          range: {
+            start: { line: 0, character: 7 },
+            end: { line: 0, character: 12 },
+          },
+          newText: newName,
+        },
+      ],
+    },
+    documentChanges: [],
+  });
+
+  const decorateWorkspace = async (workspacePromise: Promise<LspWorkspaceLike>) => {
+    const workspace = await workspacePromise;
+    return {
+      ...workspace,
+      async rename(filePath: string, line: number, column: number, newName: string) {
+        lspManager.calls.push({ method: "rename", args: [filePath, line, column, newName] });
+        return buildRenameEdit(newName);
+      },
+    } satisfies LspWorkspaceLike;
+  };
+
+  lspManager.getSession = async (filePath: string, options?: { serverId?: string }) =>
+    decorateWorkspace(originalGetSession(filePath, options));
+  lspManager.getSessionForServer = async (options?: { serverId?: string }) =>
+    decorateWorkspace(originalGetSessionForServer(options));
+
+  const service = new FileMcpService({
+    workspaceRoot: root,
+    maxReadBytes: 1024 * 1024,
+    requireReview: [
+      "create_file",
+      "write_file",
+      "edit_file",
+      "apply_patch",
+      "delete_file",
+      "copy_path",
+      "move_path",
+      "open_shell",
+      "write_shell",
+    ],
+  }, { lspManager });
+  services.push(service);
+  return { root, service, lspManager };
+};
+
 const createRelaxedReviewService = async (
   options?: ConstructorParameters<typeof FileMcpService>[1]
 ) => {
@@ -863,6 +937,37 @@ describe("FileMcpService", () => {
     expect(third.message).not.toContain("cached; no mutation since last check");
   });
 
+  test("list_dir invalidates cached snapshots after external directory changes", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "test_files"), { recursive: true });
+    await writeFile(join(root, "test_files", "u1.py"), "print('ok')\n", "utf8");
+
+    const first = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+    const second = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(second.message).toContain("cached; no mutation since last check");
+
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await writeFile(join(root, "test_files", "u2.py"), "print('external')\n", "utf8");
+
+    const third = await service.handleToolCall("file", {
+      action: "list_dir",
+      path: "test_files",
+    });
+
+    expect(third.ok).toBe(true);
+    expect(third.message).not.toContain("cached; no mutation since last check");
+    expect(third.message).toContain("[F] u2.py");
+  });
+
   test("read_file returns explicit empty-file marker", async () => {
     const { root, service } = await createService();
     await writeFile(join(root, "empty.txt"), "", "utf8");
@@ -1349,6 +1454,72 @@ describe("FileMcpService", () => {
     expect(second.ok).toBe(false);
     expect(second.message).toContain(
       "Pending conflict: write_file test_files/delete-conflict.py is already queued."
+    );
+  });
+
+  test("rejects lsp_rename when its workspace edit plan conflicts with a queued write", async () => {
+    const { root, service } = await createCrossFileRenameLspService("rust");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      ["fn greet() {", "}", "", "fn main() {", "  greet();", "}"].join("\n"),
+      "utf8"
+    );
+    await writeFile(join(root, "src", "helper.rs"), ["pub fn greet() {", "}"].join("\n"), "utf8");
+
+    const queuedWrite = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "src/helper.rs",
+      content: "pub fn greet() {\n  println!(\"queued\");\n}\n",
+    });
+    expect(queuedWrite.ok).toBe(true);
+    expect(queuedWrite.pending).toBeDefined();
+
+    const renameResult = await service.handleToolCall("file", {
+      action: "lsp_rename",
+      path: "src/demo.rs",
+      line: 1,
+      column: 4,
+      newName: "welcome",
+      serverId: "rust",
+    });
+
+    expect(renameResult.ok).toBe(false);
+    expect(renameResult.message).toContain(
+      "Pending conflict: write_file src/helper.rs is already queued."
+    );
+  });
+
+  test("rejects writes that conflict with queued multi-file lsp_rename plans", async () => {
+    const { root, service } = await createCrossFileRenameLspService("rust");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.rs"),
+      ["fn greet() {", "}", "", "fn main() {", "  greet();", "}"].join("\n"),
+      "utf8"
+    );
+    await writeFile(join(root, "src", "helper.rs"), ["pub fn greet() {", "}"].join("\n"), "utf8");
+
+    const queuedRename = await service.handleToolCall("file", {
+      action: "lsp_rename",
+      path: "src/demo.rs",
+      line: 1,
+      column: 4,
+      newName: "welcome",
+      serverId: "rust",
+    });
+    expect(queuedRename.ok).toBe(true);
+    expect(queuedRename.pending).toBeDefined();
+
+    const writeResult = await service.handleToolCall("file", {
+      action: "write_file",
+      path: "src/helper.rs",
+      content: "pub fn greet() {\n  println!(\"later\");\n}\n",
+    });
+
+    expect(writeResult.ok).toBe(false);
+    expect(writeResult.message).toContain(
+      "Pending conflict: lsp_rename src/helper.rs is already queued."
     );
   });
 
@@ -2909,7 +3080,7 @@ describe("FileMcpService", () => {
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(false);
     expect(second.message).toContain(
-      "Pending conflict: move_path src/a.txt is already queued."
+      "Pending conflict: move_path dest/shared.txt is already queued."
     );
   });
 
@@ -3642,6 +3813,37 @@ describe("FileMcpService", () => {
     }
   });
 
+  test("write_shell audits multiline blocks against the updated cwd for later lines", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { root, service, cleanup } = await createIsolatedService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+    try {
+      await mkdir(join(root, "subdir"), { recursive: true });
+      await writeFile(join(root, "root.txt"), "hello\n", "utf8");
+
+      await service.handleToolCall("file", {
+        action: "open_shell",
+        path: ".",
+      });
+
+      const result = await service.handleToolCall("file", {
+        action: "write_shell",
+        path: ".",
+        input: ["cd subdir", "cat ../root.txt"].join("\n"),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.pending).toBeUndefined();
+      expect(result.message).toContain("$ cat ../root.txt");
+      expect(result.message).toContain("ran cat ../root.txt");
+      expect(result.message).toContain("cwd: subdir");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("run_shell rejects multiline commands and nudges callers toward persistent shell", async () => {
     const { service } = await createService();
 
@@ -3850,5 +4052,48 @@ describe("FileMcpService", () => {
     });
     expect(writeAfterClose.ok).toBe(false);
     expect(writeAfterClose.message).toContain("open_shell first");
+  });
+
+  test("interrupt_shell drops stale shell control markers from later output", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    const runningQueued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "long_running",
+    });
+    expect(runningQueued.ok).toBe(true);
+    await service.approve(runningQueued.pending!.id);
+
+    const lastWrite = fakePty.state.writes[fakePty.state.writes.length - 1] ?? "";
+    const commandId = /__CYRENE_STATUS__([a-z0-9-]+)__/i.exec(lastWrite)?.[1];
+    expect(commandId).toBeTruthy();
+
+    const interrupted = await service.handleToolCall("file", {
+      action: "interrupt_shell",
+      path: ".",
+    });
+    expect(interrupted.ok).toBe(true);
+
+    fakePty.emit(
+      `__CYRENE_STATUS__${commandId}__0\n__CYRENE_CWD__${commandId}__${fakePty.state.cwd}\n`
+    );
+
+    const output = await service.handleToolCall("file", {
+      action: "read_shell",
+      path: ".",
+    });
+    expect(output.ok).toBe(true);
+    expect(output.message).not.toContain("__CYRENE_STATUS__");
+    expect(output.message).not.toContain("__CYRENE_CWD__");
   });
 });

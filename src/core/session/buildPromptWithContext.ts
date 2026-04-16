@@ -7,11 +7,34 @@ import {
 import { buildStateReducerPrompt } from "./stateReducer";
 import {
   normalizeWorkingStateSummary,
+  parseWorkingStateSummary,
   WORKING_STATE_SECTION_ORDER,
 } from "./workingState";
 
 const PROMPT_RECENT_TAIL_LIMIT = 6;
 const PROMPT_RECENT_TEXT_LIMIT = 240;
+const PROMPT_QUERY_CHAR_LIMIT = 12000;
+const PROMPT_EXTENSION_CHAR_LIMIT = 6000;
+const PROMPT_PLAN_LINE_LIMIT = 10;
+const PROMPT_PLAN_TEXT_LIMIT = 240;
+const PROMPT_WORKING_STATE_CHAR_LIMIT = 10000;
+const PROMPT_PENDING_DIGEST_CHAR_LIMIT = 6000;
+const PROMPT_FALLBACK_CHAR_LIMIT = 4000;
+const PROMPT_WORKING_STATE_LINE_LIMIT = 220;
+const PROMPT_WORKING_STATE_TRUNCATION_NOTE = "- (truncated)";
+const PROMPT_WORKING_STATE_ITEM_LIMITS: Record<
+  (typeof WORKING_STATE_SECTION_ORDER)[number],
+  number
+> = {
+  OBJECTIVE: 2,
+  "CONFIRMED FACTS": 8,
+  CONSTRAINTS: 6,
+  COMPLETED: 8,
+  REMAINING: 6,
+  "KNOWN PATHS": 8,
+  "RECENT FAILURES": 6,
+  "NEXT BEST ACTIONS": 4,
+};
 const LOW_SIGNAL_QUERY_MAX_LENGTH = 24;
 const LOW_SIGNAL_QUERY_PATTERN =
   /^(?:ok(?:ay)?|sure|yes|yep|go|go on|continue|continue please|resume|proceed|thanks?|thank you|cool|nice|good|done|start|start now|sounds good|来吧?|继续(?:吧|一下)?|开始吧?|接着|继续搞|继续做|好(?:的)?|行|可以|收到|嗯|搞吧|上吧|来|冲)$/iu;
@@ -46,6 +69,90 @@ const clipPromptLine = (text: string, max = PROMPT_RECENT_TEXT_LIMIT) => {
   return `${normalized.slice(0, max)}...`;
 };
 
+const stripBulletPrefix = (text: string) =>
+  text
+    .trim()
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    .trim();
+
+const clipPromptBlock = (text: string, maxChars: number) => {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  const marker = "\n...[truncated for prompt budget]...\n";
+  const headLength = Math.max(0, Math.floor((maxChars - marker.length) * 0.7));
+  const tailLength = Math.max(0, maxChars - marker.length - headLength);
+  const head = normalized.slice(0, headLength).trimEnd();
+  const tail = normalized.slice(-tailLength).trimStart();
+  return `${head}${marker}${tail}`;
+};
+
+const clipPromptMultilineBlock = (
+  text: string,
+  options: {
+    maxLines: number;
+    lineLimit: number;
+    charLimit?: number;
+  }
+) => {
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trimEnd())
+    .filter(Boolean);
+
+  const clipped = lines
+    .slice(0, options.maxLines)
+    .map(line => clipPromptLine(line, options.lineLimit));
+  const truncated = lines.length > clipped.length;
+  const joined = truncated
+    ? [...clipped, "...[truncated for prompt budget]..."].join("\n")
+    : clipped.join("\n");
+
+  return options.charLimit ? clipPromptBlock(joined, options.charLimit) : joined;
+};
+
+const clipWorkingStateForPrompt = (
+  text: string,
+  maxChars: number,
+  emptyFallback: "(none)" | "(missing)"
+) => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return emptyFallback;
+  }
+
+  const normalized = normalizeWorkingStateSummary(trimmed);
+  const parsed = parseWorkingStateSummary(normalized);
+  if (Object.keys(parsed).length === 0) {
+    return clipPromptBlock(normalized, maxChars);
+  }
+
+  const rendered = WORKING_STATE_SECTION_ORDER.map(section => {
+    const sourceLines = (parsed[section] ?? [])
+      .map(stripBulletPrefix)
+      .filter(line => Boolean(line) && line !== "(none)");
+    const limitedLines = sourceLines
+      .slice(0, PROMPT_WORKING_STATE_ITEM_LIMITS[section])
+      .map(line => clipPromptLine(line, PROMPT_WORKING_STATE_LINE_LIMIT));
+    const truncated = sourceLines.length > limitedLines.length;
+    const bodyLines =
+      limitedLines.length > 0
+        ? limitedLines.map(line => `- ${line}`)
+        : ["- (none)"];
+
+    if (truncated) {
+      bodyLines.push(PROMPT_WORKING_STATE_TRUNCATION_NOTE);
+    }
+
+    return `${section}:\n${bodyLines.join("\n")}`;
+  }).join("\n\n");
+
+  return clipPromptBlock(rendered, maxChars);
+};
+
 export const buildPromptWithContext = (
   query: string,
   systemPrompt: string,
@@ -69,14 +176,26 @@ export const buildPromptWithContext = (
     .join("\n");
 
   const durableSummary = promptContext.durableSummary.trim()
-    ? normalizeWorkingStateSummary(promptContext.durableSummary)
+    ? clipWorkingStateForPrompt(
+        promptContext.durableSummary,
+        PROMPT_WORKING_STATE_CHAR_LIMIT,
+        "(none)"
+      )
     : "(missing)";
   const pendingDigest = promptContext.pendingDigest.trim()
-    ? normalizeWorkingStateSummary(promptContext.pendingDigest)
+    ? clipWorkingStateForPrompt(
+        promptContext.pendingDigest,
+        PROMPT_PENDING_DIGEST_CHAR_LIMIT,
+        "(none)"
+      )
     : "(none)";
   const fallbackState =
     promptContext.summaryRecoveryNeeded && promptContext.summaryFallback.trim()
-      ? normalizeWorkingStateSummary(promptContext.summaryFallback)
+      ? clipWorkingStateForPrompt(
+          promptContext.summaryFallback,
+          PROMPT_FALLBACK_CHAR_LIMIT,
+          "(none)"
+        )
       : "";
   const archiveSectionLines = promptContext.archiveSections
     ? WORKING_STATE_SECTION_ORDER.flatMap(section => {
@@ -101,7 +220,13 @@ export const buildPromptWithContext = (
   const pendingDigestSection = `Pending turn digest (last completed turn not yet merged):\n${pendingDigest}`;
   const executionPlanSection = `Active execution plan:\n${formatExecutionPlan(
     promptContext.executionPlan
-  )}`;
+  )
+    ? clipPromptMultilineBlock(formatExecutionPlan(promptContext.executionPlan), {
+        maxLines: PROMPT_PLAN_LINE_LIMIT,
+        lineLimit: PROMPT_PLAN_TEXT_LIMIT,
+        charLimit: 4000,
+      })
+    : "(none)"}`;
   const interruptedTurnSection = promptContext.interruptedTurn
     ? `Interrupted prior turn snapshot:\n- user: ${clipPromptLine(promptContext.interruptedTurn.userText)}${
         promptContext.interruptedTurn.assistantText.trim()
@@ -142,7 +267,7 @@ export const buildPromptWithContext = (
     ".CYRENE.MD POLICY (second priority):",
     projectPrompt || "(none)",
     selectedExtensionsPrompt
-      ? selectedExtensionsPrompt
+      ? clipPromptBlock(selectedExtensionsPrompt, PROMPT_EXTENSION_CHAR_LIMIT)
       : "SELECTED EXTENSIONS (request-scoped summary):\n(none)",
     EXECUTION_PLAN_PROTOCOL,
     "TASK STATE CONTEXT:",
@@ -156,7 +281,10 @@ export const buildPromptWithContext = (
       : relevantLines
         ? `Retrieved archive memory:\n${relevantLines}`
         : "Retrieved archive memory:\n(none)",
-    `Current user query (act on this now):\n${query}`,
+    `Current user query (act on this now):\n${clipPromptBlock(
+      query,
+      PROMPT_QUERY_CHAR_LIMIT
+    )}`,
     buildStateReducerPrompt({
       mode: promptContext.reducerMode,
       durableSummary: promptContext.durableSummary,

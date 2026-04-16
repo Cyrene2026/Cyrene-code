@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   DEFAULT_PIN_MAX_COUNT,
   DEFAULT_QUERY_MAX_TOOL_STEPS,
@@ -23,12 +23,21 @@ type CyreneConfigLoadContext = {
   env?: NodeJS.ProcessEnv;
 };
 
-const DEFAULT_CONFIG: CyreneConfig = {
+export const DEFAULT_CYRENE_CONFIG: CyreneConfig = {
   pinMaxCount: DEFAULT_PIN_MAX_COUNT,
   queryMaxToolSteps: DEFAULT_QUERY_MAX_TOOL_STEPS,
   autoSummaryRefresh: true,
   requestTemperature: 0.2,
 };
+
+export const DEFAULT_PROJECT_CYRENE_CONFIG_YAML = [
+  "# Project-local Cyrene config",
+  `pin_max_count: ${DEFAULT_CYRENE_CONFIG.pinMaxCount}`,
+  `query_max_tool_steps: ${DEFAULT_CYRENE_CONFIG.queryMaxToolSteps}`,
+  `auto_summary_refresh: ${DEFAULT_CYRENE_CONFIG.autoSummaryRefresh}`,
+  `request_temperature: ${DEFAULT_CYRENE_CONFIG.requestTemperature}`,
+  "",
+].join("\n");
 
 const parseValue = (raw: string): string | number | boolean => {
   const trimmed = raw.trim();
@@ -45,34 +54,17 @@ const parseValue = (raw: string): string | number | boolean => {
   return trimmed;
 };
 
-const readFirstExistingFile = async (paths: string[]) => {
-  for (const path of paths) {
-    try {
-      return await readFile(path, "utf8");
-    } catch {
-      // Try the next location.
-    }
+const readOptionalFile = async (path: string) => {
+  try {
+    return await readFile(path, "utf8");
+  } catch {
+    return "";
   }
-  return "";
 };
 
-export const loadCyreneConfig = async (
-  appRoot?: string,
-  context?: CyreneConfigLoadContext
-): Promise<CyreneConfig> => {
-  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
-  const content = await readFirstExistingFile([
-    join(
-      getCyreneConfigDir({
-        cwd: resolvedAppRoot,
-        env: context?.env,
-      }),
-      "config.yaml"
-    ),
-    join(getLegacyProjectCyreneDir(resolvedAppRoot), "config.yaml"),
-  ]);
-  if (!content) {
-    return DEFAULT_CONFIG;
+const parseCyreneConfigContent = (content: string): Partial<CyreneConfig> => {
+  if (!content.trim()) {
+    return {};
   }
 
   const map = new Map<string, string | number | boolean>();
@@ -90,42 +82,93 @@ export const loadCyreneConfig = async (
     map.set(key, parseValue(value));
   }
 
+  const parsed: Partial<CyreneConfig> = {};
+
   const pinRaw = map.get("pin_max_count");
-  const pinMaxCount =
-    typeof pinRaw === "number" && pinRaw > 0
-      ? Math.floor(pinRaw)
-      : DEFAULT_PIN_MAX_COUNT;
+  if (typeof pinRaw === "number" && pinRaw > 0) {
+    parsed.pinMaxCount = Math.floor(pinRaw);
+  }
 
   const queryMaxToolStepsRaw = map.get("query_max_tool_steps");
-  const queryMaxToolSteps =
-    typeof queryMaxToolStepsRaw === "number" && queryMaxToolStepsRaw > 0
-      ? Math.floor(queryMaxToolStepsRaw)
-      : DEFAULT_CONFIG.queryMaxToolSteps;
+  if (
+    typeof queryMaxToolStepsRaw === "number" &&
+    queryMaxToolStepsRaw > 0
+  ) {
+    parsed.queryMaxToolSteps = Math.floor(queryMaxToolStepsRaw);
+  }
 
   const autoSummaryRefreshRaw = map.get("auto_summary_refresh");
-  const autoSummaryRefresh =
-    typeof autoSummaryRefreshRaw === "boolean"
-      ? autoSummaryRefreshRaw
-      : DEFAULT_CONFIG.autoSummaryRefresh;
+  if (typeof autoSummaryRefreshRaw === "boolean") {
+    parsed.autoSummaryRefresh = autoSummaryRefreshRaw;
+  }
 
   const requestTemperatureRaw = map.get("request_temperature");
-  const requestTemperature =
+  if (
     typeof requestTemperatureRaw === "number" &&
     Number.isFinite(requestTemperatureRaw)
-      ? Math.min(2, Math.max(0, requestTemperatureRaw))
-      : DEFAULT_CONFIG.requestTemperature;
+  ) {
+    parsed.requestTemperature = Math.min(2, Math.max(0, requestTemperatureRaw));
+  }
 
   const systemRaw = map.get("system_prompt");
-  const systemPrompt =
-    typeof systemRaw === "string" && systemRaw.trim()
-      ? systemRaw.trim()
-      : undefined;
+  if (typeof systemRaw === "string" && systemRaw.trim()) {
+    parsed.systemPrompt = systemRaw.trim();
+  }
+
+  return parsed;
+};
+
+export const ensureProjectCyreneConfig = async (
+  appRoot?: string,
+  context?: CyreneConfigLoadContext
+) => {
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const configPath = join(
+    getLegacyProjectCyreneDir(resolvedAppRoot),
+    "config.yaml"
+  );
+
+  try {
+    await access(configPath);
+    return {
+      path: configPath,
+      created: false,
+    };
+  } catch {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(configPath, DEFAULT_PROJECT_CYRENE_CONFIG_YAML, "utf8");
+    return {
+      path: configPath,
+      created: true,
+    };
+  }
+};
+
+export const loadCyreneConfig = async (
+  appRoot?: string,
+  context?: CyreneConfigLoadContext
+): Promise<CyreneConfig> => {
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const globalConfig = parseCyreneConfigContent(
+    await readOptionalFile(
+      join(
+        getCyreneConfigDir({
+          cwd: resolvedAppRoot,
+          env: context?.env,
+        }),
+        "config.yaml"
+      )
+    )
+  );
+  const projectConfig = parseCyreneConfigContent(
+    await readOptionalFile(
+      join(getLegacyProjectCyreneDir(resolvedAppRoot), "config.yaml")
+    )
+  );
 
   return {
-    pinMaxCount,
-    queryMaxToolSteps,
-    autoSummaryRefresh,
-    requestTemperature,
-    systemPrompt,
+    ...DEFAULT_CYRENE_CONFIG,
+    ...globalConfig,
+    ...projectConfig,
   };
 };

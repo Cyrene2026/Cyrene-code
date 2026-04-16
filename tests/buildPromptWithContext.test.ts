@@ -248,4 +248,64 @@ describe("buildPromptWithContext", () => {
     expect(prompt).not.toContain("ACTIVE SKILLS");
     expect(prompt).not.toContain("full prompt should not leak here");
   });
+
+  test("trims oversized working state and query blocks before sending the prompt upstream", () => {
+    const hugeSummary = [
+      "OBJECTIVE:",
+      "- stabilize the transport layer",
+      "",
+      "CONFIRMED FACTS:",
+      ...Array.from({ length: 80 }, (_, index) => `- fact ${index} ${"x".repeat(400)}`),
+      "",
+      "COMPLETED:",
+      ...Array.from({ length: 80 }, (_, index) => `- completed ${index} ${"y".repeat(400)}`),
+      "",
+      "REMAINING:",
+      ...Array.from({ length: 80 }, (_, index) => `- remaining ${index} ${"z".repeat(400)}`),
+    ].join("\n");
+
+    const prompt = buildPromptWithContext(
+      `fix the provider overflow\n${"q".repeat(30000)}`,
+      "system",
+      "project",
+      {
+        pins: [],
+        relevantMemories: [],
+        recent: [],
+        latestActionableUserMessage: "",
+        durableSummary: hugeSummary,
+        pendingDigest: hugeSummary,
+        executionPlan: {
+          capturedAt: "2026-01-01T00:00:00.000Z",
+          sourcePreview: "trim prompt",
+          projectRoot: "/workspace/repo",
+          summary: "trim prompt",
+          objective: "trim prompt",
+          acceptedAt: "",
+          acceptedSummary: "",
+          steps: Array.from({ length: 12 }, (_, index) => ({
+            id: `step-${index + 1}`,
+            title: `step ${index + 1}`,
+            details: `detail ${index} ${"p".repeat(500)}`,
+            status: index === 0 ? "in_progress" : "pending",
+            evidence: [],
+            filePaths: [],
+            recentToolResult: "",
+          })),
+        },
+        summaryFallback: hugeSummary,
+        reducerMode: "merge_and_digest",
+        summaryRecoveryNeeded: true,
+        interruptedTurn: null,
+      }
+    );
+
+    expect(prompt.length).toBeLessThan(40000);
+    expect(prompt).toContain("(truncated)");
+    expect(prompt).toContain("...[truncated for prompt budget]...");
+    expect(prompt).toContain("Working state (durable reducer):");
+    expect(prompt).toContain("Pending turn digest (last completed turn not yet merged):");
+    expect(prompt).toContain("Current user query (act on this now):");
+    expect(prompt).not.toContain("q".repeat(15000));
+  });
 });

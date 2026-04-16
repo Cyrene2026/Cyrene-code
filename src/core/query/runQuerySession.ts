@@ -81,6 +81,10 @@ type UncertaintyState = {
 
 const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
 const MAX_NON_PROGRESS_CHATTER_CHARS = 240;
+const ROUND_PROMPT_TASK_CHAR_LIMIT = 12000;
+const ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT = 16000;
+const ROUND_PROMPT_TOOL_RESULT_ITEM_CHAR_LIMIT = 3000;
+const ROUND_PROMPT_TOOL_RESULT_KEEP_LIMIT = 8;
 
 const BROAD_DISCOVERY_ACTIONS = new Set([
   "list_dir",
@@ -199,6 +203,61 @@ const isCommandLikeAction = (toolName: string, input: unknown) => {
     action === "open_shell" ||
     action === "write_shell"
   );
+};
+
+const clipRoundPromptText = (text: string, maxChars: number) => {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  const marker = "\n...[truncated for round prompt budget]...\n";
+  const headLength = Math.max(0, Math.floor((maxChars - marker.length) * 0.7));
+  const tailLength = Math.max(0, maxChars - marker.length - headLength);
+  const head = normalized.slice(0, headLength).trimEnd();
+  const tail = normalized.slice(-tailLength).trimStart();
+  return `${head}${marker}${tail}`;
+};
+
+const formatToolResultsForRoundPrompt = (toolResults: string[]) => {
+  const normalizedResults = toolResults
+    .map(result => result.trim())
+    .filter(Boolean);
+
+  if (normalizedResults.length === 0) {
+    return "(none)";
+  }
+
+  const selected: string[] = [];
+  let remainingBudget = ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT;
+
+  for (let index = normalizedResults.length - 1; index >= 0; index -= 1) {
+    if (selected.length >= ROUND_PROMPT_TOOL_RESULT_KEEP_LIMIT || remainingBudget <= 0) {
+      break;
+    }
+
+    const nextResult = clipRoundPromptText(
+      normalizedResults[index] ?? "",
+      Math.min(ROUND_PROMPT_TOOL_RESULT_ITEM_CHAR_LIMIT, remainingBudget)
+    );
+    if (!nextResult) {
+      continue;
+    }
+
+    selected.unshift(nextResult);
+    remainingBudget -= nextResult.length + 2;
+  }
+
+  const omittedCount = normalizedResults.length - selected.length;
+  const parts =
+    omittedCount > 0
+      ? [
+          `[tool results truncated] omitted ${omittedCount} older result(s) to stay within the prompt budget.`,
+          ...selected,
+        ]
+      : selected;
+
+  return parts.join("\n\n");
 };
 
 const isFilesystemBoundFileAction = (toolName: string, input: unknown) =>
@@ -1012,12 +1071,12 @@ const buildInitialExecutionMemo = (
   ledger: MultiFileProgressLedger
 ) => {
   if (uncertainty.mode !== "simple_multi_file") {
-    return query;
+    return clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT);
   }
 
   const expected = getLedgerExpectedFileCount(ledger);
   const memo = [
-    query,
+    clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT),
     "",
     "Execution memo:",
     "- This is a simple multi-file task.",
@@ -1030,7 +1089,7 @@ const buildInitialExecutionMemo = (
     "- If enough context is already clear, move straight to the remaining writes/edits.",
     "- If several similar writes are needed, emit multiple tool_call actions in the same round before the final answer.",
     "- Keep narration minimal and do not stop after partial progress.",
-    `Original user task: ${originalTask}`,
+    `Original user task: ${clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT)}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -1339,7 +1398,7 @@ const buildRoundPrompt = (
   const executionState = formatExecutionState(uncertainty, progressLedger);
   return [
     "Original user task:",
-    originalTask,
+    clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT),
     "",
     "Continue based on tool results while staying strictly on the original task.",
     "Do not inspect unrelated files unless required for the task.",
@@ -1362,7 +1421,7 @@ const buildRoundPrompt = (
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
     loopCorrection ? `\n${loopCorrection}\n` : "",
     "Tool results:",
-    toolResults.join("\n\n") || "(none)",
+    formatToolResultsForRoundPrompt(toolResults),
     "If more tool usage is needed, call tools again. Otherwise provide final answer.",
   ].join("\n\n");
 };

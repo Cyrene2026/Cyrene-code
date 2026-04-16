@@ -12,6 +12,10 @@ export type PromptPolicy = {
   projectPrompt: string;
 };
 
+type PromptPolicyLoadContext = {
+  env?: NodeJS.ProcessEnv;
+};
+
 const DEFAULT_SYSTEM_PROMPT = [
   "You are Cyrene CLI assistant. Be concise, accurate, and execution-focused.",
   "Act autonomously when the task is multi-step: create and maintain an execution plan instead of only narrating intent.",
@@ -20,17 +24,25 @@ const DEFAULT_SYSTEM_PROMPT = [
 
 export const loadPromptPolicy = async (
   config?: CyreneConfig,
-  appRoot = resolveAppRoot()
+  appRoot = resolveAppRoot(),
+  context?: PromptPolicyLoadContext
 ): Promise<PromptPolicy> => {
+  const env = context?.env ?? process.env;
   const systemPrompt =
     config?.systemPrompt?.trim() ||
-    process.env.CYRENE_SYSTEM_PROMPT?.trim() ||
+    env.CYRENE_SYSTEM_PROMPT?.trim() ||
     DEFAULT_SYSTEM_PROMPT;
 
   let projectPrompt = "";
   const projectFiles = [
-    join(getCyreneConfigDir(appRoot), ".cyrene.md"),
     join(getLegacyProjectCyreneDir(appRoot), ".cyrene.md"),
+    join(
+      getCyreneConfigDir({
+        cwd: appRoot,
+        env: context?.env,
+      }),
+      ".cyrene.md"
+    ),
   ];
   for (const projectFile of projectFiles) {
     try {

@@ -1698,4 +1698,32 @@ describe("runQuerySession", () => {
     expect(textDeltas.join("")).toContain("Known remaining paths: test_files/b.py, test_files/c.py.");
     expect(textDeltas.join("")).not.toContain("继续补齐剩余文件");
   });
+
+  test("round prompts truncate oversized accumulated tool results", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "big.txt" },
+      },
+      null,
+    ]);
+
+    const hugeToolBody = "line\n".repeat(12000);
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "inspect big.txt and continue",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: `[tool result] read_file big.txt\n${hugeToolBody}`,
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("...[truncated for round prompt budget]...");
+    expect(prompts[1]?.length ?? 0).toBeLessThan(30000);
+  });
 });

@@ -11,7 +11,10 @@ import {
   configureAppRootFromArgs,
   resetConfiguredAppRoot,
 } from "../src/infra/config/appRoot";
-import { loadCyreneConfig } from "../src/infra/config/loadCyreneConfig";
+import {
+  ensureProjectCyreneConfig,
+  loadCyreneConfig,
+} from "../src/infra/config/loadCyreneConfig";
 import { loadPromptPolicy } from "../src/infra/config/loadPromptPolicy";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../src/shared/runtimeDefaults";
 
@@ -53,6 +56,44 @@ describe("config loaders", () => {
     expect(config.systemPrompt).toBe("focus on tests");
   });
 
+  test("loadCyreneConfig merges global defaults with project overrides", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-config-merge-"));
+    tempRoots.push(root);
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await mkdir(join(root, ".cyrene"), { recursive: true });
+    await writeFile(
+      join(globalHome, "config.yaml"),
+      [
+        "pin_max_count: 12",
+        "query_max_tool_steps: 40",
+        "auto_summary_refresh: false",
+        'system_prompt: "global prompt"',
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(root, ".cyrene", "config.yaml"),
+      [
+        "pin_max_count: 7",
+        "request_temperature: 0.6",
+        'system_prompt: "project prompt"',
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = await loadCyreneConfig(root, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    expect(config.pinMaxCount).toBe(7);
+    expect(config.queryMaxToolSteps).toBe(40);
+    expect(config.autoSummaryRefresh).toBe(false);
+    expect(config.requestTemperature).toBe(0.6);
+    expect(config.systemPrompt).toBe("project prompt");
+  });
+
   test("loadCyreneConfig falls back to raised default tool budget when config is missing", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-config-default-"));
     tempRoots.push(root);
@@ -75,12 +116,43 @@ describe("config loaders", () => {
     expect(promptPolicy.systemPrompt).toContain("mark finished steps completed yourself");
   });
 
+  test("loadPromptPolicy prefers project .cyrene.md over global .cyrene.md", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-prompt-priority-"));
+    tempRoots.push(root);
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await mkdir(join(root, ".cyrene"), { recursive: true });
+    await writeFile(join(globalHome, ".cyrene.md"), "global policy\n", "utf8");
+    await writeFile(join(root, ".cyrene", ".cyrene.md"), "project policy\n", "utf8");
+
+    const promptPolicy = await loadPromptPolicy(undefined, root, {
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    expect(promptPolicy.projectPrompt).toBe("project policy");
+  });
+
   test("loadCyreneConfig clamps invalid request_temperature into 0..2", async () => {
     const root = await createWorkspace("request_temperature: 9");
 
     const config = await loadCyreneConfig(root);
 
     expect(config.requestTemperature).toBe(2);
+  });
+
+  test("ensureProjectCyreneConfig creates a default project config.yaml", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-config-init-"));
+    tempRoots.push(root);
+
+    const created = await ensureProjectCyreneConfig(root);
+    const configText = await readFile(created.path, "utf8");
+
+    expect(created.created).toBe(true);
+    expect(created.path).toBe(join(root, ".cyrene", "config.yaml"));
+    expect(configText).toContain("pin_max_count:");
+    expect(configText).toContain("query_max_tool_steps:");
+    expect(configText).toContain("auto_summary_refresh:");
+    expect(configText).toContain("request_temperature:");
   });
 
   test("loadFilesystemRuleConfig falls back to config.yaml for MCP review settings", async () => {
@@ -102,6 +174,43 @@ describe("config loaders", () => {
       "move_path",
       "run_command",
     ]);
+  });
+
+  test("loadFilesystemRuleConfig merges global defaults with project overrides", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-rule-merge-"));
+    tempRoots.push(root);
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    await mkdir(join(root, ".cyrene"), { recursive: true });
+    await writeFile(
+      join(globalHome, "config.yaml"),
+      [
+        "workspace_root: ./global-workspace",
+        "max_read_bytes: 4096",
+        "require_review:",
+        "  - create_file",
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(root, ".cyrene", "config.yaml"),
+      [
+        "workspace_root: ./project-workspace",
+        "require_review:",
+        "  - run_command",
+      ].join("\n"),
+      "utf8"
+    );
+    await mkdir(join(root, "project-workspace"), { recursive: true });
+
+    const config = await loadFilesystemRuleConfig(root, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    expect(config.workspaceRoot).toBe(join(root, "project-workspace"));
+    expect(config.maxReadBytes).toBe(4096);
+    expect(config.requireReview).toEqual(["run_command"]);
   });
 
   test("loadFilesystemRuleConfig default review list keeps dangerous ops but skips normal file writes", async () => {

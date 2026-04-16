@@ -2392,7 +2392,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     ]);
   });
 
-  test("stream errors include the final request URL", async () => {
+  test("stream errors include the final request URL and response body", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
@@ -2432,7 +2432,65 @@ describe("createHttpQueryTransport streaming usage", () => {
         // unreachable
       }
     }).toThrow(
-      "Stream error: 404 Not Found | url https://rawchat.cn/codex/v1/chat/completions"
+      "Stream error: 404 Not Found | url https://rawchat.cn/codex/v1/chat/completions | detail not found"
+    );
+  });
+
+  test("stream errors surface provider JSON error messages", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://api.siliconflow.cn/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    globalThis.fetch = mock(async (url: string) => {
+      if (url === "https://api.siliconflow.cn/v1/chat/completions") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "stream_options is not supported",
+              type: "invalid_request_error",
+            },
+          }),
+          {
+            status: 400,
+            statusText: "Bad Request",
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.siliconflow.cn/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    const streamUrl = await transport.requestStreamUrl("hello");
+
+    await expect(async () => {
+      for await (const _event of transport.stream(streamUrl)) {
+        // unreachable
+      }
+    }).toThrow(
+      "Stream error: 400 Bad Request | url https://api.siliconflow.cn/v1/chat/completions | detail stream_options is not supported"
     );
   });
 

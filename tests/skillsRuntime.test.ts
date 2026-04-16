@@ -224,6 +224,41 @@ describe("skills runtime", () => {
     );
   });
 
+  test("project skills are only loaded from the active workspace root", async () => {
+    const root = await createWorkspace();
+    const siblingRoot = await createWorkspace();
+    await writeFile(
+      join(root, ".cyrene", "skills.yaml"),
+      [
+        "skills:",
+        "  - id: repo-a-docs",
+        "    label: Repo A Docs",
+        "    prompt: repo a only",
+        "    triggers: [repo-a]",
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(siblingRoot, ".cyrene", "skills.yaml"),
+      [
+        "skills:",
+        "  - id: repo-b-docs",
+        "    label: Repo B Docs",
+        "    prompt: repo b only",
+        "    triggers: [repo-b]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createSkillsRuntime(root, {
+      cwd: root,
+      env: {},
+    });
+
+    expect(runtime.listSkills().some(skill => skill.id === "repo-a-docs")).toBe(true);
+    expect(runtime.listSkills().some(skill => skill.id === "repo-b-docs")).toBe(false);
+  });
+
   test("global skill mutations reject project-defined skills", async () => {
     const root = await createWorkspace();
     const globalHome = join(root, "user-home");

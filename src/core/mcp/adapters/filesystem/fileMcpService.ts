@@ -214,6 +214,7 @@ type ShellSessionWriteAuditResult = {
   risk: "low" | "medium" | "high";
   reason?: string;
   notes: string[];
+  nextCwd?: string;
 };
 
 type SearchableFile = {
@@ -231,6 +232,12 @@ type WalkFilesResult = {
 type PathConflict = {
   action: ToolRequest["action"];
   path: string;
+};
+
+type ListDirSnapshotFingerprint = {
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
 };
 
 type LspWorkspaceFileEditPlan = {
@@ -2847,7 +2854,12 @@ export class FileMcpService {
   private pendingApprovalGuards = new Map<string, PendingApprovalGuard>();
   private recentListDir = new Map<
     string,
-    { output: string; listedAt: number; mutationVersion: number }
+    {
+      output: string;
+      listedAt: number;
+      mutationVersion: number;
+      fingerprint: ListDirSnapshotFingerprint | null;
+    }
   >();
   private filesystemMutationVersion = 0;
   private undoHistory: UndoEntry[] = [];
@@ -3848,7 +3860,7 @@ export class FileMcpService {
     }
   }
 
-  private getConflictKeys(request: ToolRequest) {
+  private getBaseConflictKeys(request: ToolRequest) {
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
@@ -3870,23 +3882,78 @@ export class FileMcpService {
     return [...keys];
   }
 
-  private getPendingConflict(request: ToolRequest): PathConflict | null {
-    const requestKeys = this.getConflictKeys(request);
+  private getLspPlanConflictKeys(plan: LspWorkspaceEditPlan | null | undefined) {
+    if (!plan) {
+      return [];
+    }
+    return [...new Set(plan.files.map(file => file.workspacePath))];
+  }
+
+  private getPendingGuardConflictKeys(
+    guard: PendingApprovalGuard | undefined
+  ) {
+    if (!guard) {
+      return [];
+    }
+
+    switch (guard.kind) {
+      case "lsp_rename":
+      case "lsp_code_actions":
+      case "lsp_format_document":
+        return this.getLspPlanConflictKeys(guard.resolved.plan);
+      default:
+        return [];
+    }
+  }
+
+  private async getConflictKeys(request: ToolRequest) {
+    const baseKeys = this.getBaseConflictKeys(request);
+    if (!isMutatingLspRequest(request)) {
+      return baseKeys;
+    }
+
+    try {
+      let plan: LspWorkspaceEditPlan | null = null;
+      switch (request.action) {
+        case "lsp_rename":
+          plan = (await this.resolveLspRenamePlan(request)).plan;
+          break;
+        case "lsp_code_actions":
+          plan = (await this.resolveLspCodeActionPlan(request)).plan;
+          break;
+        case "lsp_format_document":
+          plan = (await this.resolveLspFormatDocumentPlan(request)).plan;
+          break;
+      }
+      return [...new Set([...baseKeys, ...this.getLspPlanConflictKeys(plan)])];
+    } catch {
+      return baseKeys;
+    }
+  }
+
+  private async getPendingConflict(request: ToolRequest): Promise<PathConflict | null> {
+    const requestKeys = await this.getConflictKeys(request);
     if (requestKeys.length === 0) {
       return null;
     }
 
     for (const item of this.pending.values()) {
-      const itemKeys = this.getConflictKeys(item.request);
+      const itemKeys = [
+        ...new Set([
+          ...this.getBaseConflictKeys(item.request),
+          ...this.getPendingGuardConflictKeys(this.pendingApprovalGuards.get(item.id)),
+        ]),
+      ];
       if (itemKeys.length === 0) {
         continue;
       }
-      if (!itemKeys.some(key => requestKeys.includes(key))) {
+      const conflictPath = itemKeys.find(key => requestKeys.includes(key));
+      if (!conflictPath) {
         continue;
       }
       return {
         action: item.request.action,
-        path: this.normalizeWorkspacePath(item.request.path),
+        path: conflictPath,
       };
     }
 
@@ -4065,7 +4132,10 @@ export class FileMcpService {
     };
   }
 
-  private auditSingleShellSessionInput(rawInput: string): ShellSessionWriteAuditResult {
+  private auditSingleShellSessionInput(
+    rawInput: string,
+    cwdOverride?: string
+  ): ShellSessionWriteAuditResult {
     const session = this.shellSession;
     const shell = session?.shell ?? (process.platform === "win32" ? "pwsh" : "bash");
     const tokenized = tokenizeSafeShellCommand(rawInput);
@@ -4083,7 +4153,7 @@ export class FileMcpService {
 
     const tokens = tokenized.tokens;
     const commandName = (tokens[0] ?? "").toLowerCase();
-    const cwd = session?.cwd ?? this.workspaceRootAbsolute;
+    const cwd = cwdOverride ?? session?.cwd ?? this.workspaceRootAbsolute;
     const targetTokens = getShellTargetOperands(commandName, tokens);
 
     if (session && !this.canAccessAbsolutePathInsideWorkspaceRoot(cwd)) {
@@ -4216,6 +4286,7 @@ export class FileMcpService {
         tokens,
         policy: "direct",
         risk: "low",
+        nextCwd: resolve(cwd, targetTokens[0] ?? "."),
         notes: [
           "Persistent shell navigation is allowlisted for direct execution inside the workspace root.",
         ],
@@ -4421,22 +4492,29 @@ export class FileMcpService {
       };
     }
 
-    const audits = inputs.map(input => this.auditSingleShellSessionInput(input));
-    const blocked = audits.find(audit => !audit.ok || audit.policy === "blocked");
-    if (blocked) {
-      return {
-        ...blocked,
-        notes:
-          inputs.length > 1
-            ? [`Multiline shell block with ${inputs.length} lines failed audit.`, ...blocked.notes]
-            : blocked.notes,
-      };
+    const audits: ShellSessionWriteAuditResult[] = [];
+    let cwd = this.shellSession?.cwd ?? this.workspaceRootAbsolute;
+
+    for (const input of inputs) {
+      const audit = this.auditSingleShellSessionInput(input, cwd);
+      audits.push(audit);
+      if (!audit.ok || audit.policy === "blocked") {
+        return {
+          ...audit,
+          notes:
+            inputs.length > 1
+              ? [`Multiline shell block with ${inputs.length} lines failed audit.`, ...audit.notes]
+              : audit.notes,
+        };
+      }
+      cwd = audit.nextCwd ?? cwd;
     }
 
     const review = audits.find(audit => audit.policy === "review");
     if (review) {
       return {
         ...review,
+        nextCwd: cwd,
         notes:
           inputs.length > 1
             ? [
@@ -4447,15 +4525,17 @@ export class FileMcpService {
       };
     }
 
+    const lastAudit = audits[audits.length - 1]!;
     return {
-      ...audits[audits.length - 1]!,
+      ...lastAudit,
+      nextCwd: cwd,
       notes:
         inputs.length > 1
           ? [
               `Multiline shell block with ${inputs.length} lines is allowlisted for direct execution.`,
-              ...audits[audits.length - 1]!.notes,
+              ...lastAudit.notes,
             ]
-          : audits[audits.length - 1]!.notes,
+          : lastAudit.notes,
     };
   }
 
@@ -4558,6 +4638,13 @@ export class FileMcpService {
         session.pendingCommandId = null;
         session.pendingCwd = null;
         session.pendingExitCode = null;
+        continue;
+      }
+
+      if (
+        line.startsWith(SHELL_STATUS_MARKER_PREFIX) ||
+        line.startsWith(SHELL_CWD_MARKER_PREFIX)
+      ) {
         continue;
       }
 
@@ -5027,15 +5114,35 @@ export class FileMcpService {
     return `reverted ${entry.sourceAction}: moved ${entry.from} -> ${entry.to}`;
   }
 
-  private getRecentListDirSnapshot(inputPath: string) {
+  private async getListDirSnapshotFingerprint(
+    inputPath: string
+  ): Promise<ListDirSnapshotFingerprint | null> {
+    try {
+      const info = await stat(this.resolvePath(inputPath));
+      return {
+        mtimeMs: info.mtimeMs,
+        ctimeMs: info.ctimeMs,
+        size: info.size,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async getRecentListDirSnapshot(inputPath: string) {
     const normalizedPath = this.normalizeWorkspacePath(inputPath);
     const snapshot = this.recentListDir.get(normalizedPath);
     if (!snapshot) {
       return null;
     }
+    const fingerprint = await this.getListDirSnapshotFingerprint(inputPath);
     if (
       snapshot.mutationVersion !== this.filesystemMutationVersion ||
-      Date.now() - snapshot.listedAt > RECENT_LIST_DIR_WINDOW_MS
+      Date.now() - snapshot.listedAt > RECENT_LIST_DIR_WINDOW_MS ||
+      !fingerprint ||
+      fingerprint.mtimeMs !== snapshot.fingerprint?.mtimeMs ||
+      fingerprint.ctimeMs !== snapshot.fingerprint?.ctimeMs ||
+      fingerprint.size !== snapshot.fingerprint?.size
     ) {
       this.recentListDir.delete(normalizedPath);
       return null;
@@ -5043,12 +5150,13 @@ export class FileMcpService {
     return snapshot;
   }
 
-  private storeRecentListDirSnapshot(inputPath: string, output: string) {
+  private async storeRecentListDirSnapshot(inputPath: string, output: string) {
     const normalizedPath = this.normalizeWorkspacePath(inputPath);
     this.recentListDir.set(normalizedPath, {
       output,
       listedAt: Date.now(),
       mutationVersion: this.filesystemMutationVersion,
+      fingerprint: await this.getListDirSnapshotFingerprint(inputPath),
     });
   }
 
@@ -8146,7 +8254,7 @@ export class FileMcpService {
       !isPersistentShellAction(request.action)
     ) {
       try {
-        const conflict = this.getPendingConflict(request);
+        const conflict = await this.getPendingConflict(request);
         if (conflict) {
           return {
             ok: false,
@@ -8219,15 +8327,24 @@ export class FileMcpService {
     }
 
     if (request.action === "list_dir") {
-      const cachedSnapshot = this.getRecentListDirSnapshot(request.path);
-      if (cachedSnapshot) {
+      try {
+        const cachedSnapshot = await this.getRecentListDirSnapshot(request.path);
+        if (cachedSnapshot) {
+          return {
+            ok: true,
+            message: this.formatListDirToolResult(
+              request.path,
+              cachedSnapshot.output,
+              true
+            ),
+          };
+        }
+      } catch (error) {
         return {
-          ok: true,
-          message: this.formatListDirToolResult(
-            request.path,
-            cachedSnapshot.output,
-            true
-          ),
+          ok: false,
+          message: `[tool error] ${request.action} ${request.path}\n${
+            error instanceof Error ? error.message : String(error)
+          }`,
         };
       }
     }
@@ -8235,7 +8352,7 @@ export class FileMcpService {
     try {
       const output = await this.execute(request);
       if (request.action === "list_dir") {
-        this.storeRecentListDirSnapshot(request.path, output);
+        await this.storeRecentListDirSnapshot(request.path, output);
         return {
           ok: true,
           message: this.formatListDirToolResult(request.path, output),

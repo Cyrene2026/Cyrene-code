@@ -137,13 +137,94 @@ const extractUsageEvent = (payload: unknown) => {
   };
 };
 
-const formatHttpFailure = (
+const MAX_HTTP_FAILURE_DETAIL_LENGTH = 1200;
+
+const truncateHttpFailureDetail = (value: string) =>
+  value.length > MAX_HTTP_FAILURE_DETAIL_LENGTH
+    ? `${value.slice(0, MAX_HTTP_FAILURE_DETAIL_LENGTH)}...`
+    : value;
+
+const extractHttpFailureDetail = (payload: unknown): string | null => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    error?: unknown;
+    message?: unknown;
+    detail?: unknown;
+  };
+
+  if (typeof record.message === "string" && record.message.trim()) {
+    return record.message.trim();
+  }
+  if (typeof record.detail === "string" && record.detail.trim()) {
+    return record.detail.trim();
+  }
+
+  if (record.error && typeof record.error === "object") {
+    const errorRecord = record.error as {
+      message?: unknown;
+      detail?: unknown;
+      code?: unknown;
+      type?: unknown;
+    };
+    if (
+      typeof errorRecord.message === "string" &&
+      errorRecord.message.trim()
+    ) {
+      return errorRecord.message.trim();
+    }
+    if (typeof errorRecord.detail === "string" && errorRecord.detail.trim()) {
+      return errorRecord.detail.trim();
+    }
+
+    const compactError = JSON.stringify(record.error);
+    if (compactError && compactError !== "{}") {
+      return compactError;
+    }
+  }
+
+  const compactPayload = JSON.stringify(payload);
+  if (compactPayload && compactPayload !== "{}") {
+    return compactPayload;
+  }
+  return null;
+};
+
+const readHttpFailureDetail = async (response: Response) => {
+  try {
+    const text = (await response.text()).trim();
+    if (!text) {
+      return null;
+    }
+
+    try {
+      const payload = JSON.parse(text) as unknown;
+      const detail = extractHttpFailureDetail(payload);
+      if (detail) {
+        return truncateHttpFailureDetail(detail);
+      }
+    } catch {
+      // Fall back to the raw response body when it is not JSON.
+    }
+
+    return truncateHttpFailureDetail(text);
+  } catch {
+    return null;
+  }
+};
+
+const formatHttpFailure = async (
   label: "Stream error" | "Model fetch failed",
   response: Response,
   requestUrl: string
 ) => {
   const resolvedUrl = response.url?.trim() || requestUrl;
-  return `${label}: ${response.status} ${response.statusText} | url ${resolvedUrl}`;
+  const detail = await readHttpFailureDetail(response);
+  return detail
+    ? `${label}: ${response.status} ${response.statusText} | url ${resolvedUrl} | detail ${detail}`
+    : `${label}: ${response.status} ${response.statusText} | url ${resolvedUrl}`;
 };
 
 export const FILE_TOOL = {
@@ -897,7 +978,7 @@ async function* streamSseOpenAI(
   );
 
   if (!response.ok || !response.body) {
-    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
+    throw new Error(await formatHttpFailure("Stream error", response, requestUrl));
   }
 
   const reader = response.body.getReader();
@@ -1288,7 +1369,7 @@ async function* streamSseOpenAIResponses(
   }
 
   if (!response.ok || !response.body) {
-    throw new Error(formatHttpFailure("Stream error", response, attemptedUrl));
+    throw new Error(await formatHttpFailure("Stream error", response, attemptedUrl));
   }
 
   const reader = response.body.getReader();
@@ -1786,7 +1867,7 @@ async function* streamSseGeminiGenerateContent(
   );
 
   if (!response.ok || !response.body) {
-    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
+    throw new Error(await formatHttpFailure("Stream error", response, requestUrl));
   }
 
   const reader = response.body.getReader();
@@ -1984,7 +2065,7 @@ async function* streamSseAnthropic(
   );
 
   if (!response.ok || !response.body) {
-    throw new Error(formatHttpFailure("Stream error", response, requestUrl));
+    throw new Error(await formatHttpFailure("Stream error", response, requestUrl));
   }
 
   const reader = response.body.getReader();
@@ -2264,7 +2345,7 @@ export const fetchProviderModelCatalog = async (options: {
         currentModel: options.currentModel,
       });
     }
-    throw new Error(formatHttpFailure("Model fetch failed", response, requestUrl));
+    throw new Error(await formatHttpFailure("Model fetch failed", response, requestUrl));
   }
   const payload = (await response.json()) as unknown;
   const models = parseModelsPayload(payload);

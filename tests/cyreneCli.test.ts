@@ -117,6 +117,52 @@ describe("cyrene CLI runtime", () => {
     expect(payload.promptPolicy.projectPromptLength).toBeGreaterThan(0);
   });
 
+  test("config command applies project config over global config", async () => {
+    const runtime = await createRuntime();
+    const configHome = join(runtime.home, ".cyrene");
+    await mkdir(configHome, { recursive: true });
+    await mkdir(join(runtime.root, ".cyrene"), { recursive: true });
+    await writeFile(
+      join(configHome, "config.yaml"),
+      [
+        "pin_max_count: 12",
+        "query_max_tool_steps: 30",
+        'system_prompt: "global operator mode"',
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(runtime.root, ".cyrene", "config.yaml"),
+      [
+        "pin_max_count: 5",
+        "request_temperature: 0.4",
+        'system_prompt: "project operator mode"',
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await handleCyreneCli(
+      ["config", "--json", "--root", runtime.root],
+      {
+        cwd: runtime.root,
+        env: runtime.env,
+        stdout: runtime.stdout.stream as never,
+        stderr: runtime.stderr.stream as never,
+      }
+    );
+
+    expect(result).toEqual({
+      kind: "handled",
+      exitCode: 0,
+    });
+
+    const payload = JSON.parse(runtime.stdout.read());
+    expect(payload.config.pinMaxCount).toBe(5);
+    expect(payload.config.queryMaxToolSteps).toBe(30);
+    expect(payload.config.requestTemperature).toBe(0.4);
+    expect(payload.promptPolicy.systemPrompt).toBe("project operator mode");
+  });
+
   test("provider name set creates a model catalog and persists provider metadata", async () => {
     const runtime = await createRuntime();
     runtime.env.CYRENE_MODEL = "gpt-5.4";

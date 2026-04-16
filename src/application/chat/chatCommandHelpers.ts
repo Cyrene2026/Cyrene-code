@@ -150,14 +150,14 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { command: "/skills list", description: "list available skills" },
   { command: "/skills create <task>", description: "ask AI to generate and save a new skill" },
   { command: "/skills show <id>", description: "show one skill details" },
-  { command: "/skills enable <id>", description: "enable one skill in project config" },
+  { command: "/skills enable <id>", description: "enable one skill in global skills config" },
   {
     command: "/skills disable <id>",
-    description: "disable one skill in project config",
+    description: "disable one skill in global skills config",
   },
   {
     command: "/skills remove <id>",
-    description: "remove one skill via project remove_skills override",
+    description: "remove one skill via global remove_skills override",
   },
   { command: "/skills use <id>", description: "use one skill for the current session only" },
   { command: "/skills reload", description: "reload skills config from disk" },

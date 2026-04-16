@@ -94,29 +94,28 @@ const readConfigFile = async (path: string) => {
   }
 };
 
-export const loadFilesystemRuleConfig = async (
-  appRoot?: string,
-  context?: RuleConfigLoadContext
-): Promise<RuleConfig> => {
-  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
-  const defaultRules = createDefaultRules(resolvedAppRoot);
-  const configDir = getCyreneConfigDir({
-    cwd: resolvedAppRoot,
-    env: context?.env,
-  });
-  const legacyConfigDir = getLegacyProjectCyreneDir(resolvedAppRoot);
-  const content =
-    (await readConfigFile(join(configDir, "config.yaml"))) ||
-    (await readConfigFile(join(configDir, "rule.yaml"))) ||
-    (await readConfigFile(join(legacyConfigDir, "config.yaml"))) ||
-    (await readConfigFile(join(legacyConfigDir, "rule.yaml")));
-  if (!content) {
-    return defaultRules;
+const readFirstExistingConfig = async (paths: string[]) => {
+  for (const path of paths) {
+    const content = await readConfigFile(path);
+    if (content) {
+      return content;
+    }
+  }
+  return "";
+};
+
+const parseRuleConfigContent = (
+  content: string,
+  resolvedAppRoot: string
+): Partial<RuleConfig> => {
+  if (!content.trim()) {
+    return {};
   }
 
-  let workspaceRoot = defaultRules.workspaceRoot;
-  let maxReadBytes = defaultRules.maxReadBytes;
+  let workspaceRoot: string | undefined;
+  let maxReadBytes: number | undefined;
   const requireReview: MpcAction[] = [];
+  let hasRequireReview = false;
   let inRequireReview = false;
 
   for (const raw of content.split(/\r?\n/)) {
@@ -143,6 +142,7 @@ export const loadFilesystemRuleConfig = async (
     }
 
     if (line === "require_review:") {
+      hasRequireReview = true;
       inRequireReview = true;
       continue;
     }
@@ -159,12 +159,60 @@ export const loadFilesystemRuleConfig = async (
   }
 
   return {
-    workspaceRoot,
-    maxReadBytes,
+    ...(workspaceRoot ? { workspaceRoot } : {}),
+    ...(typeof maxReadBytes === "number" ? { maxReadBytes } : {}),
+    ...(hasRequireReview
+      ? {
+          requireReview: Array.from(new Set(requireReview)).filter(
+            action => action !== "create_dir"
+          ),
+        }
+      : {}),
+  };
+};
+
+export const loadFilesystemRuleConfig = async (
+  appRoot?: string,
+  context?: RuleConfigLoadContext
+): Promise<RuleConfig> => {
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  const defaultRules = createDefaultRules(resolvedAppRoot);
+  const configDir = getCyreneConfigDir({
+    cwd: resolvedAppRoot,
+    env: context?.env,
+  });
+  const legacyConfigDir = getLegacyProjectCyreneDir(resolvedAppRoot);
+  const globalRules = parseRuleConfigContent(
+    await readFirstExistingConfig([
+      join(configDir, "config.yaml"),
+      join(configDir, "rule.yaml"),
+    ]),
+    resolvedAppRoot
+  );
+  const projectRules = parseRuleConfigContent(
+    await readFirstExistingConfig([
+      join(legacyConfigDir, "config.yaml"),
+      join(legacyConfigDir, "rule.yaml"),
+    ]),
+    resolvedAppRoot
+  );
+  const mergedRequireReview =
+    projectRules.requireReview ??
+    globalRules.requireReview ??
+    defaultRules.requireReview;
+
+  return {
+    workspaceRoot:
+      projectRules.workspaceRoot ??
+      globalRules.workspaceRoot ??
+      defaultRules.workspaceRoot,
+    maxReadBytes:
+      projectRules.maxReadBytes ??
+      globalRules.maxReadBytes ??
+      defaultRules.maxReadBytes,
     requireReview:
-      (requireReview.length > 0
-        ? Array.from(new Set(requireReview))
-        : defaultRules.requireReview
-      ).filter(action => action !== "create_dir"),
+      mergedRequireReview.length > 0
+        ? mergedRequireReview
+        : defaultRules.requireReview,
   };
 };

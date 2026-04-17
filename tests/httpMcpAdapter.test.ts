@@ -50,6 +50,115 @@ afterEach(async () => {
 });
 
 describe("HttpMcpAdapter", () => {
+  test("queues review-required remote tools instead of executing them immediately", async () => {
+    const port = await getAvailablePort();
+    let toolCallCount = 0;
+    const server = Bun.serve({
+      port,
+      fetch: async request => {
+        const payload = (await request.json()) as {
+          id?: number;
+          method?: string;
+          params?: Record<string, unknown>;
+        };
+        const headers = {
+          "content-type": "application/json",
+          "mcp-session-id": "session-review",
+        };
+
+        if (payload.method === "notifications/initialized") {
+          return new Response(null, { status: 204, headers });
+        }
+        if (payload.method === "initialize") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "fake-http", version: "1.0.0" },
+              },
+            },
+            { headers }
+          );
+        }
+        if (payload.method === "tools/list") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                tools: [{ name: "fetch_docs", description: "Fetch docs" }],
+              },
+            },
+            { headers }
+          );
+        }
+        if (payload.method === "tools/call") {
+          toolCallCount += 1;
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                content: [{ type: "text", text: "approved remote call" }],
+              },
+            },
+            { headers }
+          );
+        }
+
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: payload.id,
+            error: { message: `unknown method: ${payload.method}` },
+          },
+          {
+            status: 400,
+            headers,
+          }
+        );
+      },
+    });
+    cleanupTasks.push(async () => {
+      server.stop(true);
+    });
+
+    const adapter = new HttpMcpAdapter(
+      {
+        ...createHttpServerConfig(`http://127.0.0.1:${port}/mcp`),
+        tools: [
+          {
+            name: "fetch_docs",
+            requiresReview: true,
+            risk: "medium",
+          },
+        ],
+      },
+      {
+        appRoot: ".",
+      } as never
+    );
+
+    const queued = await adapter.handleToolCall("fetch_docs", {
+      topic: "routing",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending).toBeDefined();
+    expect(queued.message).toContain("[review required]");
+    expect(adapter.listPending()).toHaveLength(1);
+    expect(toolCallCount).toBe(0);
+
+    const approved = await adapter.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("approved remote call");
+    expect(adapter.listPending()).toHaveLength(0);
+    expect(toolCallCount).toBe(1);
+  });
+
   test("blocks HTTP redirects instead of following them", async () => {
     const port = await getAvailablePort();
     const server = Bun.serve({

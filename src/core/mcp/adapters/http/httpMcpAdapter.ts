@@ -4,6 +4,7 @@ import type {
   McpServerAdapter,
   McpServerDescriptor,
 } from "../../runtimeTypes";
+import type { PendingReviewItem } from "../../toolTypes";
 import {
   buildRemoteToolDescriptors,
   formatRemoteToolCallResult,
@@ -26,6 +27,13 @@ type JsonRpcResponse = {
   error?: JsonRpcErrorShape;
 };
 
+type PendingRemoteReview = {
+  id: string;
+  toolName: string;
+  input: unknown;
+  item: PendingReviewItem;
+};
+
 const CLIENT_INFO = {
   name: "cyrene-code",
   version: "0.1.3",
@@ -39,6 +47,29 @@ const getErrorText = (error: unknown) => {
   }
   return typeof error === "string" ? error : String(error);
 };
+
+const extractResultBody = (message: string) => {
+  const [, ...rest] = message.split("\n");
+  const body = rest.join("\n").trim();
+  return body || message.trim();
+};
+
+const stringifyPreviewInput = (input: unknown, pretty: boolean) => {
+  if (input === undefined) {
+    return "(none)";
+  }
+  if (typeof input === "string") {
+    return input.trim() || "(empty string)";
+  }
+  try {
+    return JSON.stringify(input, null, pretty ? 2 : 0) ?? "(unserializable)";
+  } catch {
+    return String(input);
+  }
+};
+
+const truncatePreview = (value: string, maxChars: number) =>
+  value.length > maxChars ? `${value.slice(0, maxChars)}...` : value;
 
 const normalizeToolArray = (value: unknown): RemoteMcpTool[] => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -73,6 +104,7 @@ export class HttpMcpAdapter implements McpServerAdapter {
   private sessionId: string | null = null;
   private initPromise: Promise<void> | null = null;
   private initialized = false;
+  private readonly pendingReviews = new Map<string, PendingRemoteReview>();
 
   constructor(
     private readonly server: McpConfiguredServer,
@@ -237,16 +269,64 @@ export class HttpMcpAdapter implements McpServerAdapter {
     return this.initPromise;
   }
 
-  async handleToolCall(toolName: string, input: unknown): Promise<McpHandleResult> {
-    if (!this.descriptor.enabled) {
-      return {
-        ok: false,
-        message: `MCP server disabled: ${this.server.id}`,
-      };
-    }
+  private findToolDescriptor(toolName: string) {
+    const normalized = toolName.trim().toLowerCase();
+    return this.descriptor.tools.find(
+      tool => tool.name.trim().toLowerCase() === normalized
+    );
+  }
 
+  private createPendingReview(toolName: string, input: unknown) {
+    const descriptor = this.findToolDescriptor(toolName);
+    const previewInputCompact = truncatePreview(stringifyPreviewInput(input, false), 240);
+    const previewInputFull = truncatePreview(stringifyPreviewInput(input, true), 4_000);
+    const id = crypto.randomUUID().slice(0, 8);
+    const item: PendingReviewItem = {
+      id,
+      request: {
+        action: toolName,
+        path: this.server.id,
+        input,
+      } as PendingReviewItem["request"],
+      preview: [
+        "[remote tool review]",
+        `server: ${this.server.id}`,
+        `tool: ${toolName}`,
+        `risk: ${descriptor?.risk ?? "low"}`,
+        `input: ${previewInputCompact}`,
+      ].join("\n"),
+      previewSummary: [
+        "[remote tool review]",
+        `server: ${this.server.id}`,
+        `tool: ${toolName}`,
+        `risk: ${descriptor?.risk ?? "low"}`,
+        `input: ${previewInputCompact}`,
+      ].join("\n"),
+      previewFull: [
+        "[remote tool review]",
+        `server: ${this.server.id}`,
+        `tool: ${toolName}`,
+        `risk: ${descriptor?.risk ?? "low"}`,
+        "input:",
+        previewInputFull,
+      ].join("\n"),
+      createdAt: new Date().toISOString(),
+    };
+
+    this.pendingReviews.set(id, {
+      id,
+      toolName,
+      input,
+      item,
+    });
+    return item;
+  }
+
+  private async executeRemoteToolCall(
+    toolName: string,
+    input: unknown
+  ): Promise<McpHandleResult> {
     try {
-      await this.initialize();
       const result = await this.postJsonRpc("tools/call", {
         name: toolName,
         arguments:
@@ -267,21 +347,77 @@ export class HttpMcpAdapter implements McpServerAdapter {
     }
   }
 
+  async handleToolCall(toolName: string, input: unknown): Promise<McpHandleResult> {
+    if (!this.descriptor.enabled) {
+      return {
+        ok: false,
+        message: `MCP server disabled: ${this.server.id}`,
+      };
+    }
+
+    try {
+      await this.initialize();
+      if (this.findToolDescriptor(toolName)?.requiresReview) {
+        const pending = this.createPendingReview(toolName, input);
+        return {
+          ok: true,
+          message: `[review required] ${pending.id}\n${pending.previewSummary}`,
+          pending,
+        };
+      }
+      return await this.executeRemoteToolCall(toolName, input);
+    } catch (error) {
+      this.descriptor.health = "error";
+      return {
+        ok: false,
+        message: `[tool error] ${toolName}\n${getErrorText(error)}`.trim(),
+      };
+    }
+  }
+
   listPending() {
-    return [];
+    return [...this.pendingReviews.values()]
+      .map(entry => entry.item)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
   async approve(id: string) {
+    const pending = this.pendingReviews.get(id);
+    if (!pending) {
+      return {
+        ok: false,
+        message: `Pending operation not found: ${id}`,
+      };
+    }
+
+    const result = await this.executeRemoteToolCall(pending.toolName, pending.input);
+    if (!result.ok) {
+      return {
+        ok: false,
+        message: `[approve failed] ${id}\n${extractResultBody(result.message)}`,
+      };
+    }
+
+    this.pendingReviews.delete(id);
     return {
-      ok: false,
-      message: `Pending operation not found: ${id}`,
+      ok: true,
+      message: `[approved] ${id}\n${extractResultBody(result.message)}`,
     };
   }
 
   reject(id: string) {
+    const pending = this.pendingReviews.get(id);
+    if (!pending) {
+      return {
+        ok: false,
+        message: `Pending operation not found: ${id}`,
+      };
+    }
+
+    this.pendingReviews.delete(id);
     return {
-      ok: false,
-      message: `Pending operation not found: ${id}`,
+      ok: true,
+      message: `[rejected] ${id}\n${pending.toolName}`,
     };
   }
 
@@ -295,5 +431,6 @@ export class HttpMcpAdapter implements McpServerAdapter {
   dispose() {
     this.initialized = false;
     this.sessionId = null;
+    this.pendingReviews.clear();
   }
 }

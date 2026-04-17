@@ -148,6 +148,48 @@ const restorePathEnvValue = (value: string | undefined) => {
 };
 
 describe("StdioMcpAdapter", () => {
+  test("queues review-required remote tools instead of executing them immediately", async () => {
+    const fakeProcess = createFakeSpawnProcess();
+    const adapter = new StdioMcpAdapter(
+      {
+        id: "docs",
+        transport: "stdio",
+        label: "Docs",
+        enabled: true,
+        aliases: ["docs"],
+        command: "node",
+        args: ["fake-server.mjs"],
+        tools: [
+          {
+            name: "search_docs",
+            requiresReview: true,
+            risk: "medium",
+          },
+        ],
+      },
+      {
+        appRoot: "D:/Projects/js_projects/Cyrene-code",
+        spawnProcess: fakeProcess.spawnProcess as any,
+      }
+    );
+
+    const queued = await adapter.handleToolCall("search_docs", {
+      query: "hello",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending).toBeDefined();
+    expect(queued.message).toContain("[review required]");
+    expect(adapter.listPending()).toHaveLength(1);
+
+    const approved = await adapter.approve(queued.pending!.id);
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("remote docs: hello");
+    expect(adapter.listPending()).toHaveLength(0);
+
+    adapter.dispose();
+  });
+
   test("initializes over stdio, lists tools and calls a remote tool", async () => {
     const fakeProcess = createFakeSpawnProcess();
     const adapter = new StdioMcpAdapter(

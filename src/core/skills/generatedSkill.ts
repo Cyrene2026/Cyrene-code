@@ -27,6 +27,7 @@ type RawSkillPayload = {
   tags?: unknown;
   exposure?: unknown;
   enabled?: unknown;
+  scope?: unknown;
 };
 
 const normalizeWhitespace = (value: string) => value.replace(/\s+/g, " ").trim();
@@ -68,6 +69,8 @@ const normalizeSkillPayload = (payload: RawSkillPayload): SkillCreationInput | n
   const triggers = dedupeStrings(normalizeStringArray(payload.triggers));
   const tags = dedupeStrings(normalizeStringArray(payload.tags));
   const exposure = normalizeExtensionExposureMode(payload.exposure) ?? "scoped";
+  const scope =
+    payload.scope === "global" || payload.scope === "project" ? payload.scope : "project";
 
   if (!id || !label || !prompt || triggers.length === 0) {
     return null;
@@ -82,6 +85,7 @@ const normalizeSkillPayload = (payload: RawSkillPayload): SkillCreationInput | n
     exposure,
     tags,
     enabled: payload.enabled === false ? false : true,
+    scope,
   };
 };
 

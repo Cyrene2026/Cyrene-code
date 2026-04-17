@@ -36,6 +36,7 @@ describe("generatedSkill", () => {
       tags: ["docs", "reference"],
       exposure: "scoped",
       enabled: true,
+      scope: "project",
     });
   });
 

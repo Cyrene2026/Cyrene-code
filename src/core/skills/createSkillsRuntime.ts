@@ -12,6 +12,7 @@ import type {
 import type { ExtensionExposureMode } from "../extensions/metadata";
 import {
   loadSkillsConfig,
+  saveProjectSkillsConfig,
   saveGlobalSkillsConfig,
   type LoadedSkillsConfig,
   type SkillsConfigPatch,
@@ -108,6 +109,7 @@ const normalizeSkillCreationInput = (input: SkillCreationInput) => {
   const exposure =
     normalizeExtensionExposureMode(input.exposure) ?? defaultSkillExposureMode();
   const enabled = input.enabled ?? true;
+  const scope = input.scope === "global" ? "global" : "project";
 
   return {
     id,
@@ -118,6 +120,7 @@ const normalizeSkillCreationInput = (input: SkillCreationInput) => {
     tags,
     exposure,
     enabled,
+    scope,
   };
 };
 
@@ -252,23 +255,17 @@ class ManagedSkillsRuntime implements SkillsRuntime {
       };
     }
 
-    const globalSkills = current.skills.filter(skill => skill.source === "global");
-    const patch: SkillsConfigPatch = {
-      removeSkillIds: [],
-      skills: globalSkills
-        .filter(skill => skill.id !== normalized.id)
-        .map(skill => ({
-          id: skill.id,
-          label: skill.label,
-          description: skill.description,
-          prompt: skill.prompt,
-          triggers: [...skill.triggers],
-          exposure: skill.exposure,
-          tags: [...skill.tags],
-          enabled: skill.enabled,
-        })),
-    };
-    patch.skills.push({
+    const targetPatch =
+      normalized.scope === "global" ? clonePatch(current.globalPatch) : clonePatch(current.projectPatch);
+    targetPatch.removeSkillIds = targetPatch.removeSkillIds.filter(id => id !== normalized.id);
+    targetPatch.skills = targetPatch.skills
+      .filter(skill => skill.id !== normalized.id)
+      .map(skill => ({
+        ...skill,
+        triggers: skill.triggers ? [...skill.triggers] : [],
+        tags: skill.tags ? [...skill.tags] : [],
+      }));
+    targetPatch.skills.push({
       id: normalized.id,
       label: normalized.label,
       description: normalized.description,
@@ -279,7 +276,10 @@ class ManagedSkillsRuntime implements SkillsRuntime {
       enabled: normalized.enabled,
     });
 
-    const saved = await saveGlobalSkillsConfig(this.appRoot, patch, this.context);
+    const saved =
+      normalized.scope === "global"
+        ? await saveGlobalSkillsConfig(this.appRoot, targetPatch, this.context)
+        : await saveProjectSkillsConfig(this.appRoot, targetPatch, this.context);
     await this.load();
 
     return {

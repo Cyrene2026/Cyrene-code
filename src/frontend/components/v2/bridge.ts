@@ -1335,7 +1335,7 @@ class BubbleTeaBridge {
       [
         `Summary suggests a repeatable workflow around: ${suggestion.phrase}`,
         ...suggestion.sampleLines.map(line => `- ${line}`),
-        "Use `skill create` to turn the current session summary into a reusable global skill.",
+        "Use `skill create` to turn the current session summary into a reusable project skill.",
       ].join("\n")
     );
   }
@@ -1590,11 +1590,13 @@ class BubbleTeaBridge {
   private buildSkillCreationPrompt(task: string) {
     const lines = [
       "Generate one focused reusable Cyrene skill for the described task.",
+      "This should be a project-local skill by default, saved under the active workspace .cyrene config.",
       "Return a short visible summary for the user, then include a machine-readable <cyrene_skill> JSON block.",
-      "The JSON must match: {\"version\":1,\"id\":\"...\",\"label\":\"...\",\"description\":\"...\",\"prompt\":\"...\",\"triggers\":[\"...\"],\"tags\":[\"...\"],\"exposure\":\"hidden|hinted|scoped|full\",\"enabled\":true}.",
+      "The JSON must match: {\"version\":1,\"id\":\"...\",\"label\":\"...\",\"description\":\"...\",\"prompt\":\"...\",\"triggers\":[\"...\"],\"tags\":[\"...\"],\"exposure\":\"hidden|hinted|scoped|full\",\"enabled\":true,\"scope\":\"project|global\"}.",
       "Keep the skill concise and operational. The prompt should be short, specific, and reusable.",
       "Use 2-6 meaningful triggers. Avoid vague or overly generic triggers unless they are necessary.",
       "Prefer exposure \"scoped\". enabled should usually stay true.",
+      "Prefer scope \"project\" unless the user explicitly asks for a global reusable skill.",
       "Do not duplicate an existing skill id or create a near-duplicate of an existing skill.",
       `Existing skills:\n${this.formatExistingSkillsForPrompt()}`,
       `Task:\n${task}`,

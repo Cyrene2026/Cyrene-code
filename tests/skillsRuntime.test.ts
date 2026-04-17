@@ -155,7 +155,7 @@ describe("skills runtime", () => {
     expect(skillsText).toContain("- code-review");
   });
 
-  test("createSkill persists a new skill to global config", async () => {
+  test("createSkill persists a new skill to project config by default", async () => {
     const root = await createWorkspace();
     const globalHome = join(root, "user-home");
     await mkdir(globalHome, { recursive: true });
@@ -175,21 +175,55 @@ describe("skills runtime", () => {
     expect(result?.ok).toBe(true);
     expect(result?.skillId).toBe("docs-search");
 
-    const skillsText = await readFile(join(globalHome, "skills.yaml"), "utf8");
+    const skillsText = await readFile(join(root, ".cyrene", "skills.yaml"), "utf8");
     expect(skillsText).toContain("id: docs-search");
     expect(skillsText).toContain('label: "Docs Search"');
     expect(skillsText).toContain(
       'prompt: "Search relevant documentation before proposing changes."'
     );
     expect(skillsText).toContain("- docs");
+    expect(result?.configPath).toBe(join(root, ".cyrene", "skills.yaml"));
 
     const reloaded = await loadSkillsConfig(root, {
       cwd: root,
       env: { CYRENE_HOME: globalHome },
     });
     expect(reloaded.skills.find(skill => skill.id === "docs-search")).toMatchObject({
-      source: "global",
+      source: "project",
       triggers: ["docs", "documentation", "api docs"],
+    });
+  });
+
+  test("createSkill persists to global config when scope is explicitly global", async () => {
+    const root = await createWorkspace();
+    const globalHome = join(root, "user-home");
+    await mkdir(globalHome, { recursive: true });
+    const runtime = await createSkillsRuntime(root, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+
+    const result = await runtime.createSkill?.({
+      id: "Shared Docs Search",
+      label: "Shared Docs Search",
+      description: "Search shared docs first.",
+      prompt: "Search shared documentation before proposing changes.",
+      triggers: ["shared docs", "team docs"],
+      scope: "global",
+    });
+    expect(result?.ok).toBe(true);
+    expect(result?.configPath).toBe(join(globalHome, "skills.yaml"));
+
+    const skillsText = await readFile(join(globalHome, "skills.yaml"), "utf8");
+    expect(skillsText).toContain("id: shared-docs-search");
+
+    const reloaded = await loadSkillsConfig(root, {
+      cwd: root,
+      env: { CYRENE_HOME: globalHome },
+    });
+    expect(reloaded.skills.find(skill => skill.id === "shared-docs-search")).toMatchObject({
+      source: "global",
+      triggers: ["shared docs", "team docs"],
     });
   });
 

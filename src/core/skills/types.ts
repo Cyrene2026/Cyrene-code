@@ -38,6 +38,7 @@ export type SkillCreationInput = {
   enabled?: boolean;
   exposure?: ExtensionExposureMode;
   tags?: string[];
+  scope?: "global" | "project";
 };
 
 export interface SkillsRuntime {

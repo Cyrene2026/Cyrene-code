@@ -126,7 +126,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/unpin <index>", Description: "remove a pin"},
 	{Command: "/skills", Description: "show skills runtime summary"},
 	{Command: "/skills list", Description: "list available skills"},
-	{Command: "/skills create <task>", Description: "ask AI to generate and save a new skill"},
+	{Command: "/skills create <task>", Description: "ask AI to generate and save a new project skill"},
 	{Command: "/skills show <id>", Description: "show one skill details"},
 	{Command: "/skills enable <id>", Description: "enable one skill in global skills config"},
 	{Command: "/skills disable <id>", Description: "disable one skill in global skills config"},

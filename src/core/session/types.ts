@@ -1,10 +1,18 @@
 import type { ChatRole } from "../../shared/types/chat";
 import type { ReducerMode } from "./stateReducer";
 
+export type SessionMessageKind =
+  | "transcript"
+  | "tool_status"
+  | "review_status"
+  | "system_hint"
+  | "error";
+
 export type SessionMessage = {
   role: ChatRole;
   text: string;
   createdAt: string;
+  kind?: SessionMessageKind;
 };
 
 export type SessionInFlightTurn = {

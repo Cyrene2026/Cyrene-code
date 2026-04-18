@@ -35,6 +35,7 @@ Commands:
 - `/provider profile clear [url]`
 - `/model`
 - `/model refresh`
+- `/model custom <id>`
 - `/model <name>`
 - `/sessions`
 - `/resume`

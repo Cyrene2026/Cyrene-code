@@ -56,6 +56,7 @@ import type {
   SessionExecutionPlan,
   SessionListItem,
   SessionRecord,
+  SessionMessageKind,
   SessionStateUpdateDiagnostic,
 } from "../../../core/session/types";
 import { HELP_TEXT } from "../../../application/chat/chatCommandHelpers";
@@ -130,7 +131,7 @@ type BridgeStatus =
 
 type BridgeItem = {
   role: "user" | "assistant" | "system";
-  kind: "transcript" | "tool_status" | "review_status" | "system_hint" | "error";
+  kind: SessionMessageKind;
   text: string;
 };
 
@@ -283,6 +284,12 @@ const EMPTY_USAGE_SUMMARY: BridgeUsageSummary = {
   totalTokens: 0,
 };
 
+const PERSISTED_SESSION_ITEM_KINDS = new Set<SessionMessageKind>([
+  "tool_status",
+  "review_status",
+  "error",
+]);
+
 const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
   (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
@@ -334,6 +341,14 @@ const clipBridgeLine = (value: string, max = 180) => {
   }
   return `${normalized.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
 };
+
+const formatPendingReviewText = (pending: PendingReviewItem) =>
+  [
+    `Approval required | ${pending.request.action} ${pending.request.path} | ${pending.id}`,
+    pending.previewSummary.trim(),
+  ]
+    .filter(Boolean)
+    .join("\n");
 
 const normalizeTrackedPath = (value: string) =>
   value
@@ -1174,6 +1189,27 @@ class BubbleTeaBridge {
     this.items.push(item);
     this.pendingAppendItems.push(item);
     this.scheduleAppendFlush();
+  }
+
+  private async persistSessionItem(sessionId: string, item: BridgeItem) {
+    if (
+      !this.sessionStore ||
+      !sessionId.trim() ||
+      !PERSISTED_SESSION_ITEM_KINDS.has(item.kind)
+    ) {
+      return;
+    }
+    await this.sessionStore.appendMessage(sessionId, {
+      role: item.role,
+      kind: item.kind,
+      text: item.text,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  private async pushPersistentSessionItem(sessionId: string, item: BridgeItem) {
+    this.pushItem(item);
+    await this.persistSessionItem(sessionId, item);
   }
 
   private async pushRuntimeResult(message: string, ok = true) {
@@ -2185,9 +2221,10 @@ class BubbleTeaBridge {
       record.messages.length > 0
         ? record.messages.map(message => ({
             role: message.role,
-            kind: message.role === "system" ? "system_hint" : "transcript",
+            kind: message.kind ?? (message.role === "system" ? "system_hint" : "transcript"),
             text:
-              message.role === "assistant"
+              message.role === "assistant" &&
+              (message.kind ?? "transcript") === "transcript"
                 ? this.extractVisibleAssistantText(message.text)
                 : message.text,
           }))
@@ -2409,12 +2446,12 @@ class BubbleTeaBridge {
           const result = await this.mcpService!.handleToolCall(toolName, input);
           if (result.pending) {
             const pending = result.pending;
-            const detail = `${pending.request.action} ${pending.request.path}`;
-            this.pushItem({
+            const reviewItem: BridgeItem = {
               role: "system",
               kind: "review_status",
-              text: `Approval required | ${detail} | ${pending.id}`,
-            });
+              text: formatPendingReviewText(pending),
+            };
+            await this.pushPersistentSessionItem(session.id, reviewItem);
             this.pendingReviews = this.listPendingReviews();
             this.status = "awaiting_review";
             this.emitPendingReviews();
@@ -2423,11 +2460,11 @@ class BubbleTeaBridge {
               sessionId: session.id,
               toolName,
               toolInput: input,
-              message: `Approval required ${pending.id} | ${detail}`,
+              message: reviewItem.text,
               pending: true,
             });
             return {
-              message: `Approval required ${pending.id} | ${detail}`,
+              message: firstLine(reviewItem.text),
               reviewMode: "block" as const,
             };
           }
@@ -2435,7 +2472,7 @@ class BubbleTeaBridge {
           const formatted = formatBridgeToolMessage(
             this.normalizeToolDisplayText(result.message)
           );
-          this.pushItem({
+          await this.pushPersistentSessionItem(session.id, {
             role: "system",
             kind: result.ok ? formatted.kind : "error",
             text: formatted.text,
@@ -2450,7 +2487,7 @@ class BubbleTeaBridge {
         },
         onError: message => {
           this.status = "error";
-          this.pushItem({
+          void this.pushPersistentSessionItem(session.id, {
             role: "system",
             kind: "error",
             text: message,
@@ -2746,7 +2783,11 @@ class BubbleTeaBridge {
       suspended.assistantBufferRef.current
     );
     if (message.trim()) {
-      this.pushItem({ role: "system", kind: "review_status", text: message.trim() });
+      await this.pushPersistentSessionItem(suspended.sessionId, {
+        role: "system",
+        kind: "review_status",
+        text: message.trim(),
+      });
     }
 
     this.liveText = "";
@@ -2775,14 +2816,14 @@ class BubbleTeaBridge {
       return false;
     }
 
-    this.pushItem({
+    const suspended = this.suspended;
+    await this.pushPersistentSessionItem(suspended?.sessionId ?? this.activeSessionId ?? "", {
       role: "system",
       kind: "review_status",
       text: reviewMessage("Approved", target, firstLine(result.message)),
     });
     this.emitPendingReviews();
 
-    const suspended = this.suspended;
     if (!suspended) {
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
       this.emitStatus();
@@ -2821,7 +2862,11 @@ class BubbleTeaBridge {
       return true;
     }
 
-    this.pushItem({ role: "system", kind: "review_status", text: message });
+    await this.pushPersistentSessionItem(this.activeSessionId ?? "", {
+      role: "system",
+      kind: "review_status",
+      text: message,
+    });
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     this.emitPendingReviews();
     this.emitStatus();

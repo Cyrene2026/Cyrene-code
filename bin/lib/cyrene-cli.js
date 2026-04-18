@@ -238,7 +238,7 @@ const parseCyreneConfigContent = content => {
     parsed.requestTemperature = Math.min(2, Math.max(0, requestTemperatureRaw));
   }
 
-  const systemPromptRaw = map.get("system_prompt");
+  const systemRaw = map.get("system_prompt");
   if (
     typeof systemPromptRaw === "string" &&
     trimNonEmpty(systemPromptRaw)

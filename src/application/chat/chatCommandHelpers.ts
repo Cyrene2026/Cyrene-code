@@ -107,6 +107,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   },
   { command: "/model", description: "open model picker" },
   { command: "/model refresh", description: "refresh available models" },
+  { command: "/model custom <id>", description: "switch to a custom model id directly" },
   { command: "/model <name>", description: "switch model directly" },
   { command: "/system", description: "show current system prompt" },
   { command: "/system <text>", description: "set system prompt for this runtime" },
@@ -386,6 +387,8 @@ const getSlashInsertValue = (command: string) => {
       return "/provider name clear ";
     case "/model <name>":
       return "/model ";
+    case "/model custom <id>":
+      return "/model custom ";
     case "/system <text>":
       return "/system ";
     case "/resume <id>":

@@ -66,6 +66,7 @@ const PROVIDER_ENDPOINT_USAGE =
   "Usage: /provider endpoint <responses|chat_completions|models|anthropic_messages|gemini_generate_content> <path|url> [provider] | /provider endpoint clear <kind> [provider] | /provider endpoint list";
 const PROVIDER_NAME_USAGE =
   "Usage: /provider name <display_name> | /provider name clear [url] | /provider name list";
+const MODEL_CUSTOM_USAGE = "Usage: /model custom <model_id>";
 const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
   (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
@@ -589,6 +590,34 @@ export const handleProviderModelCommand = ({
         );
       } else {
         pushSystemMessage(`[model refresh failed] ${result.message}`);
+      }
+    });
+    clearInput();
+    return true;
+  }
+
+  if (query === "/model custom" || query.startsWith("/model custom ")) {
+    const nextModel = query.slice("/model custom".length).trim();
+    enqueueTask(async () => {
+      if (!nextModel) {
+        pushSystemMessage(MODEL_CUSTOM_USAGE);
+        return;
+      }
+      if (isRepeatedActionInteraction(`command:model:${nextModel}`)) {
+        return;
+      }
+      const result = await transport.setModel(nextModel);
+      updateCurrentModelState(transport.getModel());
+      if (result.ok) {
+        await syncAuthSelection?.({
+          providerBaseUrl: transport.getProvider(),
+          model: transport.getModel(),
+        });
+      }
+      if (result.ok) {
+        pushSystemMessage(result.message);
+      } else {
+        pushSystemMessage(`[model switch failed] ${result.message}`);
       }
     });
     clearInput();

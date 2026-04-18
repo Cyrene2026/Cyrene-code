@@ -2210,6 +2210,11 @@ async function* streamSseAnthropic(
             typeof parsed.type === "string" ? parsed.type : "";
           const index = typeof parsed.index === "number" ? parsed.index : 0;
 
+          if (eventType === "message_stop") {
+            yield DONE_EVENT;
+            return;
+          }
+
           if (eventType === "content_block_start") {
             const contentBlock = parsed.content_block;
             const blockType =
@@ -2442,7 +2447,12 @@ export const fetchProviderModelCatalog = async (options: {
   const payload = (await response.json()) as unknown;
   const models = parseModelsPayload(payload);
   if (models.length === 0) {
-    throw new Error("Model fetch returned empty list.");
+    return buildManualModelCatalog({
+      providerBaseUrl,
+      providerFamily,
+      preferredModel: options.preferredModel,
+      currentModel: options.currentModel,
+    });
   }
 
   const fallbackModel = resolveDefaultModelForFamily(providerFamily);

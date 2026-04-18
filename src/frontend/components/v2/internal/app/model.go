@@ -90,6 +90,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/provider <url>", Description: "switch provider directly (also accepts openai/gemini/anthropic)"},
 	{Command: "/model", Description: "open model picker"},
 	{Command: "/model refresh", Description: "refresh available models"},
+	{Command: "/model custom <id>", Description: "switch to a custom model id directly"},
 	{Command: "/model <name>", Description: "switch model directly"},
 	{Command: "/system", Description: "show current system prompt"},
 	{Command: "/system <text>", Description: "set system prompt for this runtime"},
@@ -1343,10 +1344,17 @@ func (m *Model) handleModelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(msg.Runes) != 1 {
 			return m, nil
 		}
-		if strings.ToLower(string(msg.Runes)) == "r" {
+		switch strings.ToLower(string(msg.Runes)) {
+		case "r":
 			m.Status = StatusPreparing
 			m.setNotice("Refreshing models...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "refresh_models"})
+		case "c":
+			m.ActivePanel = PanelNone
+			m.Input = []rune("/model custom ")
+			m.Cursor = len(m.Input)
+			m.setNotice("Custom model command ready.", false)
+			return m, nil
 		}
 	}
 	return m, nil
@@ -1786,6 +1794,18 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.Status = StatusPreparing
 		m.setNotice("Refreshing models...", false)
 		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "refresh_models"})
+	case query == "/model custom":
+		m.setNotice("Usage: /model custom <id>", true)
+		return true, nil
+	case strings.HasPrefix(query, "/model custom "):
+		model := strings.TrimSpace(strings.TrimPrefix(query, "/model custom "))
+		if model == "" {
+			m.setNotice("Usage: /model custom <id>", true)
+			return true, nil
+		}
+		m.Status = StatusPreparing
+		m.setNotice("Switching model...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_model", Value: model})
 	case strings.HasPrefix(query, "/model "):
 		model := strings.TrimSpace(strings.TrimPrefix(query, "/model "))
 		if model == "" {
@@ -2760,6 +2780,8 @@ func slashInsertValue(command string) string {
 		return "/provider name clear "
 	case "/model <name>":
 		return "/model "
+	case "/model custom <id>":
+		return "/model custom "
 	case "/system <text>":
 		return "/system "
 	case "/resume <id>", "/load <id>":

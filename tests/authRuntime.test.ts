@@ -239,6 +239,36 @@ describe("createAuthRuntime", () => {
     expect(result.availableModels).toEqual(["codex-mini"]);
   });
 
+  test("validateLoginInput accepts empty provider model catalogs as manual mode", async () => {
+    const appRoot = await createTempRoot();
+    globalThis.fetch = mock(async (url: string) => {
+      expect(url).toBe("https://empty-models.test/v1/models");
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    }) as unknown as typeof fetch;
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {} as NodeJS.ProcessEnv,
+      apiKeyStore: createMemoryApiKeyStore(),
+    });
+
+    const result = await runtime.validateLoginInput({
+      providerBaseUrl: "https://empty-models.test/v1",
+      apiKey: "sk-test",
+      model: "provider-only-custom-id",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("manual model mode");
+    expect(result.providerModelMode).toBe("manual");
+    expect(result.selectedModel).toBe("provider-only-custom-id");
+    expect(result.availableModels).toEqual(["provider-only-custom-id"]);
+  });
+
   test("validateLoginInput rejects quoted api keys and hidden whitespace", async () => {
     const appRoot = await createTempRoot();
     const runtime = createAuthRuntime({

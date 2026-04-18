@@ -46,6 +46,9 @@ func TestSlashHelpSetsNotice(t *testing.T) {
 	if !strings.Contains(helpText, "/extensions exposure") {
 		t.Fatalf("expected extensions commands in help text, got %q", helpText)
 	}
+	if !strings.Contains(helpText, "/model custom <id>") {
+		t.Fatalf("expected custom model command in help text, got %q", helpText)
+	}
 }
 
 func TestWheelDownReturnsToLiveTail(t *testing.T) {
@@ -443,6 +446,30 @@ func TestTallModelsPanelUsesDynamicPageSize(t *testing.T) {
 
 	if !strings.Contains(view, "model-6") {
 		t.Fatalf("expected tall models panel to show more than the old fixed page size, got %q", view)
+	}
+	if !strings.Contains(view, "/model custom <id>") {
+		t.Fatalf("expected models panel to mention custom model command, got %q", view)
+	}
+}
+
+func TestModelPanelCustomShortcutPrefillsComposer(t *testing.T) {
+	model := app.NewModel()
+	model.ActivePanel = app.PanelModels
+	model.AvailableModels = []string{"gpt-5.4"}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+
+	if model.ActivePanel != app.PanelNone {
+		t.Fatalf("expected custom shortcut to close model panel, got %q", model.ActivePanel)
+	}
+	if got := string(model.Input); got != "/model custom " {
+		t.Fatalf("expected custom shortcut to prefill composer, got %q", got)
+	}
+	if model.Cursor != len(model.Input) {
+		t.Fatalf("expected composer cursor at end, got %d", model.Cursor)
+	}
+	if !strings.Contains(model.Notice, "Custom model command ready.") {
+		t.Fatalf("expected custom shortcut notice, got %q", model.Notice)
 	}
 }
 

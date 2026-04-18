@@ -29,6 +29,7 @@ import type {
   SessionInFlightTurn,
   SessionListItem,
   SessionMessage,
+  SessionMessageKind,
   SessionPendingChoice,
   SessionRecord,
   SessionStateUpdateDiagnostic,
@@ -68,6 +69,15 @@ const messageSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
   text: z.string(),
   createdAt: z.string(),
+  kind: z
+    .enum([
+      "transcript",
+      "tool_status",
+      "review_status",
+      "system_hint",
+      "error",
+    ] satisfies [SessionMessageKind, ...SessionMessageKind[]])
+    .optional(),
 });
 
 const inFlightTurnSchema: z.ZodType<SessionInFlightTurn> = z.object({

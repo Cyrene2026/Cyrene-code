@@ -48,17 +48,36 @@ var (
 	systemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 	sectionStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
 	codeBlockStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("7")).
+			Foreground(lipgloss.Color("#E6EDF3")).
 			Padding(0, 0)
 	inlineCodeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("14")).
+			Foreground(lipgloss.Color("#79C0FF")).
 			Underline(true)
-	codeFenceStyle   = dimStyle.Copy().Italic(true)
-	codeKeywordStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true)
-	codeStringStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	codeCommentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
-	codeNumberStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	codePlainStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	codeFenceStyle     = dimStyle.Copy().Italic(true)
+	codeKeywordStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7B72")).Bold(true)
+	codeStringStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#A5D6FF"))
+	codeCommentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B949E")).Italic(true)
+	codeNumberStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF"))
+	codeTypeStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
+	codeBuiltinStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657"))
+	codePlainStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
+	diffAddGutterStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#7EE787")).
+				Background(lipgloss.Color("#102117")).
+				Bold(true)
+	diffRemoveGutterStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFA198")).
+				Background(lipgloss.Color("#2A1215")).
+				Bold(true)
+	diffAddLineStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E6EDF3")).
+				Background(lipgloss.Color("#0D1F15"))
+	diffRemoveLineStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E6EDF3")).
+				Background(lipgloss.Color("#251417"))
+	diffHunkStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#79C0FF")).
+			Bold(true)
 
 	inputBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
@@ -723,7 +742,7 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			lines = append(lines, renderDiffRows(sign, lineNumber, content, width)...)
 		case strings.HasPrefix(trimmed, "@@"):
 			for _, row := range wrapPlainText(raw, width) {
-				lines = append(lines, asstStyle.Bold(true).Render(row))
+				lines = append(lines, diffHunkStyle.Render(row))
 			}
 		case strings.HasPrefix(trimmed, "[diff preview]"),
 			strings.HasPrefix(trimmed, "[create preview"),
@@ -1093,16 +1112,18 @@ func findInlineMarkerEndString(runes []rune, start int, marker string) int {
 }
 
 func renderDiffRows(sign, lineNumber, content string, width int) []string {
-	signStyle := userStyle
+	signStyle := diffAddGutterStyle
+	lineStyle := diffAddLineStyle
 	if sign == "-" {
-		signStyle = errorStyle
+		signStyle = diffRemoveGutterStyle
+		lineStyle = diffRemoveLineStyle
 	}
 	prefix := signStyle.Render(sign)
 	if lineNumber != "" {
-		prefix += " " + dimStyle.Render(fmt.Sprintf("%4s |", lineNumber))
+		prefix += signStyle.Render(" " + fmt.Sprintf("%4s │", lineNumber))
 	}
 	if content == "" {
-		return []string{prefix}
+		return []string{lineStyle.Render(prefix)}
 	}
 
 	contentWidth := maxInt(8, width-lipgloss.Width(prefix)-1)
@@ -1113,7 +1134,7 @@ func renderDiffRows(sign, lineNumber, content string, width int) []string {
 		if index > 0 {
 			rowPrefix = strings.Repeat(" ", maxInt(1, lipgloss.Width(prefix)))
 		}
-		lines = append(lines, rowPrefix+" "+renderCodeLine(row))
+		lines = append(lines, lineStyle.Render(rowPrefix+" "+renderCodeLine(row)))
 	}
 	return lines
 }
@@ -1233,6 +1254,10 @@ func renderCodeToken(token string) string {
 		return codeStringStyle.Render(token)
 	case isCodeKeyword(trimmed):
 		return codeKeywordStyle.Render(token)
+	case isCodeTypeToken(trimmed):
+		return codeTypeStyle.Render(token)
+	case isCodeBuiltinToken(trimmed):
+		return codeBuiltinStyle.Render(token)
 	case isNumericToken(trimmed):
 		return codeNumberStyle.Render(token)
 	default:
@@ -1256,7 +1281,30 @@ func isCodeKeyword(token string) bool {
 		"True", "False", "None", "and", "or", "not", "async", "await", "yield",
 		"func", "package", "type", "struct", "interface", "switch", "case",
 		"default", "go", "defer", "const", "var", "map", "range", "chan", "select", "fallthrough",
-		"let", "function", "export", "extends", "implements", "new":
+		"let", "function", "export", "extends", "implements", "new", "null", "undefined",
+		"static", "public", "private", "protected", "readonly", "this", "super", "throw":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodeTypeToken(token string) bool {
+	switch token {
+	case "string", "number", "boolean", "object", "void", "any", "unknown", "never",
+		"int", "int32", "int64", "float32", "float64", "byte", "rune", "error",
+		"Promise", "Record", "Array", "Map", "Set":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodeBuiltinToken(token string) bool {
+	switch token {
+	case "console", "JSON", "Math", "Date", "Error", "Object", "String", "Number", "Boolean",
+		"parseInt", "parseFloat", "require", "module", "exports", "print", "fmt", "len", "cap",
+		"append", "make", "panic", "recover":
 		return true
 	default:
 		return false
@@ -1663,10 +1711,13 @@ func (m *Model) renderModels(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(width, height))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "esc"),
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "custom c", "esc"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "models", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
 	bodyLines := []string{}
+	for _, row := range wrapPlainText("custom model id: press c to prefill /model custom <id> in the composer", bodyWidth) {
+		bodyLines = append(bodyLines, dimStyle.Render(row))
+	}
 	if len(m.AvailableModels) == 0 {
 		bodyLines = append(bodyLines, dimStyle.Render("No models available."))
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
@@ -2145,11 +2196,11 @@ func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 	case "section":
 		return []string{dimStyle.Bold(true).Render(truncatePlain("== "+emptyFallback(line.Section, "preview")+" ==", maxWidth))}
 	case "hunk":
-		return []string{asstStyle.Bold(true).Render(truncatePlain(line.Text, maxWidth))}
+		return []string{diffHunkStyle.Render(truncatePlain(line.Text, maxWidth))}
 	case "add":
-		return renderTerminalDiffRows("+", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, userStyle)
+		return renderTerminalDiffRows("+", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, diffAddGutterStyle, diffAddLineStyle)
 	case "remove":
-		return renderTerminalDiffRows("-", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, errorStyle)
+		return renderTerminalDiffRows("-", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, diffRemoveGutterStyle, diffRemoveLineStyle)
 	case "kv":
 		keyPrefix := dimStyle.Render(line.Key + ": ")
 		valueWidth := maxInt(1, maxWidth-lipgloss.Width(line.Key)-2)
@@ -2177,7 +2228,7 @@ func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 	}
 }
 
-func renderTerminalDiffRows(sign, lineNumber, content string, width int, style lipgloss.Style) []string {
+func renderTerminalDiffRows(sign, lineNumber, content string, width int, gutterStyle lipgloss.Style, lineStyle lipgloss.Style) []string {
 	gutter := sign
 	if strings.TrimSpace(lineNumber) != "" {
 		gutter = fmt.Sprintf("%s %4s │", sign, lineNumber)
@@ -2194,7 +2245,7 @@ func renderTerminalDiffRows(sign, lineNumber, content string, width int, style l
 		if index > 0 {
 			left = continuation
 		}
-		lines = append(lines, style.Render(left+" "+renderCodeLine(row)))
+		lines = append(lines, lineStyle.Render(gutterStyle.Render(left)+" "+renderCodeLine(row)))
 	}
 	return lines
 }

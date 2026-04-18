@@ -58,13 +58,15 @@ type RunRoundsOptions = {
   allowSilentPostReviewRetry?: boolean;
 };
 
-type UncertaintyMode = "normal" | "simple_multi_file";
+type UncertaintyMode = "normal" | "simple_multi_file" | "project_analysis";
 
 type UncertaintyPhase =
   | "discover"
   | "collapse"
   | "execute"
   | "verify"
+  | "trace"
+  | "synthesize"
   | "blocked";
 
 type UncertaintyState = {
@@ -72,6 +74,7 @@ type UncertaintyState = {
   phase: UncertaintyPhase;
   discoverBudgetUsed: number;
   discoverBudgetMax: number;
+  analysisSignalCount: number;
   nonProgressAutoContinueUsed: boolean;
   explicitSourceReads: Set<string>;
   explicitTaskPaths: Set<string>;
@@ -98,6 +101,16 @@ const BROAD_DISCOVERY_ACTIONS = new Set([
   "stat_paths",
 ]);
 
+const PROJECT_ANALYSIS_BROAD_DISCOVERY_ACTIONS = new Set([
+  "list_dir",
+  "find_files",
+  "search_text",
+  "stat_path",
+  "stat_paths",
+  "git_status",
+  "git_diff",
+]);
+
 const TARGETED_SOURCE_READ_ACTIONS = new Set([
   "read_file",
   "read_range",
@@ -105,8 +118,39 @@ const TARGETED_SOURCE_READ_ACTIONS = new Set([
   "read_yaml",
 ]);
 
+const PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS = new Set([
+  "read_file",
+  "read_range",
+  "read_json",
+  "read_yaml",
+  "outline_file",
+  "search_text_context",
+  "find_symbol",
+  "find_references",
+  "git_show",
+  "git_log",
+  "git_blame",
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "ts_diagnostics",
+  "ts_prepare_rename",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
+  "lsp_references",
+  "lsp_workspace_symbols",
+  "lsp_document_symbols",
+  "lsp_diagnostics",
+  "lsp_code_actions",
+]);
+
 const SIMPLE_MULTI_FILE_TASK_PATTERN =
   /(split|modulari(?:s|z)e|module|reorganize|classify|migrate|move.+into|refactor.+files|拆分|模块化|分类|迁移|整理|拆到|拆成|拆出去)/i;
+
+const PROJECT_ANALYSIS_TASK_PATTERN =
+  /(?:(?:explain|analy[sz]e|understand|summari[sz]e|map|trace|inspect|walk(?:\s+me)?\s+through)\s+(?:this\s+)?(?:repo|repository|project|codebase|architecture|structure|stack|main\s+flow|call\s+chain))|(?:(?:repo|repository|project|codebase|architecture|structure|stack|main\s+flow|call\s+chain).*(?:explain|analy[sz]e|understand|summari[sz]e|map|trace|inspect))|(?:(?:看看|分析|梳理|理解|总结|解释|讲讲|追踪|定位|看下|看一下).*(?:这个项目|这个仓库|项目|仓库|代码库|架构|结构|技术栈|主链路|调用链|入口|模块))|(?:(?:项目|仓库|代码库|架构|结构|技术栈|主链路|调用链|入口|模块).*(?:看看|分析|梳理|理解|总结|解释|讲讲|追踪|定位))/iu;
 
 const NON_PROGRESS_CHATTER_PATTERN =
   /(继续拆分|继续补齐|我来继续|再看一下|继续完善|继续处理|继续剩余|继续模块化|i(?:'| wi)ll continue|let me continue|continue splitting|continue with the remaining|keep going with the remaining)/i;
@@ -986,6 +1030,15 @@ const isBroadDiscoveryAction = (toolName: string, input: unknown) =>
 const isTargetedSourceReadAction = (toolName: string, input: unknown) =>
   TARGETED_SOURCE_READ_ACTIONS.has(getToolAction(toolName, input));
 
+const isProjectAnalysisBroadDiscoveryAction = (toolName: string, input: unknown) =>
+  PROJECT_ANALYSIS_BROAD_DISCOVERY_ACTIONS.has(getToolAction(toolName, input));
+
+const isProjectAnalysisHighSignalAction = (toolName: string, input: unknown) =>
+  PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS.has(getToolAction(toolName, input));
+
+const taskSuggestsProjectAnalysis = (task: string) =>
+  !taskSuggestsWriting(task) && PROJECT_ANALYSIS_TASK_PATTERN.test(task);
+
 const taskSuggestsSimpleMultiFile = (
   task: string,
   ledger: MultiFileProgressLedger
@@ -1001,12 +1054,15 @@ const createUncertaintyState = (
 ): UncertaintyState => {
   const mode: UncertaintyMode = taskSuggestsSimpleMultiFile(task, ledger)
     ? "simple_multi_file"
-    : "normal";
+    : taskSuggestsProjectAnalysis(task)
+      ? "project_analysis"
+      : "normal";
   return {
     mode,
-    phase: mode === "simple_multi_file" ? "discover" : "discover",
+    phase: "discover",
     discoverBudgetUsed: 0,
-    discoverBudgetMax: 4,
+    discoverBudgetMax: mode === "project_analysis" ? 3 : 4,
+    analysisSignalCount: 0,
     nonProgressAutoContinueUsed: false,
     explicitSourceReads: new Set<string>(),
     explicitTaskPaths: new Set(extractExplicitTaskPaths(task)),
@@ -1019,7 +1075,7 @@ const formatExecutionState = (
   uncertainty: UncertaintyState,
   ledger: MultiFileProgressLedger
 ) => {
-  if (uncertainty.mode !== "simple_multi_file") {
+  if (uncertainty.mode === "normal") {
     return "";
   }
 
@@ -1034,28 +1090,44 @@ const formatExecutionState = (
     `broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
   ];
 
-  if (expected > 0) {
+  if (uncertainty.mode === "project_analysis") {
+    lines.push(`architecture evidence: ${uncertainty.analysisSignalCount}`);
+  }
+
+  if (uncertainty.mode === "simple_multi_file" && expected > 0) {
     lines.push(`completed: ${completedCount}/${expected}`);
   }
-  if (remainingPaths.length > 0) {
+  if (uncertainty.mode === "simple_multi_file" && remainingPaths.length > 0) {
     lines.push(`remaining known paths: ${formatPathList(remainingPaths, 4)}`);
-  } else if (remainingCount > 0) {
+  } else if (uncertainty.mode === "simple_multi_file" && remainingCount > 0) {
     lines.push(`remaining count: ${remainingCount}`);
   }
-  if (ledger.lastCompletedPath) {
+  if (uncertainty.mode === "simple_multi_file" && ledger.lastCompletedPath) {
     lines.push(`last completed file: ${ledger.lastCompletedPath}`);
   }
-  if (uncertainty.phase === "execute") {
+  if (uncertainty.mode === "simple_multi_file" && uncertainty.phase === "execute") {
     lines.push(
       "directive: write remaining files directly; do not reread completed files or re-open broad discovery"
     );
-  } else if (uncertainty.phase === "collapse") {
+  } else if (uncertainty.mode === "simple_multi_file" && uncertainty.phase === "collapse") {
     lines.push(
       "directive: broad exploration is over; continue with the concrete remaining write/edit steps"
     );
-  } else if (uncertainty.phase === "verify") {
+  } else if (uncertainty.mode === "simple_multi_file" && uncertainty.phase === "verify") {
     lines.push(
       "directive: verify the written files directly; avoid reopening broad discovery"
+    );
+  } else if (uncertainty.mode === "project_analysis" && uncertainty.phase === "discover") {
+    lines.push(
+      "directive: identify a minimal repo snapshot first: README, manifests, and top-level entrypoints"
+    );
+  } else if (uncertainty.mode === "project_analysis" && uncertainty.phase === "trace") {
+    lines.push(
+      "directive: trace one main runtime or call chain through a few core files; stop broad directory scans"
+    );
+  } else if (uncertainty.mode === "project_analysis" && uncertainty.phase === "synthesize") {
+    lines.push(
+      "directive: synthesize the architecture now: overview, main chain, key modules, and open questions"
     );
   } else if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
     lines.push(`blocked: ${uncertainty.blockedReason}`);
@@ -1070,6 +1142,25 @@ const buildInitialExecutionMemo = (
   uncertainty: UncertaintyState,
   ledger: MultiFileProgressLedger
 ) => {
+  if (uncertainty.mode === "project_analysis") {
+    return [
+      clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT),
+      "",
+      "Project analysis memo:",
+      "- Goal: explain the project by reconstructing the main runtime chain, not by exhaustively listing files.",
+      `- phase: ${uncertainty.phase}`,
+      `- broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
+      "- Start with one minimal repo snapshot: README, package/manifest files, and top-level entrypoints only.",
+      "- Identify likely entrypoints or primary commands before opening many files.",
+      "- Trace one main execution/call path through 2-4 core files before widening out.",
+      "- Prefer read_range, outline_file, and search_text_context over dumping whole large files when they can answer the same question.",
+      "- Once entrypoints are known, stop broad directory scans and synthesize the architecture.",
+      "- Final summary shape: overall architecture, main execution chain, key modules, and open questions.",
+      "- Distinguish confirmed facts from inference. Keep file inventories minimal unless the user explicitly asks for exhaustive coverage.",
+      `Original user task: ${clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT)}`,
+    ].join("\n");
+  }
+
   if (uncertainty.mode !== "simple_multi_file") {
     return clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT);
   }
@@ -1178,8 +1269,35 @@ const maybeAdvanceUncertaintyAfterToolResult = (
   uncertainty: UncertaintyState,
   toolName: string,
   input: unknown,
+  message: string,
   ledger: MultiFileProgressLedger
 ) => {
+  if (uncertainty.mode === "project_analysis") {
+    const broadDiscovery = isProjectAnalysisBroadDiscoveryAction(toolName, input);
+    const hasConcretePath =
+      Boolean(getToolPath(input)) || extractPathsFromText(message).length > 0;
+    const highSignal =
+      isProjectAnalysisHighSignalAction(toolName, input) || hasConcretePath;
+
+    if (highSignal) {
+      uncertainty.analysisSignalCount += 1;
+    }
+
+    if (
+      uncertainty.phase === "discover" &&
+      (!broadDiscovery ||
+        uncertainty.discoverBudgetUsed >= uncertainty.discoverBudgetMax ||
+        hasConcretePath)
+    ) {
+      uncertainty.phase = "trace";
+    }
+
+    if (uncertainty.phase === "trace" && uncertainty.analysisSignalCount >= 3) {
+      uncertainty.phase = "synthesize";
+    }
+    return;
+  }
+
   if (uncertainty.mode !== "simple_multi_file") {
     return;
   }
@@ -1396,6 +1514,17 @@ const buildRoundPrompt = (
   );
   const multiFileProgressFacts = formatMultiFileProgressLedger(progressLedger);
   const executionState = formatExecutionState(uncertainty, progressLedger);
+  const analysisRules =
+    uncertainty.mode === "project_analysis"
+      ? [
+          "Project analysis rules:",
+          "- Prefer entrypoints, manifests, and bootstrap/runtime files over exhaustive file inventories.",
+          "- After one lightweight repo snapshot, trace one main execution or call chain through a few core files.",
+          "- Use targeted reads and structure tools before opening additional unrelated files.",
+          "- Once the main chain is clear enough, stop broad exploration and synthesize the architecture.",
+          "- Organize the final answer around overall architecture, main chain, key modules, and open questions.",
+        ].join("\n")
+      : "";
   return [
     "Original user task:",
     clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT),
@@ -1411,6 +1540,7 @@ const buildRoundPrompt = (
     "- Keep progress narration minimal and non-repetitive. Avoid repeated lines like 'I will now...'.",
     "- For multi-file create/edit tasks, batch similar writes naturally and move forward without repeated preambles.",
     "- Keep assistant wording in the same language as the user request unless the user asks to switch.",
+    analysisRules,
     recentMutationFacts
       ? `Recent confirmed file mutations:\n${recentMutationFacts}`
       : "",
@@ -1494,6 +1624,7 @@ export const runQuerySession = async ({
         uncertainty,
         toolName,
         input,
+        message,
         progressLedger
       );
     }
@@ -1655,6 +1786,43 @@ export const runQuerySession = async ({
                 emitRoundText(`${blockedReason}\n`);
                 return completeRound();
               }
+              continue;
+            }
+          }
+
+          if (
+            uncertainty.mode === "project_analysis" &&
+            isProjectAnalysisBroadDiscoveryAction(event.toolName, event.input)
+          ) {
+            if (uncertainty.phase === "discover") {
+              if (uncertainty.discoverBudgetUsed >= uncertainty.discoverBudgetMax) {
+                uncertainty.phase = "trace";
+              } else {
+                uncertainty.discoverBudgetUsed += 1;
+              }
+            }
+
+            if (uncertainty.phase !== "discover") {
+              const knownPaths = getRecentDiscoveredPaths(
+                accumulatedToolResults,
+                toolResults
+              );
+              loopCorrection = [
+                "Project analysis exploration collapsed:",
+                `Skipped ${action} ${toolPath ?? "."} because the initial repo snapshot budget is already exhausted.`,
+                knownPaths.length > 0
+                  ? `Trace the architecture through known anchors instead: ${formatPathList(knownPaths, 4)}.`
+                  : "Trace the architecture through README, manifest files, or already-read entrypoints instead of relisting directories.",
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
+                  `Skipped ${action} because broad repo exploration should stop after the initial snapshot.`,
+                  knownPaths.length > 0
+                    ? `Continue from known anchors: ${formatPathList(knownPaths, 4)}.`
+                    : "Continue with targeted entrypoint tracing and architecture synthesis.",
+                ].join("\n")
+              );
               continue;
             }
           }

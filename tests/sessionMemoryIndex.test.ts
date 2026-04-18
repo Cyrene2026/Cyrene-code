@@ -275,6 +275,56 @@ describe("session memory index", () => {
     expect(errorEntries[0]?.hitCount).toBe(2);
   });
 
+  test("persists system message kinds for resume transcript hydration", async () => {
+    const { root, store } = await createStore();
+    const session = await store.createSession("resume tool history");
+
+    await store.appendMessage(session.id, {
+      role: "system",
+      kind: "tool_status",
+      text: ["Tool: edit_file src/demo.ts | Updated file", "+    1 | const next = 1;"].join("\n"),
+      createdAt: "2026-04-18T00:00:01.000Z",
+    });
+    await store.appendMessage(session.id, {
+      role: "system",
+      kind: "review_status",
+      text: [
+        "Approval required | edit_file src/demo.ts | rev-1",
+        "[patch preview]",
+        "+    1 | const next = 1;",
+      ].join("\n"),
+      createdAt: "2026-04-18T00:00:02.000Z",
+    });
+
+    const loaded = await store.loadSession(session.id);
+    const stored = JSON.parse(
+      await readFile(join(root, `${session.id}.json`), "utf8")
+    ) as {
+      messages: Array<{ kind?: string; text: string }>;
+    };
+
+    expect(loaded?.messages).toMatchObject([
+      {
+        role: "system",
+        kind: "tool_status",
+        text: "Tool: edit_file src/demo.ts | Updated file\n+    1 | const next = 1;",
+      },
+      {
+        role: "system",
+        kind: "review_status",
+        text: [
+          "Approval required | edit_file src/demo.ts | rev-1",
+          "[patch preview]",
+          "+    1 | const next = 1;",
+        ].join("\n"),
+      },
+    ]);
+    expect(stored.messages.map(message => message.kind)).toEqual([
+      "tool_status",
+      "review_status",
+    ]);
+  });
+
   test("prompt context prioritizes pins and query-matching indexed memories", async () => {
     const { store } = await createStore();
     const session = await store.createSession("retrieval");

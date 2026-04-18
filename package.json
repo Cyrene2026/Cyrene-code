@@ -38,6 +38,7 @@
     "dev": "bun run v2:dev",
     "start": "node ./bin/cyrene.js",
     "build": "bun run scripts/build-cli.mjs",
+    "token:audit": "bun run scripts/token-audit.mjs",
     "v2:dev": "mkdir -p /tmp/cyrene-go-cache && cd src/frontend/components/v2 && GOCACHE=/tmp/cyrene-go-cache go run .",
     "v2:build": "bun run build",
     "test": "bun test",

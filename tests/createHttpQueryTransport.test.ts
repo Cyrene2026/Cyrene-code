@@ -1206,6 +1206,71 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(persisted).toContain("    mode: manual");
   });
 
+  test("providers returning an empty model list fall back to manual model mode", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: codex-mini",
+        "last_used_model: codex-mini",
+        "provider_base_url: https://empty-models.test/v1",
+        "models:",
+        "  - codex-mini",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (url === "https://empty-models.test/v1/models") {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://empty-models.test/v1",
+        CYRENE_API_KEY: "test-key",
+      },
+    });
+
+    expect(await transport.listModels()).toEqual(["codex-mini"]);
+    expect(transport.getModel()).toBe("codex-mini");
+    expect(await transport.setModel("provider-only-custom-id")).toEqual({
+      ok: true,
+      message: "Model switched to: provider-only-custom-id",
+    });
+    expect(await transport.listModels()).toEqual([
+      "provider-only-custom-id",
+      "codex-mini",
+    ]);
+    expect(await transport.refreshModels()).toEqual({
+      ok: true,
+      message: "Model list refreshed: 1 models",
+      models: ["provider-only-custom-id"],
+    });
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[0]?.url).toBe("https://empty-models.test/v1/models");
+    expect(fetchCalls[1]?.url).toBe("https://empty-models.test/v1/models");
+
+    const persisted = await readFile(modelFile, "utf8");
+    expect(persisted).toContain("default_model: provider-only-custom-id");
+    expect(persisted).toContain("last_used_model: provider-only-custom-id");
+    expect(persisted).toContain("provider_model_modes:");
+    expect(persisted).toContain("  - provider: https://empty-models.test/v1");
+    expect(persisted).toContain("    mode: manual");
+  });
+
   test("manual model mode lets setModel add arbitrary models and persist them", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
@@ -2287,6 +2352,89 @@ describe("createHttpQueryTransport streaming usage", () => {
     for await (const event of transport.stream(streamUrl)) {
       events.push(event);
     }
+
+    expect(events).toContain(
+      JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "list_dir", path: "." },
+      })
+    );
+    expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+  });
+
+  test("anthropic stream completes on message_stop even if the server keeps the SSE socket open", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_start',
+              'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"file"}}',
+              "",
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"action\\":\\"list_dir\\",\\"path\\":\\".\\"}"}}',
+              "",
+              'event: content_block_stop',
+              'data: {"type":"content_block_stop","index":0}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+              "",
+            ].join("\n")
+          )
+        );
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const eventsPromise = (async () => {
+      const events: string[] = [];
+      for await (const event of transport.stream(streamUrl)) {
+        events.push(event);
+      }
+      return events;
+    })();
+
+    const events = await Promise.race([
+      eventsPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timed out waiting for anthropic stream completion")), 200)
+      ),
+    ]);
 
     expect(events).toContain(
       JSON.stringify({

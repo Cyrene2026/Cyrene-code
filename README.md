@@ -147,7 +147,8 @@ Model switch:
 Model source priority:
 1. `.cyrene/model.yaml`
 2. If missing/invalid, fetch from `GET /v1/models`
-3. If fetch fails, model initialization fails (and refresh reports failure)
+3. If `/models` is unavailable or returns an empty list, Cyrene falls back to manual model mode and keeps the current/default model editable
+4. Other fetch failures still fail initialization (and refresh reports failure)
 
 Prompt priority and customization:
 - Priority is fixed as: `system prompt > .cyrene/.cyrene.md > pins`.

@@ -1524,6 +1524,100 @@ describe("runQuerySession", () => {
     expect(prompts[0]).not.toContain("Execution memo:");
   });
 
+  test("injects a project analysis memo into the first round for repo analysis tasks", async () => {
+    const { transport, prompts } = createPromptCaptureTransport({
+      toolName: "file",
+      input: { action: "list_dir", path: "." },
+    });
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "explain this repo architecture and main runtime chain",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async () => ({
+        message: [
+          "[tool result] list_dir .",
+          "[confirmed directory state] .",
+          "[F] README.md",
+          "[F] package.json",
+          "[D] src",
+        ].join("\n"),
+      }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(prompts[0]).toContain("Project analysis memo:");
+    expect(prompts[0]).toContain("Start with one minimal repo snapshot");
+    expect(prompts[0]).toContain("Trace one main execution/call path through 2-4 core files");
+    expect(prompts[0]).toContain(
+      "Final summary shape: overall architecture, main execution chain, key modules, and open questions."
+    );
+  });
+
+  test("project analysis mode collapses repeated broad exploration after a targeted anchor read", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "list_dir", path: "." },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "package.json" },
+      },
+      {
+        toolName: "file",
+        input: { action: "list_dir", path: "src" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "看看这个项目架构和主链路",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        if (action === "read_file") {
+          return {
+            message: [
+              "[tool result] read_file package.json",
+              "{",
+              '  "main": "src/index.ts",',
+              '  "scripts": { "start": "node src/index.ts" }',
+              "}",
+            ].join("\n"),
+          };
+        }
+        return {
+          message: [
+            "[tool result] list_dir .",
+            "[confirmed directory state] .",
+            "[F] README.md",
+            "[F] package.json",
+            "[D] src",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["list_dir", "read_file"]);
+    expect(prompts[3]).toContain("[tool skipped] list_dir src");
+    expect(prompts[3]).toContain("Project analysis exploration collapsed:");
+    expect(prompts[3]).toContain("Project analysis rules:");
+  });
+
   test("explicit source reads are allowed once and do not count against broad discovery budget", async () => {
     const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
       {

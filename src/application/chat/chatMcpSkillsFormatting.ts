@@ -27,6 +27,12 @@ export const formatSelectionReason = (reason: string) =>
 
 export const formatMcpAliases = (aliases?: string[]) =>
   aliases && aliases.length > 0 ? aliases.join(", ") : "(none)";
+export const formatMcpHealthReason = (reason?: string) =>
+  reason ? reason.replace(/_/g, " ") : "";
+export const formatMcpExitPhase = (phase?: string) =>
+  phase ? phase.replace(/_/g, " ") : "";
+export const formatMcpExitSource = (source?: string) =>
+  source ? source.replace(/_/g, " ") : "";
 
 export const formatMcpCapabilities = (tool: McpToolDescriptor) =>
   tool.capabilities.length > 0 ? tool.capabilities.join(", ") : "-";
@@ -77,6 +83,9 @@ export const formatMcpServerLine = (server: McpServerDescriptor) =>
     formatExtensionTrust(server.trusted),
     formatExtensionExposure(server.exposure),
     `health ${server.health}`,
+    server.health === "error" && server.healthReason
+      ? `reason ${formatMcpHealthReason(server.healthReason)}`
+      : "",
     server.enabled ? "enabled" : "disabled",
     `tools ${server.tools.length}`,
     formatMcpLspSummary(server),
@@ -86,6 +95,52 @@ export const formatMcpServerLine = (server: McpServerDescriptor) =>
   ]
     .filter(Boolean)
     .join(" | ");
+
+export const formatMcpServerDetail = (
+  server: McpServerDescriptor,
+  toolCount = server.tools.length
+) =>
+  [
+    `MCP server ${server.id}`,
+    `label: ${server.label}`,
+    `transport: ${server.transport ?? "unknown"}`,
+    `scope: ${server.scope ?? "default"}`,
+    `trust: ${
+      server.trusted === undefined ? "n/a" : server.trusted ? "trusted" : "untrusted"
+    }`,
+    `exposure: ${server.exposure}`,
+    `source: ${server.source}`,
+    `health: ${server.health}`,
+    server.healthReason ? `health_reason: ${formatMcpHealthReason(server.healthReason)}` : "",
+    server.healthDetail ? `health_detail: ${server.healthDetail}` : "",
+    server.healthExitPhase !== undefined
+      ? `health_exit_phase: ${formatMcpExitPhase(server.healthExitPhase)}`
+      : "",
+    server.healthExitCode !== undefined
+      ? `health_exit_code: ${server.healthExitCode === null ? "null" : server.healthExitCode}`
+      : "",
+    server.healthExitSignal !== undefined
+      ? `health_exit_signal: ${server.healthExitSignal ?? "null"}`
+      : "",
+    server.healthExitSource !== undefined
+      ? `health_exit_source: ${formatMcpExitSource(server.healthExitSource)}`
+      : "",
+    server.healthHint ? `health_hint: ${server.healthHint}` : "",
+    `enabled: ${server.enabled ? "true" : "false"}`,
+    `aliases: ${formatMcpAliases(server.aliases)}`,
+    `tags: ${formatExtensionTags(server.tags)}`,
+    server.hint ? `hint: ${server.hint}` : "",
+    `lsp: ${
+      server.transport === "filesystem"
+        ? server.lsp && server.lsp.configuredCount > 0
+          ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
+          : "none configured"
+        : "n/a"
+    }`,
+    `tools: ${toolCount}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
 export const formatMcpToolLine = (tool: McpToolDescriptor) =>
   [
@@ -309,32 +364,7 @@ export const formatExtensionsResolution = (resolution: ExtensionQueryResolution)
 export const formatManagedSkillDetail = (skill: ManagedSkill) => formatSkillDetail(skill);
 
 export const formatManagedMcpServerDetail = (server: ManagedMcpServer) =>
-  [
-    `MCP server ${server.id}`,
-    `label: ${server.label}`,
-    `transport: ${server.transport ?? "unknown"}`,
-    `scope: ${server.scope ?? "default"}`,
-    `trust: ${
-      server.trusted === undefined ? "n/a" : server.trusted ? "trusted" : "untrusted"
-    }`,
-    `exposure: ${server.exposure}`,
-    `source: ${server.source}`,
-    `health: ${server.health}`,
-    `enabled: ${server.enabled ? "true" : "false"}`,
-    `aliases: ${formatMcpAliases(server.aliases)}`,
-    `tags: ${formatExtensionTags(server.tags)}`,
-    server.hint ? `hint: ${server.hint}` : "",
-    `lsp: ${
-      server.transport === "filesystem"
-        ? server.lsp && server.lsp.configuredCount > 0
-          ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-          : "none configured"
-        : "n/a"
-    }`,
-    `tools: ${server.tools.length}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  formatMcpServerDetail(server, server.tools.length);
 
 export const formatSelectedExtensionsPrompt = (
   resolution: ExtensionQueryResolution

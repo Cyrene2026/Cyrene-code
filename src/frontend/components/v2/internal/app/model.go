@@ -1518,24 +1518,32 @@ func (m *Model) submitInput() tea.Cmd {
 		return cmd
 	}
 	if strings.HasPrefix(query, "/") {
-		if m.bridge == nil || !m.BridgeReady {
+		if m.bridge == nil {
 			m.Status = StatusError
 			m.setNotice("Bridge not ready yet.", true)
 			return nil
 		}
 		m.Status = StatusPreparing
-		m.setNotice("Running command...", false)
+		if !m.BridgeReady {
+			m.setNotice("Bridge starting, queued command...", false)
+		} else {
+			m.setNotice("Running command...", false)
+		}
 		return sendBridgeCommand(m.bridge, bridgeCommand{Type: "command", Text: query})
 	}
 
-	if m.bridge == nil || !m.BridgeReady {
+	if m.bridge == nil {
 		m.Status = StatusError
 		m.setNotice("Bridge not ready yet.", true)
 		return nil
 	}
 
 	m.Status = StatusPreparing
-	m.setNotice("Submitting query...", false)
+	if !m.BridgeReady {
+		m.setNotice("Bridge starting, queued query...", false)
+	} else {
+		m.setNotice("Submitting query...", false)
+	}
 	return sendBridgeCommand(m.bridge, bridgeCommand{Type: "submit", Text: query})
 }
 
@@ -2405,6 +2413,13 @@ func isDefaultEmptyState(items []Message) bool {
 		items[0].Role == "system" &&
 		items[0].Kind == "system_hint" &&
 		items[0].Text == "No messages in the current session. Start typing."
+}
+
+func isStartupBridgePlaceholder(items []Message) bool {
+	return len(items) == 1 &&
+		items[0].Role == "system" &&
+		items[0].Kind == "system_hint" &&
+		items[0].Text == "Starting Bubble Tea v2 bridge..."
 }
 
 func cloneMessages(items []Message) []Message {

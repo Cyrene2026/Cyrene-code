@@ -17,6 +17,10 @@ import {
 } from "./lspPresets";
 import { HttpMcpAdapter } from "./adapters/http";
 import { StdioMcpAdapter } from "./adapters/stdio";
+import {
+  AmapCompatibleMcpAdapter,
+  isAmapCompatibleServer,
+} from "./adapters/compat/amapCompatibleMcpAdapter";
 import type { LspServerConfig, RuleConfig } from "./toolTypes";
 import { McpManager } from "./McpManager";
 import { buildBuiltinToolDescriptors } from "./builtinTools";
@@ -51,6 +55,19 @@ type CreateMcpRuntimeContext = {
 type InitializableMcpAdapter = McpServerAdapter & {
   initialize?: () => Promise<void>;
 };
+
+const warmAdapterInBackground = (adapter: InitializableMcpAdapter) => {
+  if (typeof adapter.initialize !== "function") {
+    return;
+  }
+
+  queueMicrotask(() => {
+    void adapter.initialize?.().catch(() => undefined);
+  });
+};
+
+const shouldWarmAdapterInBackground = (adapter: InitializableMcpAdapter) =>
+  adapter.descriptor.transport === "stdio";
 
 type McpServerOrigin = LoadedMcpConfig["serverOrigins"][string];
 
@@ -357,10 +374,13 @@ const createRemoteServerAdapter = async (
   context?: CreateMcpRuntimeContext
 ): Promise<InitializableMcpAdapter> => {
   const adapter =
-    server.transport === "stdio"
+    isAmapCompatibleServer(server)
+      ? new AmapCompatibleMcpAdapter(server)
+      : server.transport === "stdio"
       ? new StdioMcpAdapter(server, {
           appRoot,
           env: context?.env,
+          spawnProcess: context?.spawnProcess,
         })
       : server.transport === "http"
         ? new HttpMcpAdapter(server, {
@@ -469,6 +489,11 @@ const toPatchServer = (
       ? toPortableWorkspaceRoot(appRoot, server.workspaceRoot)
       : server.workspaceRoot,
 });
+
+const materializePatchServer = (
+  appRoot: string,
+  server: McpConfiguredServer
+): McpConfiguredServer => toPatchServer(appRoot, server);
 
 const upsertPatchServer = (
   patch: McpConfigPatch,
@@ -777,7 +802,9 @@ const buildManagerFromConfig = async (
     adapter.descriptor.scope = origin?.scope;
     adapter.descriptor.trusted =
       server.transport === "filesystem" ? true : server.trusted ?? false;
-    if ("initialize" in adapter && typeof adapter.initialize === "function") {
+    if (shouldWarmAdapterInBackground(adapter)) {
+      warmAdapterInBackground(adapter);
+    } else if ("initialize" in adapter && typeof adapter.initialize === "function") {
       await adapter.initialize().catch(() => undefined);
     }
     adapters.push(adapter);
@@ -846,14 +873,9 @@ class ManagedMcpRuntime implements McpRuntime {
       return resolved;
     }
 
-    const currentConfig = this.getConfig();
-    const existingPatchServer =
-      currentConfig.projectPatch.servers.find(server => server.id === resolved.normalizedId) ??
-      toPatchServer(this.appRoot, resolved.server);
-
     return {
       ...resolved,
-      patchServer: existingPatchServer,
+      patchServer: materializePatchServer(this.appRoot, resolved.server),
     };
   }
 
@@ -954,12 +976,10 @@ class ManagedMcpRuntime implements McpRuntime {
 
     const patch = cloneConfigPatch(currentConfig.projectPatch);
     patch.removeServerIds = patch.removeServerIds.filter(id => id !== normalizedId);
-    const existingPatchServer =
-      patch.servers.find(server => server.id === normalizedId) ??
-      toPatchServer(this.appRoot, current);
+    const nextPatchServer = materializePatchServer(this.appRoot, current);
 
     upsertPatchServer(patch, {
-      ...existingPatchServer,
+      ...nextPatchServer,
       enabled,
       ...(current.transport !== "filesystem" && enabled ? { trusted: true } : {}),
     });
@@ -998,12 +1018,10 @@ class ManagedMcpRuntime implements McpRuntime {
 
     const patch = cloneConfigPatch(currentConfig.projectPatch);
     patch.removeServerIds = patch.removeServerIds.filter(id => id !== normalizedId);
-    const existingPatchServer =
-      patch.servers.find(server => server.id === normalizedId) ??
-      toPatchServer(this.appRoot, current);
+    const nextPatchServer = materializePatchServer(this.appRoot, current);
 
     upsertPatchServer(patch, {
-      ...existingPatchServer,
+      ...nextPatchServer,
       exposure,
     });
 
@@ -1408,6 +1426,10 @@ class ManagedMcpRuntime implements McpRuntime {
 
   async undoLastMutation() {
     return this.getManager().undoLastMutation();
+  }
+
+  async refreshServers(serverId?: string) {
+    await this.getManager().refreshServers?.(serverId);
   }
 
   listServers() {

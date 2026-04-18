@@ -23,6 +23,7 @@ const createTransport = (
     cwd?: string;
     env?: Partial<NodeJS.ProcessEnv>;
     requestTemperature?: number;
+    mcpTools?: unknown[];
   }
 ) => {
   const env: NodeJS.ProcessEnv = {
@@ -38,6 +39,7 @@ const createTransport = (
     cwd: options.cwd ?? options.appRoot,
     env,
     requestTemperature: options.requestTemperature,
+    mcpTools: options.mcpTools as any,
   });
 };
 
@@ -69,6 +71,42 @@ const createRelaxedFileService = (root: string) => {
   });
   tempServices.push(service);
   return service;
+};
+
+const AMAP_GEO_TOOL = {
+  id: "amap-maps.maps_geo",
+  serverId: "amap-maps",
+  name: "maps_geo",
+  label: "maps_geo",
+  description: "Convert a structured address into coordinates.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      address: { type: "string" },
+      city: { type: "string" },
+    },
+    required: ["address"],
+  },
+  capabilities: ["read"] as const,
+  risk: "low" as const,
+  requiresReview: false,
+  enabled: true,
+  exposure: "hinted" as const,
+  tags: ["高德", "地图"],
+};
+
+const FILE_ACTION_LIKE_TOOL = {
+  id: "filesystem.read_file",
+  serverId: "filesystem",
+  name: "read_file",
+  label: "read_file",
+  description: "Conflicting filesystem action name.",
+  capabilities: ["read"] as const,
+  risk: "low" as const,
+  requiresReview: false,
+  enabled: true,
+  exposure: "hinted" as const,
+  tags: [],
 };
 
 const collectParsedStreamEvents = async (
@@ -215,7 +253,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("interrupt_shell");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("close_shell");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_files when you already know multiple exact file paths");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("output exactly one valid `file` tool call and nothing else");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "output exactly one valid function tool call and nothing else"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not output XML tags");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not guess missing required arguments");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("correct the exact schema error");
@@ -314,6 +354,315 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not mix languages in the same response");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Keep pre-tool narration concise");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive phrases that restate the same plan");
+  });
+
+  test("openai chat requests include MCP tools and the expanded system prompt", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: [DONE]", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+      mcpTools: [AMAP_GEO_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("规划北京到上海路线");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(fetchCalls[0]?.url).toBe("https://example.test/v1/chat/completions");
+    expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
+      "file",
+      "maps_geo",
+    ]);
+    expect(requestBody.messages[0]?.content).toContain("Additional available MCP tools:");
+    expect(requestBody.messages[0]?.content).toContain(
+      "maps_geo: Convert a structured address into coordinates."
+    );
+  });
+
+  test("dynamic MCP tool exposure skips filesystem action names", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: [DONE]", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+      mcpTools: [FILE_ACTION_LIKE_TOOL, AMAP_GEO_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("规划北京到上海路线");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
+      "file",
+      "maps_geo",
+    ]);
+  });
+
+  test("openai responses requests include MCP tools", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: [DONE]", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+      mcpTools: [AMAP_GEO_TOOL],
+    });
+
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("规划北京到上海路线");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
+    expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
+      "file",
+      "maps_geo",
+    ]);
+    expect(requestBody.instructions).toContain("maps_geo");
+  });
+
+  test("gemini native requests include MCP function declarations", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gemini-2.5-flash",
+        "last_used_model: gemini-2.5-flash",
+        "provider_base_url: https://generativelanguage.googleapis.com/v1beta",
+        "models:",
+        "  - gemini-2.5-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: {}", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://generativelanguage.googleapis.com/v1beta",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+        CYRENE_MODEL: "gemini-2.5-flash",
+      },
+      mcpTools: [AMAP_GEO_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("规划北京到上海路线");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.tools[0]?.functionDeclarations.map((tool: any) => tool.name)).toEqual([
+      "file",
+      "maps_geo",
+    ]);
+    expect(requestBody.systemInstruction.parts[0]?.text).toContain("maps_geo");
+    expect(requestBody.tools[0]?.functionDeclarations[1]?.parameters).toEqual({
+      type: "object",
+      properties: {
+        address: { type: "string" },
+        city: { type: "string" },
+      },
+      required: ["address"],
+    });
+  });
+
+  test("anthropic requests include MCP tools", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+      mcpTools: [AMAP_GEO_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("规划北京到上海路线");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.tools.map((tool: any) => tool.name)).toEqual([
+      "file",
+      "maps_geo",
+    ]);
+    expect(requestBody.system).toContain("maps_geo");
   });
 });
 

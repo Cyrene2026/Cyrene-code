@@ -95,6 +95,7 @@ const mergeConfiguredTool = (
   name: remoteTool.name,
   label: configuredTool?.label ?? remoteTool.name,
   description: configuredTool?.description ?? remoteTool.description,
+  inputSchema: remoteTool.inputSchema,
   capabilities:
     configuredTool?.capabilities && configuredTool.capabilities.length > 0
       ? [...configuredTool.capabilities]

@@ -1,5 +1,6 @@
 import { createHttpQueryTransport, fetchProviderModelCatalog, normalizeProviderBaseUrl } from "../http/createHttpQueryTransport";
 import { createLocalCoreTransport } from "../local/createLocalCoreTransport";
+import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import {
   isProviderType,
@@ -74,7 +75,9 @@ export type AuthRuntime = {
     providerBaseUrl?: string;
     model?: string;
   }) => Promise<AuthStatus>;
-  buildTransport: () => Promise<QueryTransport>;
+  buildTransport: (options?: {
+    mcpTools?: McpToolDescriptor[];
+  }) => Promise<QueryTransport>;
 };
 
 const trimNonEmpty = (value: string | undefined | null) => {
@@ -698,7 +701,9 @@ export const createAuthRuntime = (
     }
   };
 
-  const buildTransport = async () => {
+  const buildTransport = async (buildOptions?: {
+    mcpTools?: McpToolDescriptor[];
+  }) => {
     const { resolved, env } = await buildEffectiveEnv();
     if (resolved.status.mode !== "http") {
       return createLocalTransport();
@@ -708,6 +713,7 @@ export const createAuthRuntime = (
       cwd: options.cwd,
       env,
       requestTemperature,
+      mcpTools: buildOptions?.mcpTools,
     });
   };
 

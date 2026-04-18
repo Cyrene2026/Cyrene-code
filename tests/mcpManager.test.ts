@@ -182,4 +182,119 @@ describe("McpManager", () => {
       path: "src/example.ts",
     });
   });
+
+  test("refreshServers initializes remote adapters before snapshot reads", async () => {
+    const initialize = mock(async () => undefined);
+    const adapter = createAdapter({
+      descriptor: {
+        id: "ddg-search",
+        label: "ddg-search",
+        enabled: true,
+        source: "local",
+        health: "unknown",
+        transport: "stdio",
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+      initialize,
+    } as Partial<McpServerAdapter> & { initialize: () => Promise<void> });
+
+    const manager = new McpManager([adapter as McpServerAdapter]);
+
+    await manager.refreshServers();
+
+    expect(initialize).toHaveBeenCalledTimes(1);
+  });
+
+  test("refreshServers can target a single adapter", async () => {
+    const initializeDocs = mock(async () => undefined);
+    const initializeDdg = mock(async () => undefined);
+    const docs = createAdapter({
+      descriptor: {
+        id: "docs",
+        label: "Docs",
+        enabled: true,
+        source: "remote",
+        health: "unknown",
+        transport: "http",
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+      initialize: initializeDocs,
+    } as Partial<McpServerAdapter> & { initialize: () => Promise<void> });
+    const ddg = createAdapter({
+      descriptor: {
+        id: "ddg-search",
+        label: "ddg-search",
+        enabled: true,
+        source: "local",
+        health: "unknown",
+        transport: "stdio",
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+      initialize: initializeDdg,
+    } as Partial<McpServerAdapter> & { initialize: () => Promise<void> });
+
+    const manager = new McpManager([
+      docs as McpServerAdapter,
+      ddg as McpServerAdapter,
+    ]);
+
+    await manager.refreshServers("ddg-search");
+
+    expect(initializeDocs).not.toHaveBeenCalled();
+    expect(initializeDdg).toHaveBeenCalledTimes(1);
+  });
+
+  test("refreshServers isolates slow adapters with a per-server timeout", async () => {
+    const initializeSlow = mock(() => new Promise<void>(() => undefined));
+    const initializeFast = mock(async () => undefined);
+    const slow = createAdapter({
+      descriptor: {
+        id: "slow-search",
+        label: "Slow Search",
+        enabled: true,
+        source: "remote",
+        health: "unknown",
+        transport: "stdio",
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+      initialize: initializeSlow,
+    } as Partial<McpServerAdapter> & { initialize: () => Promise<void> });
+    const fast = createAdapter({
+      descriptor: {
+        id: "docs",
+        label: "Docs",
+        enabled: true,
+        source: "remote",
+        health: "unknown",
+        transport: "http",
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+      initialize: initializeFast,
+    } as Partial<McpServerAdapter> & { initialize: () => Promise<void> });
+
+    const manager = new McpManager(
+      [slow as McpServerAdapter, fast as McpServerAdapter],
+      {
+        refreshServerTimeoutMs: 20,
+      }
+    );
+
+    const startedAt = Date.now();
+    await manager.refreshServers();
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(initializeSlow).toHaveBeenCalledTimes(1);
+    expect(initializeFast).toHaveBeenCalledTimes(1);
+    expect(elapsedMs).toBeLessThan(100);
+  });
 });

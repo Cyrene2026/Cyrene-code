@@ -17,6 +17,7 @@ import {
   formatMcpLspServerHeader,
   formatMcpPendingLine,
   formatMcpRuntimeSummary,
+  formatMcpServerDetail,
   formatMcpServerLine,
   formatMcpToolLine,
 } from "./chatMcpSkillsFormatting";
@@ -48,6 +49,8 @@ const NEUTRAL_MESSAGE_OPTIONS = {
   tone: "neutral",
   color: "white",
 } satisfies SystemMessageOptions;
+
+const MCP_BACKGROUND_REFRESH_NOTE = "refresh: background update started";
 
 const resolveMcpServerDescriptor = (
   servers: McpServerDescriptor[],
@@ -114,6 +117,20 @@ const pushMutationResult = (
   );
 };
 
+const withBackgroundRefreshNote = (message: string, enabled: boolean) =>
+  enabled ? `${message}\n${MCP_BACKGROUND_REFRESH_NOTE}` : message;
+
+const triggerBackgroundRefresh = (
+  mcpService: HandleMcpCommandParams["mcpService"],
+  serverId?: string
+) => {
+  if (!mcpService.refreshServers) {
+    return false;
+  }
+  void mcpService.refreshServers(serverId).catch(() => undefined);
+  return true;
+};
+
 export const handleMcpCommand = async ({
   query,
   mcpService,
@@ -124,8 +141,12 @@ export const handleMcpCommand = async ({
   if (query === "/mcp") {
     const servers = mcpService.listServers();
     const pending = mcpService.listPending();
+    const startedBackgroundRefresh = triggerBackgroundRefresh(mcpService);
     pushSystemMessage(
-      formatMcpRuntimeSummary(mcpService.describeRuntime?.(), servers, pending),
+      withBackgroundRefreshNote(
+        formatMcpRuntimeSummary(mcpService.describeRuntime?.(), servers, pending),
+        startedBackgroundRefresh
+      ),
       INFO_MESSAGE_OPTIONS
     );
     clearInput();
@@ -134,10 +155,14 @@ export const handleMcpCommand = async ({
 
   if (query === "/mcp servers") {
     const servers = mcpService.listServers();
+    const startedBackgroundRefresh = triggerBackgroundRefresh(mcpService);
     pushSystemMessage(
-      servers.length > 0
-        ? ["MCP servers", ...servers.map(formatMcpServerLine)].join("\n")
-        : "No MCP servers registered.",
+      withBackgroundRefreshNote(
+        servers.length > 0
+          ? ["MCP servers", ...servers.map(formatMcpServerLine)].join("\n")
+          : "No MCP servers registered.",
+        startedBackgroundRefresh
+      ),
       INFO_MESSAGE_OPTIONS
     );
     clearInput();
@@ -150,11 +175,15 @@ export const handleMcpCommand = async ({
       const tools = mcpService.listTools(server.id);
       return buildMcpToolSectionLines(server, tools);
     });
+    const startedBackgroundRefresh = triggerBackgroundRefresh(mcpService);
 
     pushSystemMessage(
-      lines.length > 0
-        ? ["MCP tools", ...lines].join("\n")
-        : "No MCP tools registered.",
+      withBackgroundRefreshNote(
+        lines.length > 0
+          ? ["MCP tools", ...lines].join("\n")
+          : "No MCP tools registered.",
+        startedBackgroundRefresh
+      ),
       INFO_MESSAGE_OPTIONS
     );
     clearInput();
@@ -488,31 +517,12 @@ export const handleMcpCommand = async ({
     }
 
     const tools = mcpService.listTools(server.id);
+    const startedBackgroundRefresh = triggerBackgroundRefresh(mcpService, server.id);
     pushSystemMessage(
-      [
-        `MCP server ${server.id}`,
-        `label: ${server.label}`,
-        `transport: ${server.transport ?? "unknown"}`,
-        `scope: ${server.scope ?? "default"}`,
-        `trust: ${
-          server.trusted === undefined ? "n/a" : server.trusted ? "trusted" : "untrusted"
-        }`,
-        `exposure: ${server.exposure}`,
-        `source: ${server.source}`,
-        `health: ${server.health}`,
-        `enabled: ${server.enabled ? "true" : "false"}`,
-        `aliases: ${formatMcpAliases(server.aliases)}`,
-        `tags: ${server.tags.length > 0 ? server.tags.join(", ") : "(none)"}`,
-        ...(server.hint ? [`hint: ${server.hint}`] : []),
-        `lsp: ${
-          server.transport === "filesystem"
-            ? server.lsp && server.lsp.configuredCount > 0
-              ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-              : "none configured"
-            : "n/a"
-        }`,
-        `tools: ${tools.length}`,
-      ].join("\n"),
+      withBackgroundRefreshNote(
+        formatMcpServerDetail(server, tools.length),
+        startedBackgroundRefresh
+      ),
       INFO_MESSAGE_OPTIONS
     );
     clearInput();
@@ -536,27 +546,31 @@ export const handleMcpCommand = async ({
     }
 
     const tools = mcpService.listTools(server.id);
+    const startedBackgroundRefresh = triggerBackgroundRefresh(mcpService, server.id);
     pushSystemMessage(
-      [
-        `MCP tools for ${server.id}`,
-        ...(server.transport === "filesystem"
-          ? [
-              `lsp: ${
-                server.lsp && server.lsp.configuredCount > 0
-                  ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
-                  : "none configured"
-              }`,
-              ...(!server.lsp || server.lsp.configuredCount === 0
-                ? [
-                    "tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server",
-                  ]
-                : []),
-            ]
-          : []),
-        ...(tools.length > 0
-          ? tools.map(formatMcpToolLine)
-          : ["- (no tools registered)"]),
-      ].join("\n"),
+      withBackgroundRefreshNote(
+        [
+          `MCP tools for ${server.id}`,
+          ...(server.transport === "filesystem"
+            ? [
+                `lsp: ${
+                  server.lsp && server.lsp.configuredCount > 0
+                    ? `${server.lsp.configuredCount} configured | ${server.lsp.serverIds.join(", ")}`
+                    : "none configured"
+                }`,
+                ...(!server.lsp || server.lsp.configuredCount === 0
+                  ? [
+                      "tip: lsp_* tools will fail until lsp_servers are configured for this filesystem server",
+                    ]
+                  : []),
+              ]
+            : []),
+          ...(tools.length > 0
+            ? tools.map(formatMcpToolLine)
+            : ["- (no tools registered)"]),
+        ].join("\n"),
+        startedBackgroundRefresh
+      ),
       INFO_MESSAGE_OPTIONS
     );
     clearInput();

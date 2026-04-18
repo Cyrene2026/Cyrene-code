@@ -1481,6 +1481,22 @@ func TestIncrementalBridgeAppendReplaceAndLiveText(t *testing.T) {
 	}
 }
 
+func TestSingleSystemResultDoesNotKeepStartupSplash(t *testing.T) {
+	model := app.NewModel()
+
+	if err := model.ApplyBridgeEventJSONForTest(`{"type":"replace_items","items":[{"role":"system","kind":"system_hint","text":"MCP runtime summary\nservers: 2"}]}`); err != nil {
+		t.Fatalf("replace_items failed: %v", err)
+	}
+
+	rendered := model.RenderTranscriptForTest(80, 16)
+	if !strings.Contains(rendered, "MCP runtime summary") {
+		t.Fatalf("expected transcript to show MCP summary, got %q", rendered)
+	}
+	if strings.Contains(rendered, "terminal workspace") {
+		t.Fatalf("expected startup splash hidden once real system content exists, got %q", rendered)
+	}
+}
+
 func TestIncrementalBridgeSessionsAndMetadata(t *testing.T) {
 	model := app.NewModel()
 	model.ActivePanel = app.PanelAuth

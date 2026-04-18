@@ -543,7 +543,7 @@ func (m *Model) shouldShowStartupView() bool {
 	if len(m.Items) == 0 {
 		return true
 	}
-	if len(m.Items) == 1 && m.Items[0].Role == "system" {
+	if isDefaultEmptyState(m.Items) || isStartupBridgePlaceholder(m.Items) {
 		return true
 	}
 	return false

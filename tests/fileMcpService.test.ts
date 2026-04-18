@@ -3536,6 +3536,32 @@ describe("FileMcpService", () => {
     expect(service.listPending()).toHaveLength(0);
   });
 
+  test("run_shell routes download-oriented commands through high-risk review instead of blocking", async () => {
+    const { root, service } = await createService({
+      shellRunner: async (request, cwd, shell) => {
+        expect(request.command).toBe("curl https://example.com/data.json");
+        expect(cwd).toBe(root);
+        expect(shell).toBe(process.platform === "win32" ? "pwsh" : "sh");
+        return "download ok";
+      },
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "run_shell",
+      path: ".",
+      command: "curl https://example.com/data.json",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.request.action).toBe("run_shell");
+    expect(queued.pending?.previewSummary).toContain("risk: high");
+    expect(queued.pending?.previewSummary).toContain("download-oriented command");
+
+    const approved = await service.approve(queued.pending?.id ?? "");
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("download ok");
+  });
+
   test("open_shell executes directly and opens a single persistent shell", async () => {
     const fakePty = createFakePersistentShellFactory();
     const { service, cleanup } = await createIsolatedService({
@@ -3963,6 +3989,31 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toContain("dangerous root deletion pattern");
     expect(service.listPending()).toHaveLength(0);
+  });
+
+  test("download-oriented write_shell inputs require high-risk review instead of blocking", async () => {
+    const fakePty = createFakePersistentShellFactory();
+    const { service } = await createService({
+      ptyFactory: fakePty.factory,
+      shellSettleMs: 0,
+    });
+
+    await service.handleToolCall("file", {
+      action: "open_shell",
+      path: ".",
+    });
+
+    const queued = await service.handleToolCall("file", {
+      action: "write_shell",
+      path: ".",
+      input: "curl https://example.com/data.json",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending?.request.action).toBe("write_shell");
+    expect(queued.pending?.previewSummary).toContain("policy: review");
+    expect(queued.pending?.previewSummary).toContain("risk: high");
+    expect(queued.pending?.previewSummary).toContain("download-oriented command");
   });
 
   test("read_shell returns only unread output and shell_status reflects running state", async () => {

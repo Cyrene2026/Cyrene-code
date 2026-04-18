@@ -198,6 +198,33 @@ const createFakeDiagnosticLspSpawn = () => {
   };
 };
 
+const createUnresponsiveStdioSpawn = () => {
+  const spawnCalls: Array<{ command: string; args: string[] }> = [];
+
+  const spawnProcess = (command: string, args: string[]) => {
+    const child = new EventEmitter() as FakeLspChildProcess;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = {
+      write: () => true,
+    };
+    child.kill = () => {
+      child.emit("exit", null, "SIGTERM");
+      return true;
+    };
+    spawnCalls.push({
+      command,
+      args,
+    });
+    return child as any;
+  };
+
+  return {
+    spawnProcess,
+    spawnCalls,
+  };
+};
+
 const getAvailablePort = () =>
   new Promise<number>((resolvePort, rejectPort) => {
     const probe = createServer();
@@ -641,6 +668,51 @@ describe("createMcpRuntime", () => {
     runtime.dispose();
   });
 
+  test("setServerEnabled materializes env from the effective config when a project override already exists", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    await writeFile(
+      join(cyreneHome, "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: time",
+        "    transport: stdio",
+        "    command: node",
+        `    args: ["${join(process.cwd(), "scripts/time-mcp-server.mjs")}"]`,
+        "    env:",
+        "      TZ: Asia/Shanghai",
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: time",
+        "    enabled: false",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+    });
+
+    expect(runtime.listServers().find(server => server.id === "time")?.transport).toBe("stdio");
+
+    const enableResult = await runtime.setServerEnabled?.("time", true);
+    expect(enableResult?.ok).toBe(true);
+
+    const configText = await readFile(join(root, ".cyrene", "mcp.yaml"), "utf8");
+    expect(configText).toContain("transport: stdio");
+    expect(configText).toContain("command: node");
+    expect(configText).toContain("TZ: Asia/Shanghai");
+
+    runtime.dispose();
+  });
+
   test("builtin filesystem tool descriptors include semantic tool descriptions", async () => {
     const { root, cyreneHome } = await createWorkspace();
     const runtime = await createMcpRuntime(root, {
@@ -657,6 +729,53 @@ describe("createMcpRuntime", () => {
       "TypeScript/JavaScript quick info at an exact file position."
     );
     expect(lspHover?.description).toContain("configured `lsp_servers`");
+
+    runtime.dispose();
+  });
+
+  test("runtime creation does not block on slow stdio MCP initialization", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const fakeProcess = createUnresponsiveStdioSpawn();
+
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "primary_server: filesystem",
+        "servers:",
+        "  - id: ddg-search",
+        "    transport: stdio",
+        "    trusted: true",
+        "    command: npx",
+        '    args: ["-y", "@oevortex/ddg_search@latest"]',
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtimePromise = createMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+      spawnProcess: fakeProcess.spawnProcess as any,
+    });
+
+    const runtime = await Promise.race([
+      runtimePromise,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error("createMcpRuntime blocked on stdio initialization"));
+        }, 200);
+      }),
+    ]);
+
+    expect(runtime.listServers().find(server => server.id === "ddg-search")?.health).toBe(
+      "unknown"
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(fakeProcess.spawnCalls).toHaveLength(1);
+    expect(fakeProcess.spawnCalls[0]?.command).toBe("npx");
 
     runtime.dispose();
   });

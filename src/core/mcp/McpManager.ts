@@ -11,6 +11,7 @@ import type {
 } from "./runtimeTypes";
 
 const FILE_TOOL_NAMES = new Set(["file", "fs", "mcp.file"]);
+const DEFAULT_REFRESH_SERVER_TIMEOUT_MS = 2_000;
 
 const buildFileServerAliases = (serverId: string) => ({
   file: serverId,
@@ -30,10 +31,15 @@ const withToolAction = (input: unknown, action: ToolRequest["action"]) => ({
   action,
 });
 
+type InitializableMcpServerAdapter = McpServerAdapter & {
+  initialize?: () => Promise<void>;
+};
+
 export class McpManager implements McpRuntime {
   private readonly registry: McpServerRegistry;
   private readonly router: McpToolRouter;
   private readonly summary: McpRuntimeSummary;
+  private readonly refreshServerTimeoutMs: number;
 
   constructor(
     servers: McpServerAdapter[],
@@ -42,6 +48,7 @@ export class McpManager implements McpRuntime {
       serverAliases?: Record<string, string>;
       legacyToolServerIds?: Record<string, string>;
       configPaths?: string[];
+      refreshServerTimeoutMs?: number;
     }
   ) {
     this.registry = new McpServerRegistry(servers, {
@@ -58,6 +65,10 @@ export class McpManager implements McpRuntime {
       enabledServerCount: descriptors.filter(server => server.enabled).length,
       configPaths: [...(options?.configPaths ?? [])],
     };
+    this.refreshServerTimeoutMs = Math.max(
+      0,
+      options?.refreshServerTimeoutMs ?? DEFAULT_REFRESH_SERVER_TIMEOUT_MS
+    );
   }
 
   static fromFileService(
@@ -141,6 +152,53 @@ export class McpManager implements McpRuntime {
     return {
       ...this.summary,
     };
+  }
+
+  private async refreshServerWithIsolation(server: McpServerAdapter) {
+    const initializable = server as InitializableMcpServerAdapter;
+    if (typeof initializable.initialize !== "function") {
+      return;
+    }
+
+    const initializePromise = Promise.resolve()
+      .then(() => initializable.initialize?.())
+      .catch(() => undefined);
+
+    if (this.refreshServerTimeoutMs === 0) {
+      await initializePromise;
+      return;
+    }
+
+    await new Promise<void>(resolve => {
+      let finished = false;
+      const finish = () => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        resolve();
+      };
+      const timer = setTimeout(finish, this.refreshServerTimeoutMs);
+      void initializePromise.finally(() => {
+        clearTimeout(timer);
+        finish();
+      });
+    });
+  }
+
+  async refreshServers(serverId?: string) {
+    const targets = serverId
+      ? [this.registry.getServer(serverId)].filter(
+          (server): server is McpServerAdapter => Boolean(server)
+        )
+      : this.registry
+          .listServers()
+          .map(server => this.registry.getServer(server.id))
+          .filter((server): server is McpServerAdapter => Boolean(server));
+
+    await Promise.all(
+      targets.map(server => this.refreshServerWithIsolation(server))
+    );
   }
 
   async handleToolCall(toolName: string, input: unknown): Promise<McpHandleResult> {

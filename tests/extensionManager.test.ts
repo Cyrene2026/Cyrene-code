@@ -125,4 +125,40 @@ describe("extension manager", () => {
 
     mcpRuntime.dispose();
   });
+
+  test("selects amap compatibility server for Chinese map-routing queries", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: amap-maps",
+        "    transport: stdio",
+        "    trusted: true",
+        "    command: npx",
+        "    args:",
+        "      - -y",
+        "      - @amap/amap-maps-mcp-server",
+        "    env:",
+        "      AMAP_MAPS_API_KEY: demo-key",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const skillsRuntime = await createSkillsRuntime(root, {
+      cwd: root,
+      env: { CYRENE_HOME: cyreneHome },
+    });
+    const mcpRuntime = await createMcpRuntime(root, {
+      cwd: root,
+      env: { CYRENE_HOME: cyreneHome },
+    });
+    const manager = createExtensionManager(mcpRuntime, skillsRuntime);
+
+    const matched = manager.resolveForQuery("调用下高德地图mcp，规划北京到上海路线");
+    expect(matched.mcpServers.map(entry => entry.item.id)).toContain("amap-maps");
+
+    mcpRuntime.dispose();
+  });
 });

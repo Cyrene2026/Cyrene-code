@@ -41,7 +41,7 @@ export type McpConfiguredTool = {
 
 export type McpConfiguredServer = {
   id: string;
-  transport: McpServerTransport;
+  transport?: McpServerTransport;
   label: string;
   enabled: boolean;
   trusted?: boolean;
@@ -208,12 +208,34 @@ const normalizeRisk = (value: unknown): McpToolRisk | undefined =>
     ? value
     : undefined;
 
-const normalizeTransport = (value: unknown): McpServerTransport => {
+const normalizeTransport = (value: unknown): McpServerTransport | undefined => {
   const normalized = normalizeString(value)?.toLowerCase();
   if (normalized === "filesystem" || normalized === "stdio" || normalized === "http") {
     return normalized;
   }
-  return "filesystem";
+  return undefined;
+};
+
+const inferTransport = (value: Record<string, unknown>): McpServerTransport | undefined => {
+  if (normalizeString(value.url)) {
+    return "http";
+  }
+  if (normalizeString(value.command)) {
+    return "stdio";
+  }
+  if (
+    value.workspace_root !== undefined ||
+    value.workspaceRoot !== undefined ||
+    value.max_read_bytes !== undefined ||
+    value.maxReadBytes !== undefined ||
+    value.require_review !== undefined ||
+    value.requireReview !== undefined ||
+    value.lsp_servers !== undefined ||
+    value.lspServers !== undefined
+  ) {
+    return "filesystem";
+  }
+  return undefined;
 };
 
 const normalizeTool = (value: unknown): McpConfiguredTool | null => {
@@ -305,7 +327,8 @@ const normalizeServer = (value: unknown): McpConfiguredServer | null => {
     return null;
   }
 
-  const transport = normalizeTransport(value.transport ?? value.type);
+  const transport =
+    normalizeTransport(value.transport ?? value.type) ?? inferTransport(value);
   const tools = Array.isArray(value.tools)
     ? value.tools
         .map(item => normalizeTool(item))
@@ -632,7 +655,7 @@ const serializeConfiguredLspServer = (server: LspServerConfig) => ({
 
 const serializeConfiguredServer = (server: McpConfiguredServer) => ({
   id: server.id,
-  transport: server.transport,
+  ...(server.transport ? { transport: server.transport } : {}),
   ...(server.label && server.label !== server.id ? { label: server.label } : {}),
   ...(typeof server.enabled === "boolean" && !server.enabled
     ? { enabled: server.enabled }

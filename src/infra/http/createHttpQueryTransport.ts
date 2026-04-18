@@ -22,6 +22,7 @@ import {
   type TransportFormat,
 } from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
+import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import { resolveAmbientAppRoot } from "../config/appRoot";
 
@@ -423,17 +424,19 @@ export const FILE_TOOL = {
   },
 } as const;
 export const TOOL_USAGE_SYSTEM_PROMPT = [
-  "You are operating inside a workspace through exactly one function: `file`.",
-  "Whenever you need filesystem or shell work, you MUST call `file` instead of describing the action abstractly.",
-  "Tool-call protocol is strict: when a tool call is needed, output exactly one valid `file` tool call and nothing else.",
+  "You are operating inside a workspace with function tools.",
+  "The `file` function is always available for filesystem and shell work.",
+  "When a domain-specific MCP tool is available for the task, prefer that tool instead of forcing the task through `file`.",
+  "Tool-call protocol is strict: when a tool call is needed, output exactly one valid function tool call and nothing else.",
   "Do not output XML tags, pseudo-tags, markdown code fences, wrapper text, mixed tool syntaxes, or partially formed tool calls.",
   "Do not emit placeholders such as `<path>`, `your/path`, `example`, `...`, empty strings, or guessed arguments.",
   "Do not guess missing required arguments. If you do not know a required path or symbol yet, call a narrower discovery tool first.",
+  "Use exact exposed tool names and provide arguments that match the tool schema.",
   "If a previous tool call was rejected, correct the exact schema error and retry with one corrected tool call only.",
   "Function arguments must be valid JSON and include required fields:",
   "{ action, path, content?, paths?, startLine?, endLine?, line?, column?, newName?, serverId?, title?, kind?, tabSize?, insertSpaces?, jsonPath?, yamlPath?, find?, replace?, pattern?, symbol?, query?, before?, after?, maxResults?, caseSensitive?, findInComments?, findInStrings?, destination?, revision?, command?, input?, args?, cwd? }.",
-  "Never call the file tool with empty arguments, placeholder values, guessed fields you do not need, or unrelated extra fields.",
-  "Available actions are:",
+  "Never call the `file` tool with empty arguments, placeholder values, guessed fields you do not need, or unrelated extra fields.",
+  "Available `file` actions are:",
   "read_file, read_files, read_range, read_json, read_yaml, list_dir, create_dir, create_file, write_file, edit_file, apply_patch, delete_file, stat_path, stat_paths, outline_file, find_files, find_symbol, find_references, search_text, search_text_context, copy_path, move_path, git_status, git_diff, git_log, git_show, git_blame, ts_hover, ts_definition, ts_references, ts_diagnostics, ts_prepare_rename, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, lsp_references, lsp_workspace_symbols, lsp_document_symbols, lsp_diagnostics, lsp_prepare_rename, lsp_rename, lsp_code_actions, lsp_format_document, run_command, run_shell, open_shell, write_shell, read_shell, shell_status, interrupt_shell, close_shell.",
   "Choose the narrowest action that answers the question. Prefer precise search or metadata actions over broad exploratory reads.",
   "Single-action discipline:",
@@ -556,6 +559,102 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- After each tool result, choose the next concrete step toward finishing the original task.",
   "- Stop exploring once you have enough information to act.",
 ].join(" ");
+
+const DEFAULT_DYNAMIC_TOOL_PARAMETERS = {
+  type: "object",
+  properties: {},
+  additionalProperties: true,
+} as const;
+
+type OpenAIFunctionTool = {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters: unknown;
+  };
+};
+
+const FILE_ACTION_NAMES = new Set<string>(
+  FILE_TOOL.function.parameters.properties.action.enum
+);
+
+const normalizeDynamicToolSchema = (inputSchema: unknown) =>
+  inputSchema && typeof inputSchema === "object" && !Array.isArray(inputSchema)
+    ? inputSchema
+    : DEFAULT_DYNAMIC_TOOL_PARAMETERS;
+
+const buildDynamicFunctionTools = (
+  mcpTools: McpToolDescriptor[]
+): OpenAIFunctionTool[] => {
+  const seen = new Set<string>([FILE_TOOL.function.name]);
+  const tools: OpenAIFunctionTool[] = [
+    {
+      type: "function",
+      function: {
+        name: FILE_TOOL.function.name,
+        description: FILE_TOOL.function.description,
+        parameters: FILE_TOOL.function.parameters,
+      },
+    },
+  ];
+
+  for (const tool of mcpTools) {
+    const name = tool.name.trim();
+    if (!name || seen.has(name) || FILE_ACTION_NAMES.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    tools.push({
+      type: "function" as const,
+      function: {
+        name,
+        description: tool.description ?? tool.label,
+        parameters: normalizeDynamicToolSchema(tool.inputSchema),
+      },
+    });
+  }
+
+  return tools;
+};
+
+const buildGeminiFunctionTools = (mcpTools: McpToolDescriptor[]) => ({
+  functionDeclarations: buildDynamicFunctionTools(mcpTools).map(tool => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters:
+      sanitizeGeminiSchema(tool.function.parameters) ?? {
+        type: "object",
+      },
+  })),
+});
+
+const buildAnthropicTools = (mcpTools: McpToolDescriptor[]) =>
+  buildDynamicFunctionTools(mcpTools).map(tool => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters,
+  }));
+
+const buildToolUsageSystemPrompt = (mcpTools: McpToolDescriptor[]) => {
+  const visibleTools = mcpTools
+    .filter(tool => tool.enabled && tool.exposure !== "hidden")
+    .map(tool => {
+      const description = (tool.description ?? tool.label).trim();
+      return description ? `- ${tool.name}: ${description}` : `- ${tool.name}`;
+    });
+
+  if (visibleTools.length === 0) {
+    return TOOL_USAGE_SYSTEM_PROMPT;
+  }
+
+  return [
+    TOOL_USAGE_SYSTEM_PROMPT,
+    "Additional available MCP tools:",
+    ...visibleTools,
+    "Use these additional tools directly when they are a better match than `file`.",
+  ].join("\n");
+};
 
 const trimProviderInput = (value: string) => value.trim();
 
@@ -940,6 +1039,8 @@ async function* streamSseOpenAI(
     temperature?: number;
     family?: ProviderFamily;
     endpointOverride?: string | null;
+    systemPrompt?: string;
+    mcpTools?: McpToolDescriptor[];
   }
 ): AsyncGenerator<string> {
   const headers: Record<string, string> = {
@@ -968,9 +1069,9 @@ async function* streamSseOpenAI(
         include_usage: true,
       },
       tool_choice: "auto",
-      tools: [FILE_TOOL],
+      tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
       messages: [
-        { role: "system", content: TOOL_USAGE_SYSTEM_PROMPT },
+        { role: "system", content: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT },
         { role: "user", content: query },
       ],
     }),
@@ -1216,18 +1317,6 @@ const sanitizeGeminiSchema = (value: unknown): GeminiSchema | undefined => {
   return schema;
 };
 
-const GEMINI_TOOL = {
-  functionDeclarations: [
-    {
-      name: FILE_TOOL.function.name,
-      description: FILE_TOOL.function.description,
-      parameters: sanitizeGeminiSchema(FILE_TOOL.function.parameters) ?? {
-        type: "object",
-      },
-    },
-  ],
-};
-
 type ResponsesUsageState = {
   lastEmitted?: string;
 };
@@ -1321,6 +1410,8 @@ async function* streamSseOpenAIResponses(
     temperature?: number;
     family?: ProviderFamily;
     endpointOverride?: string | null;
+    systemPrompt?: string;
+    mcpTools?: McpToolDescriptor[];
   }
 ): AsyncGenerator<string> {
   const headers: Record<string, string> = {
@@ -1337,8 +1428,8 @@ async function* streamSseOpenAIResponses(
     temperature: options?.temperature ?? 0.2,
     stream: true,
     tool_choice: "auto",
-    tools: [FILE_TOOL],
-    instructions: TOOL_USAGE_SYSTEM_PROMPT,
+    tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
+    instructions: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
     input: query,
   });
   const candidateUrls = resolveResponsesUrls(
@@ -1827,6 +1918,8 @@ async function* streamSseGeminiGenerateContent(
   options?: {
     temperature?: number;
     endpointOverride?: string | null;
+    systemPrompt?: string;
+    mcpTools?: McpToolDescriptor[];
   }
 ): AsyncGenerator<string> {
   const requestUrl = resolveGeminiGenerateContentUrl(
@@ -1845,7 +1938,7 @@ async function* streamSseGeminiGenerateContent(
       },
       body: JSON.stringify({
         systemInstruction: {
-          parts: [{ text: TOOL_USAGE_SYSTEM_PROMPT }],
+          parts: [{ text: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT }],
         },
         contents: [
           {
@@ -1853,7 +1946,7 @@ async function* streamSseGeminiGenerateContent(
             parts: [{ text: query }],
           },
         ],
-        tools: [GEMINI_TOOL],
+        tools: [buildGeminiFunctionTools(options?.mcpTools ?? [])],
         toolConfig: {
           functionCallingConfig: {
             mode: "AUTO",
@@ -1946,12 +2039,6 @@ async function* streamSseGeminiGenerateContent(
   yield DONE_EVENT;
 }
 
-const ANTHROPIC_TOOL = {
-  name: FILE_TOOL.function.name,
-  description: FILE_TOOL.function.description,
-  input_schema: FILE_TOOL.function.parameters,
-} as const;
-
 type AnthropicUsageState = {
   inputTokens?: number;
   outputTokens?: number;
@@ -2035,7 +2122,12 @@ async function* streamSseAnthropic(
   apiKey: string,
   model: string,
   query: string,
-  options?: { temperature?: number; endpointOverride?: string | null }
+  options?: {
+    temperature?: number;
+    endpointOverride?: string | null;
+    systemPrompt?: string;
+    mcpTools?: McpToolDescriptor[];
+  }
 ): AsyncGenerator<string> {
   const requestUrl = resolveAnthropicMessagesUrl(
     baseUrl,
@@ -2056,8 +2148,8 @@ async function* streamSseAnthropic(
         stream: true,
         max_tokens: 4096,
         temperature: options?.temperature ?? 0.2,
-        system: TOOL_USAGE_SYSTEM_PROMPT,
-        tools: [ANTHROPIC_TOOL],
+        system: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+        tools: buildAnthropicTools(options?.mcpTools ?? []),
         tool_choice: { type: "auto" },
         messages: [{ role: "user", content: query }],
       }),
@@ -2377,6 +2469,7 @@ export type HttpQueryTransportOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   requestTemperature?: number;
+  mcpTools?: McpToolDescriptor[];
 };
 
 type ParsedHttpEnv = z.infer<typeof envSchema>;
@@ -2515,6 +2608,10 @@ export const createHttpQueryTransport = (
       cwd: options?.cwd,
       env: effectiveEnv,
     });
+  const exposedMcpTools = (options?.mcpTools ?? []).filter(
+    tool => tool.enabled && tool.exposure !== "hidden"
+  );
+  const toolUsageSystemPrompt = buildToolUsageSystemPrompt(exposedMcpTools);
   const env = envSchema.safeParse({
     CYRENE_BASE_URL: effectiveEnv.CYRENE_BASE_URL,
     CYRENE_API_KEY: effectiveEnv.CYRENE_API_KEY,
@@ -2561,6 +2658,8 @@ export const createHttpQueryTransport = (
       family: ProviderFamily;
       format: TransportFormat;
       endpointOverrides: ProviderEndpointOverrideEntry;
+      mcpTools: McpToolDescriptor[];
+      systemPrompt: string;
     }
   >();
   const dedupeProviders = (providers: Array<string | undefined>) =>
@@ -3717,6 +3816,8 @@ export const createHttpQueryTransport = (
         family: providerFamily,
         format: providerFormat,
         endpointOverrides: getProviderEndpointOverrides(targetProvider),
+        mcpTools: exposedMcpTools,
+        systemPrompt: toolUsageSystemPrompt,
       });
       return `openai://${sessionId}`;
     },
@@ -3738,6 +3839,8 @@ export const createHttpQueryTransport = (
           {
             temperature: requestTemperature,
             endpointOverride: session.endpointOverrides.anthropic_messages,
+            mcpTools: session.mcpTools,
+            systemPrompt: session.systemPrompt,
           }
         )) {
           yield event;
@@ -3755,6 +3858,8 @@ export const createHttpQueryTransport = (
             temperature: requestTemperature,
             family: session.family,
             endpointOverride: session.endpointOverrides.responses,
+            mcpTools: session.mcpTools,
+            systemPrompt: session.systemPrompt,
           }
         )) {
           yield event;
@@ -3771,6 +3876,8 @@ export const createHttpQueryTransport = (
           {
             temperature: requestTemperature,
             endpointOverride: session.endpointOverrides.gemini_generate_content,
+            mcpTools: session.mcpTools,
+            systemPrompt: session.systemPrompt,
           }
         )) {
           yield event;
@@ -3788,6 +3895,8 @@ export const createHttpQueryTransport = (
             temperature: requestTemperature,
             family: session.family,
             endpointOverride: session.endpointOverrides.chat_completions,
+            mcpTools: session.mcpTools,
+            systemPrompt: session.systemPrompt,
           }
         )) {
           yield event;

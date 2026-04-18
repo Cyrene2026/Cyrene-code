@@ -10,7 +10,11 @@ import { loadPromptPolicy, type PromptPolicy } from "../../../infra/config/loadP
 import { createAuthRuntime, type AuthRuntime } from "../../../infra/auth/authRuntime";
 import type { AuthStatus } from "../../../infra/auth/types";
 import { createFileSessionStore } from "../../../infra/session/createFileSessionStore";
-import { createMcpRuntime, type McpRuntime, type PendingReviewItem } from "../../../core/mcp";
+import {
+  createMcpRuntime,
+  type McpRuntime,
+  type PendingReviewItem,
+} from "../../../core/mcp";
 import {
   chooseSkillCreationTask,
   createSkillsRuntime,
@@ -66,6 +70,7 @@ import {
 import {
   formatSelectedExtensionsPrompt,
 } from "../../../application/chat/chatMcpSkillsFormatting";
+import { normalizeToolDisplayText } from "./toolDisplay";
 
 type BridgeCommand =
   | { type: "init"; root?: string }
@@ -688,8 +693,8 @@ class BubbleTeaBridge {
     this.executionPlan = null;
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
-    await this.refreshRuntimeMetadata();
     this.emitInit();
+    void this.refreshRuntimeMetadata().catch(() => undefined);
   }
 
   private async loadRuntime(root: string) {
@@ -713,12 +718,12 @@ class BubbleTeaBridge {
       appRoot: this.appRoot,
       requestTemperature: this.config.requestTemperature,
     });
-    this.transport = await this.authRuntime.buildTransport();
     this.sessionStore = createFileSessionStore(undefined, {
       cwd: this.appRoot,
       env: process.env,
     });
     this.mcpService = await createMcpRuntime(this.appRoot);
+    this.transport = await this.rebuildTransportForCurrentMcpTools();
     this.skillsRuntime = await createSkillsRuntime(this.appRoot);
     this.extensionManager =
       this.mcpService && this.skillsRuntime
@@ -726,7 +731,35 @@ class BubbleTeaBridge {
         : null;
     this.pendingReviews = this.listPendingReviews();
     this.markRuntimeMetadataDirty();
-    await this.refreshRuntimeMetadata();
+  }
+
+  private listTransportMcpTools() {
+    const remoteServerIds = new Set(
+      (this.mcpService?.listServers() ?? [])
+        .filter(server => server.transport !== "filesystem")
+        .map(server => server.id)
+    );
+    return (
+      this.mcpService?.listTools().filter(
+        tool =>
+          tool.enabled &&
+          tool.exposure !== "hidden" &&
+          remoteServerIds.has(tool.serverId)
+      ) ?? []
+    );
+  }
+
+  private async rebuildTransportForCurrentMcpTools() {
+    if (!this.authRuntime) {
+      throw new Error("Auth runtime unavailable.");
+    }
+    return await this.authRuntime.buildTransport({
+      mcpTools: this.listTransportMcpTools(),
+    });
+  }
+
+  private normalizeToolDisplayText(raw: string) {
+    return normalizeToolDisplayText(raw, this.mcpService?.listTools() ?? []);
   }
 
   private async ensureRuntime() {
@@ -2117,6 +2150,7 @@ class BubbleTeaBridge {
       clearInput: () => {},
     });
     if (extensionsHandled) {
+      this.transport = await this.rebuildTransportForCurrentMcpTools();
       this.pendingReviews = this.listPendingReviews();
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
       await this.refreshRuntimeMetadata();
@@ -2134,6 +2168,7 @@ class BubbleTeaBridge {
       getApprovalRisk: action => this.getApprovalRisk(action),
     });
     if (mcpHandled) {
+      this.transport = await this.rebuildTransportForCurrentMcpTools();
       this.pendingReviews = this.listPendingReviews();
       this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
       await this.refreshRuntimeMetadata();
@@ -2367,7 +2402,7 @@ class BubbleTeaBridge {
           this.pushItem({
             role: "system",
             kind: "tool_status",
-            text: message,
+            text: this.normalizeToolDisplayText(message),
           });
         },
         onToolCall: async (toolName, input) => {
@@ -2397,7 +2432,9 @@ class BubbleTeaBridge {
             };
           }
 
-          const formatted = formatBridgeToolMessage(result.message);
+          const formatted = formatBridgeToolMessage(
+            this.normalizeToolDisplayText(result.message)
+          );
           this.pushItem({
             role: "system",
             kind: result.ok ? formatted.kind : "error",
@@ -2913,7 +2950,7 @@ class BubbleTeaBridge {
       model: previousModel,
     });
 
-    const nextTransport = await this.authRuntime.buildTransport();
+    const nextTransport = await this.rebuildTransportForCurrentMcpTools();
     if (nextTransport.getProvider() === "local-core" || nextTransport.getProvider() === "none") {
       await restorePreviousSelection();
       this.status = "error";

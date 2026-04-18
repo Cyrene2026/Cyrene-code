@@ -312,6 +312,15 @@ type ShellAuditResult = {
   notes: string[];
 };
 
+const DOWNLOAD_ORIENTED_SHELL_COMMANDS = new Set([
+  "curl",
+  "wget",
+  "invoke-webrequest",
+  "invoke-restmethod",
+  "iwr",
+  "irm",
+]);
+
 const READ_ONLY_ACTIONS: FileAction[] = [
   "read_file",
   "read_files",
@@ -4042,6 +4051,7 @@ export class FileMcpService {
 
     const tokens = tokenized.tokens;
     const commandName = (tokens[0] ?? "").toLowerCase();
+    const isDownloadOrientedCommand = DOWNLOAD_ORIENTED_SHELL_COMMANDS.has(commandName);
     const cwd = request.cwd
       ? this.resolvePath(request.cwd)
       : this.workspaceRootAbsolute;
@@ -4058,16 +4068,17 @@ export class FileMcpService {
       };
     }
 
-    if (
-      ["curl", "wget", "invoke-webrequest", "invoke-restmethod", "iwr", "irm"].includes(commandName)
-    ) {
+    if (isDownloadOrientedCommand) {
       return {
-        ok: false,
+        ok: true,
         shell,
         tokens,
         risk: "high",
-        reason: "run_shell blocks download-oriented commands in v1.",
-        notes: ["Network download commands are treated as high risk."],
+        reason: "run_shell detected a download-oriented command and requires explicit review.",
+        notes: [
+          "Network download commands are treated as high risk.",
+          "Review the command carefully before approving network access or downloaded content.",
+        ],
       };
     }
 
@@ -4086,7 +4097,7 @@ export class FileMcpService {
       };
     }
 
-    if (targetTokens.some(token => looksLikeUrl(token))) {
+    if (!isDownloadOrientedCommand && targetTokens.some(token => looksLikeUrl(token))) {
       return {
         ok: false,
         shell,
@@ -4153,6 +4164,7 @@ export class FileMcpService {
 
     const tokens = tokenized.tokens;
     const commandName = (tokens[0] ?? "").toLowerCase();
+    const isDownloadOrientedCommand = DOWNLOAD_ORIENTED_SHELL_COMMANDS.has(commandName);
     const cwd = cwdOverride ?? session?.cwd ?? this.workspaceRootAbsolute;
     const targetTokens = getShellTargetOperands(commandName, tokens);
 
@@ -4181,15 +4193,18 @@ export class FileMcpService {
       };
     }
 
-    if (["curl", "wget", "invoke-webrequest", "invoke-restmethod", "iwr", "irm"].includes(commandName)) {
+    if (isDownloadOrientedCommand) {
       return {
-        ok: false,
+        ok: true,
         shell,
         tokens,
-        policy: "blocked",
+        policy: "review",
         risk: "high",
-        reason: "write_shell blocks download-oriented commands in v1.",
-        notes: ["Network download commands are treated as high risk."],
+        reason: "write_shell detected a download-oriented command and requires explicit review.",
+        notes: [
+          "Network download commands are treated as high risk.",
+          "Review the command carefully before approving network access or downloaded content.",
+        ],
       };
     }
 
@@ -4221,7 +4236,7 @@ export class FileMcpService {
       };
     }
 
-    if (targetTokens.some(token => looksLikeUrl(token))) {
+    if (!isDownloadOrientedCommand && targetTokens.some(token => looksLikeUrl(token))) {
       return {
         ok: false,
         shell,

@@ -14,6 +14,8 @@ import {
 type HttpMcpAdapterContext = {
   appRoot: string;
   validateRequestUrl?: () => Promise<string | null>;
+  initializeTimeoutMs?: number;
+  discoveryTimeoutMs?: number;
 };
 
 type JsonRpcErrorShape = {
@@ -40,6 +42,8 @@ const CLIENT_INFO = {
 };
 
 const PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05", "2024-10-07"];
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 5_000;
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
 
 const getErrorText = (error: unknown) => {
   if (error instanceof Error) {
@@ -128,7 +132,8 @@ export class HttpMcpAdapter implements McpServerAdapter {
   private async postJsonRpc(
     method: string,
     params?: unknown,
-    notification = false
+    notification = false,
+    timeoutMs?: number
   ) {
     if (!this.server.url) {
       throw new Error(`MCP http server missing url: ${this.server.id}`);
@@ -144,22 +149,41 @@ export class HttpMcpAdapter implements McpServerAdapter {
           Object.entries(this.server.headers).map(([key, value]) => [key, value])
         )
       : {};
-    const response = await fetch(this.server.url, {
-      method: "POST",
-      redirect: "manual",
-      headers: {
-        ...normalizedHeaders,
-        "content-type": "application/json",
-        accept: "application/json",
-        ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        ...(requestId === undefined ? {} : { id: requestId }),
-        method,
-        ...(params === undefined ? {} : { params }),
-      }),
-    });
+    const controller = timeoutMs ? new AbortController() : undefined;
+    const timer = timeoutMs
+      ? setTimeout(() => controller?.abort(), timeoutMs)
+      : undefined;
+    let response: Response;
+    try {
+      response = await fetch(this.server.url, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          ...normalizedHeaders,
+          "content-type": "application/json",
+          accept: "application/json",
+          ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          ...(requestId === undefined ? {} : { id: requestId }),
+          method,
+          ...(params === undefined ? {} : { params }),
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } catch (error) {
+      if ((error as { name?: string })?.name === "AbortError" && timeoutMs) {
+        throw new Error(
+          `MCP http ${method} timed out: ${this.server.id} (${timeoutMs}ms)`
+        );
+      }
+      throw error;
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
 
     const sessionId = response.headers.get("mcp-session-id");
     if (sessionId) {
@@ -223,15 +247,23 @@ export class HttpMcpAdapter implements McpServerAdapter {
 
       for (const protocolVersion of PROTOCOL_VERSIONS) {
         try {
-          await this.postJsonRpc("initialize", {
-            protocolVersion,
-            capabilities: {},
-            clientInfo: CLIENT_INFO,
-          });
+          await this.postJsonRpc(
+            "initialize",
+            {
+              protocolVersion,
+              capabilities: {},
+              clientInfo: CLIENT_INFO,
+            },
+            false,
+            this._context.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS
+          );
           initialized = true;
           break;
         } catch (error) {
           lastError = error;
+          if (getErrorText(error).includes("timed out")) {
+            break;
+          }
         }
       }
 
@@ -244,7 +276,12 @@ export class HttpMcpAdapter implements McpServerAdapter {
       await this.postJsonRpc("notifications/initialized", {}, true);
 
       try {
-        const toolListResult = await this.postJsonRpc("tools/list", {});
+        const toolListResult = await this.postJsonRpc(
+          "tools/list",
+          {},
+          false,
+          this._context.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS
+        );
         const remoteTools = normalizeToolArray(toolListResult);
         if (remoteTools.length > 0) {
           this.descriptor.tools = buildRemoteToolDescriptors(this.server, remoteTools);

@@ -12,6 +12,27 @@ export type McpToolCapability =
 
 export type McpToolRisk = "low" | "medium" | "high";
 export type McpServerTransport = "filesystem" | "stdio" | "http";
+export type McpServerHealthReason =
+  | "initialize_timeout"
+  | "invalid_protocol_output"
+  | "process_exited_early"
+  | "tools_list_failed"
+  | "startup_failed"
+  | "request_failed"
+  | "unknown";
+export type McpServerExitPhase =
+  | "startup"
+  | "initialize"
+  | "initialized"
+  | "tools_list"
+  | "request"
+  | "unknown";
+export type McpServerExitSource =
+  | "cyrene_timeout"
+  | "cyrene_retry"
+  | "cyrene_shutdown"
+  | "external_or_server"
+  | "unknown";
 
 export type McpPolicyDecision = {
   allowed: boolean;
@@ -26,6 +47,7 @@ export type McpToolDescriptor = {
   name: string;
   label: string;
   description?: string;
+  inputSchema?: unknown;
   capabilities: McpToolCapability[];
   risk: McpToolRisk;
   requiresReview: boolean;
@@ -40,6 +62,13 @@ export type McpServerDescriptor = {
   enabled: boolean;
   source: "built_in" | "local" | "remote";
   health: "unknown" | "online" | "offline" | "error";
+  healthReason?: McpServerHealthReason;
+  healthDetail?: string;
+  healthHint?: string;
+  healthExitCode?: number | null;
+  healthExitSignal?: string | null;
+  healthExitPhase?: McpServerExitPhase;
+  healthExitSource?: McpServerExitSource;
   transport?: McpServerTransport;
   aliases?: string[];
   exposure: ExtensionExposureMode;
@@ -178,6 +207,7 @@ export interface McpRuntime {
   approve(id: string): Promise<McpHandleResult>;
   reject(id: string): McpHandleResult;
   undoLastMutation(): Promise<McpHandleResult>;
+  refreshServers?(serverId?: string): Promise<void>;
   listServers(): McpServerDescriptor[];
   listTools(serverId?: string): McpToolDescriptor[];
   describeRuntime?(): McpRuntimeSummary;

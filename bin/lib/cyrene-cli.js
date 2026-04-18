@@ -240,10 +240,10 @@ const parseCyreneConfigContent = content => {
 
   const systemRaw = map.get("system_prompt");
   if (
-    typeof systemPromptRaw === "string" &&
-    trimNonEmpty(systemPromptRaw)
+    typeof systemRaw === "string" &&
+    trimNonEmpty(systemRaw)
   ) {
-    parsed.systemPrompt = systemPromptRaw.trim();
+    parsed.systemPrompt = systemRaw.trim();
   }
 
   return parsed;

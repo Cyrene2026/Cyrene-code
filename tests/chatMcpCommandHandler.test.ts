@@ -4,47 +4,52 @@ import { handleMcpCommand } from "../src/application/chat/chatMcpCommandHandler"
 
 const createMcpService = (
   overrides: Partial<McpRuntime> = {}
-): McpRuntime => ({
-  handleToolCall: mock(async () => ({
-    ok: true,
-    message: "ok",
-  })),
-  listPending: () => [],
-  approve: mock(async () => ({
-    ok: true,
-    message: "approved",
-  })),
-  reject: mock(() => ({
-    ok: true,
-    message: "rejected",
-  })),
-  undoLastMutation: mock(async () => ({
-    ok: true,
-    message: "undo",
-  })),
-  listServers: () => [
-    {
-      id: "ddg-search",
-      label: "ddg-search",
-      enabled: true,
-      source: "remote",
-      health: "unknown",
-      transport: "stdio",
-      aliases: [],
-      exposure: "hinted",
-      tags: [],
-      tools: [],
-    },
-  ],
-  listTools: () => [],
-  describeRuntime: () => ({
-    primaryServerId: "filesystem",
-    serverCount: 1,
-    enabledServerCount: 1,
-    configPaths: [],
-  }),
-  ...overrides,
-});
+): McpRuntime => {
+  const { dispose, ...restOverrides } = overrides;
+
+  return {
+    handleToolCall: mock(async () => ({
+      ok: true,
+      message: "ok",
+    })),
+    listPending: () => [],
+    approve: mock(async () => ({
+      ok: true,
+      message: "approved",
+    })),
+    reject: mock(() => ({
+      ok: true,
+      message: "rejected",
+    })),
+    undoLastMutation: mock(async () => ({
+      ok: true,
+      message: "undo",
+    })),
+    listServers: () => [
+      {
+        id: "ddg-search",
+        label: "ddg-search",
+        enabled: true,
+        source: "remote",
+        health: "unknown",
+        transport: "stdio",
+        aliases: [],
+        exposure: "hinted",
+        tags: [],
+        tools: [],
+      },
+    ],
+    listTools: () => [],
+    describeRuntime: () => ({
+      primaryServerId: "filesystem",
+      serverCount: 1,
+      enabledServerCount: 1,
+      configPaths: [],
+    }),
+    ...restOverrides,
+    dispose: dispose ?? (() => {}),
+  };
+};
 
 describe("handleMcpCommand", () => {
   test("shows current snapshot immediately and refreshes in the background", async () => {

@@ -16,6 +16,7 @@ type HttpMcpAdapterContext = {
   validateRequestUrl?: () => Promise<string | null>;
   initializeTimeoutMs?: number;
   discoveryTimeoutMs?: number;
+  fetchImpl?: typeof fetch;
 };
 
 type JsonRpcErrorShape = {
@@ -155,7 +156,7 @@ export class HttpMcpAdapter implements McpServerAdapter {
       : undefined;
     let response: Response;
     try {
-      response = await fetch(this.server.url, {
+      response = await (this._context.fetchImpl ?? fetch)(this.server.url, {
         method: "POST",
         redirect: "manual",
         headers: {

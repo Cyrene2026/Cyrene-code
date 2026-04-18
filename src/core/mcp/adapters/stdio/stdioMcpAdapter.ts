@@ -127,7 +127,11 @@ const resolveServerCwd = (appRoot: string, cwd?: string) =>
   cwd ? resolve(appRoot, cwd) : appRoot;
 
 const getCommandBasename = (command?: string) =>
-  command ? basename(command).toLowerCase() : "";
+  command
+    ? basename(command)
+        .toLowerCase()
+        .replace(/\.(cmd|exe|bat|ps1)$/i, "")
+    : "";
 
 const isPackageBootstrapCommand = (server: McpConfiguredServer) => {
   const commandName = getCommandBasename(server.command);

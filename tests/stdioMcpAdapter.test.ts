@@ -1269,9 +1269,13 @@ describe("StdioMcpAdapter", () => {
           "--require",
           expect.stringContaining("quietLegacyStdout.cjs"),
           expect.stringContaining("resumeStdin.cjs"),
-          expect.stringContaining("node_modules/@oevortex/ddg_search/bin/cli.js"),
         ])
       );
+      expect(
+        fakeProcess.spawnCalls[1]?.args
+          .map(arg => arg.replaceAll("\\", "/"))
+          .some(arg => arg.includes("node_modules/@oevortex/ddg_search/bin/cli.js"))
+      ).toBe(true);
       expect(result.ok).toBe(true);
       expect(result.message).toContain("search completed");
       expect(adapter.descriptor.health).toBe("online");

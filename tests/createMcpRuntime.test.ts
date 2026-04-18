@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMcpRuntime } from "../src/core/mcp";
 
+const originalFetch = globalThis.fetch;
 const tempRoots: string[] = [];
 const cleanupTasks: Array<() => Promise<void>> = [];
 
@@ -249,6 +250,15 @@ const getAvailablePort = () =>
     });
   });
 
+const createTestMcpRuntime = (
+  root: string,
+  context?: Parameters<typeof createMcpRuntime>[1]
+) =>
+  createMcpRuntime(root, {
+    ...context,
+    fetchImpl: context?.fetchImpl ?? originalFetch,
+  });
+
 afterEach(async () => {
   await Promise.all(
     cleanupTasks.splice(0).map(task => task().catch(() => undefined))
@@ -376,7 +386,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -492,7 +502,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -539,7 +549,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -574,7 +584,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -603,7 +613,7 @@ describe("createMcpRuntime", () => {
 
   test("runtime mutations persist project mcp config and refresh active servers", async () => {
     const { root, cyreneHome } = await createWorkspace();
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -693,7 +703,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -715,7 +725,7 @@ describe("createMcpRuntime", () => {
 
   test("builtin filesystem tool descriptors include semantic tool descriptions", async () => {
     const { root, cyreneHome } = await createWorkspace();
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -751,7 +761,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtimePromise = createMcpRuntime(root, {
+    const runtimePromise = createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -797,7 +807,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -856,7 +866,7 @@ describe("createMcpRuntime", () => {
     await writeFile(join(root, "src", "main.tsx"), "export const App = () => null;\n", "utf8");
     await writeFile(join(root, "scripts.sh"), "echo hi\n", "utf8");
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -905,7 +915,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -946,7 +956,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -991,7 +1001,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,
@@ -1031,7 +1041,7 @@ describe("createMcpRuntime", () => {
       "utf8"
     );
 
-    const runtime = await createMcpRuntime(root, {
+    const runtime = await createTestMcpRuntime(root, {
       env: {
         ...process.env,
         CYRENE_HOME: cyreneHome,

@@ -9,6 +9,7 @@ import type {
 } from "../src/infra/auth/userScopedApiKeyStore";
 import type { QueryTransport } from "../src/core/query/transport";
 
+const originalFetch = globalThis.fetch;
 const tempRoots: string[] = [];
 
 const createTempRoot = async () => {
@@ -94,6 +95,7 @@ afterEach(async () => {
       rm(path, { recursive: true, force: true }).catch(() => undefined)
     )
   );
+  globalThis.fetch = originalFetch;
   mock.restore();
 });
 

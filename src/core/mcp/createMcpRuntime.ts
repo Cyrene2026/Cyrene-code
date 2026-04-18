@@ -50,6 +50,7 @@ type CreateMcpRuntimeContext = {
   env?: NodeJS.ProcessEnv;
   dnsLookup?: DnsLookupFn;
   spawnProcess?: typeof import("node:child_process").spawn;
+  fetchImpl?: typeof fetch;
 };
 
 type InitializableMcpAdapter = McpServerAdapter & {
@@ -385,6 +386,7 @@ const createRemoteServerAdapter = async (
       : server.transport === "http"
         ? new HttpMcpAdapter(server, {
             appRoot,
+            fetchImpl: context?.fetchImpl,
             validateRequestUrl: () =>
               getRemoteHttpBlockMessage(server, origin, context),
           })

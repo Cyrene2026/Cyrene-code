@@ -5,6 +5,7 @@ import {
   type McpConfiguredServer,
 } from "../src/core/mcp";
 
+const originalFetch = globalThis.fetch;
 const cleanupTasks: Array<() => Promise<void>> = [];
 
 const getAvailablePort = () =>
@@ -47,6 +48,7 @@ afterEach(async () => {
   await Promise.all(
     cleanupTasks.splice(0).map(task => task().catch(() => undefined))
   );
+  globalThis.fetch = originalFetch;
 });
 
 describe("HttpMcpAdapter", () => {
@@ -139,6 +141,7 @@ describe("HttpMcpAdapter", () => {
       },
       {
         appRoot: ".",
+        fetchImpl: originalFetch,
       } as never
     );
 
@@ -180,6 +183,7 @@ describe("HttpMcpAdapter", () => {
       createHttpServerConfig(`http://127.0.0.1:${port}/mcp`),
       {
         appRoot: ".",
+        fetchImpl: originalFetch,
       } as never
     );
 
@@ -273,6 +277,7 @@ describe("HttpMcpAdapter", () => {
       createHttpServerConfig(`http://127.0.0.1:${port}/mcp`),
       {
         appRoot: ".",
+        fetchImpl: originalFetch,
         validateRequestUrl: async () => {
           validationCount += 1;
           return validationCount >= 4

@@ -133,7 +133,7 @@ func TestComposerRendersCompositionInlineAtCursor(t *testing.T) {
 
 	rendered := model.RenderComposerForTest(40)
 
-	if !strings.Contains(rendered, "azh|ongb") {
+	if !strings.Contains(rendered, "azh█ongb") {
 		t.Fatalf("expected committed input and composition rendered inline, got %q", rendered)
 	}
 }
@@ -863,6 +863,40 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	}
 	if !strings.Contains(view, strings.Repeat("─", 20)) {
 		t.Fatalf("expected solid divider lines around composer, got %q", view)
+	}
+}
+
+func TestComposerUsesTextareaCursorRendering(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+
+	rendered := model.RenderComposerForTest(40)
+
+	if !strings.Contains(rendered, "hello") {
+		t.Fatalf("expected composer textarea to render input text, got %q", rendered)
+	}
+	if strings.Contains(rendered, "hello|") {
+		t.Fatalf("expected composer textarea to stop rendering pipe cursor, got %q", rendered)
+	}
+}
+
+func TestViewAnchorsTerminalCursorToComposer(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 28
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+
+	_ = model.View()
+	anchor := model.TerminalCursorAnchorForTest()
+
+	if !anchor.Active {
+		t.Fatalf("expected terminal cursor anchor to be active")
+	}
+	if anchor.RowsUp <= 0 {
+		t.Fatalf("expected anchor to move up from footer to composer, got %+v", anchor)
+	}
+	if anchor.ColumnsRight <= len("hello") {
+		t.Fatalf("expected anchor column to include left padding and prompt, got %+v", anchor)
 	}
 }
 

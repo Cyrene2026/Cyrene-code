@@ -7,9 +7,12 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -76,6 +79,12 @@ type ComposerCompositionCommitMsg struct {
 }
 
 type ComposerCompositionClearMsg struct{}
+
+type TerminalCursorAnchor struct {
+	Active       bool
+	RowsUp       int
+	ColumnsRight int
+}
 
 var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/help", Description: "show command list"},
@@ -235,6 +244,7 @@ type Model struct {
 	LiveText                   string
 	Input                      []rune
 	Cursor                     int
+	Composer                   textarea.Model
 	Composition                []rune
 	CompositionCursor          int
 	SlashSelection             int
@@ -257,6 +267,11 @@ type Model struct {
 	transcriptLiveCacheLines   []string
 	transcriptMessageCache     []transcriptMessageCacheEntry
 	transcriptVersion          int
+	composerInitialized        bool
+	composerMirrorValue        string
+	composerMirrorCursor       int
+	terminalCursorAnchorMu     sync.RWMutex
+	terminalCursorAnchor       TerminalCursorAnchor
 
 	ActivePanel Panel
 
@@ -314,7 +329,7 @@ type Model struct {
 }
 
 func NewModel() *Model {
-	return &Model{
+	model := &Model{
 		Width:                  100,
 		Height:                 30,
 		Status:                 StatusPreparing,
@@ -334,6 +349,106 @@ func NewModel() *Model {
 			Text: "Starting Bubble Tea v2 bridge...",
 		}},
 	}
+	model.ensureComposerTextarea()
+	return model
+}
+
+func newComposerTextarea() textarea.Model {
+	input := textarea.New()
+	input.Prompt = "❯ "
+	input.Placeholder = "Ask Cyrene, use / commands, or mention files with @..."
+	input.ShowLineNumbers = false
+	input.EndOfBufferCharacter = ' '
+	input.MaxHeight = 6
+	input.SetPromptFunc(2, func(lineIndex int) string {
+		if lineIndex == 0 {
+			return "❯ "
+		}
+		return "  "
+	})
+	input.SetHeight(1)
+	input.SetWidth(40)
+	_ = input.Cursor.SetMode(cursor.CursorHide)
+	_ = input.Focus()
+	return input
+}
+
+func (m *Model) ensureComposerTextarea() {
+	if m.composerInitialized {
+		return
+	}
+	m.Composer = newComposerTextarea()
+	m.composerInitialized = true
+	m.composerMirrorValue = "\x00"
+	m.composerMirrorCursor = -1
+}
+
+func composerTextareaStyle(promptStyle lipgloss.Style) textarea.Style {
+	return textarea.Style{
+		Base:             lipgloss.NewStyle(),
+		CursorLine:       lipgloss.NewStyle(),
+		CursorLineNumber: lipgloss.NewStyle(),
+		EndOfBuffer:      lipgloss.NewStyle(),
+		LineNumber:       lipgloss.NewStyle(),
+		Placeholder:      toolStatusStyle,
+		Prompt:           promptStyle,
+		Text:             lipgloss.NewStyle(),
+	}
+}
+
+func (m *Model) configureComposerTextarea(width, height int, promptStyle lipgloss.Style, placeholder string) {
+	m.ensureComposerTextarea()
+	style := composerTextareaStyle(promptStyle)
+	m.Composer.FocusedStyle = style
+	m.Composer.BlurredStyle = style
+	m.Composer.Placeholder = placeholder
+	m.Composer.ShowLineNumbers = false
+	m.Composer.EndOfBufferCharacter = ' '
+	m.Composer.SetPromptFunc(2, func(lineIndex int) string {
+		if lineIndex == 0 {
+			return "❯ "
+		}
+		return "  "
+	})
+	m.Composer.SetHeight(clampInt(height, 1, 6))
+	m.Composer.SetWidth(maxInt(1, width))
+	if len(m.Input) == 0 {
+		_ = m.Composer.Cursor.SetMode(cursor.CursorHide)
+	} else {
+		_ = m.Composer.Cursor.SetMode(cursor.CursorStatic)
+	}
+	_ = m.Composer.Focus()
+}
+
+func (m *Model) syncComposerTextareaValue() {
+	m.ensureComposerTextarea()
+	value := string(m.Input)
+	cursorPosition := clampInt(m.Cursor, 0, len(m.Input))
+	if m.composerMirrorValue == value && m.composerMirrorCursor == cursorPosition {
+		return
+	}
+
+	m.Composer.SetValue(value)
+	if cursorPosition < len(m.Input) {
+		m.Composer, _ = m.Composer.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+		for range cursorPosition {
+			m.Composer, _ = m.Composer.Update(tea.KeyMsg{Type: tea.KeyRight})
+		}
+	}
+	m.composerMirrorValue = value
+	m.composerMirrorCursor = cursorPosition
+}
+
+func (m *Model) TerminalCursorAnchor() TerminalCursorAnchor {
+	m.terminalCursorAnchorMu.RLock()
+	defer m.terminalCursorAnchorMu.RUnlock()
+	return m.terminalCursorAnchor
+}
+
+func (m *Model) setTerminalCursorAnchor(anchor TerminalCursorAnchor) {
+	m.terminalCursorAnchorMu.Lock()
+	defer m.terminalCursorAnchorMu.Unlock()
+	m.terminalCursorAnchor = anchor
 }
 
 func (m *Model) Init() tea.Cmd {

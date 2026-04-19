@@ -32,6 +32,10 @@ func (m *Model) RenderComposerForTest(width int) string {
 	return m.renderComposer(width)
 }
 
+func (m *Model) TerminalCursorAnchorForTest() TerminalCursorAnchor {
+	return m.TerminalCursorAnchor()
+}
+
 func (m *Model) SetComposerCompositionForTest(text string, cursor int) {
 	m.setComposerComposition([]rune(text), cursor)
 }

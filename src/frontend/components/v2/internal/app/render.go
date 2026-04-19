@@ -163,6 +163,7 @@ func (m *Model) View() string {
 		lipgloss.Height(footer)
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
 	body := m.renderMainArea(contentWidth, bodyHeight)
+	m.updateTerminalCursorAnchor(contentWidth, lipgloss.Height(composer), lipgloss.Height(bottomComposerDivider), lipgloss.Height(footer))
 
 	parts := []string{
 		header,
@@ -1696,6 +1697,14 @@ func (m *Model) renderComposer(width int) string {
 		lines = append(lines, renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection)...)
 	}
 
+	if len(m.Composition) == 0 {
+		lines = append(lines, m.renderComposerTextarea(contentWidth, promptStyle)...)
+		return style.
+			Width(framedRenderWidth(style, width)).
+			MaxWidth(width).
+			Render(strings.Join(lines, "\n"))
+	}
+
 	for _, row := range rows {
 		prefix := "❯ "
 		if row.Continued {
@@ -1713,6 +1722,106 @@ func (m *Model) renderComposer(width int) string {
 		Width(framedRenderWidth(style, width)).
 		MaxWidth(width).
 		Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) renderComposerTextarea(width int, promptStyle lipgloss.Style) []string {
+	placeholder := "Ask Cyrene, use / commands, or mention files with @..."
+	if m.ActivePanel != PanelNone {
+		placeholder = fmt.Sprintf("Panel %s active. Esc to close, then continue typing.", m.ActivePanel)
+	}
+
+	rowCount := len(m.visibleComposerRows(width))
+	m.configureComposerTextarea(width, rowCount, promptStyle, placeholder)
+	m.syncComposerTextareaValue()
+
+	rendered := strings.TrimRight(m.Composer.View(), "\n")
+	if rendered == "" {
+		return []string{""}
+	}
+	return strings.Split(rendered, "\n")
+}
+
+func (m *Model) updateTerminalCursorAnchor(width, composerHeight, bottomDividerHeight, footerHeight int) {
+	line, column, ok := m.composerCursorAnchorInComposer(width)
+	if !ok || composerHeight <= 0 {
+		m.setTerminalCursorAnchor(TerminalCursorAnchor{})
+		return
+	}
+	line = clampInt(line, 0, maxInt(0, composerHeight-1))
+	m.setTerminalCursorAnchor(TerminalCursorAnchor{
+		Active:       true,
+		RowsUp:       maxInt(0, composerHeight-1-line) + maxInt(0, bottomDividerHeight) + maxInt(0, footerHeight),
+		ColumnsRight: maxInt(0, column),
+	})
+}
+
+func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
+	if m.ActivePanel != PanelNone {
+		return 0, 0, false
+	}
+
+	contentWidth := maxInt(1, width)
+	prefixLines := 0
+	if m.Notice != "" {
+		prefixLines += len(wrapPlainText(m.Notice, contentWidth))
+	}
+	if matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+		prefixLines += len(renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection))
+	}
+
+	row, col, ok := m.composerInputCursorPosition(contentWidth)
+	if !ok {
+		return 0, 0, false
+	}
+
+	paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
+	prefixWidth := lipgloss.Width("❯ ")
+	return prefixLines + row, paddingLeft + prefixWidth + col, true
+}
+
+func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
+	inputWidth := maxInt(1, width-2)
+	cursor := clampInt(m.Cursor, 0, len(m.Input))
+	compositionCursor := clampInt(m.CompositionCursor, 0, len(m.Composition))
+	row, col := 0, 0
+
+	advance := func(values []rune) {
+		for _, value := range values {
+			if value == '\n' {
+				row++
+				col = 0
+				continue
+			}
+			cellWidth := lipgloss.Width(string(value))
+			if col > 0 && col+cellWidth > inputWidth {
+				row++
+				col = 0
+			}
+			col += cellWidth
+		}
+	}
+
+	advance(m.Input[:cursor])
+	if len(m.Composition) > 0 && compositionCursor > 0 {
+		advance(m.Composition[:compositionCursor])
+	}
+
+	cursorRow, cursorCol := row, col
+
+	advance([]rune(composerCursorGlyph))
+	if len(m.Composition) > 0 && compositionCursor < len(m.Composition) {
+		advance(m.Composition[compositionCursor:])
+	}
+	if cursor < len(m.Input) {
+		advance(m.Input[cursor:])
+	}
+
+	firstVisibleRow := maxInt(0, row+1-6)
+	visibleCursorRow := cursorRow - firstVisibleRow
+	if visibleCursorRow < 0 || visibleCursorRow >= 6 {
+		return 0, 0, false
+	}
+	return visibleCursorRow, cursorCol, true
 }
 
 func renderComposerDivider(width int) string {
@@ -1738,6 +1847,8 @@ type composerRow struct {
 	Placeholder bool
 	Continued   bool
 }
+
+const composerCursorGlyph = "█"
 
 func (m *Model) visibleComposerRows(width int) []composerRow {
 	if len(m.Input) == 0 && len(m.Composition) == 0 {
@@ -1775,12 +1886,12 @@ func (m *Model) composerDisplaySegments() []composerSegment {
 		if compositionCursor > 0 {
 			segments = append(segments, composerSegment{Text: string(m.Composition[:compositionCursor]), Kind: "composition"})
 		}
-		segments = append(segments, composerSegment{Text: "|", Kind: "cursor"})
+		segments = append(segments, composerSegment{Text: composerCursorGlyph, Kind: "cursor"})
 		if compositionCursor < len(m.Composition) {
 			segments = append(segments, composerSegment{Text: string(m.Composition[compositionCursor:]), Kind: "composition"})
 		}
 	} else {
-		segments = append(segments, composerSegment{Text: "|", Kind: "cursor"})
+		segments = append(segments, composerSegment{Text: composerCursorGlyph, Kind: "cursor"})
 	}
 	if cursor < len(m.Input) {
 		segments = append(segments, composerSegment{Text: string(m.Input[cursor:]), Kind: "plain"})

@@ -1,22 +1,32 @@
 package app
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 type mouseRegion string
 
 const (
-	mouseRegionNone            mouseRegion = "none"
-	mouseRegionHeader          mouseRegion = "header"
-	mouseRegionTranscript      mouseRegion = "transcript"
-	mouseRegionPanelOther      mouseRegion = "panel_other"
-	mouseRegionApprovalQueue   mouseRegion = "approval_queue"
-	mouseRegionApprovalPreview mouseRegion = "approval_preview"
-	mouseRegionPlanList        mouseRegion = "plan_list"
-	mouseRegionSessionList     mouseRegion = "session_list"
-	mouseRegionModelList       mouseRegion = "model_list"
-	mouseRegionProviderList    mouseRegion = "provider_list"
-	mouseRegionComposer        mouseRegion = "composer"
-	mouseRegionFooter          mouseRegion = "footer"
+	mouseRegionNone                     mouseRegion = "none"
+	mouseRegionHeader                   mouseRegion = "header"
+	mouseRegionTranscript               mouseRegion = "transcript"
+	mouseRegionTranscriptScrollbar      mouseRegion = "transcript_scrollbar"
+	mouseRegionPanelOther               mouseRegion = "panel_other"
+	mouseRegionApprovalQueue            mouseRegion = "approval_queue"
+	mouseRegionApprovalPreview          mouseRegion = "approval_preview"
+	mouseRegionApprovalPreviewScrollbar mouseRegion = "approval_preview_scrollbar"
+	mouseRegionPlanList                 mouseRegion = "plan_list"
+	mouseRegionPlanListScrollbar        mouseRegion = "plan_list_scrollbar"
+	mouseRegionSessionList              mouseRegion = "session_list"
+	mouseRegionSessionListScrollbar     mouseRegion = "session_list_scrollbar"
+	mouseRegionModelList                mouseRegion = "model_list"
+	mouseRegionModelListScrollbar       mouseRegion = "model_list_scrollbar"
+	mouseRegionProviderList             mouseRegion = "provider_list"
+	mouseRegionProviderListScrollbar    mouseRegion = "provider_list_scrollbar"
+	mouseRegionComposer                 mouseRegion = "composer"
+	mouseRegionFooter                   mouseRegion = "footer"
 )
 
 type mouseRect struct {
@@ -79,6 +89,61 @@ type mouseLayout struct {
 type mouseHit struct {
 	Region mouseRegion
 	Index  int
+}
+
+type scrollbarGeometry struct {
+	Region      mouseRegion
+	Rect        mouseRect
+	Scroll      panelScrollState
+	TrackHeight int
+	ThumbStart  int
+	ThumbSize   int
+}
+
+func (g scrollbarGeometry) contains(x, y int) bool {
+	return g.Rect.contains(x, y)
+}
+
+func (g scrollbarGeometry) trackLineAt(y int) int {
+	maxLine := maxInt(0, g.TrackHeight-1)
+	return clampInt(y-g.Rect.Top, 0, maxLine)
+}
+
+func (g scrollbarGeometry) thumbLine() int {
+	if g.ThumbSize <= 0 {
+		return 0
+	}
+	return clampInt(g.ThumbStart+g.ThumbSize/2, 0, maxInt(0, g.Rect.Height-1))
+}
+
+func scrollbarGeometryForBlock(region mouseRegion, left, top, fullRows, visibleRows int, scroll panelScrollState) (scrollbarGeometry, bool) {
+	if fullRows <= 1 || visibleRows <= 0 {
+		return scrollbarGeometry{}, false
+	}
+
+	clickableRows := visibleRows
+	if visibleRows >= fullRows {
+		clickableRows = maxInt(0, fullRows-1)
+	}
+	if clickableRows <= 0 {
+		return scrollbarGeometry{}, false
+	}
+
+	trackHeight := maxInt(0, fullRows-2)
+	thumbStart, thumbSize := scrollbarThumb(scroll, trackHeight)
+	return scrollbarGeometry{
+		Region: region,
+		Rect: mouseRect{
+			Left:   left,
+			Top:    top,
+			Width:  1,
+			Height: clickableRows,
+		},
+		Scroll:      scroll,
+		TrackHeight: trackHeight,
+		ThumbStart:  thumbStart,
+		ThumbSize:   thumbSize,
+	}, true
 }
 
 func (m *Model) mouseLayout() mouseLayout {
@@ -163,8 +228,14 @@ func (m *Model) mouseHitAt(mouseX, mouseY int) mouseHit {
 	layout := m.mouseLayout()
 	switch {
 	case layout.Session.contains(mouseX, mouseY):
+		if geometry, ok := m.transcriptScrollbarGeometry(layout); ok && geometry.contains(mouseX, mouseY) {
+			return mouseHit{Region: geometry.Region, Index: -1}
+		}
 		return mouseHit{Region: mouseRegionTranscript}
 	case layout.HasPanel && layout.Panel.contains(mouseX, mouseY):
+		if geometry, ok := m.panelScrollbarGeometry(layout.Panel); ok && geometry.contains(mouseX, mouseY) {
+			return mouseHit{Region: geometry.Region, Index: -1}
+		}
 		return m.panelMouseHit(layout.Panel, mouseX, mouseY)
 	case layout.Composer.contains(mouseX, mouseY):
 		return mouseHit{Region: mouseRegionComposer}
@@ -174,6 +245,176 @@ func (m *Model) mouseHitAt(mouseX, mouseY int) mouseHit {
 		return mouseHit{Region: mouseRegionFooter}
 	default:
 		return mouseHit{Region: mouseRegionNone}
+	}
+}
+
+func (m *Model) scrollbarGeometryByRegion(region mouseRegion) (scrollbarGeometry, bool) {
+	layout := m.mouseLayout()
+	switch region {
+	case mouseRegionTranscriptScrollbar:
+		return m.transcriptScrollbarGeometry(layout)
+	case mouseRegionApprovalPreviewScrollbar,
+		mouseRegionPlanListScrollbar,
+		mouseRegionSessionListScrollbar,
+		mouseRegionModelListScrollbar,
+		mouseRegionProviderListScrollbar:
+		if !layout.HasPanel {
+			return scrollbarGeometry{}, false
+		}
+		geometry, ok := m.panelScrollbarGeometry(layout.Panel)
+		if !ok || geometry.Region != region {
+			return scrollbarGeometry{}, false
+		}
+		return geometry, true
+	default:
+		return scrollbarGeometry{}, false
+	}
+}
+
+func (m *Model) transcriptScrollbarGeometry(layout mouseLayout) (scrollbarGeometry, bool) {
+	style := frameStyle
+	if m.ActivePanel == PanelNone {
+		style = activeFrameStyle
+	}
+	inner := insetRectForStyle(layout.Session, style)
+	if inner.Width <= 0 || inner.Height <= 0 {
+		return scrollbarGeometry{}, false
+	}
+
+	contentWidth := maxInt(1, inner.Width-2)
+	lines, scroll := m.renderTranscriptWindow(contentWidth, maxInt(1, inner.Height))
+	return scrollbarGeometryForBlock(
+		mouseRegionTranscriptScrollbar,
+		inner.Left+inner.Width-1,
+		inner.Top,
+		len(lines),
+		len(lines),
+		scroll,
+	)
+}
+
+func (m *Model) panelScrollbarGeometry(panelRect mouseRect) (scrollbarGeometry, bool) {
+	inner := insetRectForStyle(panelRect, panelBoxStyle)
+	if inner.Width <= 0 || inner.Height <= 0 {
+		return scrollbarGeometry{}, false
+	}
+
+	bodyWidth := framedInnerWidth(panelBoxStyle, panelRect.Width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, panelRect.Height)
+	x := inner.Left + inner.Width - 1
+
+	switch m.ActivePanel {
+	case PanelApprovals:
+		if len(m.PendingReviews) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(m.PendingReviews), m.ApprovalIndex, approvalQueuePageSize)
+		queueLines := page.End - page.Start
+		selected := m.PendingReviews[clampInt(m.ApprovalIndex, 0, len(m.PendingReviews)-1)]
+		previewSource := selected.PreviewSummary
+		if m.ApprovalPreview == ApprovalFull && strings.TrimSpace(selected.PreviewFull) != "" {
+			previewSource = selected.PreviewFull
+		}
+		previewLines := parseApprovalPreviewLines(previewSource)
+		window := previewWindow(previewLines, m.ApprovalPreviewOffset, approvalPreviewPageLines)
+		renderedRows := 0
+		for _, line := range window.Lines {
+			renderedRows += len(renderApprovalPreviewLines(line, bodyWidth))
+		}
+		startLine := 7 + queueLines
+		visibleRows := minInt(renderedRows, maxInt(0, bodyHeight-1-startLine))
+		return scrollbarGeometryForBlock(
+			mouseRegionApprovalPreviewScrollbar,
+			x,
+			inner.Top+startLine,
+			renderedRows,
+			visibleRows,
+			panelScrollState{
+				Offset:  window.Start,
+				Visible: minInt(window.Total, approvalPreviewPageLines),
+				Total:   window.Total,
+			},
+		)
+	case PanelPlans:
+		if len(m.ExecutionPlan.Steps) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(m.ExecutionPlan.Steps), m.PlanIndex, m.planPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		listRows := maxInt(1, (page.End-page.Start)*2)
+		startLine := 3 + planPanelOverviewRows(bodyWidth, m.ExecutionPlan) + planPanelAcceptedRows(bodyWidth, m.ExecutionPlan)
+		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
+		return scrollbarGeometryForBlock(
+			mouseRegionPlanListScrollbar,
+			x,
+			inner.Top+startLine,
+			listRows,
+			visibleRows,
+			panelScrollState{
+				Offset:  maxInt(0, page.CurrentPage-1),
+				Visible: 1,
+				Total:   maxInt(1, page.TotalPages),
+			},
+		)
+	case PanelSessions:
+		if len(m.Sessions) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		listRows := maxInt(1, (page.End-page.Start)*2)
+		return scrollbarGeometryForBlock(
+			mouseRegionSessionListScrollbar,
+			x,
+			inner.Top+2,
+			listRows,
+			listRows,
+			panelScrollState{
+				Offset:  maxInt(0, page.CurrentPage-1),
+				Visible: 1,
+				Total:   maxInt(1, page.TotalPages),
+			},
+		)
+	case PanelModels:
+		if len(m.AvailableModels) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		listRows := maxInt(1, (page.End-page.Start)*2)
+		startLine := 2 + len(wrapPlainText("custom model id: press c to prefill /model custom <id> in the composer", bodyWidth))
+		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
+		return scrollbarGeometryForBlock(
+			mouseRegionModelListScrollbar,
+			x,
+			inner.Top+startLine,
+			listRows,
+			visibleRows,
+			panelScrollState{
+				Offset:  maxInt(0, page.CurrentPage-1),
+				Visible: 1,
+				Total:   maxInt(1, page.TotalPages),
+			},
+		)
+	case PanelProviders:
+		if len(m.AvailableProviders) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		listRows := maxInt(1, (page.End-page.Start)*3)
+		startLine := 2 + providerPanelCommandRows(bodyWidth)
+		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
+		return scrollbarGeometryForBlock(
+			mouseRegionProviderListScrollbar,
+			x,
+			inner.Top+startLine,
+			listRows,
+			visibleRows,
+			panelScrollState{
+				Offset:  maxInt(0, page.CurrentPage-1),
+				Visible: 1,
+				Total:   maxInt(1, page.TotalPages),
+			},
+		)
+	default:
+		return scrollbarGeometry{}, false
 	}
 }
 

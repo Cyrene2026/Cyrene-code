@@ -270,6 +270,22 @@ func TestRenderMarkdownDiffRemoveUsesWhiteBackgroundAndRedMarker(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownDiffPadsTrailingBackgroundAcrossLine(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	lines := app.RenderMarkdownBodyLinesForTest("+    1 | x", 24, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	trailingBackground := regexp.MustCompile(`48;2;16;59;42m +\x1b\[0m$`)
+
+	if !trailingBackground.MatchString(rendered) {
+		t.Fatalf("expected diff row background to extend through trailing padding, got %q", rendered)
+	}
+}
+
 func TestRenderMarkdownBodyLinesRendersTables(t *testing.T) {
 	lines := app.RenderMarkdownBodyLinesForTest(
 		"| Name | Value |\n| --- | --- |\n| Alpha | 123 |\n| Beta | 456 |",

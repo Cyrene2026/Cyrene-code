@@ -325,6 +325,10 @@ type Model struct {
 	LastMouseActIdx   int
 	IgnorePasteUntil  time.Time
 
+	ScrollbarDragActive     bool
+	ScrollbarDragRegion     mouseRegion
+	ScrollbarDragGrabOffset int
+
 	bridge *bridgeClient
 }
 
@@ -523,6 +527,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		hit := m.mouseHitAt(value.X, value.Y)
 		if value.Action == tea.MouseActionPress && value.Button != tea.MouseButtonWheelUp && value.Button != tea.MouseButtonWheelDown && value.Button != tea.MouseButtonWheelLeft && value.Button != tea.MouseButtonWheelRight {
 			m.rememberMousePress(value, hit)
+		}
+		if m.handleScrollbarMouse(value, hit) {
+			return m, m.withStatusSpinner(nil)
 		}
 		switch value.Button {
 		case tea.MouseButtonWheelUp:
@@ -970,7 +977,7 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleWheelScroll(direction int, hit mouseHit) {
 	switch hit.Region {
-	case mouseRegionTranscript:
+	case mouseRegionTranscript, mouseRegionTranscriptScrollbar:
 		if direction < 0 {
 			m.TranscriptOffset += scrollStep
 			m.clampTranscriptOffset()
@@ -986,21 +993,21 @@ func (m *Model) handleWheelScroll(direction int, hit mouseHit) {
 			m.ApprovalIndex = cycleIndex(m.ApprovalIndex, len(m.PendingReviews), direction)
 			m.ApprovalPreviewOffset = 0
 		}
-	case mouseRegionApprovalPreview:
+	case mouseRegionApprovalPreview, mouseRegionApprovalPreviewScrollbar:
 		m.scrollApprovalPreview(direction * scrollStep)
-	case mouseRegionPlanList:
+	case mouseRegionPlanList, mouseRegionPlanListScrollbar:
 		if len(m.ExecutionPlan.Steps) > 0 {
 			m.PlanIndex = cycleIndex(m.PlanIndex, len(m.ExecutionPlan.Steps), direction)
 		}
-	case mouseRegionSessionList:
+	case mouseRegionSessionList, mouseRegionSessionListScrollbar:
 		if len(m.Sessions) > 0 {
 			m.SessionIndex = cycleIndex(m.SessionIndex, len(m.Sessions), direction)
 		}
-	case mouseRegionModelList:
+	case mouseRegionModelList, mouseRegionModelListScrollbar:
 		if len(m.AvailableModels) > 0 {
 			m.ModelIndex = cycleIndex(m.ModelIndex, len(m.AvailableModels), direction)
 		}
-	case mouseRegionProviderList:
+	case mouseRegionProviderList, mouseRegionProviderListScrollbar:
 		if len(m.AvailableProviders) > 0 {
 			m.ProviderIndex = cycleIndex(m.ProviderIndex, len(m.AvailableProviders), direction)
 		}
@@ -1140,6 +1147,132 @@ func (m *Model) markMouseActivation(now time.Time, hit mouseHit) {
 	m.LastMouseActIdx = hit.Index
 }
 
+func (m *Model) handleScrollbarMouse(msg tea.MouseMsg, hit mouseHit) bool {
+	if m.ScrollbarDragActive {
+		switch msg.Action {
+		case tea.MouseActionMotion:
+			if !m.updateScrollbarDrag(msg.Y) {
+				m.stopScrollbarDrag()
+			}
+			return true
+		case tea.MouseActionRelease:
+			m.stopScrollbarDrag()
+			return true
+		}
+	}
+
+	if msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress {
+		return false
+	}
+
+	geometry, ok := m.scrollbarGeometryByRegion(hit.Region)
+	if !ok {
+		return false
+	}
+
+	m.startScrollbarDrag(geometry, msg.Y)
+	return true
+}
+
+func (m *Model) startScrollbarDrag(geometry scrollbarGeometry, mouseY int) {
+	trackLine := geometry.trackLineAt(mouseY)
+	grabOffset := geometry.ThumbSize / 2
+	if geometry.ThumbSize > 0 && trackLine >= geometry.ThumbStart && trackLine < geometry.ThumbStart+geometry.ThumbSize {
+		grabOffset = trackLine - geometry.ThumbStart
+	}
+
+	m.ScrollbarDragActive = true
+	m.ScrollbarDragRegion = geometry.Region
+	m.ScrollbarDragGrabOffset = maxInt(0, grabOffset)
+	m.dragScrollbarTo(geometry, mouseY)
+}
+
+func (m *Model) stopScrollbarDrag() {
+	m.ScrollbarDragActive = false
+	m.ScrollbarDragRegion = mouseRegionNone
+	m.ScrollbarDragGrabOffset = 0
+}
+
+func (m *Model) updateScrollbarDrag(mouseY int) bool {
+	geometry, ok := m.scrollbarGeometryByRegion(m.ScrollbarDragRegion)
+	if !ok {
+		return false
+	}
+	m.dragScrollbarTo(geometry, mouseY)
+	return true
+}
+
+func (m *Model) dragScrollbarTo(geometry scrollbarGeometry, mouseY int) {
+	maxStart := scrollbarMaxStart(geometry.Scroll, geometry.TrackHeight)
+	if maxStart <= 0 {
+		m.setScrollbarOffset(geometry.Region, geometry.Scroll, 0)
+		return
+	}
+
+	trackLine := geometry.trackLineAt(mouseY)
+	thumbStart := clampInt(trackLine-m.ScrollbarDragGrabOffset, 0, maxStart)
+	m.setScrollbarOffset(geometry.Region, geometry.Scroll, scrollbarOffsetForThumbStart(geometry.Scroll, geometry.TrackHeight, thumbStart))
+}
+
+func scrollbarMaxStart(scroll panelScrollState, trackHeight int) int {
+	if trackHeight <= 0 {
+		return 0
+	}
+	_, thumbSize := scrollbarThumb(scroll, trackHeight)
+	if thumbSize <= 0 {
+		return 0
+	}
+	return maxInt(0, trackHeight-thumbSize)
+}
+
+func scrollbarOffsetForThumbStart(scroll panelScrollState, trackHeight, thumbStart int) int {
+	visible := minInt(scroll.Visible, scroll.Total)
+	maxOffset := maxInt(0, scroll.Total-visible)
+	if trackHeight <= 0 || visible <= 0 || maxOffset <= 0 {
+		return 0
+	}
+
+	maxStart := scrollbarMaxStart(scroll, trackHeight)
+	if maxStart <= 0 {
+		return 0
+	}
+
+	safeStart := clampInt(thumbStart, 0, maxStart)
+	return (safeStart*maxOffset + (maxStart / 2)) / maxStart
+}
+
+func pageSelectionForOffset(currentIndex, total, pageSize, pageOffset int) int {
+	if total <= 0 {
+		return 0
+	}
+
+	safePageSize := maxInt(1, pageSize)
+	safeIndex := clampInt(currentIndex, 0, total-1)
+	rowOffset := safeIndex % safePageSize
+	maxPage := (total - 1) / safePageSize
+	targetPage := clampInt(pageOffset, 0, maxPage)
+	return minInt(targetPage*safePageSize+rowOffset, total-1)
+}
+
+func (m *Model) setScrollbarOffset(region mouseRegion, scroll panelScrollState, offset int) {
+	switch region {
+	case mouseRegionTranscriptScrollbar:
+		maxOffset := maxInt(0, scroll.Total-minInt(scroll.Visible, scroll.Total))
+		m.TranscriptOffset = clampInt(maxOffset-offset, 0, maxOffset)
+		m.clampTranscriptOffset()
+	case mouseRegionApprovalPreviewScrollbar:
+		m.ApprovalPreviewOffset = clampInt(offset, 0, maxInt(0, m.currentApprovalPreviewLineCount()-approvalPreviewPageLines))
+	case mouseRegionPlanListScrollbar:
+		m.PlanIndex = pageSelectionForOffset(m.PlanIndex, len(m.ExecutionPlan.Steps), m.planPanelPageSize(), offset)
+	case mouseRegionSessionListScrollbar:
+		m.SessionIndex = pageSelectionForOffset(m.SessionIndex, len(m.Sessions), m.sessionPanelPageSize(), offset)
+	case mouseRegionModelListScrollbar:
+		m.ModelIndex = pageSelectionForOffset(m.ModelIndex, len(m.AvailableModels), m.modelPanelPageSize(), offset)
+	case mouseRegionProviderListScrollbar:
+		m.ProviderIndex = pageSelectionForOffset(m.ProviderIndex, len(m.AvailableProviders), m.providerPanelPageSize(), offset)
+	}
+}
+
 func (m *Model) activePanelRect() (int, int, int, int, bool) {
 	layout := m.mouseLayout()
 	if !layout.HasPanel {
@@ -1224,6 +1357,17 @@ func planPanelOverviewRows(bodyWidth int, plan ExecutionPlan) int {
 	return rows
 }
 
+func planPanelAcceptedRows(bodyWidth int, plan ExecutionPlan) int {
+	if strings.TrimSpace(plan.AcceptedAt) == "" {
+		return 0
+	}
+	acceptedLabel := "accepted " + plan.AcceptedAt
+	if strings.TrimSpace(plan.AcceptedSummary) != "" {
+		acceptedLabel += "  |  " + plan.AcceptedSummary
+	}
+	return len(wrapPlainText(acceptedLabel, bodyWidth))
+}
+
 func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
 	if rowsPerItem <= 0 {
 		return 1
@@ -1236,12 +1380,7 @@ func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
 }
 
 func providerPanelCommandRows(bodyWidth int) int {
-	return len(wrapPlainText("provider type commands: /provider type list | /provider type <type> [url]", bodyWidth)) +
-		len(wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth)) +
-		len(wrapPlainText("provider format commands: /provider format list | /provider format <format> [url]", bodyWidth)) +
-		len(wrapPlainText("provider endpoint commands: /provider endpoint list | /provider endpoint <kind> <path|url> [provider]", bodyWidth)) +
-		len(wrapPlainText("endpoint kinds: responses | chat_completions | models | anthropic_messages | gemini_generate_content", bodyWidth)) +
-		len(wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth))
+	return 0
 }
 
 func listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataStartLine int) (int, bool) {

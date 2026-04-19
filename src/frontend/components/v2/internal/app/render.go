@@ -112,6 +112,11 @@ var (
 	statusChipBase = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			Padding(0, 1)
+	selectedPanelItemStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("15")).
+				Foreground(lipgloss.Color("0")).
+				ColorWhitespace(true).
+				Bold(true)
 	selectedSlashStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("15")).
 				Foreground(lipgloss.Color("0")).
@@ -130,16 +135,24 @@ var startupShadowLogoLines = []string{
 var statusSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 var (
-	diffPattern         = regexp.MustCompile(`^([+-])\s*(\d+)?\s*\|\s?(.*)$`)
-	numberedDiffPattern = regexp.MustCompile(`^\s*(\d+)\s*\|\s?(.*)$`)
-	orderedListPattern  = regexp.MustCompile(`^(\d+)[.)]\s+(.*)$`)
-	kvPattern           = regexp.MustCompile(`^([a-z][a-z0-9_ ]*):\s*(.*)$`)
-	headerKVPattern     = regexp.MustCompile(`^[a-z_]+=.*$`)
+	diffPattern                  = regexp.MustCompile(`^([+-])\s*(\d+)?\s*\|\s?(.*)$`)
+	numberedDiffPattern          = regexp.MustCompile(`^\s*(\d+)\s*\|\s?(.*)$`)
+	diffStatsPattern             = regexp.MustCompile(`^\s*(?:diff_stats|diff):\s*(\+\d+)\s+(-\d+)\s*$`)
+	fileMutationToolLinePattern  = regexp.MustCompile(`^Tool:\s+(create_file|write_file|edit_file|apply_patch)\s+(.+?)(?:\s+\|\s+.*)?$`)
+	fileMutationReceiptPattern   = regexp.MustCompile(`^(?:Created|Wrote|Edited|Patched) file:\s+(.+)$`)
+	confirmedMutationLinePattern = regexp.MustCompile(`^\[confirmed file mutation\]\s+(create_file|write_file|edit_file|apply_patch)\s+(.+)$`)
+	leakedToolActionJSONPattern  = regexp.MustCompile(`"action"\s*:\s*"(read_file|read_files|read_range|read_json|read_yaml|list_dir|create_dir|create_file|write_file|edit_file|apply_patch|applypatch|delete_file|stat_path|stat_paths|outline_file|find_files|find_symbol|find_references|search_text|search_text_context|copy_path|move_path|git_status|git_diff|git_log|git_show|git_blame|ts_hover|ts_definition|ts_references|ts_diagnostics|ts_prepare_rename|lsp_hover|lsp_definition|lsp_implementation|lsp_type_definition|lsp_references|lsp_workspace_symbols|lsp_document_symbols|lsp_diagnostics|lsp_prepare_rename|lsp_rename|lsp_code_actions|lsp_format_document|run_command|run_shell|open_shell|write_shell|read_shell|shell_status|interrupt_shell|close_shell)"`)
+	leakedFunctionCallPattern    = regexp.MustCompile(`(?:to=functions\.[a-z_]+|recipient_name"\s*:\s*"functions\.[a-z_]+")`)
+	orderedListPattern           = regexp.MustCompile(`^(\d+)[.)]\s+(.*)$`)
+	kvPattern                    = regexp.MustCompile(`^([a-z][a-z0-9_ ]*):\s*(.*)$`)
+	headerKVPattern              = regexp.MustCompile(`^[a-z_]+=.*$`)
 )
 
 const (
 	toolStatusANSIStart = "\x1b[38;2;139;148;158m"
 	toolStatusANSIEnd   = "\x1b[0m"
+	diffAddSignANSI     = "\x1b[38;2;126;231;135m"
+	diffRemoveSignANSI  = "\x1b[38;2;255;161;152m"
 	diffAddANSIStart    = "\x1b[38;2;126;231;135;48;2;16;63;43m"
 	diffRemoveANSIStart = "\x1b[38;2;255;161;152;48;2;93;30;39m"
 	diffANSIEnd         = "\x1b[0m"
@@ -853,11 +866,64 @@ func renderPrefixedTranscriptLines(prefix string, value string, width int, baseS
 }
 
 func sanitizeTranscriptDisplayText(message Message) string {
+	if message.Role == "system" || message.Kind == "tool_status" || message.Kind == "review_status" || message.Kind == "system_hint" {
+		return compactToolStatusDisplayText(stripLeakedToolProtocolText(message.Text))
+	}
 	if message.Role != "assistant" || message.Kind != "transcript" {
 		return message.Text
 	}
+	return stripLeakedToolProtocolText(message.Text)
+}
 
-	rawLines := strings.Split(message.Text, "\n")
+func compactToolStatusDisplayText(text string) string {
+	lines := strings.Split(text, "\n")
+	path := ""
+	diffSummary := ""
+	hasFileMutation := false
+
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if matches := diffStatsPattern.FindStringSubmatch(trimmed); len(matches) == 3 {
+			diffSummary = "diff: " + matches[1] + " " + matches[2]
+			continue
+		}
+		if matches := fileMutationReceiptPattern.FindStringSubmatch(trimmed); len(matches) == 2 {
+			path = strings.TrimSpace(matches[1])
+			hasFileMutation = true
+			continue
+		}
+		if matches := confirmedMutationLinePattern.FindStringSubmatch(trimmed); len(matches) == 3 {
+			if path == "" {
+				path = strings.TrimSpace(matches[2])
+			}
+			hasFileMutation = true
+			continue
+		}
+		if matches := fileMutationToolLinePattern.FindStringSubmatch(trimmed); len(matches) == 3 {
+			if path == "" {
+				path = strings.TrimSpace(matches[2])
+			}
+			hasFileMutation = true
+			continue
+		}
+	}
+
+	if !hasFileMutation || path == "" {
+		return text
+	}
+
+	summary := []string{path}
+	if diffSummary != "" {
+		summary = append(summary, diffSummary)
+	}
+	return strings.Join(summary, "\n")
+}
+
+func stripLeakedToolProtocolText(text string) string {
+	rawLines := strings.Split(text, "\n")
 	filtered := make([]string, 0, len(rawLines))
 	lastBlank := false
 	for _, raw := range rawLines {
@@ -890,7 +956,9 @@ func isLeakedToolProtocolLine(trimmed string) bool {
 		strings.HasPrefix(trimmed, "<parameter "),
 		strings.HasPrefix(trimmed, "</parameter"),
 		strings.HasPrefix(trimmed, "<minimax:tool_call"),
-		strings.HasPrefix(trimmed, "</minimax:tool_call"):
+		strings.HasPrefix(trimmed, "</minimax:tool_call"),
+		(strings.HasPrefix(trimmed, "{") && leakedToolActionJSONPattern.MatchString(trimmed)),
+		leakedFunctionCallPattern.MatchString(trimmed):
 		return true
 	default:
 		return false
@@ -937,6 +1005,8 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		}
 
 		switch {
+		case diffStatsPattern.MatchString(raw):
+			lines = append(lines, renderDiffStatsLine(raw, width, baseStyle)...)
 		case diffPattern.MatchString(raw):
 			parts := diffPattern.FindStringSubmatch(raw)
 			sign := "+"
@@ -1021,6 +1091,23 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		return []string{""}
 	}
 	return lines
+}
+
+func renderDiffStatsLine(raw string, width int, baseStyle lipgloss.Style) []string {
+	parts := diffStatsPattern.FindStringSubmatch(raw)
+	if len(parts) != 3 {
+		return []string{fitDisplayWidth(raw, width)}
+	}
+
+	addDigits := strings.TrimPrefix(parts[1], "+")
+	removeDigits := strings.TrimPrefix(parts[2], "-")
+	rendered := baseStyle.Render("diff: ") +
+		diffAddSignANSI + "+" + diffANSIEnd +
+		baseStyle.Render(addDigits) +
+		" " +
+		diffRemoveSignANSI + "-" + diffANSIEnd +
+		baseStyle.Render(removeDigits)
+	return []string{fitDisplayWidth(rendered, width)}
 }
 
 type markdownTable struct {
@@ -1584,10 +1671,16 @@ func renderDiffContinuationGutter(sign, plain string) string {
 func renderDiffCodeSegment(value string, width int, lineStyle lipgloss.Style) string {
 	segmentWidth := maxInt(1, width+1)
 	if strings.TrimSpace(value) == "" {
-		return lineStyle.Width(segmentWidth).MaxWidth(segmentWidth).Render(strings.Repeat(" ", segmentWidth))
+		return lineStyle.Render(strings.Repeat(" ", segmentWidth))
 	}
-	rendered := fitDisplayWidth(" "+renderCodeLineWithPalette(value, diffCodePalette(lineStyle)), segmentWidth)
-	return lineStyle.Width(segmentWidth).MaxWidth(segmentWidth).Render(rendered)
+
+	renderedCode := renderCodeLineWithPalette(value, diffCodePalette(lineStyle))
+	maxCodeWidth := maxInt(0, segmentWidth-1)
+	if ansi.StringWidth(renderedCode) > maxCodeWidth {
+		renderedCode = ansi.Truncate(renderedCode, maxCodeWidth, "")
+	}
+	padding := maxInt(0, maxCodeWidth-ansi.StringWidth(renderedCode))
+	return lineStyle.Render(" ") + renderedCode + lineStyle.Render(strings.Repeat(" ", padding))
 }
 
 func isQuotedCodeToken(token string) bool {
@@ -2247,6 +2340,7 @@ func (m *Model) renderSessions(width, height int) string {
 func (m *Model) renderModels(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	listWidth := maxInt(1, bodyWidth-2)
 	page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(width, height))
 	headerLines := []string{
 		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "custom c", "esc"),
@@ -2265,17 +2359,22 @@ func (m *Model) renderModels(width, height int) string {
 	for index := page.Start; index < page.End; index++ {
 		model := m.AvailableModels[index]
 		prefix := "  "
-		style := lipgloss.NewStyle()
 		if index == m.ModelIndex {
 			prefix = "> "
-			style = asstStyle.Bold(true)
 		}
 		marker := ""
 		if model == m.CurrentModel {
 			marker = " [current]"
 		}
-		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(model, bodyWidth-20), marker)))
-		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   family %s", modelFamily(model))))
+		nameLine := fmt.Sprintf("%s%s%s", prefix, truncatePlain(model, bodyWidth-20), marker)
+		familyLine := fmt.Sprintf("   family %s", modelFamily(model))
+		if index == m.ModelIndex {
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, nameLine, listWidth))
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, familyLine, listWidth))
+			continue
+		}
+		listLines = append(listLines, nameLine)
+		listLines = append(listLines, dimStyle.Render(familyLine))
 	}
 	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
 		Offset:  maxInt(0, page.CurrentPage-1),
@@ -2293,30 +2392,13 @@ func (m *Model) renderModels(width, height int) string {
 func (m *Model) renderProviders(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	listWidth := maxInt(1, bodyWidth-2)
 	page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(width, height))
 	headerLines := []string{
 		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "esc"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "providers", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
 	bodyLines := []string{}
-	for _, row := range wrapPlainText("provider profile commands: /provider profile list | /provider profile <profile> [url]", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
-	for _, row := range wrapPlainText("provider type commands: /provider type list | /provider type <type> [url]", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
-	for _, row := range wrapPlainText("provider format commands: /provider format list | /provider format <format> [url]", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
-	for _, row := range wrapPlainText("provider endpoint commands: /provider endpoint list | /provider endpoint <kind> <path|url> [provider]", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
-	for _, row := range wrapPlainText("endpoint kinds: responses | chat_completions | models | anthropic_messages | gemini_generate_content", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
-	for _, row := range wrapPlainText("provider name commands: /provider name <display_name> | /provider name list | /provider name clear [url]", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
 	if len(m.AvailableProviders) == 0 {
 		bodyLines = append(bodyLines, dimStyle.Render("No providers available."))
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
@@ -2326,10 +2408,8 @@ func (m *Model) renderProviders(width, height int) string {
 	for index := page.Start; index < page.End; index++ {
 		provider := m.AvailableProviders[index]
 		prefix := "  "
-		style := lipgloss.NewStyle()
 		if index == m.ProviderIndex {
 			prefix = "> "
-			style = asstStyle.Bold(true)
 		}
 		marker := ""
 		if provider == m.CurrentProvider {
@@ -2339,9 +2419,18 @@ func (m *Model) renderProviders(width, height int) string {
 		profile := formatProviderProfileLabel(m.providerProfile(provider))
 		format := formatTransportFormatLabel(m.providerFormat(provider))
 		source := formatProviderProfileSourceLabel(m.providerProfileSource(provider))
-		listLines = append(listLines, style.Render(fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)))
-		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   endpoint %s  |  source %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-30)), maxInt(8, bodyWidth-4)), source)))
-		listLines = append(listLines, dimStyle.Render(fmt.Sprintf("   profile %s  |  format %s", profile, format)))
+		nameLine := fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)
+		endpointLine := fmt.Sprintf("   endpoint %s  |  source %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-30)), maxInt(8, bodyWidth-4)), source)
+		profileLine := fmt.Sprintf("   profile %s  |  format %s", profile, format)
+		if index == m.ProviderIndex {
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, nameLine, listWidth))
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, endpointLine, listWidth))
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, profileLine, listWidth))
+			continue
+		}
+		listLines = append(listLines, nameLine)
+		listLines = append(listLines, dimStyle.Render(endpointLine))
+		listLines = append(listLines, dimStyle.Render(profileLine))
 	}
 	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
 		Offset:  maxInt(0, page.CurrentPage-1),
@@ -2371,13 +2460,13 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
 	bodyLines := []string{}
 
-	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider)
-	typeLine := formatAuthFieldLine(2, "Provider Type", string(m.AuthProviderType), m.AuthStep == AuthStepProviderType)
-	apiLine := formatAuthFieldLine(3, "API Key", maskSecret(string(m.AuthAPIKey)), m.AuthStep == AuthStepAPIKey)
-	modelLine := formatAuthFieldLine(4, "Model", emptyFallback(strings.TrimSpace(string(m.AuthModel)), m.CurrentModel), m.AuthStep == AuthStepModel)
+	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider, bodyWidth)
+	typeLine := formatAuthFieldLine(2, "Provider Type", string(m.AuthProviderType), m.AuthStep == AuthStepProviderType, bodyWidth)
+	apiLine := formatAuthFieldLine(3, "API Key", maskSecret(string(m.AuthAPIKey)), m.AuthStep == AuthStepAPIKey, bodyWidth)
+	modelLine := formatAuthFieldLine(4, "Model", emptyFallback(strings.TrimSpace(string(m.AuthModel)), m.CurrentModel), m.AuthStep == AuthStepModel, bodyWidth)
 	confirmLine := "[5] Confirm and connect"
 	if m.AuthStep == AuthStepConfirm {
-		confirmLine = asstStyle.Bold(true).Render(confirmLine)
+		confirmLine = renderFullWidthStyledLine(selectedPanelItemStyle, confirmLine, bodyWidth)
 	}
 	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, typeLine, apiLine, modelLine, confirmLine)
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
@@ -2399,10 +2488,10 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
-func formatAuthFieldLine(index int, label, value string, selected bool) string {
+func formatAuthFieldLine(index int, label, value string, selected bool, width int) string {
 	line := fmt.Sprintf("[%d] %s  %s", index, label, emptyFallback(strings.TrimSpace(value), "(empty)"))
 	if selected {
-		return asstStyle.Bold(true).Render(line)
+		return renderFullWidthStyledLine(selectedPanelItemStyle, line, width)
 	}
 	return line
 }

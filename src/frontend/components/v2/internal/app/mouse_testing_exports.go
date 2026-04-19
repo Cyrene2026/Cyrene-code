@@ -40,9 +40,58 @@ func (m *Model) ApprovalPreviewMousePointForTest() (int, int, bool) {
 	return inner.pointAtLine(previewStart)
 }
 
+func (m *Model) TranscriptScrollbarThumbMousePointForTest() (int, int, bool) {
+	return m.scrollbarThumbMousePointForTest(mouseRegionTranscriptScrollbar)
+}
+
+func (m *Model) TranscriptScrollbarTrackMousePointForTest(line int) (int, int, bool) {
+	return m.scrollbarTrackMousePointForTest(mouseRegionTranscriptScrollbar, line)
+}
+
+func (m *Model) PanelScrollbarThumbMousePointForTest() (int, int, bool) {
+	return m.scrollbarThumbMousePointForTest(m.activePanelScrollbarRegionForTest())
+}
+
+func (m *Model) PanelScrollbarTrackMousePointForTest(line int) (int, int, bool) {
+	return m.scrollbarTrackMousePointForTest(m.activePanelScrollbarRegionForTest(), line)
+}
+
 func (m *Model) ComposerMousePointForTest() (int, int, bool) {
 	layout := m.mouseLayout()
 	return layout.Composer.pointAtLine(maxInt(0, layout.Composer.Height/2))
+}
+
+func (m *Model) scrollbarThumbMousePointForTest(region mouseRegion) (int, int, bool) {
+	geometry, ok := m.scrollbarGeometryByRegion(region)
+	if !ok {
+		return 0, 0, false
+	}
+	return geometry.Rect.pointAtLine(geometry.thumbLine())
+}
+
+func (m *Model) scrollbarTrackMousePointForTest(region mouseRegion, line int) (int, int, bool) {
+	geometry, ok := m.scrollbarGeometryByRegion(region)
+	if !ok {
+		return 0, 0, false
+	}
+	return geometry.Rect.pointAtLine(line)
+}
+
+func (m *Model) activePanelScrollbarRegionForTest() mouseRegion {
+	switch m.ActivePanel {
+	case PanelApprovals:
+		return mouseRegionApprovalPreviewScrollbar
+	case PanelPlans:
+		return mouseRegionPlanListScrollbar
+	case PanelSessions:
+		return mouseRegionSessionListScrollbar
+	case PanelModels:
+		return mouseRegionModelListScrollbar
+	case PanelProviders:
+		return mouseRegionProviderListScrollbar
+	default:
+		return mouseRegionNone
+	}
 }
 
 func (m *Model) panelItemLineForTest(panelRect mouseRect, index, rowOffset int) (int, bool) {

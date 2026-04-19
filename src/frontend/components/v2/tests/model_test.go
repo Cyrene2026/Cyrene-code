@@ -7,7 +7,87 @@ import (
 
 	"cyrenecode/v2/internal/app"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
+
+var (
+	ansiPattern    = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	ansiSGRPattern = regexp.MustCompile(`\x1b\[([0-9;]*)m`)
+)
+
+func enableColorRenderingForTest(t *testing.T) {
+	t.Helper()
+
+	previousProfile := lipgloss.ColorProfile()
+	previousDarkBackground := lipgloss.HasDarkBackground()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	lipgloss.SetHasDarkBackground(true)
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(previousProfile)
+		lipgloss.SetHasDarkBackground(previousDarkBackground)
+	})
+}
+
+func assertLineUsesInverseSelection(t *testing.T, view, fragment string) {
+	t.Helper()
+
+	for _, line := range strings.Split(view, "\n") {
+		plain := ansiPattern.ReplaceAllString(line, "")
+		if !strings.Contains(plain, fragment) {
+			continue
+		}
+		if !lineHasInverseSelectionANSI(line) {
+			t.Fatalf("expected %q to use inverse selection colors, got %q", fragment, line)
+		}
+		paddingPattern := regexp.MustCompile(regexp.QuoteMeta(fragment) + ` +\x1b\[[0-9;]*m`)
+		if !paddingPattern.MatchString(line) {
+			t.Fatalf("expected %q to keep inverse highlight across trailing padding, got %q", fragment, line)
+		}
+		return
+	}
+
+	t.Fatalf("expected line containing %q, got %q", fragment, view)
+}
+
+func lineHasInverseSelectionANSI(line string) bool {
+	matches := ansiSGRPattern.FindAllStringSubmatch(line, -1)
+	for _, match := range matches {
+		tokens := strings.Split(match[1], ";")
+		if sgrTokensContain(tokens, []string{"30"}) && sgrTokensContain(tokens, []string{"47"}) {
+			return true
+		}
+		if sgrTokensContain(tokens, []string{"30"}) && sgrTokensContain(tokens, []string{"107"}) {
+			return true
+		}
+		if sgrTokensContain(tokens, []string{"38", "5", "0"}) && sgrTokensContain(tokens, []string{"48", "5", "15"}) {
+			return true
+		}
+		if sgrTokensContain(tokens, []string{"38", "2", "0", "0", "0"}) && sgrTokensContain(tokens, []string{"48", "2", "255", "255", "255"}) {
+			return true
+		}
+	}
+	return false
+}
+
+func sgrTokensContain(tokens, sequence []string) bool {
+	if len(sequence) == 0 || len(tokens) < len(sequence) {
+		return false
+	}
+	for start := 0; start <= len(tokens)-len(sequence); start++ {
+		match := true
+		for index, token := range sequence {
+			if tokens[start+index] != token {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
 
 func TestSubmitWithoutBridgeShowsErrorNotice(t *testing.T) {
 	model := app.NewModel()
@@ -562,6 +642,23 @@ func TestTallModelsPanelUsesDynamicPageSize(t *testing.T) {
 	if !strings.Contains(view, "/model custom <id>") {
 		t.Fatalf("expected models panel to mention custom model command, got %q", view)
 	}
+}
+
+func TestModelsPanelSelectedEntryUsesInverseHighlight(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 40
+	model.ActivePanel = app.PanelModels
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.AvailableModels = []string{"gpt-5.4", "claude-3-7-sonnet"}
+	model.ModelIndex = 1
+
+	view := model.View()
+
+	assertLineUsesInverseSelection(t, view, "> claude-3-7-sonnet")
+	assertLineUsesInverseSelection(t, view, "   family anthropic-like")
 }
 
 func TestModelPanelCustomShortcutPrefillsComposer(t *testing.T) {
@@ -1163,8 +1260,8 @@ func TestProvidersPanelShowsProviderFormat(t *testing.T) {
 	if !strings.Contains(view, "profile OpenAI-compatible  |  format") {
 		t.Fatalf("expected provider format in panel list, got %q", view)
 	}
-	if !strings.Contains(view, "endpoint kinds:") || !strings.Contains(view, "chat_completions") {
-		t.Fatalf("expected provider panel endpoint kind hint, got %q", view)
+	if strings.Contains(view, "provider profile commands:") || strings.Contains(view, "endpoint kinds:") {
+		t.Fatalf("expected provider command hints removed from panel, got %q", view)
 	}
 	if !strings.Contains(view, "responses  /responses") {
 		t.Fatalf("expected provider endpoint override in panel detail, got %q", view)
@@ -1172,6 +1269,39 @@ func TestProvidersPanelShowsProviderFormat(t *testing.T) {
 	if !strings.Contains(view, "models     https://catalog.example.com/models") {
 		t.Fatalf("expected provider models endpoint override in panel detail, got %q", view)
 	}
+}
+
+func TestProvidersPanelSelectedEntryUsesInverseHighlight(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 170
+	model.Height = 44
+	model.ActivePanel = app.PanelProviders
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+	model.AvailableProviders = []string{"https://relay.example.com/v1", "https://backup.example.com/v1"}
+	model.ProviderIndex = 0
+	model.ProviderProfiles = map[string]string{
+		"https://relay.example.com/v1":  "openai",
+		"https://backup.example.com/v1": "openai",
+	}
+	model.ProviderFormats = map[string]string{
+		"https://relay.example.com/v1":  "openai_responses",
+		"https://backup.example.com/v1": "openai_chat",
+	}
+	model.ProviderProfileSources = map[string]string{
+		"https://relay.example.com/v1":  "manual",
+		"https://backup.example.com/v1": "manual",
+	}
+	model.ProviderNames = map[string]string{
+		"https://relay.example.com/v1": "Work Relay",
+	}
+
+	view := model.View()
+
+	assertLineUsesInverseSelection(t, view, "> Work Relay")
+	assertLineUsesInverseSelection(t, view, "   endpoint relay.example.com/v1  |  source manual")
+	assertLineUsesInverseSelection(t, view, "   profile OpenAI-compatible  |  format OpenAI Responses")
 }
 
 func TestAssistantToolProtocolLeakIsHiddenFromTranscript(t *testing.T) {
@@ -1210,6 +1340,50 @@ func TestComposerShowsSmartCommandMatches(t *testing.T) {
 	}
 	if !strings.Contains(view, "/provider") {
 		t.Fatalf("expected provider command in matches, got %q", view)
+	}
+}
+
+func TestTranscriptHidesLeakedToolJSONPayload(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 32
+	model.Items = []app.Message{
+		{
+			Role: "assistant",
+			Kind: "transcript",
+			Text: "先看看。\n{\"action\":\"apply_patch\",\"path\":\"simplex.py\",\"find\":\"alpha\",\"replace\":\"beta\"} to=functions.file\n已处理。",
+		},
+	}
+
+	view := model.View()
+
+	if strings.Contains(view, "\"action\":\"apply_patch\"") || strings.Contains(view, "to=functions.file") {
+		t.Fatalf("expected leaked tool JSON payload hidden from transcript, got %q", view)
+	}
+	if !strings.Contains(view, "先看看。") || !strings.Contains(view, "已处理。") {
+		t.Fatalf("expected surrounding assistant text preserved, got %q", view)
+	}
+}
+
+func TestToolStatusHidesLeakedToolJSONPayload(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 20
+	model.Items = []app.Message{
+		{
+			Role: "system",
+			Kind: "tool_status",
+			Text: "Tool: read_range simplex.py | range content hidden\n{\"action\":\"apply_patch\",\"path\":\"simplex.py\",\"find\":\"alpha\",\"replace\":\"beta\"} to=functions.file",
+		},
+	}
+
+	view := model.View()
+
+	if strings.Contains(view, "\"action\":\"apply_patch\"") || strings.Contains(view, "to=functions.file") {
+		t.Fatalf("expected leaked tool JSON payload hidden from tool status, got %q", view)
+	}
+	if !strings.Contains(view, "Tool: read_range simplex.py | range content hidden") {
+		t.Fatalf("expected visible tool status preserved, got %q", view)
 	}
 }
 
@@ -1340,6 +1514,135 @@ func TestWheelOverComposerDoesNothing(t *testing.T) {
 
 	if model.TranscriptOffset != 10 {
 		t.Fatalf("expected composer wheel to leave transcript offset unchanged, got %d", model.TranscriptOffset)
+	}
+}
+
+func TestTranscriptScrollbarDragMovesViewport(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("line\n", 80)},
+	}
+
+	startX, startY, ok := model.TranscriptScrollbarThumbMousePointForTest()
+	if !ok {
+		t.Fatalf("expected transcript scrollbar thumb point")
+	}
+	endX, endY, ok := model.TranscriptScrollbarTrackMousePointForTest(0)
+	if !ok {
+		t.Fatalf("expected transcript scrollbar track point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      startX,
+		Y:      startY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionMotion,
+		X:      endX,
+		Y:      endY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		X:      endX,
+		Y:      endY,
+	})
+
+	if model.TranscriptOffset <= 0 {
+		t.Fatalf("expected transcript drag to move viewport away from live tail, got %d", model.TranscriptOffset)
+	}
+}
+
+func TestSessionScrollbarDragMovesPageSelection(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.Status = app.StatusIdle
+	model.ActivePanel = app.PanelSessions
+	for index := 0; index < 24; index++ {
+		model.Sessions = append(model.Sessions, app.BridgeSession{
+			ID:    "s" + string(rune('a'+index)),
+			Title: "session",
+		})
+	}
+
+	startX, startY, ok := model.PanelScrollbarThumbMousePointForTest()
+	if !ok {
+		t.Fatalf("expected session scrollbar thumb point")
+	}
+	endX, endY, ok := model.PanelScrollbarTrackMousePointForTest(999)
+	if !ok {
+		t.Fatalf("expected session scrollbar track point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      startX,
+		Y:      startY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionMotion,
+		X:      endX,
+		Y:      endY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		X:      endX,
+		Y:      endY,
+	})
+
+	if model.SessionIndex <= 0 {
+		t.Fatalf("expected session drag to move selection to a later page, got %d", model.SessionIndex)
+	}
+	if strings.Contains(model.Notice, "Loading selected session") {
+		t.Fatalf("expected scrollbar drag to avoid loading a session, got notice %q", model.Notice)
+	}
+}
+
+func TestApprovalPreviewScrollbarDragMovesPreviewOffset(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 40
+	model.ActivePanel = app.PanelApprovals
+	model.PendingReviews = []app.BridgeReview{{
+		ID:          "r-1",
+		Action:      "edit_file",
+		Path:        "a.txt",
+		PreviewFull: strings.Repeat("line\n", 60),
+	}}
+
+	startX, startY, ok := model.PanelScrollbarThumbMousePointForTest()
+	if !ok {
+		t.Fatalf("expected approval preview scrollbar thumb point")
+	}
+	endX, endY, ok := model.PanelScrollbarTrackMousePointForTest(999)
+	if !ok {
+		t.Fatalf("expected approval preview scrollbar track point")
+	}
+
+	model.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+		X:      startX,
+		Y:      startY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionMotion,
+		X:      endX,
+		Y:      endY,
+	})
+	model.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		X:      endX,
+		Y:      endY,
+	})
+
+	if model.ApprovalPreviewOffset <= 0 {
+		t.Fatalf("expected approval preview drag to move offset, got %d", model.ApprovalPreviewOffset)
 	}
 }
 
@@ -1615,6 +1918,27 @@ func TestAuthPanelHeaderMentionsAltDigitJump(t *testing.T) {
 	if !strings.Contains(view, "ALT+1/2/3/4") {
 		t.Fatalf("expected auth header to mention alt digit jump, got %q", view)
 	}
+}
+
+func TestAuthPanelSelectedEntryUsesInverseHighlight(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 150
+	model.Height = 36
+	model.ActivePanel = app.PanelAuth
+	model.AuthProvider = []rune("https://api.example.com/v1")
+	model.AuthProviderType = []rune("openai-compatible")
+	model.AuthAPIKey = []rune("sk-live")
+	model.AuthModel = []rune("gpt-5.4")
+	model.AuthStep = app.AuthStepAPIKey
+
+	view := model.View()
+	assertLineUsesInverseSelection(t, view, "[3] API Key  *******")
+
+	model.AuthStep = app.AuthStepConfirm
+	view = model.View()
+	assertLineUsesInverseSelection(t, view, "[5] Confirm and connect")
 }
 
 func TestAuthControlRunesAreIgnored(t *testing.T) {

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -95,6 +95,58 @@ const isWindowsLockError = error =>
       "code" in error &&
       (error.code === "EACCES" || error.code === "EPERM" || error.code === "EBUSY")
   );
+
+const replaceHostAlias = async (sourcePath, aliasPath, label) => {
+  const backupPath = `${aliasPath}.old`;
+  try {
+    await rm(backupPath, { force: true });
+  } catch (error) {
+    if (!isWindowsLockError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    await rm(aliasPath, { force: true });
+  } catch (error) {
+    if (!isWindowsLockError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    await copyFile(sourcePath, aliasPath);
+    return true;
+  } catch (error) {
+    if (!isWindowsLockError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    if (existsSync(aliasPath)) {
+      await rename(aliasPath, backupPath);
+    }
+  } catch (error) {
+    if (!isWindowsLockError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    await copyFile(sourcePath, aliasPath);
+    return true;
+  } catch (error) {
+    if (isWindowsLockError(error)) {
+      console.warn(
+        `Warning: unable to update ${label} alias at ${aliasPath} because the file is busy or locked. ` +
+          `Use the freshly built target artifact directly: ${sourcePath}`
+      );
+      return false;
+    }
+    throw error;
+  }
+};
 
 try {
   await rm(distDir, { recursive: true, force: true });
@@ -199,17 +251,25 @@ if (hostGoarch) {
   if (hostTarget) {
     const sourcePath = resolve(distDir, targetBinaryName(hostTarget));
     const legacyPath = resolve(distDir, legacyBinaryName);
-    await copyFile(sourcePath, legacyPath);
-    if (process.platform !== "win32") {
+    const replacedCliAlias = await replaceHostAlias(sourcePath, legacyPath, "CLI");
+    if (replacedCliAlias && process.platform !== "win32") {
       await chmod(legacyPath, 0o755);
     }
-    console.log(`Built host CLI binary alias at ${legacyPath}.`);
+    if (replacedCliAlias) {
+      console.log(`Built host CLI binary alias at ${legacyPath}.`);
+    }
 
     if (hostTarget.goos === "windows") {
       const helperSourcePath = resolve(distDir, helperBinaryName(hostTarget));
       const helperLegacyPath = resolve(distDir, "cyrene-ime-bridge.exe");
-      await copyFile(helperSourcePath, helperLegacyPath);
-      console.log(`Built host helper alias at ${helperLegacyPath}.`);
+      const replacedHelperAlias = await replaceHostAlias(
+        helperSourcePath,
+        helperLegacyPath,
+        "helper",
+      );
+      if (replacedHelperAlias) {
+        console.log(`Built host helper alias at ${helperLegacyPath}.`);
+      }
     }
   }
 }

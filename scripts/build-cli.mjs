@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, mkdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -31,9 +31,6 @@ const hostGoarch =
 
 const targetBinaryName = target =>
   `cyrene-v2-${target.goos}-${target.goarch}${target.ext}`;
-
-const helperBinaryName = target =>
-  `cyrene-ime-bridge-${target.goos}-${target.goarch}${target.ext}`;
 
 const legacyBinaryName = process.platform === "win32" ? "cyrene-v2.exe" : "cyrene-v2";
 
@@ -96,58 +93,6 @@ const isWindowsLockError = error =>
       (error.code === "EACCES" || error.code === "EPERM" || error.code === "EBUSY")
   );
 
-const replaceHostAlias = async (sourcePath, aliasPath, label) => {
-  const backupPath = `${aliasPath}.old`;
-  try {
-    await rm(backupPath, { force: true });
-  } catch (error) {
-    if (!isWindowsLockError(error)) {
-      throw error;
-    }
-  }
-
-  try {
-    await rm(aliasPath, { force: true });
-  } catch (error) {
-    if (!isWindowsLockError(error)) {
-      throw error;
-    }
-  }
-
-  try {
-    await copyFile(sourcePath, aliasPath);
-    return true;
-  } catch (error) {
-    if (!isWindowsLockError(error)) {
-      throw error;
-    }
-  }
-
-  try {
-    if (existsSync(aliasPath)) {
-      await rename(aliasPath, backupPath);
-    }
-  } catch (error) {
-    if (!isWindowsLockError(error)) {
-      throw error;
-    }
-  }
-
-  try {
-    await copyFile(sourcePath, aliasPath);
-    return true;
-  } catch (error) {
-    if (isWindowsLockError(error)) {
-      console.warn(
-        `Warning: unable to update ${label} alias at ${aliasPath} because the file is busy or locked. ` +
-          `Use the freshly built target artifact directly: ${sourcePath}`
-      );
-      return false;
-    }
-    throw error;
-  }
-};
-
 try {
   await rm(distDir, { recursive: true, force: true });
 } catch (error) {
@@ -202,48 +147,6 @@ for (const target of targets) {
   if (target.goos !== "windows") {
     await chmod(binaryPath, 0o755);
   }
-
-  if (target.goos === "windows") {
-    const helperPath = resolve(distDir, helperBinaryName(target));
-    console.log(`Building helper ${target.goos}/${target.goarch} -> ${helperPath}`);
-
-    let helperBuild;
-    try {
-      helperBuild = Bun.spawn(
-        [
-          goExecutable,
-          "build",
-          "-ldflags",
-          "-H=windowsgui",
-          "-o",
-          helperPath,
-          "./cmd/cyrene-ime-bridge",
-        ],
-        {
-          cwd: v2Dir,
-          stdout: "inherit",
-          stderr: "inherit",
-          stdin: "inherit",
-          env: {
-            ...process.env,
-            CGO_ENABLED: "0",
-            GOOS: target.goos,
-            GOARCH: target.goarch,
-            GOCACHE: goCacheDir,
-          },
-        },
-      );
-    } catch (error) {
-      throw new Error(formatMissingGoMessage(error));
-    }
-
-    const helperExitCode = await helperBuild.exited;
-    if (helperExitCode !== 0) {
-      process.exit(helperExitCode);
-    }
-
-    await stat(helperPath);
-  }
 }
 
 if (hostGoarch) {
@@ -251,26 +154,11 @@ if (hostGoarch) {
   if (hostTarget) {
     const sourcePath = resolve(distDir, targetBinaryName(hostTarget));
     const legacyPath = resolve(distDir, legacyBinaryName);
-    const replacedCliAlias = await replaceHostAlias(sourcePath, legacyPath, "CLI");
-    if (replacedCliAlias && process.platform !== "win32") {
+    await copyFile(sourcePath, legacyPath);
+    if (process.platform !== "win32") {
       await chmod(legacyPath, 0o755);
     }
-    if (replacedCliAlias) {
-      console.log(`Built host CLI binary alias at ${legacyPath}.`);
-    }
-
-    if (hostTarget.goos === "windows") {
-      const helperSourcePath = resolve(distDir, helperBinaryName(hostTarget));
-      const helperLegacyPath = resolve(distDir, "cyrene-ime-bridge.exe");
-      const replacedHelperAlias = await replaceHostAlias(
-        helperSourcePath,
-        helperLegacyPath,
-        "helper",
-      );
-      if (replacedHelperAlias) {
-        console.log(`Built host helper alias at ${helperLegacyPath}.`);
-      }
-    }
+    console.log(`Built host CLI binary alias at ${legacyPath}.`);
   }
 }
 

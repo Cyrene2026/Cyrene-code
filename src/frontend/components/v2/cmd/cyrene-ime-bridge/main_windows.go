@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode/utf16"
 	"unsafe"
@@ -74,6 +75,8 @@ const (
 
 	helperTextColor       = 0x00F4F4F4
 	helperBackgroundColor = 0x00161616
+
+	attachThreadInputTimeoutMs = 100
 )
 
 type nativeEvent struct {
@@ -129,6 +132,7 @@ var (
 	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	procLoadCursorW              = user32.NewProc("LoadCursorW")
 	procMoveWindow               = user32.NewProc("MoveWindow")
+	procMsgWaitForMultipleObjects = user32.NewProc("MsgWaitForMultipleObjects")
 	procPostQuitMessage          = user32.NewProc("PostQuitMessage")
 	procRegisterClassExW         = user32.NewProc("RegisterClassExW")
 	procSetActiveWindow          = user32.NewProc("SetActiveWindow")
@@ -140,6 +144,10 @@ var (
 	procShowWindow               = user32.NewProc("ShowWindow")
 	procTranslateMessage         = user32.NewProc("TranslateMessage")
 	procUpdateWindow             = user32.NewProc("UpdateWindow")
+	procWaitForSingleObject      = kernel32.NewProc("WaitForSingleObject")
+	procCreateEventW             = kernel32.NewProc("CreateEventW")
+	procSetEvent                 = kernel32.NewProc("SetEvent")
+	procCloseHandle              = kernel32.NewProc("CloseHandle")
 	procCreateSolidBrush         = gdi32.NewProc("CreateSolidBrush")
 	procSetBkColor               = gdi32.NewProc("SetBkColor")
 	procSetTextColor             = gdi32.NewProc("SetTextColor")
@@ -151,12 +159,18 @@ var (
 
 	writer = bufio.NewWriter(os.Stdout)
 
-	parentProcPtr       = syscall.NewCallback(windowProc)
-	inputProcPtr        = syscall.NewCallback(inputWindowProc)
-	inputHandle         windows.Handle
-	originalInputProc   uintptr
+	parentProcPtr = syscall.NewCallback(windowProc)
+	inputProcPtr  = syscall.NewCallback(inputWindowProc)
+
+	inputHandle       windows.Handle
+	originalInputProc uintptr
 	suppressedCharCount int
-	backgroundBrush     windows.Handle
+
+	backgroundBrush windows.Handle
+
+	inputMu        sync.Mutex
+	inputDestroyed  bool
+	focusInProgress bool
 )
 
 func main() {
@@ -247,7 +261,12 @@ func createInputWindow(parent windows.Handle, instance windows.Handle) error {
 	if hwnd == 0 {
 		return fmt.Errorf("CreateWindowExW edit control failed: %v", callErr)
 	}
+
+	inputMu.Lock()
 	inputHandle = windows.Handle(hwnd)
+	inputDestroyed = false
+	inputMu.Unlock()
+
 	previous, _, _ := procSetWindowLongPtrW.Call(hwnd, gwlpWndProc, inputProcPtr)
 	originalInputProc = previous
 	resizeInputWindow(parent, helperWidth, helperHeight)
@@ -270,6 +289,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		resizeInputWindow(windows.Handle(hwnd), int32(loword(lParam)), int32(hiword(lParam)))
 		return 0
 	case wmDestroy:
+		markDestroyed()
 		emit(nativeEvent{Type: "composition_clear"})
 		procPostQuitMessage.Call(0)
 		return 0
@@ -280,6 +300,13 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 }
 
 func inputWindowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
+	inputMu.Lock()
+	destroyed := inputDestroyed
+	inputMu.Unlock()
+	if destroyed && message != wmDestroy {
+		return callOriginalInputProc(hwnd, message, wParam, lParam)
+	}
+
 	switch message {
 	case wmKeyDown:
 		if key, ok := translateVirtualKey(uint32(wParam)); ok {
@@ -287,8 +314,13 @@ func inputWindowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintp
 			return 0
 		}
 	case wmChar:
-		if suppressedCharCount > 0 {
+		inputMu.Lock()
+		suppressed := suppressedCharCount
+		if suppressed > 0 {
 			suppressedCharCount--
+		}
+		inputMu.Unlock()
+		if suppressed > 0 {
 			clearInputWindow()
 			return 0
 		}
@@ -323,7 +355,9 @@ func handleIMEComposition(hwnd windows.Handle, lParam uintptr) {
 	if lParam&gcsResultStr != 0 {
 		text := getCompositionString(himc, gcsResultStr)
 		if text != "" {
+			inputMu.Lock()
 			suppressedCharCount += len(utf16.Encode([]rune(text)))
+			inputMu.Unlock()
 			emit(nativeEvent{Type: "composition_commit", Text: text})
 		}
 	}
@@ -395,9 +429,13 @@ func isKeyPressed(code int32) bool {
 }
 
 func resizeInputWindow(parent windows.Handle, width int32, height int32) {
-	if inputHandle == 0 {
+	inputMu.Lock()
+	h := inputHandle
+	inputMu.Unlock()
+	if h == 0 {
 		return
 	}
+
 	marginX := int32(helperMargin)
 	marginY := int32(helperMargin)
 	controlWidth := width - marginX*2
@@ -408,50 +446,129 @@ func resizeInputWindow(parent windows.Handle, width int32, height int32) {
 	if controlHeight < 28 {
 		controlHeight = 28
 	}
-	procMoveWindow.Call(
-		uintptr(inputHandle),
+
+	ret, _, err := procMoveWindow.Call(
+		uintptr(h),
 		uintptr(marginX),
 		uintptr(marginY),
 		uintptr(controlWidth),
 		uintptr(controlHeight),
 		1,
 	)
+	if ret == 0 {
+		fmt.Fprintf(os.Stderr, "cyrene-ime-bridge: MoveWindow failed: %v\n", err)
+	}
 	_ = parent
 }
 
 func ensureInputFocus(parent windows.Handle) {
-	if parent == 0 || inputHandle == 0 {
+	inputMu.Lock()
+	h := inputHandle
+	inputMu.Unlock()
+	if parent == 0 || h == 0 {
 		return
 	}
+
+	inputMu.Lock()
+	if focusInProgress {
+		inputMu.Unlock()
+		return
+	}
+	focusInProgress = true
+	inputMu.Unlock()
+
+	defer func() {
+		inputMu.Lock()
+		focusInProgress = false
+		inputMu.Unlock()
+	}()
+
 	currentThread, _, _ := procGetCurrentThreadID.Call()
 	foregroundWindow, _, _ := procGetForegroundWindow.Call()
-	attached := false
-	var foregroundThread uintptr
+
 	if foregroundWindow != 0 {
-		foregroundThread, _, _ = procGetWindowThreadProcessId.Call(foregroundWindow, 0)
+		foregroundThread, _, _ := procGetWindowThreadProcessId.Call(foregroundWindow, 0)
 		if foregroundThread != 0 && foregroundThread != currentThread {
-			procAttachThreadInput.Call(currentThread, foregroundThread, 1)
-			attached = true
+			if !attachThreadInputWithTimeout(currentThread, foregroundThread) {
+				attachThreadInput(currentThread, foregroundThread, 0)
+			}
 		}
 	}
+
 	procShowWindow.Call(uintptr(parent), swShow)
-	procSetWindowPos.Call(uintptr(parent), hwndTopMost, 0, 0, 0, 0, swpNoMove|swpNoSize|swpShowWindow)
+	procSetWindowPos.Call(uintptr(parent), hwndTopMost, 0, 0, 0, 0, swpNoSize|swpNoMove)
 	procBringWindowToTop.Call(uintptr(parent))
 	procSetActiveWindow.Call(uintptr(parent))
 	procSetForegroundWindow.Call(uintptr(parent))
-	procSetFocus.Call(uintptr(inputHandle))
+
+	inputMu.Lock()
+	currentHandle := inputHandle
+	inputMu.Unlock()
+	if currentHandle != 0 {
+		procSetFocus.Call(uintptr(currentHandle))
+	}
+
 	procSetWindowPos.Call(uintptr(parent), hwndNoTopMost, 0, 0, 0, 0, swpNoMove|swpNoSize|swpShowWindow)
-	if attached {
-		procAttachThreadInput.Call(currentThread, foregroundThread, 0)
+
+	if foregroundWindow != 0 {
+		foregroundThread, _, _ := procGetWindowThreadProcessId.Call(foregroundWindow, 0)
+		if foregroundThread != 0 && foregroundThread != currentThread {
+			attachThreadInput(currentThread, foregroundThread, 0)
+		}
 	}
 }
 
+func attachThreadInputWithTimeout(currentThread, foregroundThread uintptr) bool {
+	stopEvent, _, _ := procCreateEventW.Call(0, 0, 0, 0)
+	if stopEvent == 0 {
+		return false
+	}
+	defer procCloseHandle.Call(stopEvent)
+
+	done := make(chan bool, 1)
+	go func() {
+		attachThreadInput(currentThread, foregroundThread, 1)
+		done <- true
+	}()
+
+	timeout := uint32(attachThreadInputTimeoutMs)
+	select {
+	case <-done:
+		return true
+	default:
+		wait, _, _ := procWaitForSingleObject.Call(stopEvent, uintptr(timeout))
+		if wait == 0x102 {
+			return false
+		}
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func attachThreadInput(currentThread, foregroundThread uintptr, attach uintptr) {
+	procAttachThreadInput.Call(currentThread, foregroundThread, attach)
+}
+
+func markDestroyed() {
+	inputMu.Lock()
+	inputDestroyed = true
+	inputHandle = 0
+	inputMu.Unlock()
+}
+
 func clearInputWindow() {
-	if inputHandle == 0 {
+	inputMu.Lock()
+	h := inputHandle
+	inputMu.Unlock()
+	if h == 0 {
 		return
 	}
 	empty, _ := windows.UTF16PtrFromString("")
-	procSetWindowTextW.Call(uintptr(inputHandle), uintptr(unsafe.Pointer(empty)))
+	procSetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(empty)))
 }
 
 func callOriginalInputProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {

@@ -3,21 +3,31 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"cyrenecode/v2/internal/app"
+	"cyrenecode/v2/internal/nativeinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
 	model := app.NewModel()
-	options := []tea.ProgramOption{}
-	if model.MouseCapture {
-		options = append(options, tea.WithMouseCellMotion())
+	useNativeInput := runtime.GOOS == "windows" && nativeinput.Available()
+	program := tea.NewProgram(model, programOptions(model.MouseCapture, useNativeInput)...)
+	if runtime.GOOS == "windows" {
+		nativeBridge, _, err := nativeinput.Start(program, os.Stderr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cyrene-v2 native-input: %v\n", err)
+			if useNativeInput {
+				program = tea.NewProgram(model, programOptions(model.MouseCapture, false)...)
+			}
+		}
+		if nativeBridge != nil {
+			defer func() {
+				_ = nativeBridge.Close()
+			}()
+		}
 	}
-	program := tea.NewProgram(
-		model,
-		options...,
-	)
 
 	finalModel, err := program.Run()
 	if err != nil {
@@ -28,4 +38,15 @@ func main() {
 		fmt.Fprint(os.Stdout, "\033[2J\033[H")
 		fmt.Fprintln(os.Stdout, resolved.ExitSummaryText())
 	}
+}
+
+func programOptions(mouseCapture bool, useNativeInput bool) []tea.ProgramOption {
+	options := []tea.ProgramOption{}
+	if useNativeInput {
+		options = append(options, tea.WithInput(nil))
+	}
+	if mouseCapture {
+		options = append(options, tea.WithMouseCellMotion())
+	}
+	return options
 }

@@ -44,6 +44,19 @@ func (r mouseRect) inset(dx, dy int) mouseRect {
 	}
 }
 
+func insetRectForStyle(r mouseRect, style lipgloss.Style) mouseRect {
+	left := style.GetPaddingLeft() + style.GetBorderLeftSize()
+	right := style.GetPaddingRight() + style.GetBorderRightSize()
+	top := style.GetPaddingTop() + style.GetBorderTopSize()
+	bottom := style.GetPaddingBottom() + style.GetBorderBottomSize()
+	return mouseRect{
+		Left:   r.Left + left,
+		Top:    r.Top + top,
+		Width:  maxInt(0, r.Width-left-right),
+		Height: maxInt(0, r.Height-top-bottom),
+	}
+}
+
 func (r mouseRect) pointAtLine(line int) (int, int, bool) {
 	if r.Width <= 0 || r.Height <= 0 {
 		return 0, 0, false
@@ -76,41 +89,43 @@ func (m *Model) mouseLayout() mouseLayout {
 
 	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
+	topComposerDivider := renderComposerDivider(contentWidth)
+	bottomComposerDivider := renderComposerDivider(contentWidth)
 	footer := m.renderBottomStatusBar(contentWidth)
 	headerHeight := lipgloss.Height(header)
 	composerHeight := lipgloss.Height(composer)
+	topDividerHeight := lipgloss.Height(topComposerDivider)
+	bottomDividerHeight := lipgloss.Height(bottomComposerDivider)
 	footerHeight := lipgloss.Height(footer)
 
-	fixedHeight := headerHeight + composerHeight + footerHeight + 2
+	fixedHeight := headerHeight + composerHeight + topDividerHeight + bottomDividerHeight + footerHeight
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
-	// After the outer border, header/body/composer/footer are joined directly
-	// with '\n', so each section starts on the next row with no extra spacer.
-	bodyTop := 1 + headerHeight
+	bodyTop := headerHeight
 
 	layout := mouseLayout{
 		Header: mouseRect{
-			Left:   1,
-			Top:    1,
+			Left:   0,
+			Top:    0,
 			Width:  contentWidth,
 			Height: maxInt(1, headerHeight),
 		},
 		Session: mouseRect{
-			Left:   1,
+			Left:   0,
 			Top:    bodyTop,
 			Width:  contentWidth,
 			Height: bodyHeight,
 		},
-		Composer: mouseRect{
-			Left:   1,
-			Top:    bodyTop + bodyHeight,
-			Width:  contentWidth,
-			Height: maxInt(1, composerHeight),
-		},
 		Footer: mouseRect{
-			Left:   1,
-			Top:    bodyTop + bodyHeight + composerHeight,
+			Left:   0,
+			Top:    bodyTop + bodyHeight + topDividerHeight + composerHeight + bottomDividerHeight,
 			Width:  contentWidth,
 			Height: maxInt(1, footerHeight),
+		},
+		Composer: mouseRect{
+			Left:   0,
+			Top:    bodyTop + bodyHeight + topDividerHeight,
+			Width:  contentWidth,
+			Height: maxInt(1, composerHeight),
 		},
 		HasPanel: m.ActivePanel != PanelNone,
 	}
@@ -124,7 +139,7 @@ func (m *Model) mouseLayout() mouseLayout {
 		sessionWidth := maxInt(24, contentWidth-panelWidth-1)
 		layout.Session.Width = sessionWidth
 		layout.Panel = mouseRect{
-			Left:   1 + sessionWidth + 1,
+			Left:   sessionWidth + 1,
 			Top:    bodyTop,
 			Width:  panelWidth,
 			Height: bodyHeight,
@@ -136,7 +151,7 @@ func (m *Model) mouseLayout() mouseLayout {
 	sessionHeight := maxInt(4, bodyHeight-panelHeight-1)
 	layout.Session.Height = sessionHeight
 	layout.Panel = mouseRect{
-		Left:   1,
+		Left:   0,
 		Top:    bodyTop + sessionHeight,
 		Width:  contentWidth,
 		Height: panelHeight,
@@ -163,7 +178,7 @@ func (m *Model) mouseHitAt(mouseX, mouseY int) mouseHit {
 }
 
 func (m *Model) panelMouseHit(panelRect mouseRect, mouseX, mouseY int) mouseHit {
-	inner := panelRect.inset(1, 1)
+	inner := insetRectForStyle(panelRect, panelBoxStyle)
 	if !inner.contains(mouseX, mouseY) {
 		return mouseHit{Region: mouseRegionPanelOther}
 	}

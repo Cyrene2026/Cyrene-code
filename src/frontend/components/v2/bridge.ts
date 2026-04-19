@@ -72,6 +72,7 @@ import {
   formatSelectedExtensionsPrompt,
 } from "../../../application/chat/chatMcpSkillsFormatting";
 import { normalizeToolDisplayText } from "./toolDisplay";
+import { formatReadToolResultDisplay } from "./toolResultFormatting";
 
 type BridgeCommand =
   | { type: "init"; root?: string }
@@ -393,79 +394,6 @@ const collectTrackedPaths = (toolInput: unknown, message: string) => {
   return [...collected].slice(0, 8);
 };
 
-const trimWhitespaceOnlyEdges = (value: string) => {
-  const lines = value.split(/\r?\n/);
-  let start = 0;
-  let end = lines.length;
-  while (start < end && lines[start] !== undefined && lines[start]!.trim() === "") {
-    start += 1;
-  }
-  while (end > start && lines[end - 1] !== undefined && lines[end - 1]!.trim() === "") {
-    end -= 1;
-  }
-  return lines.slice(start, end).join("\n");
-};
-
-const clampReadFilesSection = (value: string, maxLines = 18, maxChars = 1200) => {
-  const trimmed = trimWhitespaceOnlyEdges(value);
-  if (!trimmed) {
-    return "(empty file)";
-  }
-
-  const lines = trimmed.split("\n");
-  const visibleLines = lines.slice(0, maxLines);
-  let preview = visibleLines.join("\n");
-  let truncatedByChars = false;
-  if (preview.length > maxChars) {
-    preview = preview.slice(0, maxChars).trimEnd();
-    truncatedByChars = true;
-  }
-
-  const omittedLineCount = Math.max(0, lines.length - visibleLines.length);
-  if (omittedLineCount > 0 || truncatedByChars) {
-    const suffix = [];
-    if (omittedLineCount > 0) {
-      suffix.push(`${omittedLineCount} more line(s)`);
-    }
-    if (truncatedByChars) {
-      suffix.push("truncated");
-    }
-    preview += `\n... (${suffix.join(", ")})`;
-  }
-  return preview;
-};
-
-const normalizeReadFilesDisplayBody = (body: string) => {
-  const lines = body.split(/\r?\n/);
-  const sections: string[] = [];
-  let currentHeader = "";
-  let currentBody: string[] = [];
-
-  const flush = () => {
-    if (!currentHeader) {
-      return;
-    }
-    const content = clampReadFilesSection(currentBody.join("\n"));
-    sections.push(`${currentHeader}\n${content}`);
-    currentHeader = "";
-    currentBody = [];
-  };
-
-  for (const line of lines) {
-    if (line.startsWith("[file] ")) {
-      flush();
-      currentHeader = line;
-      continue;
-    }
-    currentBody.push(line);
-  }
-  flush();
-
-  return sections.length > 0
-    ? sections.join("\n\n")
-    : trimWhitespaceOnlyEdges(body);
-};
-
 const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text"> => {
   const normalized = normalizeMcpMessage(raw);
   const summary = summarizeChatToolMessage(raw);
@@ -483,12 +411,9 @@ const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text">
       detail.startsWith("read_yaml ") ||
       detail.startsWith("search_text_context ")
     ) {
-      const displayBody = detail.startsWith("read_files ")
-        ? normalizeReadFilesDisplayBody(body || "(empty)")
-        : trimWhitespaceOnlyEdges(body || "(empty)");
       return {
         kind: "tool_status",
-        text: `Tool: ${detail}\n\`\`\`\n${displayBody}\n\`\`\``,
+        text: `Tool: ${detail} | ${formatReadToolResultDisplay(detail, body || "(empty)")}`,
       };
     }
     if (FILE_MUTATION_ACTIONS.has(action)) {

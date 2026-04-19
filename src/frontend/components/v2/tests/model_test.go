@@ -124,6 +124,32 @@ func TestPlainAStillInsertsAfterF6Toggle(t *testing.T) {
 	}
 }
 
+func TestComposerRendersCompositionInlineAtCursor(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 80
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ab")})
+	model.Cursor = 1
+	model.SetComposerCompositionForTest("zhong", 2)
+
+	rendered := model.RenderComposerForTest(40)
+
+	if !strings.Contains(rendered, "azh|ongb") {
+		t.Fatalf("expected committed input and composition rendered inline, got %q", rendered)
+	}
+}
+
+func TestComposerCompositionCommitInsertsRunes(t *testing.T) {
+	model := app.NewModel()
+	model.CommitComposerCompositionForTest("中文")
+
+	if got := string(model.Input); got != "中文" {
+		t.Fatalf("expected committed composition inserted, got %q", got)
+	}
+	if len(model.Composition) != 0 {
+		t.Fatalf("expected composition cleared after commit, got %q", string(model.Composition))
+	}
+}
+
 func TestCtrlVPastesIntoComposerWithoutF6Toggle(t *testing.T) {
 	restore := app.SetClipboardReaderForTest(func() (string, error) {
 		return "alpha\r\nbeta", nil
@@ -138,17 +164,14 @@ func TestCtrlVPastesIntoComposerWithoutF6Toggle(t *testing.T) {
 	}
 }
 
-func TestCopyModeHelperMentionsRightClickPaste(t *testing.T) {
+func TestCopyModeToggleShowsPasteNotice(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
 	model.Height = 24
 
 	model.Update(tea.KeyMsg{Type: tea.KeyF6})
-	model.Notice = ""
-	view := model.View()
-
-	if !strings.Contains(view, "right-click paste") {
-		t.Fatalf("expected copy mode helper to mention right-click paste, got %q", view)
+	if !strings.Contains(model.Notice, "terminal paste is active here") {
+		t.Fatalf("expected copy mode notice to explain terminal paste behavior, got %q", model.Notice)
 	}
 	model.Update(tea.KeyMsg{Type: tea.KeyF6})
 	model.Update(tea.KeyMsg{Type: tea.KeyF6})
@@ -259,18 +282,89 @@ func TestViewUsesTerminalFlowPrefixes(t *testing.T) {
 		{Role: "user", Kind: "transcript", Text: "inspect this repo"},
 		{Role: "assistant", Kind: "transcript", Text: "working on it"},
 		{Role: "system", Kind: "tool_status", Text: "Running read_file | main.go"},
+		{Role: "system", Kind: "system_hint", Text: "Use /help"},
 	}
 
 	view := model.View()
 
-	if !strings.Contains(view, "user>") {
-		t.Fatalf("expected terminal flow user prefix, got %q", view)
+	if strings.Contains(view, "user>") {
+		t.Fatalf("expected compact transcript without user prefix, got %q", view)
 	}
-	if !strings.Contains(view, "assistant>") {
-		t.Fatalf("expected terminal flow assistant prefix, got %q", view)
+	if strings.Contains(view, "assistant>") {
+		t.Fatalf("expected compact transcript without assistant prefix, got %q", view)
 	}
-	if !strings.Contains(view, "tool>") {
-		t.Fatalf("expected terminal flow tool prefix, got %q", view)
+	if strings.Contains(view, "tool>") {
+		t.Fatalf("expected compact transcript without tool prefix, got %q", view)
+	}
+	if strings.Contains(view, "system>") {
+		t.Fatalf("expected compact transcript without system prefix, got %q", view)
+	}
+}
+
+func TestViewRemovesOuterShellBorder(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+
+	view := model.View()
+
+	if strings.Contains(view, "╔") || strings.Contains(view, "╗") || strings.Contains(view, "╚") || strings.Contains(view, "╝") {
+		t.Fatalf("expected outer shell border removed, got %q", view)
+	}
+}
+
+func TestComposerRendersSlashSessionSuggestions(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 24
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/resume")})
+
+	view := model.View()
+
+	if !strings.Contains(view, "/resume") || !strings.Contains(view, "Resume a previous conversation") {
+		t.Fatalf("expected resume suggestion, got %q", view)
+	}
+	if !strings.Contains(view, "/clear") || !strings.Contains(view, "Start a new session with empty context") {
+		t.Fatalf("expected clear suggestion, got %q", view)
+	}
+}
+
+func TestSlashMenuSupportsArrowSelection(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 24
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/resume")})
+
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if model.SlashSelection < 0 {
+		t.Fatalf("expected up arrow to select a slash suggestion")
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "/clear") {
+		t.Fatalf("expected slash suggestion list to include /clear, got %q", view)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := string(model.Input); got != "/clear" {
+		t.Fatalf("expected enter to apply selected slash command, got %q", got)
+	}
+	if model.SlashSelection != -1 {
+		t.Fatalf("expected slash selection reset after applying command, got %d", model.SlashSelection)
+	}
+}
+
+func TestSlashMenuUpSelectsVisibleItemImmediatelyFromBareSlash(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 140
+	model.Height = 24
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+
+	if model.SlashSelection < 0 || model.SlashSelection >= 4 {
+		t.Fatalf("expected first up press to select a visible slash suggestion, got %d", model.SlashSelection)
 	}
 }
 
@@ -327,6 +421,24 @@ func TestSlashPlanShowOpensPlanPanel(t *testing.T) {
 
 	if model.ActivePanel != app.PanelPlans {
 		t.Fatalf("expected plan panel to open, got %q", model.ActivePanel)
+	}
+}
+
+func TestSlashClearStartsNewSessionFlow(t *testing.T) {
+	model := app.NewModel()
+	model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "old session"}}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/clear")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if model.Status != app.StatusPreparing {
+		t.Fatalf("expected /clear to enter preparing state, got %q", model.Status)
+	}
+	if !strings.Contains(model.Notice, "Starting a new session") {
+		t.Fatalf("expected /clear notice to start new session, got %q", model.Notice)
+	}
+	if !strings.Contains(model.View(), "old session") {
+		t.Fatalf("expected current transcript to remain until bridge switches sessions")
 	}
 }
 
@@ -507,6 +619,28 @@ func TestTranscriptRenderKeepsHistoryAcrossLiveUpdates(t *testing.T) {
 	}
 }
 
+func TestLiveTranscriptRendersBeforeTrailingToolStatuses(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: "fix the bug"},
+		{Role: "system", Kind: "tool_status", Text: "Running read_file | main.go..."},
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file main.go | content hidden"},
+	}
+	model.LiveText = "先补齐中间实现，再直接改 simplex.py。"
+
+	view := model.View()
+	liveIndex := strings.Index(view, "先补齐中间实现，再直接改 simplex.py。")
+	toolIndex := strings.Index(view, "Running read_file | main.go...")
+	if liveIndex < 0 || toolIndex < 0 {
+		t.Fatalf("expected both live transcript and tool status, got %q", view)
+	}
+	if liveIndex > toolIndex {
+		t.Fatalf("expected live transcript to render before trailing tool statuses, got %q", view)
+	}
+}
+
 func TestStartupSplashReturnsAfterLiveTextClears(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
@@ -600,26 +734,31 @@ func TestPanelSummaryStaysAtBottomOfSessionsPanel(t *testing.T) {
 	view := model.View()
 	lines := strings.Split(view, "\n")
 	summaryLine := -1
-	bottomBorder := -1
 	for index, line := range lines {
 		if strings.Contains(line, "SESSIONS") && strings.Contains(line, "TOTAL 3") {
 			summaryLine = index
 		}
-		if strings.Contains(line, "┘") && strings.Contains(line, "└") {
-			bottomBorder = index
-			break
-		}
 	}
 
-	if summaryLine < 0 || bottomBorder < 0 {
+	if summaryLine < 0 {
 		t.Fatalf("expected sessions summary/footer lines, got %q", view)
 	}
-	if bottomBorder-summaryLine != 1 {
+	if summaryLine > len(lines)-5 {
 		t.Fatalf("expected sessions summary near panel bottom, got %q", view)
+	}
+	if strings.Contains(lines[summaryLine], "┘") || strings.Contains(lines[summaryLine], "└") {
+		t.Fatalf("expected sessions summary near panel bottom, got %q", view)
+	}
+	if summaryLine+1 >= len(lines) {
+		t.Fatalf("expected one blank line below sessions summary, got %q", view)
+	}
+	nextLineContent := strings.NewReplacer("│", "", "┌", "", "┐", "", "└", "", "┘", "").Replace(lines[summaryLine+1])
+	if strings.TrimSpace(nextLineContent) != "" {
+		t.Fatalf("expected one blank line below sessions summary, got %q", view)
 	}
 }
 
-func TestWidePanelLayoutClosesBothFramesOnSameRow(t *testing.T) {
+func TestWidePanelLayoutStaysSideBySideWithoutBorders(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 180
 	model.Height = 50
@@ -627,12 +766,15 @@ func TestWidePanelLayoutClosesBothFramesOnSameRow(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "┘ └") {
-		t.Fatalf("expected session pane and side panel to close on the same row, got %q", view)
+	if !strings.Contains(view, "terminal workspace") || !strings.Contains(view, "SESSIONS") {
+		t.Fatalf("expected session pane and side panel content to remain visible, got %q", view)
+	}
+	if !strings.Contains(view, "┌") || !strings.Contains(view, "┘") {
+		t.Fatalf("expected sidebar panel to render with a white border, got %q", view)
 	}
 }
 
-func TestViewUsesSquareBorders(t *testing.T) {
+func TestViewUsesBorderlessSessionPaneAndBorderedSidebar(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 100
 	model.Height = 24
@@ -644,14 +786,8 @@ func TestViewUsesSquareBorders(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "┌") {
-		t.Fatalf("expected square border glyphs, got %q", view)
-	}
-	if strings.Contains(view, "╭") {
-		t.Fatalf("expected rounded borders removed, got %q", view)
-	}
-	if !strings.Contains(view, "╔") {
-		t.Fatalf("expected outer special border, got %q", view)
+	if !strings.Contains(view, "┌") || !strings.Contains(view, "┐") || !strings.Contains(view, "└") || !strings.Contains(view, "┘") {
+		t.Fatalf("expected sidebar border glyphs, got %q", view)
 	}
 }
 
@@ -673,11 +809,13 @@ func TestApprovalPreviewLooksLikeTerminalDiff(t *testing.T) {
 	}
 
 	view := model.View()
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plainView := stripANSI.ReplaceAllString(view, "")
 
-	if !strings.Contains(view, "+   12 │") {
+	if !strings.Contains(plainView, "+   12 │") {
 		t.Fatalf("expected terminal diff add gutter, got %q", view)
 	}
-	if !strings.Contains(view, "-   10 │") {
+	if !strings.Contains(plainView, "-   10 │") {
 		t.Fatalf("expected terminal diff remove gutter, got %q", view)
 	}
 }
@@ -696,17 +834,14 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	if strings.Contains(view, "/login  /provider  /model") {
 		t.Fatalf("expected command catalog removed from header, got %q", view)
 	}
-	if !strings.Contains(view, "/help") {
-		t.Fatalf("expected /help hint to remain discoverable, got %q", view)
-	}
 	if !strings.Contains(view, "STATUS") {
 		t.Fatalf("expected top status chips, got %q", view)
 	}
-	headerLine := strings.Split(view, "\n")[1]
+	headerLine := strings.Split(view, "\n")[0]
 	if strings.Contains(headerLine, "MODE ") {
 		t.Fatalf("expected MODE chip removed from header, got %q", headerLine)
 	}
-	if !strings.Contains(view, "PROJECT") || !strings.Contains(view, ".../path/example") {
+	if !strings.Contains(view, "PROJECT") || !strings.Contains(view, "path/example") {
 		t.Fatalf("expected project path to use same chip style, got %q", view)
 	}
 	if !strings.Contains(view, "SESSION") || !strings.Contains(view, "MODEL") || !strings.Contains(view, "FORMAT") || !strings.Contains(view, "PROVIDER") || !strings.Contains(view, "KEY") {
@@ -717,6 +852,17 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	}
 	if !strings.Contains(view, "FORMAT OpenAI Responses") {
 		t.Fatalf("expected provider format in footer, got %q", view)
+	}
+	if strings.Contains(view, "Enter send | Tab complete") {
+		t.Fatalf("expected legacy helper line removed from composer, got %q", view)
+	}
+	promptIndex := strings.Index(view, "❯ Ask Cyrene, use / commands, or mention files with @...")
+	statusIndex := strings.Index(view, "SESSION")
+	if promptIndex < 0 || statusIndex < 0 || promptIndex > statusIndex {
+		t.Fatalf("expected prompt block above footer status row, got %q", view)
+	}
+	if !strings.Contains(view, strings.Repeat("─", 20)) {
+		t.Fatalf("expected solid divider lines around composer, got %q", view)
 	}
 }
 
@@ -730,8 +876,25 @@ func TestSlashSuggestionsIncludeExtensionsAndRenderProfessionalHints(t *testing.
 	if !strings.Contains(view, "/extensions") {
 		t.Fatalf("expected extensions suggestion in composer, got %q", view)
 	}
-	if !strings.Contains(view, "match") || !strings.Contains(view, "also") {
-		t.Fatalf("expected richer match/also suggestion rows, got %q", view)
+	lines := strings.Split(view, "\n")
+	firstSuggestionLine := -1
+	promptLine := -1
+	for index, line := range lines {
+		if firstSuggestionLine < 0 && strings.Contains(line, "/extensions") {
+			firstSuggestionLine = index
+		}
+		if strings.Contains(line, "❯ /ext") {
+			promptLine = index
+		}
+	}
+	if firstSuggestionLine <= 0 || promptLine <= firstSuggestionLine || promptLine+1 >= len(lines) {
+		t.Fatalf("expected slash suggestion block layout discoverable, got %q", view)
+	}
+	if !strings.Contains(lines[firstSuggestionLine-1], strings.Repeat("─", 20)) {
+		t.Fatalf("expected solid separator above slash suggestions, got %q", view)
+	}
+	if !strings.Contains(lines[promptLine+1], strings.Repeat("─", 20)) {
+		t.Fatalf("expected solid separator below slash prompt, got %q", view)
 	}
 	if !strings.Contains(view, "show extensions runtime summary") {
 		t.Fatalf("expected suggestion description in composer, got %q", view)
@@ -1008,11 +1171,38 @@ func TestComposerShowsSmartCommandMatches(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "match") {
-		t.Fatalf("expected smart command matching hint, got %q", view)
+	if !strings.Contains(view, "─") {
+		t.Fatalf("expected compact slash suggestion block, got %q", view)
 	}
 	if !strings.Contains(view, "/provider") {
 		t.Fatalf("expected provider command in matches, got %q", view)
+	}
+}
+
+func TestEscapeClosesPanelWithoutClosedNotice(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 28
+	model.ActivePanel = app.PanelSessions
+	model.Sessions = []app.BridgeSession{
+		{ID: "sess-1", Title: "Current session", UpdatedAt: "2026-04-11T00:00:00Z"},
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+
+	if model.ActivePanel != app.PanelNone {
+		t.Fatalf("expected panel closed, got %q", model.ActivePanel)
+	}
+	if model.Notice != "" {
+		t.Fatalf("expected panel close to be silent, got %q", model.Notice)
+	}
+
+	view := model.View()
+	if strings.Contains(view, "Panel closed.") {
+		t.Fatalf("expected panel closed notice hidden from composer, got %q", view)
+	}
+	if !strings.Contains(view, "❯ Ask Cyrene, use / commands, or mention files with @...") {
+		t.Fatalf("expected default composer prompt after closing panel, got %q", view)
 	}
 }
 

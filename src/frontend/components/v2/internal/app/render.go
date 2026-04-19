@@ -22,74 +22,79 @@ var (
 	startupLogoANSIPalette    = []string{"12", "12", "13", "13"}
 
 	appShellStyle = lipgloss.NewStyle().
-			Border(lipgloss.DoubleBorder()).
-			BorderForeground(lipgloss.Color("13")).
 			Padding(0)
 
 	frameStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("12")).
-			Padding(0, 1)
+			Padding(1, 1, 0, 1)
 
-	activeFrameStyle = frameStyle.Copy().
-				BorderForeground(lipgloss.Color("11"))
+	activeFrameStyle = frameStyle.Copy()
 
 	brandChipStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("11")).
 			Padding(0, 1)
 
-	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	asstStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	reviewStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	systemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
-	sectionStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
-	codeBlockStyle = lipgloss.NewStyle().
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	userStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	userBubbleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(lipgloss.Color("#30363D")).
+			ColorWhitespace(true).
+			Padding(0, 1, 0, 0)
+	asstStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	reviewStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	toolStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B949E"))
+	systemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	sectionStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
+	codeBlockStyle  = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E6EDF3")).
 			Padding(0, 0)
 	inlineCodeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#79C0FF")).
-			Underline(true)
-	codeFenceStyle     = dimStyle.Copy().Italic(true)
-	codeKeywordStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7B72")).Bold(true)
-	codeStringStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#A5D6FF"))
-	codeCommentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B949E")).Italic(true)
-	codeNumberStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF"))
-	codeTypeStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
-	codeBuiltinStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657"))
-	codePlainStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Bold(true)
+	codeFenceStyle      = dimStyle.Copy().Italic(true)
+	codeKeywordStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7B72")).Bold(true)
+	codeStringStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#A5D6FF"))
+	codeCommentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B949E")).Italic(true)
+	codeNumberStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF"))
+	codeTypeStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
+	codeBuiltinStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657"))
+	codePlainStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
+	diffGutterBaseStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#24292F")).
+				Background(lipgloss.Color("#FFFFFF")).
+				ColorWhitespace(true)
 	diffAddGutterStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#7EE787")).
-				Background(lipgloss.Color("#102117")).
 				Bold(true)
 	diffRemoveGutterStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FFA198")).
-				Background(lipgloss.Color("#2A1215")).
 				Bold(true)
 	diffAddLineStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#E6EDF3")).
-				Background(lipgloss.Color("#0D1F15"))
+				Background(lipgloss.Color("#103B2A")).
+				ColorWhitespace(true)
 	diffRemoveLineStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E6EDF3")).
-				Background(lipgloss.Color("#251417"))
+				Foreground(lipgloss.Color("#F0D7DA")).
+				Background(lipgloss.Color("#5D1E27")).
+				ColorWhitespace(true)
 	diffHunkStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#79C0FF")).
 			Bold(true)
 
 	inputBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("12")).
 			Padding(0, 1)
+	compositionStyle = lipgloss.NewStyle().
+				Underline(true).
+				Foreground(lipgloss.Color("#E6EDF3"))
 
-	focusedInputBoxStyle = inputBoxStyle.Copy().
-				BorderForeground(lipgloss.Color("11"))
+	focusedInputBoxStyle = inputBoxStyle.Copy()
 
 	panelBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("12")).
+			BorderForeground(lipgloss.Color("15")).
 			Padding(0, 1)
 
 	panelHeaderBarStyle = lipgloss.NewStyle().
@@ -99,13 +104,18 @@ var (
 
 	panelSummaryStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("15"))
+				Foreground(lipgloss.Color("0")).
+				Background(lipgloss.Color("#FFF"))
 
 	cursorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	statusKeyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	statusChipBase = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			Padding(0, 1)
+	selectedSlashStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("15")).
+				Foreground(lipgloss.Color("0")).
+				Bold(true)
 )
 
 var startupShadowLogoLines = []string{
@@ -127,6 +137,14 @@ var (
 	headerKVPattern     = regexp.MustCompile(`^[a-z_]+=.*$`)
 )
 
+const (
+	toolStatusANSIStart = "\x1b[38;2;139;148;158m"
+	toolStatusANSIEnd   = "\x1b[0m"
+	diffAddANSIStart    = "\x1b[38;2;126;231;135;48;2;16;63;43m"
+	diffRemoveANSIStart = "\x1b[38;2;255;161;152;48;2;93;30;39m"
+	diffANSIEnd         = "\x1b[0m"
+)
+
 func (m *Model) View() string {
 	width := maxInt(50, m.Width)
 	height := maxInt(18, m.Height)
@@ -135,15 +153,23 @@ func (m *Model) View() string {
 
 	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
+	topComposerDivider := renderComposerDivider(contentWidth)
+	bottomComposerDivider := renderComposerDivider(contentWidth)
 	footer := m.renderBottomStatusBar(contentWidth)
-	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	fixedHeight := lipgloss.Height(header) +
+		lipgloss.Height(composer) +
+		lipgloss.Height(topComposerDivider) +
+		lipgloss.Height(bottomComposerDivider) +
+		lipgloss.Height(footer)
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
 	body := m.renderMainArea(contentWidth, bodyHeight)
 
 	parts := []string{
 		header,
 		body,
+		topComposerDivider,
 		composer,
+		bottomComposerDivider,
 		footer,
 	}
 	content := strings.Join(parts, "\n")
@@ -454,9 +480,9 @@ func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScroll
 }
 
 func (m *Model) renderSessionPane(width, height int, active bool) string {
-	style := frameStyle.Copy().BorderForeground(lipgloss.Color("11"))
+	style := frameStyle.Copy()
 	if active {
-		style = activeFrameStyle.Copy().BorderForeground(lipgloss.Color("11"))
+		style = activeFrameStyle.Copy()
 	}
 	bodyWidth := framedInnerWidth(style, width)
 	bodyHeight := framedInnerHeight(style, height)
@@ -467,7 +493,7 @@ func (m *Model) renderSessionPane(width, height int, active bool) string {
 }
 
 func (m *Model) renderTranscriptLines(width int) []string {
-	if m.transcriptCacheWidth == width && m.transcriptCacheVersion == m.transcriptVersion && m.transcriptCacheLines != nil {
+	if !m.hasAnimatedToolStatus() && m.transcriptCacheWidth == width && m.transcriptCacheVersion == m.transcriptVersion && m.transcriptCacheLines != nil {
 		return m.transcriptCacheLines
 	}
 
@@ -476,42 +502,42 @@ func (m *Model) renderTranscriptLines(width int) []string {
 		if m.ActivePanel != PanelNone {
 			lines = m.renderCompactStartupLines(width)
 		}
-		m.transcriptCacheWidth = width
-		m.transcriptCacheVersion = m.transcriptVersion
-		m.transcriptCacheLines = lines
+		if !m.hasAnimatedToolStatus() {
+			m.transcriptCacheWidth = width
+			m.transcriptCacheVersion = m.transcriptVersion
+			m.transcriptCacheLines = lines
+		}
 		return lines
 	}
 
 	lines := append([]string(nil), m.renderStaticTranscriptLines(width)...)
 	if liveLines := m.renderLiveTranscriptLines(width); len(liveLines) > 0 {
-		lines = append(lines, liveLines...)
+		lines = m.insertLiveTranscriptLines(lines, liveLines, width)
 	}
 	if len(lines) == 0 {
 		lines = append(lines, dimStyle.Render("No transcript yet."))
 	}
 
-	m.transcriptCacheWidth = width
-	m.transcriptCacheVersion = m.transcriptVersion
-	m.transcriptCacheLines = lines
+	if !m.hasAnimatedToolStatus() {
+		m.transcriptCacheWidth = width
+		m.transcriptCacheVersion = m.transcriptVersion
+		m.transcriptCacheLines = lines
+	}
 	return lines
 }
 
 func (m *Model) renderStaticTranscriptLines(width int) []string {
-	if m.transcriptStaticCacheWidth == width && m.transcriptStaticCacheLines != nil {
+	if !m.hasAnimatedToolStatus() && m.transcriptStaticCacheWidth == width && m.transcriptStaticCacheLines != nil {
 		return m.transcriptStaticCacheLines
 	}
 
 	m.syncTranscriptMessageCache()
-	lines := make([]string, 0, len(m.Items)*3)
-	for index, item := range m.Items {
-		lines = append(lines, m.renderCachedMessageLines(index, item, width)...)
-		if index < len(m.Items)-1 && item.Kind == "transcript" && m.Items[index+1].Kind != "transcript" {
-			lines = append(lines, "")
-		}
-	}
+	lines := m.renderTranscriptItemRange(0, len(m.Items), width)
 
-	m.transcriptStaticCacheWidth = width
-	m.transcriptStaticCacheLines = lines
+	if !m.hasAnimatedToolStatus() {
+		m.transcriptStaticCacheWidth = width
+		m.transcriptStaticCacheLines = lines
+	}
 	return lines
 }
 
@@ -525,6 +551,10 @@ func (m *Model) syncTranscriptMessageCache() {
 }
 
 func (m *Model) renderCachedMessageLines(index int, item Message, width int) []string {
+	if m.isAnimatedToolStatus(index, item) {
+		return m.renderAnimatedToolStatusLines(item, width)
+	}
+
 	if index < 0 || index >= len(m.transcriptMessageCache) {
 		return renderMessageLines(item, width)
 	}
@@ -538,6 +568,86 @@ func (m *Model) renderCachedMessageLines(index int, item Message, width int) []s
 	entry.message = item
 	entry.lines = renderMessageLines(item, width)
 	return entry.lines
+}
+
+func (m *Model) hasAnimatedToolStatus() bool {
+	if !m.isAnimatingStatus() || len(m.Items) == 0 {
+		return false
+	}
+	return isRunningToolStatus(m.Items[len(m.Items)-1])
+}
+
+func (m *Model) isAnimatedToolStatus(index int, item Message) bool {
+	return m.isAnimatingStatus() && index == len(m.Items)-1 && isRunningToolStatus(item)
+}
+
+func (m *Model) insertLiveTranscriptLines(staticLines, liveLines []string, width int) []string {
+	if len(liveLines) == 0 {
+		return staticLines
+	}
+	start := m.trailingSystemStatusStart()
+	if start >= len(m.Items) {
+		return append(staticLines, liveLines...)
+	}
+
+	head := m.renderTranscriptItemRange(0, start, width)
+	tail := m.renderTranscriptItemRange(start, len(m.Items), width)
+	combined := make([]string, 0, len(head)+len(liveLines)+len(tail))
+	combined = append(combined, head...)
+	if len(combined) > 0 && strings.TrimSpace(combined[len(combined)-1]) != "" {
+		combined = append(combined, "")
+	}
+	combined = append(combined, liveLines...)
+	if len(tail) > 0 && strings.TrimSpace(tail[0]) != "" {
+		combined = append(combined, "")
+	}
+	combined = append(combined, tail...)
+	return combined
+}
+
+func (m *Model) trailingSystemStatusStart() int {
+	start := len(m.Items)
+	for start > 0 {
+		item := m.Items[start-1]
+		if !isTrailingSystemStatus(item) {
+			break
+		}
+		start--
+	}
+	return start
+}
+
+func isTrailingSystemStatus(item Message) bool {
+	if item.Role != "system" {
+		return false
+	}
+	switch item.Kind {
+	case "tool_status", "review_status", "error", "system_hint":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Model) renderTranscriptItemRange(start, end, width int) []string {
+	start = clampInt(start, 0, len(m.Items))
+	end = clampInt(end, start, len(m.Items))
+	lines := make([]string, 0, maxInt(0, end-start)*3)
+	for index := start; index < end; index++ {
+		item := m.Items[index]
+		if index > start && item.Role == "user" && item.Kind == "transcript" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, m.renderCachedMessageLines(index, item, width)...)
+		if index < end-1 && item.Role == "user" && item.Kind == "transcript" {
+			lines = append(lines, "")
+			continue
+		}
+		if index < end-1 && item.Kind == "transcript" && m.Items[index+1].Kind != "transcript" {
+			lines = append(lines, "")
+		}
+	}
+	return lines
 }
 
 func (m *Model) renderLiveTranscriptLines(width int) []string {
@@ -569,7 +679,8 @@ func (m *Model) shouldShowStartupView() bool {
 }
 
 func (m *Model) renderStartupLines(width int) []string {
-	lines := make([]string, 0, len(startupShadowLogoLines)+18)
+	lines := make([]string, 0, len(startupShadowLogoLines)+20)
+	lines = append(lines, "")
 	logoLines, logoWidth := startupLogoLinesForWidth(width)
 	for index, line := range logoLines {
 		lines = append(lines, renderGradientLogoLine(line, index, len(logoLines), logoWidth))
@@ -594,12 +705,14 @@ func (m *Model) renderStartupLines(width int) []string {
 		"• One-screen workflow without leaving the terminal.",
 		"",
 		"Use /help for full command reference.",
+		"",
 	)
 	return wrapLinesToWidth(lines, width)
 }
 
 func (m *Model) renderCompactStartupLines(width int) []string {
 	lines := []string{
+		"",
 		titleStyle.Bold(true).Render("terminal workspace"),
 		dimStyle.Render("Startup splash is compressed while the inspector is open."),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("active panel  %s", emptyFallback(string(m.ActivePanel), "none")), width)),
@@ -615,11 +728,29 @@ func (m *Model) renderCompactStartupLines(width int) []string {
 		"/help  command reference and shortcuts",
 		"/sessions  /review  /model  /provider",
 		"Esc closes the panel and restores the full startup view.",
+		"",
 	}
 	return wrapLinesToWidth(lines, width)
 }
 
 func renderMessageLines(message Message, width int) []string {
+	if message.Role == "user" && message.Kind == "transcript" {
+		return renderUserTranscriptLines(message, width)
+	}
+
+	if message.Kind == "tool_status" {
+		lines := renderPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, lipgloss.NewStyle())
+		return wrapTranscriptLinesWithANSI(lines, toolStatusANSIStart, toolStatusANSIEnd)
+	}
+
+	if shouldRenderCompactTranscript(message) {
+		lines := renderPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, transcriptBodyStyle(message))
+		if len(lines) == 0 {
+			return []string{""}
+		}
+		return lines
+	}
+
 	label, labelStyle, contentStyle := messageStyles(message)
 	prefixWidth := minInt(10, maxInt(6, width/6))
 	bodyWidth := maxInt(1, width-prefixWidth-1)
@@ -636,6 +767,86 @@ func renderMessageLines(message Message, width int) []string {
 			continue
 		}
 		lines = append(lines, dimStyle.Render(padding)+" "+row)
+	}
+	return lines
+}
+
+func isRunningToolStatus(message Message) bool {
+	return message.Kind == "tool_status" && strings.HasPrefix(strings.TrimSpace(message.Text), "Running ")
+}
+
+func (m *Model) renderAnimatedToolStatusLines(message Message, width int) []string {
+	text := strings.TrimSpace(message.Text)
+	if strings.HasPrefix(text, "Running ") {
+		text = strings.TrimPrefix(text, "Running ")
+		text = "Calling tool: " + text
+	}
+	frame := "•"
+	if len(statusSpinnerFrames) > 0 {
+		frame = statusSpinnerFrames[m.SpinnerFrame%len(statusSpinnerFrames)]
+	}
+	lines := renderPrefixedTranscriptLines(frame+" ", text, width, lipgloss.NewStyle())
+	return wrapTranscriptLinesWithANSI(lines, toolStatusANSIStart, toolStatusANSIEnd)
+}
+
+func wrapTranscriptLinesWithANSI(lines []string, start, end string) []string {
+	if len(lines) == 0 || start == "" {
+		return lines
+	}
+	styled := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			styled = append(styled, line)
+			continue
+		}
+		styled = append(styled, start+line+end)
+	}
+	return styled
+}
+
+func renderUserTranscriptLines(message Message, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+
+	prefix := "❯ "
+	contentWidth := maxInt(1, width-userBubbleStyle.GetHorizontalFrameSize()-lipgloss.Width(prefix))
+	bodyLines := renderMarkdownBodyLines(sanitizeTranscriptDisplayText(message), contentWidth, transcriptBodyStyle(message))
+	if len(bodyLines) == 0 {
+		bodyLines = []string{""}
+	}
+
+	lines := make([]string, 0, len(bodyLines))
+	for index, row := range bodyLines {
+		linePrefix := prefix
+		if index > 0 {
+			linePrefix = "  "
+		}
+		lines = append(lines, userBubbleStyle.
+			Width(width).
+			MaxWidth(width).
+			Render(fitDisplayWidth(linePrefix+row, contentWidth+lipgloss.Width(prefix))))
+	}
+	return lines
+}
+
+func renderPrefixedTranscriptLines(prefix string, value string, width int, baseStyle lipgloss.Style) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	bodyWidth := maxInt(1, width-lipgloss.Width(prefix))
+	bodyLines := renderMarkdownBodyLines(value, bodyWidth, baseStyle)
+	if len(bodyLines) == 0 {
+		return []string{""}
+	}
+
+	lines := make([]string, 0, len(bodyLines))
+	for index, row := range bodyLines {
+		linePrefix := prefix
+		if index > 0 {
+			linePrefix = strings.Repeat(" ", lipgloss.Width(prefix))
+		}
+		lines = append(lines, linePrefix+row)
 	}
 	return lines
 }
@@ -1019,6 +1230,10 @@ func renderMarkdownTableRow(row []string, widths []int, style lipgloss.Style) st
 }
 
 func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {
+	if !strings.ContainsAny(value, "`*_~") {
+		return baseStyle.Render(value)
+	}
+
 	var builder strings.Builder
 	parts := strings.Split(value, "`")
 	for index, part := range parts {
@@ -1118,30 +1333,32 @@ func renderDiffRows(sign, lineNumber, content string, width int) []string {
 		signStyle = diffRemoveGutterStyle
 		lineStyle = diffRemoveLineStyle
 	}
-	prefix := signStyle.Render(sign)
-	if lineNumber != "" {
-		prefix += signStyle.Render(" " + fmt.Sprintf("%4s │", lineNumber))
-	}
+	plainPrefix := diffPlainGutter(sign, lineNumber)
+	prefix := renderDiffGutter(sign, lineNumber, signStyle)
 	if content == "" {
-		return []string{lineStyle.Render(prefix)}
+		return []string{prefix + renderDiffCodeSegment("", width-lipgloss.Width(plainPrefix)-1, lineStyle)}
 	}
 
-	contentWidth := maxInt(8, width-lipgloss.Width(prefix)-1)
+	contentWidth := maxInt(8, width-lipgloss.Width(plainPrefix)-1)
 	wrapped := wrapPlainText(content, contentWidth)
 	lines := make([]string, 0, len(wrapped))
 	for index, row := range wrapped {
 		rowPrefix := prefix
 		if index > 0 {
-			rowPrefix = strings.Repeat(" ", maxInt(1, lipgloss.Width(prefix)))
+			rowPrefix = renderDiffContinuationGutter(sign, plainPrefix)
 		}
-		lines = append(lines, lineStyle.Render(rowPrefix+" "+renderCodeLine(row)))
+		lines = append(lines, rowPrefix+renderDiffCodeSegment(row, contentWidth, lineStyle))
 	}
 	return lines
 }
 
 func renderCodeLine(value string) string {
+	return renderCodeLineWithPalette(value, defaultCodePalette())
+}
+
+func renderCodeLineWithPalette(value string, palette codePalette) string {
 	if strings.TrimSpace(value) == "" {
-		return value
+		return palette.Plain.Render(value)
 	}
 
 	commentIndex := findCommentIndex(value)
@@ -1155,10 +1372,10 @@ func renderCodeLine(value string) string {
 	var builder strings.Builder
 	tokens := tokenizeCode(codePart)
 	for _, token := range tokens {
-		builder.WriteString(renderCodeToken(token))
+		builder.WriteString(renderCodeTokenWithPalette(token, palette))
 	}
 	if commentPart != "" {
-		builder.WriteString(codeCommentStyle.Render(commentPart))
+		builder.WriteString(palette.Comment.Render(commentPart))
 	}
 	return builder.String()
 }
@@ -1246,23 +1463,130 @@ func tokenizeCode(value string) []string {
 }
 
 func renderCodeToken(token string) string {
+	return renderCodeTokenWithPalette(token, defaultCodePalette())
+}
+
+func renderCodeTokenWithPalette(token string, palette codePalette) string {
 	trimmed := strings.TrimSpace(token)
 	switch {
 	case trimmed == "":
-		return token
+		return palette.Plain.Render(token)
 	case isQuotedCodeToken(token):
-		return codeStringStyle.Render(token)
+		return palette.String.Render(token)
 	case isCodeKeyword(trimmed):
-		return codeKeywordStyle.Render(token)
+		return palette.Keyword.Render(token)
 	case isCodeTypeToken(trimmed):
-		return codeTypeStyle.Render(token)
+		return palette.Type.Render(token)
 	case isCodeBuiltinToken(trimmed):
-		return codeBuiltinStyle.Render(token)
+		return palette.Builtin.Render(token)
 	case isNumericToken(trimmed):
-		return codeNumberStyle.Render(token)
+		return palette.Number.Render(token)
 	default:
-		return codePlainStyle.Render(token)
+		return palette.Plain.Render(token)
 	}
+}
+
+type codePalette struct {
+	Keyword lipgloss.Style
+	String  lipgloss.Style
+	Comment lipgloss.Style
+	Number  lipgloss.Style
+	Type    lipgloss.Style
+	Builtin lipgloss.Style
+	Plain   lipgloss.Style
+}
+
+func defaultCodePalette() codePalette {
+	return codePalette{
+		Keyword: codeKeywordStyle,
+		String:  codeStringStyle,
+		Comment: codeCommentStyle,
+		Number:  codeNumberStyle,
+		Type:    codeTypeStyle,
+		Builtin: codeBuiltinStyle,
+		Plain:   codePlainStyle,
+	}
+}
+
+func diffCodePalette(lineStyle lipgloss.Style) codePalette {
+	background := lipgloss.Color("#103B2A")
+	plain := lipgloss.Color("#E6EDF3")
+	keyword := lipgloss.Color("#FF9B9B")
+	stringColor := lipgloss.Color("#A5D6FF")
+	comment := lipgloss.Color("#8B949E")
+	number := lipgloss.Color("#79C0FF")
+	typeColor := lipgloss.Color("#D2A8FF")
+	builtin := lipgloss.Color("#FFB86B")
+	if bg := lineStyle.GetBackground(); bg != nil {
+		if color, ok := bg.(lipgloss.Color); ok {
+			background = color
+		}
+	}
+	if background == lipgloss.Color("#5D1E27") {
+		plain = lipgloss.Color("#F0D7DA")
+		keyword = lipgloss.Color("#FFB3BA")
+		stringColor = lipgloss.Color("#FFD8A8")
+		comment = lipgloss.Color("#C9A7AD")
+		number = lipgloss.Color("#A5D6FF")
+		typeColor = lipgloss.Color("#E2C5FF")
+		builtin = lipgloss.Color("#FFD29D")
+	}
+	return codePalette{
+		Keyword: lipgloss.NewStyle().Foreground(keyword).Background(background).Bold(true),
+		String:  lipgloss.NewStyle().Foreground(stringColor).Background(background),
+		Comment: lipgloss.NewStyle().Foreground(comment).Background(background).Italic(true),
+		Number:  lipgloss.NewStyle().Foreground(number).Background(background),
+		Type:    lipgloss.NewStyle().Foreground(typeColor).Background(background),
+		Builtin: lipgloss.NewStyle().Foreground(builtin).Background(background),
+		Plain:   lipgloss.NewStyle().Foreground(plain).Background(background),
+	}
+}
+
+func diffPlainGutter(sign, lineNumber string) string {
+	if strings.TrimSpace(lineNumber) == "" {
+		return sign
+	}
+	return fmt.Sprintf("%s %4s │", sign, lineNumber)
+}
+
+func renderDiffGutter(sign, lineNumber string, signStyle lipgloss.Style) string {
+	plain := diffPlainGutter(sign, lineNumber)
+	switch sign {
+	case "+":
+		return diffAddANSIStart + plain + diffANSIEnd
+	case "-":
+		return diffRemoveANSIStart + plain + diffANSIEnd
+	default:
+		renderedSign := signStyle.Copy().
+			Background(lipgloss.Color("#FFFFFF")).
+			Render(sign)
+		if strings.TrimSpace(lineNumber) == "" {
+			return renderedSign
+		}
+		return renderedSign + diffGutterBaseStyle.Render(" "+fmt.Sprintf("%4s │", lineNumber))
+	}
+}
+
+func renderDiffContinuationGutter(sign, plain string) string {
+	if plain == "" {
+		return ""
+	}
+	switch sign {
+	case "+":
+		return diffAddANSIStart + strings.Repeat(" ", lipgloss.Width(plain)) + diffANSIEnd
+	case "-":
+		return diffRemoveANSIStart + strings.Repeat(" ", lipgloss.Width(plain)) + diffANSIEnd
+	}
+	return diffGutterBaseStyle.Render(strings.Repeat(" ", lipgloss.Width(plain)))
+}
+
+func renderDiffCodeSegment(value string, width int, lineStyle lipgloss.Style) string {
+	segmentWidth := maxInt(1, width+1)
+	if strings.TrimSpace(value) == "" {
+		return lineStyle.Width(segmentWidth).MaxWidth(segmentWidth).Render(strings.Repeat(" ", segmentWidth))
+	}
+	rendered := fitDisplayWidth(" "+renderCodeLineWithPalette(value, diffCodePalette(lineStyle)), segmentWidth)
+	return lineStyle.Width(segmentWidth).MaxWidth(segmentWidth).Render(rendered)
 }
 
 func isQuotedCodeToken(token string) bool {
@@ -1357,20 +1681,7 @@ func (m *Model) renderComposer(width int) string {
 		rows = m.visibleComposerRows(contentWidth)
 	}
 
-	lines := make([]string, 0, len(rows)+2)
-	for _, row := range rows {
-		prefix := "> "
-		if row.Continued {
-			prefix = "· "
-		}
-
-		if row.Placeholder {
-			lines = append(lines, promptStyle.Render(prefix)+dimStyle.Render(row.Text))
-		} else {
-			lines = append(lines, promptStyle.Render(prefix)+row.Text)
-		}
-	}
-
+	lines := make([]string, 0, len(rows)+8)
 	if m.Notice != "" {
 		noticeStyle := dimStyle
 		if m.NoticeIsError {
@@ -1379,48 +1690,36 @@ func (m *Model) renderComposer(width int) string {
 		for _, line := range wrapPlainText(m.Notice, contentWidth) {
 			lines = append(lines, noticeStyle.Render(line))
 		}
-	} else {
-		helper := "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | wheel pane | click select | dbl-click load/switch | F6 copy mode | /help"
-		if !m.MouseCapture {
-			helper = "Enter send | Ctrl+J newline | Ctrl+U clear | Ctrl+W word | Home/End move | drag select/copy | right-click paste | F6 app mouse | /help"
-		}
-		lines = append(lines, dimStyle.Render(helper))
 	}
 
-	if matches := m.composerSlashSuggestions(4); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
-		best := matches[0]
-		bestCommand := truncatePlain(best.Command, maxInt(0, contentWidth-8))
-		lines = append(lines, sectionStyle.Render("match  ")+titleStyle.Render(bestCommand))
+	if matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+		lines = append(lines, renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection)...)
+	}
 
-		bestHintParts := []string{best.Description}
-		if argumentHint := slashArgumentHint(best.Command); argumentHint != "" {
-			bestHintParts = append(bestHintParts, fmt.Sprintf("args %s", argumentHint))
+	for _, row := range rows {
+		prefix := "❯ "
+		if row.Continued {
+			prefix = "  "
 		}
-		if best.InsertValue != "" && best.InsertValue != best.Command {
-			bestHintParts = append(bestHintParts, fmt.Sprintf("Tab → %s", strings.TrimSpace(best.InsertValue)))
-		}
-		lines = append(lines, dimStyle.Render(truncatePlain(strings.Join(bestHintParts, "  |  "), contentWidth)))
 
-		if len(matches) > 1 {
-			alternates := make([]string, 0, len(matches)-1)
-			for _, item := range matches[1:] {
-				alternates = append(alternates, slashAlternateSummary(item))
-			}
-			wrappedAlternates := wrapPlainText(strings.Join(alternates, "  |  "), maxInt(1, contentWidth-8))
-			for index, row := range wrappedAlternates {
-				if index == 0 {
-					lines = append(lines, sectionStyle.Render("also   ")+dimStyle.Render(row))
-					continue
-				}
-				lines = append(lines, dimStyle.Render("       "+row))
-			}
+		if row.Placeholder {
+			lines = append(lines, promptStyle.Render(prefix)+dimStyle.Render(row.Text))
+			continue
 		}
+		lines = append(lines, promptStyle.Render(prefix)+row.Text)
 	}
 
 	return style.
 		Width(framedRenderWidth(style, width)).
 		MaxWidth(width).
 		Render(strings.Join(lines, "\n"))
+}
+
+func renderComposerDivider(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return strings.Repeat("─", width)
 }
 
 func slashAlternateSummary(item slashCommandSpec) string {
@@ -1441,33 +1740,158 @@ type composerRow struct {
 }
 
 func (m *Model) visibleComposerRows(width int) []composerRow {
-	if len(m.Input) == 0 {
+	if len(m.Input) == 0 && len(m.Composition) == 0 {
 		placeholder := "Ask Cyrene, use / commands, or mention files with @..."
 		if m.ActivePanel != PanelNone {
 			placeholder = fmt.Sprintf("Panel %s active. Esc to close, then continue typing.", m.ActivePanel)
 		}
 		return []composerRow{{
-			Text:        cursorStyle.Render("|") + " " + placeholder,
+			Text:        placeholder,
 			Placeholder: true,
 		}}
 	}
 
-	cursor := clampInt(m.Cursor, 0, len(m.Input))
-	before := string(m.Input[:cursor])
-	after := string(m.Input[cursor:])
-	plain := before + "|" + after
-	wrapped := wrapPlainText(plain, maxInt(1, width-2))
-
-	rows := make([]composerRow, 0, len(wrapped))
-	for index, row := range wrapped {
-		rendered := strings.Replace(row, "|", cursorStyle.Render("|"), 1)
-		rows = append(rows, composerRow{Text: rendered, Continued: index > 0})
-	}
+	rows := renderComposerSegments(m.composerDisplaySegments(), maxInt(1, width-2))
 
 	if len(rows) <= 6 {
 		return rows
 	}
 	return rows[len(rows)-6:]
+}
+
+type composerSegment struct {
+	Text string
+	Kind string
+}
+
+func (m *Model) composerDisplaySegments() []composerSegment {
+	cursor := clampInt(m.Cursor, 0, len(m.Input))
+	compositionCursor := clampInt(m.CompositionCursor, 0, len(m.Composition))
+	segments := make([]composerSegment, 0, 6)
+	if cursor > 0 {
+		segments = append(segments, composerSegment{Text: string(m.Input[:cursor]), Kind: "plain"})
+	}
+	if len(m.Composition) > 0 {
+		if compositionCursor > 0 {
+			segments = append(segments, composerSegment{Text: string(m.Composition[:compositionCursor]), Kind: "composition"})
+		}
+		segments = append(segments, composerSegment{Text: "|", Kind: "cursor"})
+		if compositionCursor < len(m.Composition) {
+			segments = append(segments, composerSegment{Text: string(m.Composition[compositionCursor:]), Kind: "composition"})
+		}
+	} else {
+		segments = append(segments, composerSegment{Text: "|", Kind: "cursor"})
+	}
+	if cursor < len(m.Input) {
+		segments = append(segments, composerSegment{Text: string(m.Input[cursor:]), Kind: "plain"})
+	}
+	return segments
+}
+
+func renderComposerSegments(segments []composerSegment, width int) []composerRow {
+	if width <= 0 {
+		return []composerRow{{Text: ""}}
+	}
+
+	rows := make([]composerRow, 0, 2)
+	var current strings.Builder
+	currentWidth := 0
+	continued := false
+
+	flush := func() {
+		rows = append(rows, composerRow{Text: current.String(), Continued: continued})
+		current.Reset()
+		currentWidth = 0
+		continued = true
+	}
+
+	appendSegment := func(text string, kind string) {
+		for _, r := range text {
+			if r == '\n' {
+				flush()
+				continue
+			}
+			cellWidth := lipgloss.Width(string(r))
+			if currentWidth > 0 && currentWidth+cellWidth > width {
+				flush()
+			}
+			switch kind {
+			case "cursor":
+				current.WriteString(cursorStyle.Render(string(r)))
+			case "composition":
+				current.WriteString(compositionStyle.Render(string(r)))
+			default:
+				current.WriteRune(r)
+			}
+			currentWidth += cellWidth
+		}
+	}
+
+	for _, segment := range segments {
+		appendSegment(segment.Text, segment.Kind)
+	}
+	if current.Len() > 0 || len(rows) == 0 {
+		rows = append(rows, composerRow{Text: current.String(), Continued: continued})
+	}
+	return rows
+}
+
+func renderSlashSuggestionBlock(items []slashCommandSpec, width int, selected int) []string {
+	if len(items) == 0 || width <= 0 {
+		return nil
+	}
+
+	maxCommandWidth := 0
+	for _, item := range items {
+		maxCommandWidth = maxInt(maxCommandWidth, lipgloss.Width(strings.TrimSpace(slashDisplayCommand(item))))
+	}
+	commandWidth := clampInt(maxCommandWidth, 18, minInt(30, maxInt(18, width/3)))
+	descriptionWidth := maxInt(1, width-commandWidth-2)
+	lines := make([]string, 0, len(items)*2)
+	for itemIndex, item := range items {
+		command := truncatePlain(slashDisplayCommand(item), commandWidth)
+		descriptionRows := wrapPlainText(strings.TrimSpace(item.Description), descriptionWidth)
+		if len(descriptionRows) == 0 {
+			descriptionRows = []string{""}
+		}
+
+		padding := strings.Repeat(" ", maxInt(1, commandWidth-lipgloss.Width(command)+1))
+		firstLinePlain := " " + command + padding + descriptionRows[0]
+		if itemIndex == selected && selected >= 0 {
+			lines = append(lines, renderSelectedSlashLine(firstLinePlain, width))
+		} else {
+			lines = append(lines, fitDisplayWidth(firstLinePlain, width))
+		}
+		for _, row := range descriptionRows[1:] {
+			plain := " " + strings.Repeat(" ", commandWidth+1) + row
+			if itemIndex == selected && selected >= 0 {
+				lines = append(lines, renderSelectedSlashLine(plain, width))
+				continue
+			}
+			lines = append(lines, fitDisplayWidth(plain, width))
+		}
+	}
+	return lines
+}
+
+func renderSelectedSlashLine(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return selectedSlashStyle.
+		Width(width).
+		MaxWidth(width).
+		Render(fitDisplayWidth(text, width))
+}
+
+func slashDisplayCommand(item slashCommandSpec) string {
+	command := strings.TrimSpace(item.Command)
+	if strings.HasPrefix(command, "/") {
+		if compact := compactSlashCommand(command); compact != "" {
+			return compact
+		}
+	}
+	return command
 }
 
 func (m *Model) renderApprovals(width, height int) string {
@@ -1657,7 +2081,10 @@ func (m *Model) renderSessions(width, height int) string {
 	headerLines := []string{
 		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "load ↵", "new n", "refresh r", "esc"),
 	}
-	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "sessions", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	footerLines := []string{
+		renderPanelSummaryColumns(bodyWidth, "sessions", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total)),
+		"",
+	}
 	bodyLines := []string{}
 	if len(m.Sessions) == 0 {
 		bodyLines = append(bodyLines, dimStyle.Render("No saved sessions."))
@@ -2229,25 +2656,33 @@ func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 }
 
 func renderTerminalDiffRows(sign, lineNumber, content string, width int, gutterStyle lipgloss.Style, lineStyle lipgloss.Style) []string {
-	gutter := sign
-	if strings.TrimSpace(lineNumber) != "" {
-		gutter = fmt.Sprintf("%s %4s │", sign, lineNumber)
-	}
-	contentWidth := maxInt(1, width-lipgloss.Width(gutter)-1)
+	plainGutter := diffPlainGutter(sign, lineNumber)
+	gutter := renderDiffGutter(sign, lineNumber, gutterStyle)
+	contentWidth := maxInt(1, width-lipgloss.Width(plainGutter)-1)
 	wrapped := wrapPlainText(content, contentWidth)
 	if len(wrapped) == 0 {
 		wrapped = []string{""}
 	}
 	lines := make([]string, 0, len(wrapped))
-	continuation := strings.Repeat(" ", maxInt(1, lipgloss.Width(gutter)))
+	continuation := renderDiffContinuationGutter(sign, plainGutter)
 	for index, row := range wrapped {
 		left := gutter
 		if index > 0 {
 			left = continuation
 		}
-		lines = append(lines, lineStyle.Render(gutterStyle.Render(left)+" "+renderCodeLine(row)))
+		lines = append(lines, left+renderDiffCodeSegment(row, contentWidth, lineStyle))
 	}
 	return lines
+}
+
+func renderFullWidthStyledLine(style lipgloss.Style, text string, width int) string {
+	if width <= 0 {
+		return style.Render(text)
+	}
+	return style.
+		Width(width).
+		MaxWidth(width).
+		Render(fitDisplayWidth(text, width))
 }
 
 func actionBadge(action string) string {
@@ -2628,13 +3063,18 @@ func renderScrollableBlock(lines []string, width int, scroll panelScrollState) [
 		return nil
 	}
 	contentWidth := maxInt(1, width-2)
-	thumbStart, thumbSize := scrollbarThumb(scroll, len(lines))
+	trackHeight := maxInt(0, len(lines)-2)
+	thumbStart, thumbSize := scrollbarThumb(scroll, trackHeight)
 	rendered := make([]string, 0, len(lines))
 	for index, line := range lines {
 		base := fitDisplayWidth(line, contentWidth)
-		glyph := scrollbarTrackStyle().Render("│")
-		if index >= thumbStart && index < thumbStart+thumbSize {
-			glyph = scrollbarThumbStyle().Render("█")
+		glyph := " "
+		if index >= 0 && index < len(lines)-1 {
+			trackIndex := index
+			glyph = scrollbarTrackStyle().Render("│")
+			if trackIndex >= thumbStart && trackIndex < thumbStart+thumbSize {
+				glyph = scrollbarThumbStyle().Render("█")
+			}
 		}
 		rendered = append(rendered, base+" "+glyph)
 	}
@@ -2718,6 +3158,32 @@ func messageStyles(message Message) (string, lipgloss.Style, lipgloss.Style) {
 		return "assistant>", asstStyle.Bold(true), lipgloss.NewStyle()
 	default:
 		return "system>", systemStyle.Bold(true), systemStyle
+	}
+}
+
+func transcriptBodyStyle(message Message) lipgloss.Style {
+	switch {
+	case message.Role == "user":
+		return lipgloss.NewStyle()
+	case message.Role == "assistant":
+		return lipgloss.NewStyle()
+	case message.Kind == "tool_status":
+		return toolStatusStyle
+	case message.Kind == "review_status":
+		return reviewStyle.Copy().Bold(false)
+	case message.Kind == "error":
+		return errorStyle.Copy().Bold(false)
+	default:
+		return systemStyle
+	}
+}
+
+func shouldRenderCompactTranscript(message Message) bool {
+	switch message.Kind {
+	case "transcript", "tool_status", "review_status", "system_hint", "error":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -28,6 +28,18 @@ func (m *Model) RenderTranscriptForTest(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
+func (m *Model) RenderComposerForTest(width int) string {
+	return m.renderComposer(width)
+}
+
+func (m *Model) SetComposerCompositionForTest(text string, cursor int) {
+	m.setComposerComposition([]rune(text), cursor)
+}
+
+func (m *Model) CommitComposerCompositionForTest(text string) {
+	m.commitComposerComposition([]rune(text))
+}
+
 func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style) []string {
 	return renderMarkdownBodyLines(text, width, base)
 }

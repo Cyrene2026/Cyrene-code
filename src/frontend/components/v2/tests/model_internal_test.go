@@ -94,26 +94,80 @@ func TestRenderTranscriptClampsTopOffsetToFullPage(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 lines, got %d", len(lines))
 	}
-	if strings.TrimSpace(lines[0]) == "" || strings.TrimSpace(lines[1]) == "" {
-		t.Fatalf("expected top transcript page to stay filled, got %q", rendered)
+	if !strings.Contains(rendered, "one") || !strings.Contains(rendered, "two") {
+		t.Fatalf("expected top transcript page to preserve visible transcript content, got %q", rendered)
+	}
+}
+
+func TestUserTranscriptRendersFullWidthGrayBackgroundWithWhiteText(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	model := app.NewModel()
+	model.Items = []app.Message{
+		{Role: "user", Kind: "transcript", Text: "不要调用工具，回答:已经看过的内容"},
+	}
+
+	rendered := model.RenderTranscriptForTest(48, 2)
+
+	if !strings.Contains(rendered, "不要调用工具，回答:已经看过的内容") {
+		t.Fatalf("expected user transcript text preserved, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "\x1b[48;2;48;54;60m") {
+		t.Fatalf("expected full-width gray background ANSI, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;255;255;255") {
+		t.Fatalf("expected white foreground ANSI for user transcript, got %q", rendered)
+	}
+}
+
+func TestUserTranscriptGetsVerticalBreathingRoom(t *testing.T) {
+	model := app.NewModel()
+	model.Items = []app.Message{
+		{Role: "assistant", Kind: "transcript", Text: "上一条回复"},
+		{Role: "user", Kind: "transcript", Text: "这是用户输入"},
+		{Role: "assistant", Kind: "transcript", Text: "这是 AI 回复"},
+	}
+
+	rendered := model.RenderTranscriptForTest(40, 8)
+	lines := strings.Split(rendered, "\n")
+	userLine := -1
+	for index, line := range lines {
+		if strings.Contains(line, "这是用户输入") {
+			userLine = index
+			break
+		}
+	}
+
+	if userLine <= 0 || userLine+1 >= len(lines) {
+		t.Fatalf("expected user transcript line in rendered output, got %q", rendered)
+	}
+	if strings.TrimSpace(lines[userLine-1]) != "" {
+		t.Fatalf("expected blank line above user transcript, got %q", rendered)
+	}
+	if strings.TrimSpace(lines[userLine+1]) != "" {
+		t.Fatalf("expected blank line below user transcript, got %q", rendered)
 	}
 }
 
 func TestClampTranscriptOffsetPreventsOverscrollAccumulation(t *testing.T) {
 	model := app.NewModel()
-	model.Width = 80
+	model.Width = 40
 	model.Height = 12
 	model.Items = []app.Message{
-		{Role: "user", Kind: "transcript", Text: "one"},
-		{Role: "assistant", Kind: "transcript", Text: "two"},
-		{Role: "user", Kind: "transcript", Text: "three"},
-		{Role: "assistant", Kind: "transcript", Text: "four"},
-		{Role: "user", Kind: "transcript", Text: "five"},
-		{Role: "assistant", Kind: "transcript", Text: "six"},
-		{Role: "user", Kind: "transcript", Text: "seven"},
-		{Role: "assistant", Kind: "transcript", Text: "eight"},
-		{Role: "user", Kind: "transcript", Text: "nine"},
-		{Role: "assistant", Kind: "transcript", Text: "ten"},
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("one ", 12)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("two ", 12)},
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("three ", 12)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("four ", 12)},
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("five ", 12)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("six ", 12)},
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("seven ", 12)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("eight ", 12)},
+		{Role: "user", Kind: "transcript", Text: strings.Repeat("nine ", 12)},
+		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("ten ", 12)},
 	}
 	x, y, ok := model.TranscriptMousePointForTest()
 	if !ok {
@@ -174,6 +228,45 @@ func TestRenderMarkdownBodyLinesHandlesListsQuotesAndEmphasis(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "1. ") || !strings.Contains(rendered, "• ") || !strings.Contains(rendered, "│ ") {
 		t.Fatalf("expected list and quote prefixes rendered, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownDiffAddUsesWhiteBackgroundAndGreenMarker(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	lines := app.RenderMarkdownBodyLinesForTest("+    1 | from __future__ import annotations", 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+
+	if !strings.Contains(rendered, "38;2;126;231;135;48;2;16;63;43") {
+		t.Fatalf("expected green add gutter background, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "48;2;16;59;42") {
+		t.Fatalf("expected dark green diff background, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;255;155;155") {
+		t.Fatalf("expected keyword syntax highlight on dark green diff background, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownDiffRemoveUsesWhiteBackgroundAndRedMarker(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	lines := app.RenderMarkdownBodyLinesForTest("-    2 | return old_value", 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+
+	if !strings.Contains(rendered, "38;2;255;161;152;48;2;93;30;39") {
+		t.Fatalf("expected red remove gutter background, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "48;2;93;30;39") {
+		t.Fatalf("expected dark red diff background, got %q", rendered)
 	}
 }
 

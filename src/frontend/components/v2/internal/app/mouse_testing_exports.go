@@ -2,7 +2,8 @@ package app
 
 func (m *Model) TranscriptMousePointForTest() (int, int, bool) {
 	layout := m.mouseLayout()
-	return layout.Session.pointAtLine(maxInt(0, layout.Session.Height/2))
+	inner := insetRectForStyle(layout.Session, frameStyle)
+	return inner.pointAtLine(maxInt(0, inner.Height/2))
 }
 
 func (m *Model) PanelItemMousePointForTest(index, rowOffset int) (int, int, bool) {
@@ -11,7 +12,7 @@ func (m *Model) PanelItemMousePointForTest(index, rowOffset int) (int, int, bool
 		return 0, 0, false
 	}
 
-	inner := layout.Panel.inset(1, 1)
+	inner := insetRectForStyle(layout.Panel, panelBoxStyle)
 	if inner.Width <= 0 || inner.Height <= 0 {
 		return 0, 0, false
 	}
@@ -29,7 +30,7 @@ func (m *Model) ApprovalPreviewMousePointForTest() (int, int, bool) {
 		return 0, 0, false
 	}
 
-	inner := layout.Panel.inset(1, 1)
+	inner := insetRectForStyle(layout.Panel, panelBoxStyle)
 	if inner.Width <= 0 || inner.Height <= 0 {
 		return 0, 0, false
 	}

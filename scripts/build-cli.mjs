@@ -32,6 +32,9 @@ const hostGoarch =
 const targetBinaryName = target =>
   `cyrene-v2-${target.goos}-${target.goarch}${target.ext}`;
 
+const helperBinaryName = target =>
+  `cyrene-ime-bridge-${target.goos}-${target.goarch}${target.ext}`;
+
 const legacyBinaryName = process.platform === "win32" ? "cyrene-v2.exe" : "cyrene-v2";
 
 const resolveGoExecutable = () => {
@@ -147,6 +150,48 @@ for (const target of targets) {
   if (target.goos !== "windows") {
     await chmod(binaryPath, 0o755);
   }
+
+  if (target.goos === "windows") {
+    const helperPath = resolve(distDir, helperBinaryName(target));
+    console.log(`Building helper ${target.goos}/${target.goarch} -> ${helperPath}`);
+
+    let helperBuild;
+    try {
+      helperBuild = Bun.spawn(
+        [
+          goExecutable,
+          "build",
+          "-ldflags",
+          "-H=windowsgui",
+          "-o",
+          helperPath,
+          "./cmd/cyrene-ime-bridge",
+        ],
+        {
+          cwd: v2Dir,
+          stdout: "inherit",
+          stderr: "inherit",
+          stdin: "inherit",
+          env: {
+            ...process.env,
+            CGO_ENABLED: "0",
+            GOOS: target.goos,
+            GOARCH: target.goarch,
+            GOCACHE: goCacheDir,
+          },
+        },
+      );
+    } catch (error) {
+      throw new Error(formatMissingGoMessage(error));
+    }
+
+    const helperExitCode = await helperBuild.exited;
+    if (helperExitCode !== 0) {
+      process.exit(helperExitCode);
+    }
+
+    await stat(helperPath);
+  }
 }
 
 if (hostGoarch) {
@@ -159,6 +204,13 @@ if (hostGoarch) {
       await chmod(legacyPath, 0o755);
     }
     console.log(`Built host CLI binary alias at ${legacyPath}.`);
+
+    if (hostTarget.goos === "windows") {
+      const helperSourcePath = resolve(distDir, helperBinaryName(hostTarget));
+      const helperLegacyPath = resolve(distDir, "cyrene-ime-bridge.exe");
+      await copyFile(helperSourcePath, helperLegacyPath);
+      console.log(`Built host helper alias at ${helperLegacyPath}.`);
+    }
   }
 }
 

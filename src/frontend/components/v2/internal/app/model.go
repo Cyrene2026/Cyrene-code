@@ -61,9 +61,21 @@ const (
 	mouseReleaseWindow       = 500 * time.Millisecond
 	mouseActivationDedup     = 150 * time.Millisecond
 	statusSpinnerInterval    = 120 * time.Millisecond
+	slashSuggestionLimit     = 4
 )
 
 type statusSpinnerTickMsg struct{}
+
+type ComposerCompositionMsg struct {
+	Text   []rune
+	Cursor int
+}
+
+type ComposerCompositionCommitMsg struct {
+	Text []rune
+}
+
+type ComposerCompositionClearMsg struct{}
 
 var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/help", Description: "show command list"},
@@ -111,7 +123,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/plan reopen", Description: "reopen an accepted plan for more work"},
 	{Command: "/plan clear", Description: "clear the active execution plan"},
 	{Command: "/sessions", Description: "open sessions panel"},
-	{Command: "/resume", Description: "open session resume picker"},
+	{Command: "/resume", Description: "Resume a previous conversation"},
 	{Command: "/resume <id>", Description: "resume a session by id"},
 	{Command: "/load <id>", Description: "alias for /resume <id>"},
 	{Command: "/new", Description: "start a fresh session"},
@@ -168,9 +180,11 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/approve all", Description: "approve all pending operations"},
 	{Command: "/reject [id]", Description: "reject pending operation(s)"},
 	{Command: "/reject all", Description: "reject all pending operations"},
-	{Command: "/clear", Description: "clear transcript"},
+	{Command: "/clear", Description: "Start a new session with empty context; previous session stays on disk (resumable with /resume)"},
 	{Command: "/quit", Description: "quit bubble tea frontend"},
 }
+
+var slashPinnedDisplayCommands = []string{"/resume", "/clear"}
 
 var readClipboardText = defaultClipboardTextReader
 
@@ -221,6 +235,9 @@ type Model struct {
 	LiveText                   string
 	Input                      []rune
 	Cursor                     int
+	Composition                []rune
+	CompositionCursor          int
+	SlashSelection             int
 	TranscriptOffset           int
 	ShouldQuit                 bool
 	BridgeReady                bool
@@ -301,6 +318,7 @@ func NewModel() *Model {
 		Width:                  100,
 		Height:                 30,
 		Status:                 StatusPreparing,
+		SlashSelection:         -1,
 		ActivePanel:            PanelNone,
 		ApprovalPreview:        ApprovalFull,
 		AuthStep:               AuthStepProvider,
@@ -345,6 +363,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.SpinnerFrame = (m.SpinnerFrame + 1) % len(statusSpinnerFrames)
 		return m, m.withStatusSpinner(nil)
+	case ComposerCompositionMsg:
+		m.setComposerComposition(value.Text, value.Cursor)
+		return m, nil
+	case ComposerCompositionCommitMsg:
+		m.commitComposerComposition(value.Text)
+		return m, nil
+	case ComposerCompositionClearMsg:
+		m.clearComposerComposition()
+		return m, nil
 	case bridgeEventMsg:
 		m.handleBridgeEvent(value.Event)
 		if appRoot := value.Event.appRoot(); appRoot != "" {
@@ -755,6 +782,9 @@ func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
 func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
+		if m.applySelectedSlashCompletion() {
+			return m, nil
+		}
 		return m, m.submitInput()
 	case tea.KeyHome:
 		m.Cursor = 0
@@ -791,10 +821,16 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyUp:
+		if m.moveSlashSelection(-1) {
+			return m, nil
+		}
 		m.TranscriptOffset++
 		m.clampTranscriptOffset()
 		return m, nil
 	case tea.KeyDown:
+		if m.moveSlashSelection(1) {
+			return m, nil
+		}
 		if m.TranscriptOffset > 0 {
 			m.TranscriptOffset--
 		}
@@ -1114,7 +1150,7 @@ func (m *Model) handlePanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEscape {
 		m.ActivePanel = PanelNone
 		m.AuthSaving = false
-		m.setNotice("Panel closed.", false)
+		m.setNotice("", false)
 		return m, nil
 	}
 
@@ -1520,6 +1556,7 @@ func (m *Model) submitInput() tea.Cmd {
 	m.TranscriptOffset = 0
 	m.Input = m.Input[:0]
 	m.Cursor = 0
+	m.clearComposerComposition()
 
 	handled, cmd := m.handleSlashCommand(query)
 	if handled {
@@ -1577,13 +1614,9 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.setNotice("No cancellable in-flight operation in v2 bridge mode.", true)
 		return true, nil
 	case query == "/clear":
-		m.Items = []Message{}
-		m.LiveText = ""
-		m.resetTranscriptMessageCache()
-		m.invalidateTranscriptCache()
-		m.TranscriptOffset = 0
-		m.setNotice("Transcript cleared.", false)
-		return true, nil
+		m.Status = StatusPreparing
+		m.setNotice("Starting a new session...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "new_session"})
 	case query == "/new":
 		m.Status = StatusPreparing
 		m.setNotice("Creating a new session...", false)
@@ -2310,6 +2343,8 @@ func (m *Model) insertRunes(values []rune) {
 	next = append(next, m.Input[m.Cursor:]...)
 	m.Input = next
 	m.Cursor += len(values)
+	m.clearComposerComposition()
+	m.resetSlashSelection()
 }
 
 func (m *Model) deleteForward() {
@@ -2320,20 +2355,28 @@ func (m *Model) deleteForward() {
 	next = append(next, m.Input[:m.Cursor]...)
 	next = append(next, m.Input[m.Cursor+1:]...)
 	m.Input = next
+	m.clearComposerComposition()
+	m.resetSlashSelection()
 }
 
 func (m *Model) deleteComposerWordBackward() {
 	m.Input, m.Cursor = deleteWordBackwardRunes(m.Input, m.Cursor)
+	m.clearComposerComposition()
+	m.resetSlashSelection()
 }
 
 func (m *Model) deleteComposerToEnd() {
 	cursor := clampInt(m.Cursor, 0, len(m.Input))
 	m.Input = append([]rune{}, m.Input[:cursor]...)
+	m.clearComposerComposition()
+	m.resetSlashSelection()
 }
 
 func (m *Model) clearComposerInput() {
 	m.Input = m.Input[:0]
 	m.Cursor = 0
+	m.clearComposerComposition()
+	m.resetSlashSelection()
 }
 
 func normalizeComposerRunes(values []rune) []rune {
@@ -2426,6 +2469,25 @@ func (m *Model) deleteBackward() {
 	next = append(next, m.Input[m.Cursor:]...)
 	m.Input = next
 	m.Cursor--
+	m.clearComposerComposition()
+	m.resetSlashSelection()
+}
+
+func (m *Model) setComposerComposition(text []rune, cursor int) {
+	normalized := normalizeComposerRunes(text)
+	m.Composition = append(m.Composition[:0], normalized...)
+	m.CompositionCursor = clampInt(cursor, 0, len(m.Composition))
+	m.resetSlashSelection()
+}
+
+func (m *Model) commitComposerComposition(text []rune) {
+	m.insertRunes(text)
+	m.clearComposerComposition()
+}
+
+func (m *Model) clearComposerComposition() {
+	m.Composition = m.Composition[:0]
+	m.CompositionCursor = 0
 }
 
 func isDefaultEmptyState(items []Message) bool {
@@ -3188,12 +3250,110 @@ func (m *Model) composerSlashSuggestions(limit int) []slashCommandSpec {
 	return suggestSlashCommands(string(m.Input), limit)
 }
 
+func (m *Model) composerSlashSuggestionsForDisplay(limit int) []slashCommandSpec {
+	if limit <= 0 {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(string(m.Input))
+	if !strings.HasPrefix(trimmed, "/") {
+		return nil
+	}
+
+	raw := m.composerSlashSuggestions(maxInt(limit*2, limit+2))
+	display := collapseSlashSuggestionsForDisplay(raw, limit)
+	if len(display) >= limit {
+		return display[:limit]
+	}
+	if len(display) > 0 && !strings.HasPrefix(strings.TrimSpace(display[0].Command), "/") {
+		return display
+	}
+
+	for _, command := range slashPinnedDisplayCommands {
+		item, ok := findSlashCommandSpec(command)
+		if !ok {
+			continue
+		}
+		if hasSlashDisplayCommand(display, item) {
+			continue
+		}
+		display = append(display, item)
+		if len(display) == limit {
+			break
+		}
+	}
+	return display
+}
+
+func (m *Model) resetSlashSelection() {
+	m.SlashSelection = -1
+}
+
+func (m *Model) moveSlashSelection(direction int) bool {
+	matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit)
+	if len(matches) == 0 {
+		m.resetSlashSelection()
+		return false
+	}
+
+	switch {
+	case m.SlashSelection < 0 && direction < 0:
+		m.SlashSelection = len(matches) - 1
+	case m.SlashSelection < 0:
+		m.SlashSelection = 0
+	case direction < 0 && m.SlashSelection > 0:
+		m.SlashSelection--
+	case direction > 0 && m.SlashSelection < len(matches)-1:
+		m.SlashSelection++
+	case direction > 0:
+		m.SlashSelection = -1
+	}
+	return true
+}
+
+func (m *Model) selectedSlashSuggestion() (slashCommandSpec, bool) {
+	matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit)
+	if len(matches) == 0 {
+		return slashCommandSpec{}, false
+	}
+
+	index := m.SlashSelection
+	if index < 0 || index >= len(matches) {
+		return slashCommandSpec{}, false
+	}
+	return matches[index], true
+}
+
+func (m *Model) applySelectedSlashCompletion() bool {
+	item, ok := m.selectedSlashSuggestion()
+	if !ok {
+		return false
+	}
+
+	insertValue := item.InsertValue
+	if insertValue == "" {
+		insertValue = item.Command
+	}
+	if insertValue == "" || insertValue == string(m.Input) {
+		return false
+	}
+	m.Input = []rune(insertValue)
+	m.Cursor = len(m.Input)
+	m.resetSlashSelection()
+	return true
+}
+
 func (m *Model) applySlashCompletion() bool {
+	if m.applySelectedSlashCompletion() {
+		return true
+	}
+
 	matches := m.composerSlashSuggestions(1)
 	if len(matches) == 0 {
 		if completed, ok := applySlashCompletion(string(m.Input)); ok {
 			m.Input = []rune(completed)
 			m.Cursor = len(m.Input)
+			m.resetSlashSelection()
 			return true
 		}
 		return false
@@ -3207,6 +3367,7 @@ func (m *Model) applySlashCompletion() bool {
 	}
 	m.Input = []rune(insertValue)
 	m.Cursor = len(m.Input)
+	m.resetSlashSelection()
 	return true
 }
 
@@ -3276,4 +3437,57 @@ func suggestSlashCommands(input string, limit int) []slashCommandSpec {
 		}
 	}
 	return suggestions
+}
+
+func collapseSlashSuggestionsForDisplay(items []slashCommandSpec, limit int) []slashCommandSpec {
+	if len(items) == 0 || limit <= 0 {
+		return nil
+	}
+
+	collapsed := make([]slashCommandSpec, 0, minInt(limit, len(items)))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		key := strings.ToLower(strings.TrimSpace(item.Command))
+		if strings.HasPrefix(key, "/") {
+			key = compactSlashCommand(key)
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		collapsed = append(collapsed, item)
+		if len(collapsed) == limit {
+			break
+		}
+	}
+	return collapsed
+}
+
+func hasSlashDisplayCommand(items []slashCommandSpec, target slashCommandSpec) bool {
+	targetKey := strings.ToLower(strings.TrimSpace(target.Command))
+	if strings.HasPrefix(targetKey, "/") {
+		targetKey = compactSlashCommand(targetKey)
+	}
+	for _, item := range items {
+		key := strings.ToLower(strings.TrimSpace(item.Command))
+		if strings.HasPrefix(key, "/") {
+			key = compactSlashCommand(key)
+		}
+		if key == targetKey {
+			return true
+		}
+	}
+	return false
+}
+
+func findSlashCommandSpec(command string) (slashCommandSpec, bool) {
+	for _, item := range slashCommandCatalog {
+		if item.Command == command {
+			return item, true
+		}
+	}
+	return slashCommandSpec{}, false
 }

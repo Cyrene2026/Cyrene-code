@@ -18,6 +18,7 @@ import (
 
 const (
 	wmActivate          = 0x0006
+	wmCtlColorEdit      = 0x0133
 	wmDestroy           = 0x0002
 	wmShowWindow        = 0x0018
 	wmSize              = 0x0005
@@ -40,9 +41,7 @@ const (
 	hwndTopMost   = ^uintptr(0)
 	hwndNoTopMost = ^uintptr(1)
 
-	wsOverlapped   = 0x00000000
-	wsCaption      = 0x00C00000
-	wsSysMenu      = 0x00080000
+	wsPopup        = 0x80000000
 	wsVisible      = 0x10000000
 	wsTabStop      = 0x00010000
 	wsChild        = 0x40000000
@@ -68,6 +67,13 @@ const (
 	vkDown    = 0x28
 	vkDelete  = 0x2E
 	vkControl = 0x11
+
+	helperWidth  = 420
+	helperHeight = 56
+	helperMargin = 10
+
+	helperTextColor       = 0x00F4F4F4
+	helperBackgroundColor = 0x00161616
 )
 
 type nativeEvent struct {
@@ -108,6 +114,7 @@ type wndClassEx struct {
 
 var (
 	user32                       = windows.NewLazySystemDLL("user32.dll")
+	gdi32                        = windows.NewLazySystemDLL("gdi32.dll")
 	kernel32                     = windows.NewLazySystemDLL("kernel32.dll")
 	imm32                        = windows.NewLazySystemDLL("imm32.dll")
 	procAttachThreadInput        = user32.NewProc("AttachThreadInput")
@@ -133,6 +140,9 @@ var (
 	procShowWindow               = user32.NewProc("ShowWindow")
 	procTranslateMessage         = user32.NewProc("TranslateMessage")
 	procUpdateWindow             = user32.NewProc("UpdateWindow")
+	procCreateSolidBrush         = gdi32.NewProc("CreateSolidBrush")
+	procSetBkColor               = gdi32.NewProc("SetBkColor")
+	procSetTextColor             = gdi32.NewProc("SetTextColor")
 	procGetCurrentThreadID       = kernel32.NewProc("GetCurrentThreadId")
 	procGetModuleHandleW         = kernel32.NewProc("GetModuleHandleW")
 	procImmGetContext            = imm32.NewProc("ImmGetContext")
@@ -146,6 +156,7 @@ var (
 	inputHandle         windows.Handle
 	originalInputProc   uintptr
 	suppressedCharCount int
+	backgroundBrush     windows.Handle
 )
 
 func main() {
@@ -165,6 +176,8 @@ func run() error {
 	className, _ := windows.UTF16PtrFromString("CyreneImeBridgeWindow")
 	title, _ := windows.UTF16PtrFromString("Cyrene Input")
 	cursor, _, _ := procLoadCursorW.Call(0, uintptr(32512))
+	brush, _, _ := procCreateSolidBrush.Call(helperBackgroundColor)
+	backgroundBrush = windows.Handle(brush)
 	class := wndClassEx{
 		Size:       uint32(unsafe.Sizeof(wndClassEx{})),
 		Style:      csHRedraw | csVRedraw,
@@ -172,7 +185,7 @@ func run() error {
 		Instance:   windows.Handle(instance),
 		Cursor:     windows.Handle(cursor),
 		ClassName:  className,
-		Background: 0,
+		Background: backgroundBrush,
 	}
 	if atom, _, callErr := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&class))); atom == 0 {
 		return callErr
@@ -182,9 +195,9 @@ func run() error {
 		uintptr(wsExToolWindow),
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(title)),
-		uintptr(wsOverlapped|wsCaption|wsSysMenu|wsVisible),
+		uintptr(wsPopup|wsVisible),
 		uintptr(cwUseDefault), uintptr(cwUseDefault),
-		uintptr(760), uintptr(104),
+		uintptr(helperWidth), uintptr(helperHeight),
 		0, 0,
 		instance,
 		0,
@@ -223,9 +236,9 @@ func createInputWindow(parent windows.Handle, instance windows.Handle) error {
 		0,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(initialText)),
-		uintptr(wsChild|wsVisible|wsTabStop|wsBorder|esAutoHScroll),
-		uintptr(16), uintptr(16),
-		uintptr(720), uintptr(30),
+		uintptr(wsChild|wsVisible|wsTabStop|esAutoHScroll),
+		uintptr(helperMargin), uintptr(helperMargin),
+		uintptr(helperWidth-helperMargin*2), uintptr(helperHeight-helperMargin*2),
 		uintptr(parent),
 		0,
 		uintptr(instance),
@@ -237,12 +250,16 @@ func createInputWindow(parent windows.Handle, instance windows.Handle) error {
 	inputHandle = windows.Handle(hwnd)
 	previous, _, _ := procSetWindowLongPtrW.Call(hwnd, gwlpWndProc, inputProcPtr)
 	originalInputProc = previous
-	resizeInputWindow(parent, 760, 104)
+	resizeInputWindow(parent, helperWidth, helperHeight)
 	return nil
 }
 
 func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
+	case wmCtlColorEdit:
+		procSetTextColor.Call(wParam, helperTextColor)
+		procSetBkColor.Call(wParam, helperBackgroundColor)
+		return uintptr(backgroundBrush)
 	case wmActivate, wmShowWindow:
 		ensureInputFocus(windows.Handle(hwnd))
 		return 0
@@ -381,8 +398,8 @@ func resizeInputWindow(parent windows.Handle, width int32, height int32) {
 	if inputHandle == 0 {
 		return
 	}
-	marginX := int32(16)
-	marginY := int32(14)
+	marginX := int32(helperMargin)
+	marginY := int32(helperMargin)
 	controlWidth := width - marginX*2
 	if controlWidth < 64 {
 		controlWidth = 64

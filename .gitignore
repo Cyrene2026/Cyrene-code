@@ -38,3 +38,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 test_files/
 
 .codex
+src/frontend/components/v2/cyrene-ime-bridge.exe
+src/frontend/components/v2/cyrenecode.exe
+src/frontend/components/v2/cyrene-ime-bridge.exe

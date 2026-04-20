@@ -18,6 +18,7 @@ export type SessionMessage = {
 export type SessionInFlightTurn = {
   userText: string;
   assistantText: string;
+  committedVisibleText?: string;
   startedAt: string;
   updatedAt: string;
 };

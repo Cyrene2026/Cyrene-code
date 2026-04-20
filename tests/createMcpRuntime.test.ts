@@ -865,6 +865,16 @@ describe("createMcpRuntime", () => {
     await writeFile(join(root, "tsconfig.json"), '{ "compilerOptions": {} }\n', "utf8");
     await writeFile(join(root, "src", "main.tsx"), "export const App = () => null;\n", "utf8");
     await writeFile(join(root, "scripts.sh"), "echo hi\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+      ].join("\n"),
+      "utf8"
+    );
 
     const runtime = await createTestMcpRuntime(root, {
       env: {
@@ -873,11 +883,12 @@ describe("createMcpRuntime", () => {
       },
     });
 
-    const result = await runtime.bootstrapLsp?.("filesystem");
+    const result = await runtime.bootstrapLsp?.("repo");
     expect(result?.ok).toBe(true);
     expect(result?.message).toContain("MCP LSP bootstrap");
-    expect(result?.message).toContain("detected: typescript, json, bash");
-    expect(result?.message).toContain("added: typescript, json, bash");
+    expect(result?.message).toContain("filesystem_server: repo");
+    expect(result?.message).toContain("detected: typescript, json, yaml, bash");
+    expect(result?.message).toContain("added: typescript, json, yaml, bash");
     expect(result?.message).toContain(
       "- typescript: npm install -g typescript-language-server typescript"
     );
@@ -885,12 +896,16 @@ describe("createMcpRuntime", () => {
       "- json: npm install -g vscode-langservers-extracted"
     );
     expect(result?.message).toContain(
+      "- yaml: npm install -g yaml-language-server"
+    );
+    expect(result?.message).toContain(
       "- bash: npm install -g bash-language-server"
     );
-    expect(runtime.listLspServers?.("filesystem").map(entry => entry.id)).toEqual([
+    expect(runtime.listLspServers?.("repo").map(entry => entry.id).sort()).toEqual([
       "bash",
       "json",
       "typescript",
+      "yaml",
     ]);
 
     runtime.dispose();

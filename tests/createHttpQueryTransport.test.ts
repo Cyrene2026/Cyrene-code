@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileMcpService } from "../src/core/mcp";
 import { parseStreamChunk } from "../src/core/query/streamProtocol";
 import {
+  ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT,
   FILE_TOOL,
   TOOL_USAGE_SYSTEM_PROMPT,
   createHttpQueryTransport,
@@ -24,6 +25,10 @@ const createTransport = (
     env?: Partial<NodeJS.ProcessEnv>;
     requestTemperature?: number;
     mcpTools?: unknown[];
+    debugAnthropicRequests?: {
+      capture?: boolean;
+      directory?: string;
+    };
   }
 ) => {
   const env: NodeJS.ProcessEnv = {
@@ -40,6 +45,7 @@ const createTransport = (
     env,
     requestTemperature: options.requestTemperature,
     mcpTools: options.mcpTools as any,
+    debugAnthropicRequests: options.debugAnthropicRequests,
   });
 };
 
@@ -356,6 +362,28 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive phrases that restate the same plan");
   });
 
+  test("anthropic uses a shorter tool usage prompt with core guardrails intact", () => {
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT.length).toBeLessThan(5000);
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT.length).toBeLessThan(
+      TOOL_USAGE_SYSTEM_PROMPT.length
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "emit exactly one valid tool call"
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Do not send placeholders"
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "For workspace-wide find_files/search_text/search_text_context, set `path` to `.`."
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "after a confirmed write/edit/patch, continue instead of rereading just to confirm"
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Use open_shell/write_shell/read_shell/shell_status/interrupt_shell/close_shell only when persistent shell state is required."
+    );
+  });
+
   test("openai chat requests include MCP tools and the expanded system prompt", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
@@ -662,7 +690,655 @@ describe("createHttpQueryTransport tool exposure", () => {
       "file",
       "maps_geo",
     ]);
-    expect(requestBody.system).toContain("maps_geo");
+    expect(requestBody.tools[0]?.cache_control).toBeUndefined();
+    expect(requestBody.tools[1]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
+    expect(requestBody.system).toEqual([
+      expect.objectContaining({
+        type: "text",
+        cache_control: {
+          type: "ephemeral",
+        },
+      }),
+    ]);
+    expect(requestBody.system[0]?.text).toContain("maps_geo");
+    expect(requestBody.system[0]?.text).toContain(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT);
+    expect(requestBody.system[0]?.text).not.toContain(
+      "Available `file` actions are:"
+    );
+    expect(requestBody.messages[0]?.content[0]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
+  });
+
+  test("anthropic moves structured prompt prefix into system for better cache reuse", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const structuredPrompt = [
+      "SYSTEM PROMPT (highest priority):",
+      "system prompt block",
+      "",
+      ".CYRENE.MD POLICY (second priority):",
+      "project policy block",
+      "",
+      "SELECTED EXTENSIONS (request-scoped summary):",
+      "- request-scoped extension summary",
+      "",
+      "EXECUTION PLAN PROTOCOL:",
+      "plan protocol block",
+      "",
+      "TASK STATE CONTEXT:",
+      "Working state (durable reducer):",
+      "- durable fact",
+      "",
+      "Current user query (act on this now):",
+      "continue",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(structuredPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.system[0]?.text).toContain("SYSTEM PROMPT (highest priority):");
+    expect(requestBody.system[0]?.text).toContain("EXECUTION PLAN PROTOCOL:");
+    expect(requestBody.system[0]?.text).not.toContain(
+      "SELECTED EXTENSIONS (request-scoped summary):"
+    );
+    expect(requestBody.system[0]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
+    expect(requestBody.system[1]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("SELECTED EXTENSIONS (request-scoped summary):"),
+      })
+    );
+    expect(requestBody.system[1]?.cache_control).toBeUndefined();
+    expect(requestBody.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          expect.objectContaining({
+            type: "text",
+            cache_control: {
+              type: "ephemeral",
+            },
+          }),
+          expect.objectContaining({
+            type: "text",
+          }),
+        ],
+      },
+    ]);
+    expect(requestBody.messages[0]?.content[0]?.text).toContain("TASK STATE CONTEXT:\n");
+    expect(requestBody.messages[0]?.content[1]?.text).toContain(
+      "Current user query (act on this now):\n"
+    );
+    expect(requestBody.messages[0]?.content[0]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
+    expect(requestBody.messages[0]?.content[1]?.cache_control).toBeUndefined();
+    expect(requestBody.messages[0]?.content[0]?.text).not.toContain(
+      "SYSTEM PROMPT (highest priority):"
+    );
+  });
+
+  test("anthropic splits continuation tool results into separate text blocks", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: list_dir . | confirmed directory state | [F] package.json",
+      "",
+      "[tool_result] file",
+      "Tool: read_files package.json, tsconfig.json | package.json, tsconfig.json (2 files)",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const contentBlocks = requestBody.messages[0]?.content;
+    expect(contentBlocks).toEqual([
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("Tool results:"),
+        cache_control: {
+          type: "ephemeral",
+        },
+      }),
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("[tool_result] file"),
+      }),
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("[tool_result] file"),
+      }),
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining(
+          "If more tool usage is needed, call tools again. Otherwise provide final answer."
+        ),
+      }),
+    ]);
+    expect(contentBlocks[1]?.cache_control).toBeUndefined();
+    expect(contentBlocks[2]?.cache_control).toBeUndefined();
+    expect(contentBlocks[3]?.cache_control).toBeUndefined();
+  });
+
+  test("anthropic moves dynamic continuation state after tool results to protect cache prefix", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Execution state:",
+      "mode: project_analysis",
+      "phase: synthesize",
+      "architecture evidence: 4",
+      "",
+      "Heuristic nudges:",
+      "1. Continue from confirmed facts.",
+      "",
+      "Loop warning:",
+      "Tool call was repeated.",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: read_files README.md | README.md (1 file)",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const contentBlocks = requestBody.messages[0]?.content;
+    expect(contentBlocks[0]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
+    expect(contentBlocks[0]?.text).toContain("Original user task:");
+    expect(contentBlocks[0]?.text).toContain("Tool results:");
+    expect(contentBlocks[0]?.text).not.toContain("Execution state:");
+    expect(contentBlocks[1]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("[tool_result] file"),
+      })
+    );
+    expect(contentBlocks[1]?.cache_control).toBeUndefined();
+    expect(contentBlocks[2]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("Execution state:"),
+      })
+    );
+    expect(contentBlocks[2]?.cache_control).toBeUndefined();
+    expect(contentBlocks[2]?.text).toContain("Loop warning:");
+  });
+
+  test("anthropic can snapshot each outbound request body when debug capture is enabled", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const globalHome = join(root, "global-home");
+    await mkdir(globalHome, { recursive: true });
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        HOME: globalHome,
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+      debugAnthropicRequests: {
+        capture: true,
+        directory: join("logs", "anthropic-debug"),
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl(
+      [
+        "Original user task:",
+        "inspect repo",
+        "",
+        "Continue based on tool results while staying strictly on the original task.",
+        "",
+        "Tool results:",
+        "[tool_result] file",
+        "Tool: list_dir . | confirmed directory state | [F] package.json",
+        "",
+        "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+      ].join("\n")
+    );
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const snapshotDir = join(
+      root,
+      "logs",
+      "anthropic-debug"
+    );
+    const snapshotFiles = await readdir(snapshotDir);
+    expect(snapshotFiles.length).toBe(1);
+
+    const snapshot = JSON.parse(
+      await readFile(join(snapshotDir, snapshotFiles[0]!), "utf8")
+    );
+    expect(snapshot.provider).toBe("https://api.anthropic.com");
+    expect(snapshot.model).toBe("claude-3-7-sonnet-latest");
+    expect(snapshot.summary.cacheBreakpointPaths).toEqual([
+      "tools[0]",
+      "system[0]",
+      "messages[0].content[0]",
+    ]);
+    expect(snapshot.summary.resolvedCacheControl).toEqual({
+      type: "ephemeral",
+    });
+    expect(snapshot.summary.resolvedBetaHeaders).toEqual([]);
+    expect(snapshot.summary.systemSplitSummary).toEqual({
+      cachedSystemTextLength: snapshot.requestBody.system[0]?.text.length ?? 0,
+      uncachedSystemTailTextLength: 0,
+    });
+    expect(snapshot.requestBody.tools[0]).toEqual(
+      expect.objectContaining({
+        name: "file",
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
+    expect(snapshot.requestBody.system[0]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
+    expect(snapshot.requestBody.messages[0]?.content[0]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
+  });
+
+  test("anthropic latches TTL and scope per transport session", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const env: NodeJS.ProcessEnv = {
+      CYRENE_ROOT: root,
+      CYRENE_HOME: cyreneHome,
+      CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      CYRENE_ANTHROPIC_CACHE_TTL: "1h",
+      CYRENE_ANTHROPIC_CACHE_SCOPE: "global",
+    };
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = () =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              [
+                "event: message_stop",
+                'data: {"type":"message_stop"}',
+                "",
+              ].join("\n")
+            )
+          );
+          controller.close();
+        },
+      });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody(), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createHttpQueryTransport({
+      appRoot: root,
+      cwd: root,
+      env,
+    });
+
+    const firstStreamUrl = await transport.requestStreamUrl("first turn");
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+
+    delete env.CYRENE_ANTHROPIC_CACHE_TTL;
+    delete env.CYRENE_ANTHROPIC_CACHE_SCOPE;
+
+    const secondStreamUrl = await transport.requestStreamUrl("second turn");
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    const firstRequestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const secondRequestBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(firstRequestBody.system[0]?.cache_control).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+      scope: "global",
+    });
+    expect(secondRequestBody.system[0]?.cache_control).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+      scope: "global",
+    });
+    expect(secondRequestBody.messages[0]?.content[0]?.cache_control).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+      scope: "global",
+    });
+  });
+
+  test("anthropic beta headers are sticky and sorted per transport session", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const env: NodeJS.ProcessEnv = {
+      CYRENE_ROOT: root,
+      CYRENE_HOME: cyreneHome,
+      CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      CYRENE_ANTHROPIC_BETA_HEADERS: "zeta,alpha",
+    };
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = () =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              [
+                "event: message_stop",
+                'data: {"type":"message_stop"}',
+                "",
+              ].join("\n")
+            )
+          );
+          controller.close();
+        },
+      });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody(), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createHttpQueryTransport({
+      appRoot: root,
+      cwd: root,
+      env,
+    });
+
+    const firstStreamUrl = await transport.requestStreamUrl("first turn");
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+
+    env.CYRENE_ANTHROPIC_BETA_HEADERS = "beta,alpha";
+
+    const secondStreamUrl = await transport.requestStreamUrl("second turn");
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    delete env.CYRENE_ANTHROPIC_BETA_HEADERS;
+
+    const thirdStreamUrl = await transport.requestStreamUrl("third turn");
+    for await (const _event of transport.stream(thirdStreamUrl)) {
+      // consume stream
+    }
+
+    expect((fetchCalls[0]?.init?.headers as Record<string, string>)["anthropic-beta"]).toBe(
+      "alpha,zeta"
+    );
+    expect((fetchCalls[1]?.init?.headers as Record<string, string>)["anthropic-beta"]).toBe(
+      "alpha,beta,zeta"
+    );
+    expect((fetchCalls[2]?.init?.headers as Record<string, string>)["anthropic-beta"]).toBe(
+      "alpha,beta,zeta"
+    );
   });
 });
 
@@ -2285,6 +2961,86 @@ describe("createHttpQueryTransport streaming usage", () => {
       })
     );
     expect(events.at(-1)).toBe(JSON.stringify({ type: "done" }));
+  });
+
+  test("anthropic usage includes cache read tokens in normalized usage events", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_start",
+              'data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":40}}}',
+              "",
+              "event: message_delta",
+              'data: {"type":"message_delta","usage":{"output_tokens":5}}',
+              "",
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(
+      async () =>
+        new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        })
+    ) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 140,
+        cachedTokens: 90,
+        completionTokens: 0,
+        totalTokens: 140,
+      }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 140,
+        cachedTokens: 90,
+        completionTokens: 5,
+        totalTokens: 145,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
   });
 
   test("anthropic tool input ignores empty object seeds before streamed json deltas", async () => {

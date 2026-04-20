@@ -5,12 +5,24 @@ import {
   getLegacyProjectCyreneDir,
   resolveAmbientAppRoot,
 } from "../../../../infra/config/appRoot";
+import { listLspPresets } from "../../lspPresets";
 import type { MpcAction, RuleConfig } from "../../toolTypes";
 
 type RuleConfigLoadContext = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
 };
+
+const createDefaultLspServers = () =>
+  listLspPresets().map(preset => ({
+    id: preset.id,
+    command: preset.command,
+    args: [...(preset.args ?? [])],
+    filePatterns: [...preset.filePatterns],
+    rootMarkers: [...(preset.rootMarkers ?? [])],
+    ...(preset.workspaceRoot ? { workspaceRoot: preset.workspaceRoot } : {}),
+    ...(preset.env ? { env: { ...preset.env } } : {}),
+  }));
 
 const createDefaultRules = (appRoot: string): RuleConfig => ({
   workspaceRoot: appRoot,
@@ -25,6 +37,7 @@ const createDefaultRules = (appRoot: string): RuleConfig => ({
     "run_shell",
     "write_shell",
   ],
+  lspServers: createDefaultLspServers(),
 });
 
 const parseScalar = (value: string) =>
@@ -214,5 +227,6 @@ export const loadFilesystemRuleConfig = async (
       mergedRequireReview.length > 0
         ? mergedRequireReview
         : defaultRules.requireReview,
+    lspServers: defaultRules.lspServers,
   };
 };

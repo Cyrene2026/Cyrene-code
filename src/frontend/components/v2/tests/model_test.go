@@ -297,6 +297,26 @@ func TestComposerPasteStripsWindowsFormattingRunes(t *testing.T) {
 	}
 }
 
+func TestComposerPastePreservesNoTerminalCursorArtifacts(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("❯ ❯ • 补充更多测试用例到 simplex.py:303\n       █\n        █\n        █\n         • 增加退化/无界/不可行示例")})
+
+	if strings.Contains(string(model.Input), "█") {
+		t.Fatalf("expected pasted terminal cursor artifacts stripped, got %q", string(model.Input))
+	}
+}
+
+func TestComposerAllowsLiteralSingleBlockRuneInput(t *testing.T) {
+	model := app.NewModel()
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("█")})
+
+	if got := string(model.Input); got != "█" {
+		t.Fatalf("expected literal block rune preserved, got %q", got)
+	}
+}
+
 func TestComposerSupportsClearAndWordDeleteShortcuts(t *testing.T) {
 	model := app.NewModel()
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("alpha beta gamma")})
@@ -716,7 +736,7 @@ func TestTranscriptRenderKeepsHistoryAcrossLiveUpdates(t *testing.T) {
 	}
 }
 
-func TestLiveTranscriptRendersBeforeTrailingToolStatuses(t *testing.T) {
+func TestLiveTranscriptRendersAfterTrailingToolStatuses(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
 	model.Height = 24
@@ -733,8 +753,8 @@ func TestLiveTranscriptRendersBeforeTrailingToolStatuses(t *testing.T) {
 	if liveIndex < 0 || toolIndex < 0 {
 		t.Fatalf("expected both live transcript and tool status, got %q", view)
 	}
-	if liveIndex > toolIndex {
-		t.Fatalf("expected live transcript to render before trailing tool statuses, got %q", view)
+	if liveIndex < toolIndex {
+		t.Fatalf("expected live transcript to render after trailing tool statuses, got %q", view)
 	}
 }
 
@@ -974,6 +994,21 @@ func TestComposerUsesTextareaCursorRendering(t *testing.T) {
 	}
 	if strings.Contains(rendered, "hello|") {
 		t.Fatalf("expected composer textarea to stop rendering pipe cursor, got %q", rendered)
+	}
+}
+
+func TestComposerCollapsesToCharacterCountAfterThreshold(t *testing.T) {
+	model := app.NewModel()
+	longInput := strings.Repeat("a", 1001)
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(longInput)})
+
+	rendered := model.RenderComposerForTest(40)
+
+	if !strings.Contains(rendered, "1001 chars") {
+		t.Fatalf("expected composer to show character count summary, got %q", rendered)
+	}
+	if strings.Contains(rendered, longInput[:32]) {
+		t.Fatalf("expected long composer input hidden behind count summary, got %q", rendered)
 	}
 }
 

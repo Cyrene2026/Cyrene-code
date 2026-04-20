@@ -7,6 +7,7 @@ import {
   loadMcpConfig,
   saveProjectMcpConfig,
 } from "../src/core/mcp";
+import { listLspPresets } from "../src/core/mcp/lspPresets";
 import {
   configureAppRootFromArgs,
   resetConfiguredAppRoot,
@@ -44,6 +45,8 @@ describe("config loaders", () => {
       "query_max_tool_steps: 31",
       "auto_summary_refresh: false",
       "request_temperature: 0.15",
+      "debug_capture_anthropic_requests: true",
+      "debug_capture_anthropic_requests_dir: .cyrene/debug/anthropic-requests",
       'system_prompt: "focus on tests"',
     ].join("\n"));
 
@@ -53,6 +56,10 @@ describe("config loaders", () => {
     expect(config.queryMaxToolSteps).toBe(31);
     expect(config.autoSummaryRefresh).toBe(false);
     expect(config.requestTemperature).toBe(0.15);
+    expect(config.debugCaptureAnthropicRequests).toBe(true);
+    expect(config.debugCaptureAnthropicRequestsDir).toBe(
+      ".cyrene/debug/anthropic-requests"
+    );
     expect(config.systemPrompt).toBe("focus on tests");
   });
 
@@ -68,6 +75,7 @@ describe("config loaders", () => {
         "pin_max_count: 12",
         "query_max_tool_steps: 40",
         "auto_summary_refresh: false",
+        "debug_capture_anthropic_requests: true",
         'system_prompt: "global prompt"',
       ].join("\n"),
       "utf8"
@@ -77,6 +85,8 @@ describe("config loaders", () => {
       [
         "pin_max_count: 7",
         "request_temperature: 0.6",
+        "debug_capture_anthropic_requests: false",
+        "debug_capture_anthropic_requests_dir: ./tmp/anthropic-debug",
         'system_prompt: "project prompt"',
       ].join("\n"),
       "utf8"
@@ -91,6 +101,8 @@ describe("config loaders", () => {
     expect(config.queryMaxToolSteps).toBe(40);
     expect(config.autoSummaryRefresh).toBe(false);
     expect(config.requestTemperature).toBe(0.6);
+    expect(config.debugCaptureAnthropicRequests).toBe(false);
+    expect(config.debugCaptureAnthropicRequestsDir).toBe("./tmp/anthropic-debug");
     expect(config.systemPrompt).toBe("project prompt");
   });
 
@@ -103,6 +115,8 @@ describe("config loaders", () => {
     expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
     expect(config.autoSummaryRefresh).toBe(true);
     expect(config.requestTemperature).toBe(0.2);
+    expect(config.debugCaptureAnthropicRequests).toBe(false);
+    expect(config.debugCaptureAnthropicRequestsDir).toBeUndefined();
   });
 
   test("loadPromptPolicy default system prompt enables autonomous execution plans", async () => {
@@ -153,6 +167,8 @@ describe("config loaders", () => {
     expect(configText).toContain("query_max_tool_steps:");
     expect(configText).toContain("auto_summary_refresh:");
     expect(configText).toContain("request_temperature:");
+    expect(configText).toContain("debug_capture_anthropic_requests:");
+    expect(configText).toContain("debug_capture_anthropic_requests_dir:");
   });
 
   test("loadFilesystemRuleConfig falls back to config.yaml for MCP review settings", async () => {
@@ -217,6 +233,7 @@ describe("config loaders", () => {
     const root = await createWorkspace("");
 
     const config = await loadFilesystemRuleConfig(root);
+    const defaultPresetIds = listLspPresets().map(preset => preset.id).sort();
 
     expect(config.workspaceRoot).toBe(root);
     expect(config.requireReview).not.toContain("create_file");
@@ -227,6 +244,9 @@ describe("config loaders", () => {
     expect(config.requireReview).toContain("run_command");
     expect(config.requireReview).toContain("write_shell");
     expect(config.requireReview).not.toContain("open_shell");
+    expect((config.lspServers ?? []).map(server => server.id).sort()).toEqual(
+      defaultPresetIds
+    );
   });
 
   test("config loaders prefer the ambient workspace over an unrelated configured app root", async () => {

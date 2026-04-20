@@ -2638,6 +2638,7 @@ func normalizeComposerRunes(values []rune) []rune {
 		return nil
 	}
 
+	stripStandaloneCursorArtifacts := len(values) > 1 && hasStandaloneComposerCursorLine(values)
 	normalized := make([]rune, 0, len(values))
 	for index := 0; index < len(values); index++ {
 		r := values[index]
@@ -2654,6 +2655,9 @@ func normalizeComposerRunes(values []rune) []rune {
 		case '\u00a0':
 			normalized = append(normalized, ' ')
 		default:
+			if stripStandaloneCursorArtifacts && isStandaloneComposerCursorLineRune(values, index) {
+				continue
+			}
 			if isWindowsIgnoredInputRune(r) {
 				continue
 			}
@@ -2693,6 +2697,60 @@ func isWindowsIgnoredInputRune(value rune) bool {
 	default:
 		return false
 	}
+}
+
+func hasStandaloneComposerCursorLine(values []rune) bool {
+	for start := 0; start <= len(values); {
+		end := start
+		for end < len(values) && values[end] != '\n' && values[end] != '\r' {
+			end++
+		}
+		if lineContainsOnlyStandaloneComposerCursor(values[start:end]) {
+			return true
+		}
+		if end >= len(values) {
+			return false
+		}
+		if values[end] == '\r' && end+1 < len(values) && values[end+1] == '\n' {
+			start = end + 2
+			continue
+		}
+		start = end + 1
+	}
+	return false
+}
+
+func isStandaloneComposerCursorLineRune(values []rune, index int) bool {
+	if index < 0 || index >= len(values) || values[index] != composerCursorRune {
+		return false
+	}
+
+	start := index
+	for start > 0 && values[start-1] != '\n' && values[start-1] != '\r' {
+		start--
+	}
+
+	end := index + 1
+	for end < len(values) && values[end] != '\n' && values[end] != '\r' {
+		end++
+	}
+
+	return lineContainsOnlyStandaloneComposerCursor(values[start:end])
+}
+
+func lineContainsOnlyStandaloneComposerCursor(values []rune) bool {
+	cursorCount := 0
+	for _, value := range values {
+		switch {
+		case value == composerCursorRune:
+			cursorCount++
+		case unicode.IsSpace(value):
+			continue
+		default:
+			return false
+		}
+	}
+	return cursorCount == 1
 }
 
 func deleteWordBackwardRunes(values []rune, cursor int) ([]rune, int) {

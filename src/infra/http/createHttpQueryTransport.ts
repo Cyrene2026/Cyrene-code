@@ -1,3 +1,5 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import {
   inferProviderType,
@@ -24,7 +26,7 @@ import {
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
-import { resolveAmbientAppRoot } from "../config/appRoot";
+import { resolveAmbientAppRoot, resolveUserHomeDir } from "../config/appRoot";
 
 const envSchema = z.object({
   CYRENE_BASE_URL: z.string().min(1).optional(),
@@ -560,6 +562,25 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Stop exploring once you have enough information to act.",
 ].join(" ");
 
+export const ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT = [
+  "You are operating inside a workspace with native function tools.",
+  "The `file` function handles filesystem, search, semantic/LSP, git, patch, and shell actions. Use domain-specific MCP tools when they fit better than `file`.",
+  "When a tool is needed, emit exactly one valid tool call and no surrounding prose, XML, markdown fences, wrapper text, or partial JSON.",
+  "Use the exact exposed tool name and the schema-defined fields only. Do not send placeholders, empty strings, empty arrays, guessed paths, or unrelated optional fields.",
+  "Choose the narrowest action: prefer stat/find/search/outline/range reads before broad file reads; use read_files/stat_paths for multiple known paths; use search_text_context only when surrounding lines matter.",
+  "For workspace-wide find_files/search_text/search_text_context, set `path` to `.`.",
+  "For read_file/stat_path provide only `path`; for read_files/stat_paths put the first path in `path` and the rest in `paths`.",
+  "For read_range/git_blame use 1-based inclusive `startLine` and `endLine`.",
+  "For TS/LSP hover, definition, references, rename, and code actions, provide exact 1-based `line` and `column`; use optional `serverId` only when multiple LSP servers may match.",
+  "For write_file provide full `content`; for edit_file/apply_patch provide both `find` and `replace`; after a confirmed write/edit/patch, continue instead of rereading just to confirm unless explicitly asked.",
+  "Use git_status/git_diff/git_log/git_show/git_blame instead of shell when those answer the question.",
+  "Use run_command for direct program execution with optional `args`; do not put shell syntax, pipes, redirects, chains, subshells, or multiline input into run_command.",
+  "Use open_shell/write_shell/read_shell/shell_status/interrupt_shell/close_shell only when persistent shell state is required.",
+  "Respect confirmed tool results: do not repeat identical list_dir/read_file/tool calls unless state changed; if a result already answers the question, reuse it.",
+  "If a previous tool call was rejected, correct the exact schema error and retry with one corrected call only.",
+  "Match the user's language in progress and final responses. Keep pre-tool narration minimal and stop calling tools once you have enough information to answer or act.",
+].join(" ");
+
 const DEFAULT_DYNAMIC_TOOL_PARAMETERS = {
   type: "object",
   properties: {},
@@ -629,14 +650,649 @@ const buildGeminiFunctionTools = (mcpTools: McpToolDescriptor[]) => ({
   })),
 });
 
-const buildAnthropicTools = (mcpTools: McpToolDescriptor[]) =>
-  buildDynamicFunctionTools(mcpTools).map(tool => ({
+type AnthropicCacheTTL = "1h";
+type AnthropicCacheScope = "global";
+
+type AnthropicCacheControl = {
+  type: "ephemeral";
+  ttl?: AnthropicCacheTTL;
+  scope?: AnthropicCacheScope;
+};
+
+type AnthropicPromptCacheSessionState = {
+  cacheControlLatched: boolean;
+  latchedCacheTtl?: AnthropicCacheTTL;
+  latchedCacheScope?: AnthropicCacheScope;
+  latchedBetaHeaders: string[];
+};
+
+type AnthropicPromptProjection = {
+  cachedSystemText: string;
+  uncachedSystemTailText: string;
+  userText: string;
+};
+
+type AnthropicToolDefinition = {
+  name: string;
+  description?: string;
+  input_schema: unknown;
+  cache_control?: AnthropicCacheControl;
+};
+
+const createAnthropicPromptCacheSessionState = (): AnthropicPromptCacheSessionState => ({
+  cacheControlLatched: false,
+  latchedBetaHeaders: [],
+});
+
+const resolveAnthropicCacheControlFromEnv = (env?: NodeJS.ProcessEnv) => {
+  const ttlValue = env?.CYRENE_ANTHROPIC_CACHE_TTL?.trim().toLowerCase();
+  const scopeValue = env?.CYRENE_ANTHROPIC_CACHE_SCOPE?.trim().toLowerCase();
+  return {
+    ttl: ttlValue === "1h" ? ("1h" as const) : undefined,
+    scope: scopeValue === "global" ? ("global" as const) : undefined,
+  };
+};
+
+const parseAnthropicBetaHeaders = (value: string | undefined) =>
+  Array.from(
+    new Set(
+      (value ?? "")
+        .split(",")
+        .map(header => header.trim())
+        .filter(Boolean)
+    )
+  ).sort((left, right) => left.localeCompare(right));
+
+const latchAnthropicCacheControl = (
+  state: AnthropicPromptCacheSessionState,
+  env?: NodeJS.ProcessEnv
+) => {
+  if (state.cacheControlLatched) {
+    return;
+  }
+  state.cacheControlLatched = true;
+  const resolved = resolveAnthropicCacheControlFromEnv(env);
+  state.latchedCacheTtl = resolved.ttl;
+  state.latchedCacheScope = resolved.scope;
+};
+
+const getAnthropicCacheControl = (
+  state: AnthropicPromptCacheSessionState,
+  env?: NodeJS.ProcessEnv
+): AnthropicCacheControl => {
+  latchAnthropicCacheControl(state, env);
+  return {
+    type: "ephemeral",
+    ...(state.latchedCacheTtl ? { ttl: state.latchedCacheTtl } : {}),
+    ...(state.latchedCacheScope ? { scope: state.latchedCacheScope } : {}),
+  };
+};
+
+const getAnthropicBetaHeaders = (
+  state: AnthropicPromptCacheSessionState,
+  env?: NodeJS.ProcessEnv
+) => {
+  const resolved = parseAnthropicBetaHeaders(env?.CYRENE_ANTHROPIC_BETA_HEADERS);
+  if (resolved.length > 0) {
+    state.latchedBetaHeaders = Array.from(
+      new Set([...state.latchedBetaHeaders, ...resolved])
+    ).sort((left, right) => left.localeCompare(right));
+  }
+  return [...state.latchedBetaHeaders];
+};
+
+const buildAnthropicTools = (
+  mcpTools: McpToolDescriptor[],
+  cacheControl: AnthropicCacheControl
+) => {
+  const tools: AnthropicToolDefinition[] = buildDynamicFunctionTools(mcpTools).map(tool => ({
     name: tool.function.name,
     description: tool.function.description,
     input_schema: tool.function.parameters,
   }));
 
-const buildToolUsageSystemPrompt = (mcpTools: McpToolDescriptor[]) => {
+  const lastTool = tools.at(-1);
+  if (lastTool) {
+    tools[tools.length - 1] = {
+      ...lastTool,
+      cache_control: cacheControl,
+    };
+  }
+
+  return tools;
+};
+
+const ANTHROPIC_TASK_STATE_MARKER = "TASK STATE CONTEXT:\n";
+const ANTHROPIC_CURRENT_USER_QUERY_MARKER = "Current user query (act on this now):\n";
+const ANTHROPIC_SELECTED_EXTENSIONS_MARKER =
+  "SELECTED EXTENSIONS (request-scoped summary):\n";
+const ANTHROPIC_EXECUTION_PLAN_PROTOCOL_MARKER = "EXECUTION PLAN PROTOCOL:";
+const ANTHROPIC_TOOL_RESULTS_MARKER = "\n\nTool results:\n";
+const ANTHROPIC_TOOL_RESULTS_SUFFIX =
+  "\n\nIf more tool usage is needed, call tools again. Otherwise provide final answer.";
+const ANTHROPIC_DYNAMIC_CONTINUATION_MARKERS = [
+  "\n\nRecent confirmed file mutations:\n",
+  "\n\nMulti-file progress ledger:\n",
+  "\n\nExecution state:\n",
+  "\n\nHeuristic nudges:\n",
+] as const;
+const ANTHROPIC_NORMALIZED_OMITTED_TOOL_RESULTS_PREFIX =
+  "[tool results truncated] older results omitted to stay within the prompt budget.";
+
+type AnthropicTextBlock = {
+  type: "text";
+  text: string;
+  cache_control?: AnthropicCacheControl;
+};
+
+type AnthropicSystemBlock = AnthropicTextBlock;
+
+const buildAnthropicSystemBlocks = (
+  systemProjection: Pick<
+    AnthropicPromptProjection,
+    "cachedSystemText" | "uncachedSystemTailText"
+  >,
+  cacheControl: AnthropicCacheControl
+): AnthropicSystemBlock[] => {
+  const cachedSystemText = systemProjection.cachedSystemText.trim();
+  const uncachedSystemTailText = systemProjection.uncachedSystemTailText.trim();
+
+  if (!cachedSystemText && !uncachedSystemTailText) {
+    return [];
+  }
+
+  if (!cachedSystemText) {
+    return [
+      {
+        type: "text",
+        text: uncachedSystemTailText,
+        cache_control: cacheControl,
+      },
+    ];
+  }
+
+  return [
+    {
+      type: "text",
+      text: cachedSystemText,
+      cache_control: cacheControl,
+    },
+    ...(uncachedSystemTailText
+      ? [
+          {
+            type: "text" as const,
+            text: uncachedSystemTailText,
+          },
+        ]
+      : []),
+  ];
+};
+
+type AnthropicMessagesRequestBody = {
+  model: string;
+  stream: true;
+  max_tokens: number;
+  temperature: number;
+  system: AnthropicSystemBlock[];
+  tools: AnthropicToolDefinition[];
+  tool_choice: { type: string };
+  messages: Array<{
+    role: "user";
+    content: AnthropicTextBlock[];
+  }>;
+};
+
+type AnthropicRequestSnapshotRecord = {
+  createdAt: string;
+  captureId: string;
+  provider: string;
+  model: string;
+  requestUrl: string;
+  requestHeaders?: Record<string, string>;
+  summary: {
+    systemBlockCount: number;
+    toolCount: number;
+    messageCount: number;
+    userContentBlockCount: number;
+    cacheBreakpointPaths: string[];
+    resolvedCacheControl: AnthropicCacheControl | null;
+    resolvedBetaHeaders: string[];
+    systemSplitSummary: {
+      cachedSystemTextLength: number;
+      uncachedSystemTailTextLength: number;
+    };
+  };
+  requestBody: AnthropicMessagesRequestBody;
+  response?: {
+    status: number;
+    headers: Record<string, string>;
+  };
+  usageEvents?: Array<{
+    eventType: string;
+    usage: unknown;
+  }>;
+};
+
+type AnthropicRequestCaptureOptions = {
+  capture?: boolean;
+  directory?: string;
+};
+
+const isTruthyEnvFlag = (value: string | undefined) =>
+  /^(?:1|true|yes|on)$/iu.test(value?.trim() ?? "");
+
+const shouldCaptureAnthropicRequests = (env?: NodeJS.ProcessEnv) =>
+  isTruthyEnvFlag(env?.CYRENE_CAPTURE_ANTHROPIC_REQUESTS) ||
+  isTruthyEnvFlag(env?.CYRENE_DEBUG_HTTP_REQUESTS);
+
+const collectAnthropicCacheBreakpointPaths = (
+  requestBody: AnthropicMessagesRequestBody
+) => {
+  const paths: string[] = [];
+  requestBody.tools.forEach((tool, toolIndex) => {
+    if (tool.cache_control) {
+      paths.push(`tools[${toolIndex}]`);
+    }
+  });
+  requestBody.system.forEach((block, blockIndex) => {
+    if (block.cache_control) {
+      paths.push(`system[${blockIndex}]`);
+    }
+  });
+  requestBody.messages.forEach((message, messageIndex) => {
+    message.content.forEach((block, blockIndex) => {
+      if (block.cache_control) {
+        paths.push(`messages[${messageIndex}].content[${blockIndex}]`);
+      }
+    });
+  });
+  return paths;
+};
+
+const resolveAnthropicSnapshotDir = (options?: {
+  appRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  capture?: AnthropicRequestCaptureOptions;
+}) => {
+  const configuredDir =
+    options?.capture?.directory?.trim() ||
+    options?.env?.CYRENE_CAPTURE_ANTHROPIC_REQUESTS_DIR?.trim() ||
+    options?.env?.CYRENE_DEBUG_HTTP_REQUESTS_DIR?.trim();
+  if (configuredDir) {
+    if (isAbsolute(configuredDir)) {
+      return resolve(configuredDir);
+    }
+    return resolve(options?.appRoot ?? process.cwd(), configuredDir);
+  }
+  return join(
+    resolveUserHomeDir({ env: options?.env }),
+    ".cyrene",
+    "debug",
+    "anthropic-requests"
+  );
+};
+
+const sanitizeAnthropicRequestHeaders = (headers: Record<string, string>) =>
+  Object.fromEntries(
+    Object.entries(headers).filter(([key]) => key.toLowerCase() !== "x-api-key")
+  );
+
+const buildAnthropicRequestHeaders = (
+  apiKey: string,
+  betaHeaders: string[]
+) => ({
+  Accept: "text/event-stream",
+  "Content-Type": "application/json",
+  "x-api-key": apiKey,
+  "anthropic-version": "2023-06-01",
+  ...(betaHeaders.length > 0
+    ? {
+        "anthropic-beta": betaHeaders.join(","),
+      }
+    : {}),
+});
+
+const headersToObject = (headers: Headers) => {
+  const result: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
+};
+
+const updateAnthropicRequestSnapshot = async (
+  snapshotPath: string,
+  patch: Partial<AnthropicRequestSnapshotRecord>
+) => {
+  const current = JSON.parse(
+    await readFile(snapshotPath, "utf8")
+  ) as AnthropicRequestSnapshotRecord;
+  const next: AnthropicRequestSnapshotRecord = {
+    ...current,
+    ...patch,
+  };
+  await writeFile(snapshotPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+};
+
+const writeAnthropicRequestSnapshot = async (options: {
+  appRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  capture?: AnthropicRequestCaptureOptions;
+  captureId: string;
+  provider: string;
+  model: string;
+  requestUrl: string;
+  requestHeaders: Record<string, string>;
+  requestBody: AnthropicMessagesRequestBody;
+  resolvedCacheControl: AnthropicCacheControl;
+  resolvedBetaHeaders: string[];
+  systemProjection: Pick<
+    AnthropicPromptProjection,
+    "cachedSystemText" | "uncachedSystemTailText"
+  >;
+}) => {
+  const snapshotDir = resolveAnthropicSnapshotDir({
+    appRoot: options.appRoot,
+    env: options.env,
+    capture: options.capture,
+  });
+  const createdAt = new Date().toISOString();
+  const snapshotPath = join(
+    snapshotDir,
+    `${createdAt.replaceAll(":", "-")}-${options.captureId}.json`
+  );
+  const snapshot: AnthropicRequestSnapshotRecord = {
+    createdAt,
+    captureId: options.captureId,
+    provider: options.provider,
+    model: options.model,
+    requestUrl: options.requestUrl,
+    requestHeaders: sanitizeAnthropicRequestHeaders(options.requestHeaders),
+    summary: {
+      systemBlockCount: options.requestBody.system.length,
+      toolCount: options.requestBody.tools.length,
+      messageCount: options.requestBody.messages.length,
+      userContentBlockCount:
+        options.requestBody.messages[0]?.content.length ?? 0,
+      cacheBreakpointPaths: collectAnthropicCacheBreakpointPaths(
+        options.requestBody
+      ),
+      resolvedCacheControl: options.resolvedCacheControl,
+      resolvedBetaHeaders: options.resolvedBetaHeaders,
+      systemSplitSummary: {
+        cachedSystemTextLength: options.systemProjection.cachedSystemText.length,
+        uncachedSystemTailTextLength:
+          options.systemProjection.uncachedSystemTailText.length,
+      },
+    },
+    requestBody: options.requestBody,
+  };
+  await mkdir(snapshotDir, { recursive: true });
+  await writeFile(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  return snapshotPath;
+};
+
+const splitAnthropicSystemPromptForCaching = (systemPrompt: string) => {
+  const extensionIndex = systemPrompt.indexOf(
+    ANTHROPIC_SELECTED_EXTENSIONS_MARKER
+  );
+  if (extensionIndex < 0) {
+    return {
+      cachedSystemText: systemPrompt.trim(),
+      uncachedSystemTailText: "",
+    };
+  }
+
+  const executionPlanIndex = systemPrompt.indexOf(
+    ANTHROPIC_EXECUTION_PLAN_PROTOCOL_MARKER,
+    extensionIndex + ANTHROPIC_SELECTED_EXTENSIONS_MARKER.length
+  );
+  if (executionPlanIndex < 0) {
+    return {
+      cachedSystemText: systemPrompt.trim(),
+      uncachedSystemTailText: "",
+    };
+  }
+
+  const prefixText = systemPrompt.slice(0, extensionIndex).trim();
+  const extensionText = systemPrompt
+    .slice(extensionIndex, executionPlanIndex)
+    .trim();
+  const suffixText = systemPrompt.slice(executionPlanIndex).trim();
+
+  return {
+    cachedSystemText: [prefixText, suffixText].filter(Boolean).join("\n\n"),
+    uncachedSystemTailText: extensionText,
+  };
+};
+
+const splitAnthropicPromptForCaching = (
+  query: string,
+  fallbackSystemPrompt: string
+): AnthropicPromptProjection => {
+  const taskStateIndex = query.indexOf(ANTHROPIC_TASK_STATE_MARKER);
+  if (taskStateIndex <= 0) {
+    return {
+      cachedSystemText: fallbackSystemPrompt.trim(),
+      uncachedSystemTailText: "",
+      userText: query,
+    };
+  }
+
+  const stablePrefix = query.slice(0, taskStateIndex).trim();
+  const dynamicSuffix = query.slice(taskStateIndex).trim();
+
+  if (!stablePrefix || !dynamicSuffix) {
+    return {
+      cachedSystemText: fallbackSystemPrompt.trim(),
+      uncachedSystemTailText: "",
+      userText: query,
+    };
+  }
+
+  const systemSplit = splitAnthropicSystemPromptForCaching(stablePrefix);
+  return {
+    cachedSystemText: systemSplit.cachedSystemText,
+    uncachedSystemTailText: systemSplit.uncachedSystemTailText,
+    userText: dynamicSuffix,
+  };
+};
+
+const splitAnthropicUserTextAroundCurrentQuery = (userText: string) => {
+  const queryIndex = userText.indexOf(ANTHROPIC_CURRENT_USER_QUERY_MARKER);
+  if (queryIndex <= 0) {
+    return null;
+  }
+  const stablePrefix = userText.slice(0, queryIndex).trim();
+  const currentQuery = userText.slice(queryIndex).trim();
+  if (!stablePrefix || !currentQuery) {
+    return null;
+  }
+  return {
+    stablePrefix,
+    currentQuery,
+  };
+};
+
+const parseAnthropicToolResultBlocks = (text: string) => {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === "(none)") {
+    return [];
+  }
+
+  return trimmed
+    .split(/\n\n(?=\[tool_result\]\s+)/)
+    .map(part => part.trim())
+    .filter(Boolean);
+};
+
+const splitAnthropicContinuationPrefix = (text: string) => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return {
+      stablePrefix: "",
+      dynamicPrefix: "",
+    };
+  }
+
+  let dynamicStart = -1;
+  for (const marker of ANTHROPIC_DYNAMIC_CONTINUATION_MARKERS) {
+    const index = trimmed.indexOf(marker);
+    if (index >= 0 && (dynamicStart === -1 || index < dynamicStart)) {
+      dynamicStart = index;
+    }
+  }
+
+  if (dynamicStart < 0) {
+    return {
+      stablePrefix: trimmed,
+      dynamicPrefix: "",
+    };
+  }
+
+  return {
+    stablePrefix: trimmed.slice(0, dynamicStart).trim(),
+    dynamicPrefix: trimmed.slice(dynamicStart).trim(),
+  };
+};
+
+const normalizeAnthropicOmittedToolResultsPrefix = (text: string) => {
+  if (!text.startsWith("[tool results truncated]")) {
+    return text;
+  }
+  return ANTHROPIC_NORMALIZED_OMITTED_TOOL_RESULTS_PREFIX;
+};
+
+const buildAnthropicUserBlocks = (
+  userText: string,
+  cacheControl: AnthropicCacheControl
+): AnthropicTextBlock[] => {
+  const toolResultsIndex = userText.indexOf(ANTHROPIC_TOOL_RESULTS_MARKER);
+  if (toolResultsIndex >= 0) {
+    const prefixText = userText.slice(0, toolResultsIndex).trim();
+    const remainder = userText.slice(toolResultsIndex + ANTHROPIC_TOOL_RESULTS_MARKER.length);
+    const suffixIndex = remainder.indexOf(ANTHROPIC_TOOL_RESULTS_SUFFIX);
+    const toolResultsText =
+      suffixIndex >= 0 ? remainder.slice(0, suffixIndex).trim() : remainder.trim();
+    const suffixText =
+      suffixIndex >= 0 ? remainder.slice(suffixIndex).trim() : "";
+    const { stablePrefix, dynamicPrefix } =
+      splitAnthropicContinuationPrefix(prefixText);
+    const parsedToolResults = parseAnthropicToolResultBlocks(toolResultsText);
+    const blocks: AnthropicTextBlock[] = [];
+
+    if (stablePrefix) {
+      blocks.push({
+        type: "text",
+        text: parsedToolResults.length
+          ? `${stablePrefix}\n\nTool results:`
+          : stablePrefix,
+        cache_control: cacheControl,
+      });
+    }
+
+    const omittedPrefix =
+      parsedToolResults[0]?.startsWith("[tool results truncated]")
+        ? normalizeAnthropicOmittedToolResultsPrefix(parsedToolResults.shift() ?? "")
+        : "";
+    if (omittedPrefix) {
+      blocks.push({ type: "text", text: omittedPrefix });
+    }
+
+    parsedToolResults.forEach((result, index) => {
+      void index;
+      blocks.push({
+        type: "text",
+        text: result,
+      });
+    });
+
+    if (!parsedToolResults.length && toolResultsText) {
+      blocks.push({
+        type: "text",
+        text: stablePrefix
+          ? toolResultsText
+          : `Tool results:\n${toolResultsText}`,
+      });
+    }
+
+    if (dynamicPrefix) {
+      blocks.push({ type: "text", text: dynamicPrefix });
+    }
+
+    if (suffixText) {
+      blocks.push({ type: "text", text: suffixText });
+    }
+
+    if (blocks.length > 0) {
+      if (!blocks.some(block => block.cache_control)) {
+        blocks[0] = {
+          ...blocks[0]!,
+          cache_control: cacheControl,
+        };
+      }
+      return blocks;
+    }
+  }
+
+  const querySplit = splitAnthropicUserTextAroundCurrentQuery(userText);
+  if (querySplit) {
+    return [
+      {
+        type: "text",
+        text: querySplit.stablePrefix,
+        cache_control: cacheControl,
+      },
+      {
+        type: "text",
+        text: querySplit.currentQuery,
+      },
+    ];
+  }
+
+  return [
+    {
+      type: "text",
+      text: userText,
+      cache_control: cacheControl,
+    },
+  ];
+};
+
+const buildAnthropicMessagesRequestBody = (options: {
+  model: string;
+  temperature: number;
+  promptProjection: AnthropicPromptProjection;
+  userText: string;
+  mcpTools: McpToolDescriptor[];
+  cacheControl: AnthropicCacheControl;
+}): AnthropicMessagesRequestBody => ({
+  model: options.model,
+  stream: true,
+  max_tokens: 4096,
+  temperature: options.temperature,
+  system: buildAnthropicSystemBlocks(options.promptProjection, options.cacheControl),
+  tools: buildAnthropicTools(options.mcpTools, options.cacheControl),
+  tool_choice: { type: "auto" },
+  messages: [
+    {
+      role: "user",
+      content: buildAnthropicUserBlocks(options.userText, options.cacheControl),
+    },
+  ],
+});
+
+const sortMcpToolsForStablePromptCache = (tools: McpToolDescriptor[]) =>
+  [...tools].sort((left, right) =>
+    `${left.serverId}\u0000${left.name}\u0000${left.id}`.localeCompare(
+      `${right.serverId}\u0000${right.name}\u0000${right.id}`
+    )
+  );
+
+const buildToolUsageSystemPrompt = (
+  mcpTools: McpToolDescriptor[],
+  basePrompt = TOOL_USAGE_SYSTEM_PROMPT
+) => {
   const visibleTools = mcpTools
     .filter(tool => tool.enabled && tool.exposure !== "hidden")
     .map(tool => {
@@ -645,11 +1301,11 @@ const buildToolUsageSystemPrompt = (mcpTools: McpToolDescriptor[]) => {
     });
 
   if (visibleTools.length === 0) {
-    return TOOL_USAGE_SYSTEM_PROMPT;
+    return basePrompt;
   }
 
   return [
-    TOOL_USAGE_SYSTEM_PROMPT,
+    basePrompt,
     "Additional available MCP tools:",
     ...visibleTools,
     "Use these additional tools directly when they are a better match than `file`.",
@@ -2042,6 +2698,8 @@ async function* streamSseGeminiGenerateContent(
 type AnthropicUsageState = {
   inputTokens?: number;
   outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   lastEmitted?: string;
 };
 
@@ -2087,6 +2745,8 @@ const extractAnthropicUsageEvent = (
   const usageRecord = usageCandidate as {
     input_tokens?: unknown;
     output_tokens?: unknown;
+    cache_read_input_tokens?: unknown;
+    cache_creation_input_tokens?: unknown;
   };
   if (typeof usageRecord.input_tokens === "number") {
     state.inputTokens = Math.max(0, Math.floor(usageRecord.input_tokens));
@@ -2094,17 +2754,35 @@ const extractAnthropicUsageEvent = (
   if (typeof usageRecord.output_tokens === "number") {
     state.outputTokens = Math.max(0, Math.floor(usageRecord.output_tokens));
   }
+  if (typeof usageRecord.cache_read_input_tokens === "number") {
+    state.cacheReadInputTokens = Math.max(
+      0,
+      Math.floor(usageRecord.cache_read_input_tokens)
+    );
+  }
+  if (typeof usageRecord.cache_creation_input_tokens === "number") {
+    state.cacheCreationInputTokens = Math.max(
+      0,
+      Math.floor(usageRecord.cache_creation_input_tokens)
+    );
+  }
 
   if (
     typeof state.inputTokens !== "number" &&
-    typeof state.outputTokens !== "number"
+    typeof state.outputTokens !== "number" &&
+    typeof state.cacheReadInputTokens !== "number" &&
+    typeof state.cacheCreationInputTokens !== "number"
   ) {
     return null;
   }
 
-  const promptTokens = state.inputTokens ?? 0;
+  const promptTokens =
+    (state.inputTokens ?? 0) +
+    (state.cacheReadInputTokens ?? 0) +
+    (state.cacheCreationInputTokens ?? 0);
   const completionTokens = state.outputTokens ?? 0;
-  const signature = `${promptTokens}:${completionTokens}`;
+  const cachedTokens = state.cacheReadInputTokens ?? 0;
+  const signature = `${promptTokens}:${cachedTokens}:${completionTokens}:${promptTokens + completionTokens}`;
   if (state.lastEmitted === signature) {
     return null;
   }
@@ -2112,6 +2790,7 @@ const extractAnthropicUsageEvent = (
   return JSON.stringify({
     type: "usage",
     promptTokens,
+    ...(cachedTokens > 0 ? { cachedTokens } : {}),
     completionTokens,
     totalTokens: promptTokens + completionTokens,
   });
@@ -2127,34 +2806,89 @@ async function* streamSseAnthropic(
     endpointOverride?: string | null;
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
+    appRoot?: string;
+    env?: NodeJS.ProcessEnv;
+    captureId?: string;
+    debugAnthropicRequests?: AnthropicRequestCaptureOptions;
+    cacheSessionState?: AnthropicPromptCacheSessionState;
   }
 ): AsyncGenerator<string> {
+  const cacheSessionState =
+    options?.cacheSessionState ?? createAnthropicPromptCacheSessionState();
+  const anthropicPrompt = splitAnthropicPromptForCaching(
+    query,
+    options?.systemPrompt ?? ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT
+  );
+  const resolvedCacheControl = getAnthropicCacheControl(
+    cacheSessionState,
+    options?.env
+  );
+  const resolvedBetaHeaders = getAnthropicBetaHeaders(
+    cacheSessionState,
+    options?.env
+  );
   const requestUrl = resolveAnthropicMessagesUrl(
     baseUrl,
     options?.endpointOverride
   );
+  const requestHeaders = buildAnthropicRequestHeaders(
+    apiKey,
+    resolvedBetaHeaders
+  );
+  const requestBody = buildAnthropicMessagesRequestBody({
+    model,
+    temperature: options?.temperature ?? 0.2,
+    promptProjection: anthropicPrompt,
+    userText: anthropicPrompt.userText,
+    mcpTools: options?.mcpTools ?? [],
+    cacheControl: resolvedCacheControl,
+  });
+  let snapshotPath: string | null = null;
+  if (
+    options?.captureId &&
+    (options?.debugAnthropicRequests?.capture === true ||
+      shouldCaptureAnthropicRequests(options.env))
+  ) {
+    try {
+      snapshotPath = await writeAnthropicRequestSnapshot({
+        appRoot: options.appRoot,
+        env: options.env,
+        capture: options.debugAnthropicRequests,
+        captureId: options.captureId,
+        provider: baseUrl,
+        model,
+        requestUrl,
+        requestHeaders,
+        requestBody,
+        resolvedCacheControl,
+        resolvedBetaHeaders,
+        systemProjection: anthropicPrompt,
+      });
+    } catch {
+      // Snapshotting should not break live requests.
+    }
+  }
   const response = await fetch(
     requestUrl,
     {
       method: "POST",
-      headers: {
-        Accept: "text/event-stream",
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        max_tokens: 4096,
-        temperature: options?.temperature ?? 0.2,
-        system: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
-        tools: buildAnthropicTools(options?.mcpTools ?? []),
-        tool_choice: { type: "auto" },
-        messages: [{ role: "user", content: query }],
-      }),
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody),
     }
   );
+
+  if (snapshotPath) {
+    try {
+      await updateAnthropicRequestSnapshot(snapshotPath, {
+        response: {
+          status: response.status,
+          headers: headersToObject(response.headers),
+        },
+      });
+    } catch {
+      // ignore debug write errors
+    }
+  }
 
   if (!response.ok || !response.body) {
     throw new Error(await formatHttpFailure("Stream error", response, requestUrl));
@@ -2165,6 +2899,7 @@ async function* streamSseAnthropic(
   let buffer = "";
   const usageState: AnthropicUsageState = {};
   const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
+  const usageEvents: Array<{ eventType: string; usage: unknown }> = [];
 
   while (true) {
     const { done, value } = await reader.read();
@@ -2202,6 +2937,26 @@ async function* streamSseAnthropic(
             };
           };
           const usageEvent = extractAnthropicUsageEvent(parsed, usageState);
+          const usageCandidate =
+            parsed && typeof parsed === "object" && "usage" in parsed
+              ? (parsed as { usage?: unknown }).usage
+              : parsed &&
+                  typeof parsed === "object" &&
+                  "message" in parsed &&
+                  (parsed as { message?: { usage?: unknown } }).message?.usage
+                ? (parsed as { message?: { usage?: unknown } }).message?.usage
+                : null;
+          if (
+            snapshotPath &&
+            usageCandidate &&
+            usageEvents.length < 16
+          ) {
+            usageEvents.push({
+              eventType:
+                typeof parsed.type === "string" ? parsed.type : "unknown",
+              usage: usageCandidate,
+            });
+          }
           if (usageEvent) {
             yield usageEvent;
           }
@@ -2211,6 +2966,15 @@ async function* streamSseAnthropic(
           const index = typeof parsed.index === "number" ? parsed.index : 0;
 
           if (eventType === "message_stop") {
+            if (snapshotPath && usageEvents.length > 0) {
+              try {
+                await updateAnthropicRequestSnapshot(snapshotPath, {
+                  usageEvents,
+                });
+              } catch {
+                // ignore debug write errors
+              }
+            }
             yield DONE_EVENT;
             return;
           }
@@ -2320,6 +3084,16 @@ async function* streamSseAnthropic(
         yield DONE_EVENT;
         return;
       }
+    }
+  }
+
+  if (snapshotPath && usageEvents.length > 0) {
+    try {
+      await updateAnthropicRequestSnapshot(snapshotPath, {
+        usageEvents,
+      });
+    } catch {
+      // ignore debug write errors
     }
   }
 
@@ -2480,6 +3254,7 @@ export type HttpQueryTransportOptions = {
   env?: NodeJS.ProcessEnv;
   requestTemperature?: number;
   mcpTools?: McpToolDescriptor[];
+  debugAnthropicRequests?: AnthropicRequestCaptureOptions;
 };
 
 type ParsedHttpEnv = z.infer<typeof envSchema>;
@@ -2618,10 +3393,14 @@ export const createHttpQueryTransport = (
       cwd: options?.cwd,
       env: effectiveEnv,
     });
-  const exposedMcpTools = (options?.mcpTools ?? []).filter(
-    tool => tool.enabled && tool.exposure !== "hidden"
+  const exposedMcpTools = sortMcpToolsForStablePromptCache(
+    (options?.mcpTools ?? []).filter(tool => tool.enabled && tool.exposure !== "hidden")
   );
-  const toolUsageSystemPrompt = buildToolUsageSystemPrompt(exposedMcpTools);
+  const defaultToolUsageSystemPrompt = buildToolUsageSystemPrompt(exposedMcpTools);
+  const anthropicToolUsageSystemPrompt = buildToolUsageSystemPrompt(
+    exposedMcpTools,
+    ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT
+  );
   const env = envSchema.safeParse({
     CYRENE_BASE_URL: effectiveEnv.CYRENE_BASE_URL,
     CYRENE_API_KEY: effectiveEnv.CYRENE_API_KEY,
@@ -2658,6 +3437,7 @@ export const createHttpQueryTransport = (
   let providerEndpointOverrides: ProviderEndpointOverrideMap = {};
   let providerNameOverrides: ProviderNameOverrideMap = {};
   let initializationError: string | null = null;
+  const anthropicCacheSessionState = createAnthropicPromptCacheSessionState();
   const sessionQueries = new Map<
     string,
     {
@@ -3827,7 +4607,10 @@ export const createHttpQueryTransport = (
         format: providerFormat,
         endpointOverrides: getProviderEndpointOverrides(targetProvider),
         mcpTools: exposedMcpTools,
-        systemPrompt: toolUsageSystemPrompt,
+        systemPrompt:
+          providerFormat === "anthropic_messages"
+            ? anthropicToolUsageSystemPrompt
+            : defaultToolUsageSystemPrompt,
       });
       return `openai://${sessionId}`;
     },
@@ -3851,6 +4634,11 @@ export const createHttpQueryTransport = (
             endpointOverride: session.endpointOverrides.anthropic_messages,
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
+            appRoot,
+            env: effectiveEnv,
+            captureId: sessionId,
+            debugAnthropicRequests: options?.debugAnthropicRequests,
+            cacheSessionState: anthropicCacheSessionState,
           }
         )) {
           yield event;

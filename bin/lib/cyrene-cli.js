@@ -8,6 +8,7 @@ const DEFAULT_CONFIG = {
   queryMaxToolSteps: 19200,
   autoSummaryRefresh: true,
   requestTemperature: 0.2,
+  debugCaptureAnthropicRequests: false,
 };
 
 const PROVIDER_ALIASES = {
@@ -244,6 +245,24 @@ const parseCyreneConfigContent = content => {
     trimNonEmpty(systemRaw)
   ) {
     parsed.systemPrompt = systemRaw.trim();
+  }
+
+  const debugCaptureAnthropicRequestsRaw = map.get(
+    "debug_capture_anthropic_requests"
+  );
+  if (typeof debugCaptureAnthropicRequestsRaw === "boolean") {
+    parsed.debugCaptureAnthropicRequests = debugCaptureAnthropicRequestsRaw;
+  }
+
+  const debugCaptureAnthropicRequestsDirRaw = map.get(
+    "debug_capture_anthropic_requests_dir"
+  );
+  if (
+    typeof debugCaptureAnthropicRequestsDirRaw === "string" &&
+    trimNonEmpty(debugCaptureAnthropicRequestsDirRaw)
+  ) {
+    parsed.debugCaptureAnthropicRequestsDir =
+      debugCaptureAnthropicRequestsDirRaw.trim();
   }
 
   return parsed;

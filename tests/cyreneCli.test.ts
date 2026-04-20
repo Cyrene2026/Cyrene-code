@@ -85,6 +85,8 @@ describe("cyrene CLI runtime", () => {
         "query_max_tool_steps: 30",
         "auto_summary_refresh: false",
         "request_temperature: 0.7",
+        "debug_capture_anthropic_requests: true",
+        "debug_capture_anthropic_requests_dir: ./tmp/anthropic-debug",
         "system_prompt: Project operator mode",
         "",
       ].join("\n"),
@@ -112,6 +114,10 @@ describe("cyrene CLI runtime", () => {
     expect(payload.config.queryMaxToolSteps).toBe(30);
     expect(payload.config.autoSummaryRefresh).toBe(false);
     expect(payload.config.requestTemperature).toBe(0.7);
+    expect(payload.config.debugCaptureAnthropicRequests).toBe(true);
+    expect(payload.config.debugCaptureAnthropicRequestsDir).toBe(
+      "./tmp/anthropic-debug"
+    );
     expect(payload.promptPolicy.systemPrompt).toBe("Project operator mode");
     expect(payload.promptPolicy.systemPromptSource).toBe("config.yaml");
     expect(payload.promptPolicy.projectPromptLength).toBeGreaterThan(0);
@@ -136,6 +142,7 @@ describe("cyrene CLI runtime", () => {
       [
         "pin_max_count: 5",
         "request_temperature: 0.4",
+        "debug_capture_anthropic_requests: true",
         'system_prompt: "project operator mode"',
       ].join("\n"),
       "utf8"
@@ -160,6 +167,7 @@ describe("cyrene CLI runtime", () => {
     expect(payload.config.pinMaxCount).toBe(5);
     expect(payload.config.queryMaxToolSteps).toBe(30);
     expect(payload.config.requestTemperature).toBe(0.4);
+    expect(payload.config.debugCaptureAnthropicRequests).toBe(true);
     expect(payload.promptPolicy.systemPrompt).toBe("project operator mode");
   });
 

@@ -184,6 +184,49 @@ const FILE_MUTATION_ACTIONS = new Set([
 ]);
 
 const DIFF_PREVIEW_LINE_PATTERN = /^[+-]\s+\d+\s+\|/;
+const MASKED_DIFF_PREVIEW_LINE_PATTERN = /^[+-]\s*\*{3,}.*$/;
+
+const extractDiffPreviewLines = (lines: string[]) => {
+  const previewLines: string[] = [];
+  let inDiffPreview = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed === "[diff preview]") {
+      inDiffPreview = true;
+      continue;
+    }
+    if (!inDiffPreview) {
+      if (
+        DIFF_PREVIEW_LINE_PATTERN.test(line) ||
+        MASKED_DIFF_PREVIEW_LINE_PATTERN.test(trimmed)
+      ) {
+        previewLines.push(trimmed);
+      }
+      continue;
+    }
+    if (
+      /^diff_preview_omitted:/i.test(trimmed) ||
+      /^next:/i.test(trimmed) ||
+      /^postcondition:/i.test(trimmed) ||
+      /^bytes_(before|after):/i.test(trimmed) ||
+      /^lines_(before|after):/i.test(trimmed) ||
+      /^\[confirmed file mutation\]/i.test(trimmed) ||
+      /^(Created|Wrote|Edited|Patched) file:/i.test(trimmed) ||
+      /^diff_stats:/i.test(trimmed)
+    ) {
+      inDiffPreview = false;
+      continue;
+    }
+    previewLines.push(trimmed);
+  }
+
+  return previewLines;
+};
 
 const summarizeFileMutationToolMessage = (detail: string, body: string) => {
   const action = detail.split(/\s+/, 1)[0] ?? "";
@@ -201,9 +244,7 @@ const summarizeFileMutationToolMessage = (detail: string, body: string) => {
   }
 
   const diffStats = getFieldValue(lines, "diff_stats");
-  const diffPreviewLines = lines
-    .filter(line => DIFF_PREVIEW_LINE_PATTERN.test(line))
-    .map(line => line);
+  const diffPreviewLines = extractDiffPreviewLines(lines);
   const omittedRaw = getFieldValue(lines, "diff_preview_omitted");
   const omitted = Number.parseInt(omittedRaw, 10);
 

@@ -17,6 +17,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+const bridgeShutdownGrace = 8 * time.Second
+
 type bridgeCommand struct {
 	Type            string `json:"type"`
 	Root            string `json:"root,omitempty"`
@@ -185,6 +187,7 @@ type bridgeClient struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
 	events    chan tea.Msg
+	exitDone  chan struct{}
 	closeOnce sync.Once
 	exited    atomic.Bool
 	mu        sync.Mutex
@@ -261,9 +264,10 @@ func startBridge() (*bridgeClient, error) {
 	}
 
 	client := &bridgeClient{
-		cmd:    cmd,
-		stdin:  stdin,
-		events: make(chan tea.Msg, 128),
+		cmd:      cmd,
+		stdin:    stdin,
+		events:   make(chan tea.Msg, 128),
+		exitDone: make(chan struct{}),
 	}
 
 	var wg sync.WaitGroup
@@ -306,13 +310,23 @@ func (c *bridgeClient) Close() {
 			_ = stdin.Close()
 		}
 
-		go func() {
-			time.Sleep(250 * time.Millisecond)
-			if c.exited.Load() || c.cmd == nil || c.cmd.Process == nil {
-				return
-			}
+		if c.exited.Load() || c.cmd == nil || c.cmd.Process == nil {
+			return
+		}
+
+		select {
+		case <-c.exitDone:
+			return
+		case <-time.After(bridgeShutdownGrace):
+		}
+
+		if !c.exited.Load() {
 			_ = c.cmd.Process.Kill()
-		}()
+			select {
+			case <-c.exitDone:
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	})
 }
 
@@ -361,6 +375,7 @@ func (c *bridgeClient) scanStderr(reader io.Reader, wg *sync.WaitGroup) {
 func (c *bridgeClient) waitForExit(wg *sync.WaitGroup) {
 	err := c.cmd.Wait()
 	c.exited.Store(true)
+	close(c.exitDone)
 	wg.Wait()
 
 	if err != nil && strings.Contains(err.Error(), "killed") {

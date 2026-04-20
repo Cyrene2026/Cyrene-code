@@ -16,6 +16,8 @@ export type CyreneConfig = {
   autoSummaryRefresh: boolean;
   requestTemperature: number;
   systemPrompt?: string;
+  debugCaptureAnthropicRequests: boolean;
+  debugCaptureAnthropicRequestsDir?: string;
 };
 
 type CyreneConfigLoadContext = {
@@ -28,6 +30,7 @@ export const DEFAULT_CYRENE_CONFIG: CyreneConfig = {
   queryMaxToolSteps: DEFAULT_QUERY_MAX_TOOL_STEPS,
   autoSummaryRefresh: true,
   requestTemperature: 0.2,
+  debugCaptureAnthropicRequests: false,
 };
 
 export const DEFAULT_PROJECT_CYRENE_CONFIG_YAML = [
@@ -36,6 +39,8 @@ export const DEFAULT_PROJECT_CYRENE_CONFIG_YAML = [
   `query_max_tool_steps: ${DEFAULT_CYRENE_CONFIG.queryMaxToolSteps}`,
   `auto_summary_refresh: ${DEFAULT_CYRENE_CONFIG.autoSummaryRefresh}`,
   `request_temperature: ${DEFAULT_CYRENE_CONFIG.requestTemperature}`,
+  `debug_capture_anthropic_requests: ${DEFAULT_CYRENE_CONFIG.debugCaptureAnthropicRequests}`,
+  "# debug_capture_anthropic_requests_dir: .cyrene/debug/anthropic-requests",
   "",
 ].join("\n");
 
@@ -113,6 +118,24 @@ const parseCyreneConfigContent = (content: string): Partial<CyreneConfig> => {
   const systemRaw = map.get("system_prompt");
   if (typeof systemRaw === "string" && systemRaw.trim()) {
     parsed.systemPrompt = systemRaw.trim();
+  }
+
+  const debugCaptureAnthropicRequestsRaw = map.get(
+    "debug_capture_anthropic_requests"
+  );
+  if (typeof debugCaptureAnthropicRequestsRaw === "boolean") {
+    parsed.debugCaptureAnthropicRequests = debugCaptureAnthropicRequestsRaw;
+  }
+
+  const debugCaptureAnthropicRequestsDirRaw = map.get(
+    "debug_capture_anthropic_requests_dir"
+  );
+  if (
+    typeof debugCaptureAnthropicRequestsDirRaw === "string" &&
+    debugCaptureAnthropicRequestsDirRaw.trim()
+  ) {
+    parsed.debugCaptureAnthropicRequestsDir =
+      debugCaptureAnthropicRequestsDirRaw.trim();
   }
 
   return parsed;

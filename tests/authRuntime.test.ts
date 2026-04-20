@@ -937,6 +937,47 @@ describe("createAuthRuntime", () => {
     );
   });
 
+  test("buildTransport forwards formal Anthropic debug capture options", async () => {
+    const appRoot = await createTempRoot();
+    const createHttpTransport = mock((_options?: { env?: NodeJS.ProcessEnv }) =>
+      createStubTransport("claude-relay", "https://relay.test/v1")
+    );
+    const runtime = createAuthRuntime({
+      appRoot,
+      env: {
+        CYRENE_BASE_URL: "https://relay.test/v1",
+        CYRENE_MODEL: "claude-relay",
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      } as NodeJS.ProcessEnv,
+      debugAnthropicRequestsCapture: true,
+      debugAnthropicRequestsDir: ".cyrene/debug/anthropic-requests",
+      apiKeyStore: createMemoryApiKeyStore(),
+      createHttpTransport: createHttpTransport as any,
+      createLocalTransport: mock(() => createStubTransport("local-core", "local-core")) as any,
+      loadModelYamlImpl: mock(async () => ({
+        models: ["claude-relay"],
+        defaultModel: "claude-relay",
+        lastUsedModel: "claude-relay",
+        providerBaseUrl: "https://relay.test/v1",
+        providers: ["https://relay.test/v1"],
+        providerProfiles: {
+          "https://relay.test/v1": "anthropic" as const,
+        },
+      })),
+    });
+
+    await runtime.buildTransport();
+
+    expect(createHttpTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        debugAnthropicRequests: {
+          capture: true,
+          directory: ".cyrene/debug/anthropic-requests",
+        },
+      })
+    );
+  });
+
   test("status resolves relay remembered keys from provider profile overrides", async () => {
     const appRoot = await createTempRoot();
     const store = createMemoryApiKeyStore();

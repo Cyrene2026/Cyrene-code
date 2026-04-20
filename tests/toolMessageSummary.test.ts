@@ -28,6 +28,30 @@ describe("toolMessageSummary", () => {
     expect(result.text).toContain("+    2 | print('still ok')");
   });
 
+  test("summarizes file mutations with masked diff preview lines", () => {
+    const result = summarizeToolMessage(
+      [
+        "[tool result] write_file simplex.py",
+        "Wrote file: simplex.py",
+        "[confirmed file mutation] write_file simplex.py",
+        "postcondition: file content was overwritten successfully",
+        "diff_stats: +32 -16",
+        "[diff preview]",
+        "+***",
+        "-***",
+        "diff_preview_omitted: 12",
+      ].join("\n")
+    );
+
+    expect(result.kind).toBe("tool_status");
+    expect(result.text).toContain(
+      "Tool: write_file simplex.py | Wrote file: simplex.py | +32 -16"
+    );
+    expect(result.text).toContain("+***");
+    expect(result.text).toContain("-***");
+    expect(result.text).toContain("... 12 more changed line(s)");
+  });
+
   test("summarizes tool error to a single readable line", () => {
     const result = summarizeToolMessage(
       "[tool error] create_file test_files/u4.py\nEEXIST: file already exists"

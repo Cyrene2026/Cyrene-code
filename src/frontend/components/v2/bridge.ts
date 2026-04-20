@@ -268,7 +268,24 @@ type SuspendedRun = {
   userText: string;
   startedAt: string;
   assistantBufferRef: { current: string };
+  assistantStreamRef: { committedVisibleText: string };
   resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
+};
+
+type PendingInFlightSnapshot = {
+  userText: string;
+  assistantText: string;
+  committedVisibleText: string;
+  startedAt: string;
+  updatedAt: string;
+};
+
+type ActiveStreamingTurn = {
+  sessionId: string;
+  userText: string;
+  startedAt: string;
+  assistantBufferRef: { current: string };
+  assistantStreamRef: { committedVisibleText: string };
 };
 
 const DEFAULT_EMPTY_STATE: BridgeItem = {
@@ -286,8 +303,10 @@ const EMPTY_USAGE_SUMMARY: BridgeUsageSummary = {
 };
 
 const PERSISTED_SESSION_ITEM_KINDS = new Set<SessionMessageKind>([
+  "transcript",
   "tool_status",
   "review_status",
+  "system_hint",
   "error",
 ]);
 
@@ -453,7 +472,7 @@ const toBridgeAuthStatus = (status: AuthStatus | null): BridgeAuthStatus => ({
   onboardingAvailable: Boolean(status?.onboardingAvailable),
 });
 
-class BubbleTeaBridge {
+export class BubbleTeaBridge {
   private static readonly WINDOWS_RUNTIME_METADATA_DEBOUNCE_MS = 80;
   private appRoot = resolve(parseRootArg() ?? process.cwd());
   private config: CyreneConfig | null = null;
@@ -463,6 +482,9 @@ class BubbleTeaBridge {
   private authRuntime: AuthRuntime | null = null;
   private transport: QueryTransport | null = null;
   private sessionStore: SessionStore | null = null;
+  private pendingSessionMutations = new Map<string, Promise<void>>();
+  private pendingInFlightSnapshots = new Map<string, PendingInFlightSnapshot>();
+  private inFlightSnapshotFlushes = new Map<string, Promise<void>>();
   private mcpService: McpRuntime | null = null;
   private skillsRuntime: SkillsRuntime | null = null;
   private extensionManager: ExtensionManager | null = null;
@@ -497,8 +519,18 @@ class BubbleTeaBridge {
   private runtimeMetadataRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingAppendItems: BridgeItem[] = [];
   private appendFlushScheduled = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private isShuttingDown = false;
+  private activeStreamingTurn: ActiveStreamingTurn | null = null;
 
   enqueue(command: BridgeCommand) {
+    if (command.type === "shutdown") {
+      void this.shutdown();
+      return;
+    }
+    if (this.isShuttingDown) {
+      return;
+    }
     this.commandChain = this.commandChain
       .then(() => this.handleCommand(command))
       .catch(error => {
@@ -615,8 +647,8 @@ class BubbleTeaBridge {
         await this.logout();
         return;
       case "shutdown":
-        this.dispose();
-        process.exit(0);
+        await this.shutdown();
+        return;
     }
   }
 
@@ -638,7 +670,7 @@ class BubbleTeaBridge {
   }
 
   private async loadRuntime(root: string) {
-    this.dispose();
+    await this.dispose();
     this.appRoot = resolve(root);
     this.sessionSkillUseIds.clear();
     process.chdir(this.appRoot);
@@ -657,6 +689,8 @@ class BubbleTeaBridge {
     this.authRuntime = createAuthRuntime({
       appRoot: this.appRoot,
       requestTemperature: this.config.requestTemperature,
+      debugAnthropicRequestsCapture: this.config.debugCaptureAnthropicRequests,
+      debugAnthropicRequestsDir: this.config.debugCaptureAnthropicRequestsDir,
     });
     this.sessionStore = createFileSessionStore(undefined, {
       cwd: this.appRoot,
@@ -1124,12 +1158,215 @@ class BubbleTeaBridge {
     ) {
       return;
     }
-    await this.sessionStore.appendMessage(sessionId, {
-      role: item.role,
-      kind: item.kind,
-      text: item.text,
-      createdAt: new Date().toISOString(),
+
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.appendMessage(sessionId, {
+        role: item.role,
+        kind: item.kind,
+        text: item.text,
+        createdAt: new Date().toISOString(),
+      });
     });
+  }
+
+  private queueSessionMutation<T>(sessionId: string, mutation: () => Promise<T>) {
+    if (!sessionId.trim()) {
+      return mutation();
+    }
+
+    const previous = this.pendingSessionMutations.get(sessionId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(mutation);
+    const settled = next.then(
+      () => undefined,
+      () => undefined
+    );
+    this.pendingSessionMutations.set(sessionId, settled);
+    return next.finally(() => {
+      if (this.pendingSessionMutations.get(sessionId) === settled) {
+        this.pendingSessionMutations.delete(sessionId);
+      }
+    });
+  }
+
+  private async waitForSessionMutations(sessionId: string) {
+    const pending = this.pendingSessionMutations.get(sessionId);
+    if (pending) {
+      await pending.catch(() => undefined);
+    }
+  }
+
+  private async appendUserMessage(
+    sessionId: string,
+    userText: string,
+    createdAt: string
+  ) {
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.appendMessage(sessionId, {
+        role: "user",
+        text: userText,
+        createdAt,
+      });
+    });
+  }
+
+  private async updateInFlightTurn(
+    sessionId: string,
+    turn: SessionRecord["inFlightTurn"]
+  ) {
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.updateInFlightTurn(sessionId, turn);
+    });
+  }
+
+  private async updateSessionExecutionPlan(
+    sessionId: string,
+    executionPlan: SessionExecutionPlan | null
+  ) {
+    return await this.queueSessionMutation(sessionId, async () => {
+      return await this.sessionStore!.updateExecutionPlan(sessionId, executionPlan);
+    });
+  }
+
+  private async updateSessionExecutionPlanAndEmit(
+    sessionId: string,
+    executionPlan: SessionExecutionPlan | null
+  ) {
+    const updated = await this.updateSessionExecutionPlan(sessionId, executionPlan);
+    if (this.activeSessionId === updated.id) {
+      this.executionPlan = updated.executionPlan;
+      this.emitExecutionPlan();
+    }
+    return updated;
+  }
+
+  private async updateSessionWorkingState(
+    sessionId: string,
+    state: {
+      summary?: string;
+      pendingDigest?: string;
+      lastStateUpdate?: SessionStateUpdateDiagnostic | null;
+    }
+  ) {
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.updateWorkingState(sessionId, state);
+    });
+  }
+
+  private async updateSessionPendingChoice(
+    sessionId: string,
+    pendingChoice: SessionRecord["pendingChoice"]
+  ) {
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.updatePendingChoice(sessionId, pendingChoice);
+    });
+  }
+
+  private async loadSessionAfterPendingMutations(sessionId: string) {
+    if (!this.sessionStore) {
+      return null;
+    }
+    await this.waitForSessionMutations(sessionId);
+    return await this.sessionStore.loadSession(sessionId);
+  }
+
+  private queueInFlightSnapshotFlush(sessionId: string) {
+    if (!this.sessionStore || !sessionId.trim() || this.inFlightSnapshotFlushes.has(sessionId)) {
+      return;
+    }
+    const flush = (async () => {
+      while (true) {
+        const snapshot = this.pendingInFlightSnapshots.get(sessionId);
+        if (!snapshot) {
+          return;
+        }
+        this.pendingInFlightSnapshots.delete(sessionId);
+        await this.updateInFlightTurn(sessionId, snapshot);
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        this.inFlightSnapshotFlushes.delete(sessionId);
+        if (this.pendingInFlightSnapshots.has(sessionId)) {
+          this.queueInFlightSnapshotFlush(sessionId);
+        }
+      });
+    this.inFlightSnapshotFlushes.set(sessionId, flush);
+  }
+
+  private scheduleInFlightSnapshot(input: {
+    sessionId: string;
+    userText: string;
+    startedAt: string;
+    assistantBufferRef: { current: string };
+    assistantStreamRef: { committedVisibleText: string };
+  }) {
+    if (!this.sessionStore || !input.sessionId.trim()) {
+      return;
+    }
+
+    this.pendingInFlightSnapshots.set(input.sessionId, {
+      userText: input.userText,
+      assistantText: input.assistantBufferRef.current,
+      committedVisibleText: input.assistantStreamRef.committedVisibleText,
+      startedAt: input.startedAt,
+      updatedAt: new Date().toISOString(),
+    });
+    this.queueInFlightSnapshotFlush(input.sessionId);
+  }
+
+  private async flushInFlightSnapshot(sessionId: string) {
+    if (!sessionId.trim()) {
+      return;
+    }
+    while (
+      this.pendingInFlightSnapshots.has(sessionId) ||
+      this.inFlightSnapshotFlushes.has(sessionId)
+    ) {
+      this.queueInFlightSnapshotFlush(sessionId);
+      const activeFlush = this.inFlightSnapshotFlushes.get(sessionId);
+      if (!activeFlush) {
+        break;
+      }
+      await activeFlush;
+    }
+  }
+
+  private captureActiveStreamingSnapshot() {
+    const active = this.activeStreamingTurn;
+    if (!active) {
+      return;
+    }
+    this.scheduleInFlightSnapshot({
+      sessionId: active.sessionId,
+      userText: active.userText,
+      startedAt: active.startedAt,
+      assistantBufferRef: active.assistantBufferRef,
+      assistantStreamRef: active.assistantStreamRef,
+    });
+  }
+
+  private async flushActiveStreamingSnapshot() {
+    const active = this.activeStreamingTurn;
+    if (!active) {
+      return;
+    }
+    this.captureActiveStreamingSnapshot();
+    await this.flushInFlightSnapshot(active.sessionId);
+    await this.waitForSessionMutations(active.sessionId);
+  }
+
+  private async drainAllSessionMutations() {
+    while (this.pendingSessionMutations.size > 0) {
+      await Promise.all(
+        [...this.pendingSessionMutations.values()].map(write =>
+          write.catch(() => undefined)
+        )
+      );
+    }
+  }
+
+  private discardInFlightSnapshot(sessionId: string) {
+    this.pendingInFlightSnapshots.delete(sessionId);
   }
 
   private async pushPersistentSessionItem(sessionId: string, item: BridgeItem) {
@@ -1360,11 +1597,7 @@ class BubbleTeaBridge {
       return { ok: false, message: "No active execution plan." as const };
     }
     const nextPlan = updater(session.executionPlan);
-    const next = await this.sessionStore!.updateExecutionPlan(session.id, nextPlan);
-    if (this.activeSessionId === next.id) {
-      this.executionPlan = next.executionPlan;
-      this.emitExecutionPlan();
-    }
+    const next = await this.updateSessionExecutionPlanAndEmit(session.id, nextPlan);
     return { ok: true, session: next };
   }
 
@@ -1405,7 +1638,7 @@ class BubbleTeaBridge {
     message: string;
     pending?: boolean;
   }) {
-    const session = await this.sessionStore?.loadSession(input.sessionId);
+    const session = await this.loadSessionAfterPendingMutations(input.sessionId);
     if (!session?.executionPlan) {
       return;
     }
@@ -1455,17 +1688,81 @@ class BubbleTeaBridge {
         };
       }),
     };
-    const updated = await this.sessionStore!.updateExecutionPlan(input.sessionId, nextPlan);
-    if (this.activeSessionId === input.sessionId) {
-      this.executionPlan = updated.executionPlan;
-      this.emitExecutionPlan()
-    }
+    await this.updateSessionExecutionPlanAndEmit(input.sessionId, nextPlan);
   }
 
   private extractVisibleAssistantText(rawText: string) {
     const parsedPlan = parseAssistantPlanUpdate(rawText);
     const parsedSkill = parseAssistantSkillUpdate(parsedPlan.visibleText);
     return parseAssistantStateUpdate(parsedSkill.visibleText).visibleText;
+  }
+
+  private splitStreamedAssistantText(rawText: string, committedVisibleText: string) {
+    const visibleText = this.extractVisibleAssistantText(rawText);
+    if (!committedVisibleText) {
+      return {
+        visibleText,
+        pendingText: visibleText,
+      };
+    }
+    if (visibleText.startsWith(committedVisibleText)) {
+      return {
+        visibleText,
+        pendingText: visibleText.slice(committedVisibleText.length),
+      };
+    }
+    if (committedVisibleText.startsWith(visibleText)) {
+      return {
+        visibleText,
+        pendingText: "",
+      };
+    }
+    return {
+      visibleText,
+      pendingText: visibleText,
+    };
+  }
+
+  private updateStreamingLiveText(
+    rawText: string,
+    assistantStreamRef: { committedVisibleText: string }
+  ) {
+    const { pendingText } = this.splitStreamedAssistantText(
+      rawText,
+      assistantStreamRef.committedVisibleText
+    );
+    if (this.liveText === pendingText) {
+      return;
+    }
+    this.liveText = pendingText;
+    this.emitLiveText();
+  }
+
+  private flushStreamingAssistantText(
+    sessionId: string,
+    rawText: string,
+    assistantStreamRef: { committedVisibleText: string }
+  ) {
+    const { visibleText, pendingText } = this.splitStreamedAssistantText(
+      rawText,
+      assistantStreamRef.committedVisibleText
+    );
+    assistantStreamRef.committedVisibleText = visibleText;
+
+    if (pendingText.trim()) {
+      const item: BridgeItem = {
+        role: "assistant",
+        kind: "transcript",
+        text: pendingText,
+      };
+      this.pushItem(item);
+      void this.persistSessionItem(sessionId, item);
+    }
+
+    if (this.liveText !== "") {
+      this.liveText = "";
+      this.emitLiveText();
+    }
   }
 
   private findExecutionPlanStep(
@@ -1519,11 +1816,7 @@ class BubbleTeaBridge {
         return { ...step };
       }),
     };
-    const next = await this.sessionStore!.updateExecutionPlan(session.id, nextPlan);
-    if (this.activeSessionId === next.id) {
-      this.executionPlan = next.executionPlan;
-      this.emitExecutionPlan();
-    }
+    const next = await this.updateSessionExecutionPlanAndEmit(session.id, nextPlan);
     return {
       ok: true,
       message: `Updated plan step ${target.id} to ${status}.`,
@@ -1659,11 +1952,7 @@ class BubbleTeaBridge {
         await this.pushSystemMessage("No active session loaded yet.", { kind: "error" });
         return;
       }
-      await this.sessionStore!.updateExecutionPlan(session.id, null);
-      if (this.activeSessionId === session.id) {
-        this.executionPlan = null;
-        this.emitExecutionPlan();
-      }
+      await this.updateSessionExecutionPlanAndEmit(session.id, null);
       await this.pushSystemMessage("Execution plan cleared.");
       return;
     }
@@ -1683,11 +1972,7 @@ class BubbleTeaBridge {
           acceptedAt: new Date().toISOString(),
           acceptedSummary: note,
         };
-        const updated = await this.sessionStore!.updateExecutionPlan(session.id, acceptedPlan);
-        if (this.activeSessionId === updated.id) {
-          this.executionPlan = updated.executionPlan;
-          this.emitExecutionPlan();
-        }
+        await this.updateSessionExecutionPlanAndEmit(session.id, acceptedPlan);
         await this.pushSystemMessage(
           note ? `Execution plan accepted: ${note}` : "Execution plan accepted."
         );
@@ -2142,7 +2427,7 @@ class BubbleTeaBridge {
   }
 
   private hydrateTranscript(record: SessionRecord) {
-    this.items =
+    const items: BridgeItem[] =
       record.messages.length > 0
         ? record.messages.map(message => ({
             role: message.role,
@@ -2154,16 +2439,78 @@ class BubbleTeaBridge {
                 : message.text,
           }))
         : [DEFAULT_EMPTY_STATE];
+    this.items = this.recoverCommittedInFlightAssistantText(items, record);
     this.liveText = record.inFlightTurn
-      ? this.extractVisibleAssistantText(record.inFlightTurn.assistantText)
+      ? this.splitStreamedAssistantText(
+          record.inFlightTurn.assistantText,
+          record.inFlightTurn.committedVisibleText ?? ""
+        ).pendingText
       : "";
+  }
+
+  private recoverCommittedInFlightAssistantText(
+    items: BridgeItem[],
+    record: SessionRecord
+  ): BridgeItem[] {
+    const committedVisibleText = record.inFlightTurn?.committedVisibleText ?? "";
+    if (!committedVisibleText.trim()) {
+      return items;
+    }
+
+    let lastUserIndex = -1;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.role === "user" && item.kind === "transcript") {
+        lastUserIndex = index;
+        break;
+      }
+    }
+    const turnItems = lastUserIndex >= 0 ? items.slice(lastUserIndex + 1) : items;
+    const persistedVisibleText = turnItems
+      .filter(item => item.role === "assistant" && item.kind === "transcript")
+      .map(item => this.extractVisibleAssistantText(item.text))
+      .join("");
+
+    if (persistedVisibleText === committedVisibleText || persistedVisibleText.length >= committedVisibleText.length) {
+      return items;
+    }
+    if (committedVisibleText.startsWith(persistedVisibleText)) {
+      const missingText = committedVisibleText.slice(persistedVisibleText.length);
+      if (missingText.trim()) {
+        const recoveredItem: BridgeItem = {
+          role: "assistant",
+          kind: "transcript",
+          text: missingText,
+        };
+        return [
+          ...items,
+          recoveredItem,
+        ];
+      }
+      return items;
+    }
+
+    const recoveredItem: BridgeItem = {
+      role: "assistant",
+      kind: "transcript",
+      text: committedVisibleText,
+    };
+    return [
+      ...items,
+      recoveredItem,
+    ];
   }
 
   private async loadSession(sessionId: string, options?: { emit?: boolean }) {
     await this.ensureRuntime();
-    let record = await this.sessionStore?.loadSession(sessionId);
+    let record = await this.loadSessionAfterPendingMutations(sessionId);
     if (!record) {
       this.emitError(`Session not found: ${sessionId}`);
+      return;
+    }
+    record = await this.loadSessionAfterPendingMutations(sessionId);
+    if (!record) {
+      this.emitError(`Session not found after pending writes: ${sessionId}`);
       return;
     }
 
@@ -2172,7 +2519,7 @@ class BubbleTeaBridge {
       if (normalizedProjectRoot !== this.appRoot) {
         await this.loadRuntime(normalizedProjectRoot);
         await this.refreshSessions();
-        record = await this.sessionStore?.loadSession(sessionId);
+        record = await this.loadSessionAfterPendingMutations(sessionId);
         if (!record) {
           this.emitError(`Session not found after runtime switch: ${sessionId}`);
           return;
@@ -2181,7 +2528,6 @@ class BubbleTeaBridge {
     }
 
     this.activeSessionId = record.id;
-    this.suspended = null;
     this.executionPlan = record.executionPlan;
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
@@ -2315,14 +2661,11 @@ class BubbleTeaBridge {
     );
 
     const startedAt = new Date().toISOString();
-    await this.sessionStore!.appendMessage(session.id, {
-      role: "user",
-      text: userText,
-      createdAt: startedAt,
-    });
-    await this.sessionStore!.updateInFlightTurn(session.id, {
+    await this.appendUserMessage(session.id, userText, startedAt);
+    await this.updateInFlightTurn(session.id, {
       userText,
       assistantText: "",
+      committedVisibleText: "",
       startedAt,
       updatedAt: startedAt,
     });
@@ -2337,6 +2680,14 @@ class BubbleTeaBridge {
     await this.refreshRuntimeMetadata();
 
     const assistantBufferRef = { current: "" };
+    const assistantStreamRef = { committedVisibleText: "" };
+    this.activeStreamingTurn = {
+      sessionId: session.id,
+      userText,
+      startedAt,
+      assistantBufferRef,
+      assistantStreamRef,
+    };
     try {
       const result = await runQuerySession({
         query: prompt,
@@ -2352,15 +2703,46 @@ class BubbleTeaBridge {
         },
         onTextDelta: delta => {
           assistantBufferRef.current += delta;
-          this.liveText = this.extractVisibleAssistantText(assistantBufferRef.current);
+          this.updateStreamingLiveText(assistantBufferRef.current, assistantStreamRef);
+          this.scheduleInFlightSnapshot({
+            sessionId: session.id,
+            userText,
+            startedAt,
+            assistantBufferRef,
+            assistantStreamRef,
+          });
+          if (this.isShuttingDown) {
+            return;
+          }
           this.status = "streaming";
           this.emitStatus();
-          this.emitLiveText();
         },
         onUsage: usage => {
           this.recordUsage(session.id, usage);
         },
         onToolStatus: message => {
+          if (this.isShuttingDown) {
+            this.scheduleInFlightSnapshot({
+              sessionId: session.id,
+              userText,
+              startedAt,
+              assistantBufferRef,
+              assistantStreamRef,
+            });
+            return;
+          }
+          this.flushStreamingAssistantText(
+            session.id,
+            assistantBufferRef.current,
+            assistantStreamRef
+          );
+          this.scheduleInFlightSnapshot({
+            sessionId: session.id,
+            userText,
+            startedAt,
+            assistantBufferRef,
+            assistantStreamRef,
+          });
           this.pushItem({
             role: "system",
             kind: "tool_status",
@@ -2368,6 +2750,30 @@ class BubbleTeaBridge {
           });
         },
         onToolCall: async (toolName, input) => {
+          if (this.isShuttingDown) {
+            this.scheduleInFlightSnapshot({
+              sessionId: session.id,
+              userText,
+              startedAt,
+              assistantBufferRef,
+              assistantStreamRef,
+            });
+            await this.flushInFlightSnapshot(session.id);
+            return { message: "Bridge is shutting down." };
+          }
+          this.flushStreamingAssistantText(
+            session.id,
+            assistantBufferRef.current,
+            assistantStreamRef
+          );
+          this.scheduleInFlightSnapshot({
+            sessionId: session.id,
+            userText,
+            startedAt,
+            assistantBufferRef,
+            assistantStreamRef,
+          });
+          await this.flushInFlightSnapshot(session.id);
           const result = await this.mcpService!.handleToolCall(toolName, input);
           if (result.pending) {
             const pending = result.pending;
@@ -2411,6 +2817,30 @@ class BubbleTeaBridge {
           return { message: result.message };
         },
         onError: message => {
+          if (this.isShuttingDown) {
+            this.scheduleInFlightSnapshot({
+              sessionId: session.id,
+              userText,
+              startedAt,
+              assistantBufferRef,
+              assistantStreamRef,
+            });
+            void this.flushInFlightSnapshot(session.id).catch(() => undefined);
+            return;
+          }
+          this.flushStreamingAssistantText(
+            session.id,
+            assistantBufferRef.current,
+            assistantStreamRef
+          );
+          this.scheduleInFlightSnapshot({
+            sessionId: session.id,
+            userText,
+            startedAt,
+            assistantBufferRef,
+            assistantStreamRef,
+          });
+          void this.flushInFlightSnapshot(session.id).catch(() => undefined);
           this.status = "error";
           void this.pushPersistentSessionItem(session.id, {
             role: "system",
@@ -2426,13 +2856,24 @@ class BubbleTeaBridge {
         userText,
         startedAt,
         assistantBufferRef,
+        assistantStreamRef,
         result,
       });
     } catch (error) {
-      await this.sessionStore!.updateInFlightTurn(session.id, null);
+      this.discardInFlightSnapshot(session.id);
+      await this.waitForSessionMutations(session.id);
+      await this.updateInFlightTurn(session.id, null);
       this.status = "error";
       this.emitError(error instanceof Error ? error.message : String(error));
       this.emitStatus();
+    } finally {
+      if (
+        this.activeStreamingTurn &&
+        this.activeStreamingTurn.sessionId === session.id &&
+        this.activeStreamingTurn.assistantBufferRef === assistantBufferRef
+      ) {
+        this.activeStreamingTurn = null;
+      }
     }
   }
 
@@ -2441,10 +2882,15 @@ class BubbleTeaBridge {
     userText: string;
     startedAt: string;
     assistantBufferRef: { current: string };
+    assistantStreamRef: { committedVisibleText: string };
     result: RunQuerySessionResult | void;
   }) {
     if (!input.result || input.result.status === "completed") {
-      await this.finalizeAssistant(input.sessionId, input.assistantBufferRef.current);
+      await this.finalizeAssistant(
+        input.sessionId,
+        input.assistantBufferRef.current,
+        input.assistantStreamRef.committedVisibleText
+      );
       return;
     }
 
@@ -2453,11 +2899,15 @@ class BubbleTeaBridge {
       userText: input.userText,
       startedAt: input.startedAt,
       assistantBufferRef: input.assistantBufferRef,
+      assistantStreamRef: input.assistantStreamRef,
       resume: input.result.resume,
     };
-    await this.sessionStore!.updateInFlightTurn(input.sessionId, {
+    this.discardInFlightSnapshot(input.sessionId);
+    await this.waitForSessionMutations(input.sessionId);
+    await this.updateInFlightTurn(input.sessionId, {
       userText: input.userText,
       assistantText: input.assistantBufferRef.current,
+      committedVisibleText: input.assistantStreamRef.committedVisibleText,
       startedAt: input.startedAt,
       updatedAt: new Date().toISOString(),
     });
@@ -2497,7 +2947,11 @@ class BubbleTeaBridge {
     });
   }
 
-  private async applyAssistantStateUpdate(sessionId: string, rawAssistantText: string) {
+  private async applyAssistantStateUpdate(
+    sessionId: string,
+    rawAssistantText: string,
+    committedVisibleText = ""
+  ) {
     const parsedPlan = parseAssistantPlanUpdate(rawAssistantText);
     const parsedSkill = parseAssistantSkillUpdate(parsedPlan.visibleText);
     const parsed = parseAssistantStateUpdate(parsedSkill.visibleText, {
@@ -2505,24 +2959,30 @@ class BubbleTeaBridge {
         this.warnIncompleteStateUpdate(sessionId, stateText, visibleText);
       },
     });
-    const visibleAssistantText = parsed.visibleText.trim();
+    const fullVisibleAssistantText = parsed.visibleText.trim();
+    const { pendingText: visibleAssistantPendingText } = this.splitStreamedAssistantText(
+      rawAssistantText,
+      committedVisibleText
+    );
+    const visibleAssistantText = visibleAssistantPendingText;
     const updatedAt = new Date().toISOString();
     const nextPendingChoice = extractPendingChoiceFromAssistantText(
-      visibleAssistantText,
+      fullVisibleAssistantText,
       updatedAt
     );
 
-    if (visibleAssistantText) {
-      this.pushItem({ role: "assistant", kind: "transcript", text: visibleAssistantText });
-      await this.sessionStore!.appendMessage(sessionId, {
+    if (visibleAssistantText.trim()) {
+      const item: BridgeItem = {
         role: "assistant",
+        kind: "transcript",
         text: visibleAssistantText,
-        createdAt: updatedAt,
-      });
+      };
+      this.pushItem(item);
+      await this.persistSessionItem(sessionId, item);
     }
 
     if (parsedPlan.plan) {
-      const updatedPlanSession = await this.sessionStore!.updateExecutionPlan(sessionId, {
+      const updatedPlanSession = await this.updateSessionExecutionPlan(sessionId, {
         ...parsedPlan.plan,
         projectRoot: parsedPlan.plan.projectRoot || this.appRoot,
         capturedAt: updatedAt,
@@ -2559,7 +3019,7 @@ class BubbleTeaBridge {
       }
     }
 
-    const latest = await this.sessionStore!.loadSession(sessionId);
+    const latest = await this.loadSessionAfterPendingMutations(sessionId);
     if (latest) {
       let nextSummary = latest.summary;
       let nextPendingDigest = latest.pendingDigest;
@@ -2672,7 +3132,7 @@ class BubbleTeaBridge {
         }
       }
 
-      await this.sessionStore!.updateWorkingState(sessionId, {
+      await this.updateSessionWorkingState(sessionId, {
         summary: nextSummary,
         pendingDigest: nextPendingDigest,
         lastStateUpdate: diagnostic,
@@ -2680,14 +3140,20 @@ class BubbleTeaBridge {
       await this.maybeSuggestSkillCreation(sessionId, nextSummary);
     }
 
-    await this.sessionStore!.updatePendingChoice(sessionId, nextPendingChoice);
+    await this.updateSessionPendingChoice(sessionId, nextPendingChoice);
   }
 
-  private async finalizeAssistant(sessionId: string, assistantText: string) {
+  private async finalizeAssistant(
+    sessionId: string,
+    assistantText: string,
+    committedVisibleText = ""
+  ) {
     this.liveText = "";
     this.suspended = null;
-    await this.applyAssistantStateUpdate(sessionId, assistantText);
-    await this.sessionStore!.updateInFlightTurn(sessionId, null);
+    await this.applyAssistantStateUpdate(sessionId, assistantText, committedVisibleText);
+    this.discardInFlightSnapshot(sessionId);
+    await this.waitForSessionMutations(sessionId);
+    await this.updateInFlightTurn(sessionId, null);
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
@@ -2705,7 +3171,8 @@ class BubbleTeaBridge {
 
     await this.applyAssistantStateUpdate(
       suspended.sessionId,
-      suspended.assistantBufferRef.current
+      suspended.assistantBufferRef.current,
+      suspended.assistantStreamRef.committedVisibleText
     );
     if (message.trim()) {
       await this.pushPersistentSessionItem(suspended.sessionId, {
@@ -2717,7 +3184,9 @@ class BubbleTeaBridge {
 
     this.liveText = "";
     this.suspended = null;
-    await this.sessionStore!.updateInFlightTurn(suspended.sessionId, null);
+    this.discardInFlightSnapshot(suspended.sessionId);
+    await this.waitForSessionMutations(suspended.sessionId);
+    await this.updateInFlightTurn(suspended.sessionId, null);
     this.pendingReviews = this.listPendingReviews();
     this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
     await this.refreshSessions();
@@ -2762,6 +3231,7 @@ class BubbleTeaBridge {
       userText: suspended.userText,
       startedAt: suspended.startedAt,
       assistantBufferRef: suspended.assistantBufferRef,
+      assistantStreamRef: suspended.assistantStreamRef,
       result: nextResult,
     });
     return true;
@@ -3383,8 +3853,35 @@ class BubbleTeaBridge {
     await this.pushRuntimeResult(result.message, result.ok);
   }
 
-  private dispose() {
+  private async shutdown(exitCode = 0) {
+    if (!this.shutdownPromise) {
+      this.isShuttingDown = true;
+      this.shutdownPromise = (async () => {
+        await this.flushActiveStreamingSnapshot();
+        await this.dispose();
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          process.exit(exitCode);
+        });
+    }
+    await this.shutdownPromise;
+  }
+
+  private async dispose() {
     this.flushPendingAppendItems();
+    await this.flushActiveStreamingSnapshot();
+    while (this.pendingInFlightSnapshots.size > 0 || this.inFlightSnapshotFlushes.size > 0) {
+      await Promise.all(
+        [...new Set([
+          ...this.pendingInFlightSnapshots.keys(),
+          ...this.inFlightSnapshotFlushes.keys(),
+        ])].map(sessionId => this.flushInFlightSnapshot(sessionId).catch(() => undefined))
+      );
+    }
+    await this.drainAllSessionMutations();
+    await this.flushActiveStreamingSnapshot();
+    await this.drainAllSessionMutations();
     try {
       this.mcpService?.dispose();
     } catch {
@@ -3394,27 +3891,41 @@ class BubbleTeaBridge {
   }
 }
 
-const bridge = new BubbleTeaBridge();
-const input = readline.createInterface({
-  input: process.stdin,
-  crlfDelay: Infinity,
-});
+const startBridgeCli = () => {
+  const bridge = new BubbleTeaBridge();
+  const input = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
 
-input.on("line", line => {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return;
-  }
-  try {
-    bridge.enqueue(JSON.parse(trimmed) as BridgeCommand);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stdout.write(
-      `${JSON.stringify({ type: "error", message: `Invalid command: ${message}` })}\n`
-    );
-  }
-});
+  input.on("line", line => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    try {
+      bridge.enqueue(JSON.parse(trimmed) as BridgeCommand);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stdout.write(
+        `${JSON.stringify({ type: "error", message: `Invalid command: ${message}` })}\n`
+      );
+    }
+  });
 
-input.on("close", () => {
-  bridge.enqueue({ type: "shutdown" });
-});
+  input.on("close", () => {
+    bridge.enqueue({ type: "shutdown" });
+  });
+
+  const requestShutdown = () => {
+    bridge.enqueue({ type: "shutdown" });
+  };
+
+  process.once("SIGINT", requestShutdown);
+  process.once("SIGTERM", requestShutdown);
+  process.once("SIGHUP", requestShutdown);
+};
+
+if (import.meta.main) {
+  startBridgeCli();
+}

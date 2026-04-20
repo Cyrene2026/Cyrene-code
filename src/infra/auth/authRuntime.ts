@@ -50,6 +50,8 @@ type AuthRuntimeOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   requestTemperature?: number;
+  debugAnthropicRequestsCapture?: boolean;
+  debugAnthropicRequestsDir?: string;
   apiKeyStore?: UserScopedApiKeyStore;
   createHttpTransport?: typeof createHttpQueryTransport;
   createLocalTransport?: typeof createLocalCoreTransport;
@@ -714,6 +716,10 @@ export const createAuthRuntime = (
       env,
       requestTemperature,
       mcpTools: buildOptions?.mcpTools,
+      debugAnthropicRequests: {
+        capture: options.debugAnthropicRequestsCapture,
+        directory: options.debugAnthropicRequestsDir,
+      },
     });
   };
 

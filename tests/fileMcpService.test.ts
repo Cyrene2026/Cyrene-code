@@ -876,11 +876,29 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("[tool result] read_files a.txt");
+    expect(result.message).toContain("[tool result] read_files a.txt, b.txt");
     expect(result.message).toContain("[file] a.txt");
     expect(result.message).toContain("alpha");
     expect(result.message).toContain("[file] b.txt");
     expect(result.message).toContain("(empty file)");
+  });
+
+  test("read_files reports directory targets clearly and includes all requested targets", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "package.json"), '{ "name": "demo" }\n', "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "read_files",
+      path: "package.json",
+      paths: ["src"],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("[tool error] read_files package.json, src");
+    expect(result.message).toContain(
+      "read_files only supports files; got directory target: src. Use list_dir for directories."
+    );
   });
 
   test("list_dir confirms directory state in result output", async () => {
@@ -1653,7 +1671,7 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("[tool result] stat_paths .");
+    expect(result.message).toContain("[tool result] stat_paths ., src/main.ts, missing.ts");
     expect(result.message).toContain("Stat 3 path(s):");
     expect(result.message).toContain("[path] .");
     expect(result.message).toContain("[path] src/main.ts");

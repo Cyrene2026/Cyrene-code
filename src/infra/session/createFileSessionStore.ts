@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { compressContext } from "../../core/session/contextCompression";
@@ -39,6 +39,9 @@ type SessionStoreContext = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
 };
+
+const SESSION_LOCK_POLL_MS = 25;
+const SESSION_LOCK_STALE_MS = 15_000;
 
 const LOW_SIGNAL_CONTINUATION_PATTERN =
   /^(?:ok(?:ay)?|sure|yes|yep|go|go on|continue|continue please|resume|proceed|thanks?|thank you|cool|nice|good|done|start|start now|sounds good|来吧?|继续(?:吧|一下)?|开始吧?|接着|继续搞|继续做|好(?:的)?|行|可以|收到|嗯|搞吧|上吧|来|冲)$/iu;
@@ -83,6 +86,7 @@ const messageSchema = z.object({
 const inFlightTurnSchema: z.ZodType<SessionInFlightTurn> = z.object({
   userText: z.string(),
   assistantText: z.string(),
+  committedVisibleText: z.string().optional(),
   startedAt: z.string(),
   updatedAt: z.string(),
 });
@@ -225,6 +229,16 @@ const sanitizeTitle = (title: string) => {
   return `${normalized.slice(0, 60)}...`;
 };
 
+const normalizeInFlightTurn = (turn: SessionInFlightTurn | null | undefined) => {
+  if (!turn) {
+    return null;
+  }
+  return {
+    ...turn,
+    committedVisibleText: turn.committedVisibleText ?? "",
+  };
+};
+
 const isEmptyPlaceholderSession = (session: SessionRecord) => {
   const summary = session.summary?.trim() ?? "";
   const pendingDigest = session.pendingDigest?.trim() ?? "";
@@ -344,6 +358,81 @@ export const createFileSessionStore = (
   const getSessionPath = (id: string) => join(resolvedSessionDir, fileNameFor(id));
   const getIndexPath = (id: string) => join(resolvedSessionDir, indexFileNameFor(id));
   const getListCachePath = (id: string) => join(resolvedSessionDir, listCacheFileNameFor(id));
+  const getLockPath = (id: string) => join(resolvedSessionDir, `${id}.lock`);
+  const pendingMutationLocks = new Map<string, Promise<void>>();
+
+  const sleep = (ms: number) =>
+    new Promise(resolve => {
+      setTimeout(resolve, ms);
+    });
+
+  const writeTextAtomic = async (path: string, content: string) => {
+    const temporaryPath = `${path}.${process.pid}.${Date.now()}.${Math.random()
+      .toString(16)
+      .slice(2)}.tmp`;
+    try {
+      await writeFile(temporaryPath, content, "utf8");
+      await rename(temporaryPath, path);
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  const acquireSessionLock = async (id: string) => {
+    const lockPath = getLockPath(id);
+    while (true) {
+      try {
+        await mkdir(lockPath);
+        return lockPath;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "EEXIST") {
+          throw error;
+        }
+
+        try {
+          const details = await stat(lockPath);
+          if (Date.now() - details.mtimeMs > SESSION_LOCK_STALE_MS) {
+            await rm(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch (statError) {
+          const statCode = (statError as NodeJS.ErrnoException | undefined)?.code;
+          if (statCode === "ENOENT") {
+            continue;
+          }
+          throw statError;
+        }
+
+        await sleep(SESSION_LOCK_POLL_MS);
+      }
+    }
+  };
+
+  const withSessionMutationLock = async <T>(id: string, mutation: () => Promise<T>) => {
+    const previous = pendingMutationLocks.get(id) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const lockPath = await acquireSessionLock(id);
+        try {
+          return await mutation();
+        } finally {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+        }
+      });
+    const settled = next.then(
+      () => undefined,
+      () => undefined
+    );
+    pendingMutationLocks.set(id, settled);
+    return next.finally(() => {
+      if (pendingMutationLocks.get(id) === settled) {
+        pendingMutationLocks.delete(id);
+      }
+    });
+  };
 
   const toSessionListCache = (session: SessionRecord): SessionListCacheRecord => ({
     version: 1,
@@ -376,7 +465,7 @@ export const createFileSessionStore = (
         pendingChoice: normalized.pendingChoice ?? null,
         executionPlan: normalizeExecutionPlan(normalized.executionPlan ?? null),
         lastStateUpdate: normalized.lastStateUpdate ?? null,
-        inFlightTurn: normalized.inFlightTurn ?? null,
+        inFlightTurn: normalizeInFlightTurn(normalized.inFlightTurn),
         focus: normalized.focus ?? [],
         tags: normalizeTagSet(normalized.tags ?? []),
       };
@@ -387,9 +476,12 @@ export const createFileSessionStore = (
 
   const writeSession = async (session: SessionRecord) => {
     await ensureDir();
-    await writeFile(getSessionPath(session.id), JSON.stringify(session, null, 2), "utf8");
+    await writeTextAtomic(getSessionPath(session.id), JSON.stringify(session, null, 2));
     const listCache = toSessionListCache(session);
-    await writeFile(getListCachePath(session.id), JSON.stringify(listCache, null, 2), "utf8");
+    await writeTextAtomic(
+      getListCachePath(session.id),
+      JSON.stringify(listCache, null, 2)
+    );
   };
 
   const readMemoryIndex = async (id: string): Promise<SessionMemoryIndex | null> => {
@@ -405,7 +497,10 @@ export const createFileSessionStore = (
 
   const writeMemoryIndex = async (index: SessionMemoryIndex) => {
     await ensureDir();
-    await writeFile(getIndexPath(index.sessionId), JSON.stringify(index, null, 2), "utf8");
+    await writeTextAtomic(
+      getIndexPath(index.sessionId),
+      JSON.stringify(index, null, 2)
+    );
   };
 
   const readSessionListCache = async (id: string): Promise<SessionListCacheRecord | null> => {
@@ -549,23 +644,24 @@ export const createFileSessionStore = (
     return score;
   };
 
-  const recordMemoriesInternal = async (id: string, entries: SessionMemoryInput[]) => {
-    const loaded = await ensureSessionWithIndex(id);
-    if (!loaded) {
-      throw new Error(`Session not found: ${id}`);
-    }
-    if (entries.length === 0) {
-      return loaded.session;
-    }
-    const nextIndex = upsertMemoryEntries(loaded.index, entries);
-    return persistWithIndex(
-      {
-        ...loaded.session,
-        updatedAt: new Date().toISOString(),
-      },
-      nextIndex
-    );
-  };
+  const recordMemoriesInternal = async (id: string, entries: SessionMemoryInput[]) =>
+    withSessionMutationLock(id, async () => {
+      const loaded = await ensureSessionWithIndex(id);
+      if (!loaded) {
+        throw new Error(`Session not found: ${id}`);
+      }
+      if (entries.length === 0) {
+        return loaded.session;
+      }
+      const nextIndex = upsertMemoryEntries(loaded.index, entries);
+      return persistWithIndex(
+        {
+          ...loaded.session,
+          updatedAt: new Date().toISOString(),
+        },
+        nextIndex
+      );
+    });
 
   return {
     createSession: async title => {
@@ -685,43 +781,44 @@ export const createFileSessionStore = (
       const loaded = await ensureSessionWithIndex(id);
       return loaded?.session ?? null;
     },
-    appendMessage: async (id, message) => {
-      const loaded = await ensureSessionWithIndex(id);
-      if (!loaded) {
-        throw new Error(`Session not found: ${id}`);
-      }
+    appendMessage: async (id, message) =>
+      withSessionMutationLock(id, async () => {
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded) {
+          throw new Error(`Session not found: ${id}`);
+        }
 
-      const validated = messageSchema.parse(message) as SessionMessage;
-      const nextMessages = [...loaded.session.messages, validated];
-      const nextSession: SessionRecord = {
-        ...loaded.session,
-        messages: nextMessages,
-        updatedAt: new Date().toISOString(),
-        summary: loaded.session.summary,
-        title:
-          loaded.session.messages.length === 0 && validated.role === "user"
-            ? sanitizeTitle(validated.text)
-            : loaded.session.title,
-      };
+        const validated = messageSchema.parse(message) as SessionMessage;
+        const nextMessages = [...loaded.session.messages, validated];
+        const nextSession: SessionRecord = {
+          ...loaded.session,
+          messages: nextMessages,
+          updatedAt: new Date().toISOString(),
+          summary: loaded.session.summary,
+          title:
+            loaded.session.messages.length === 0 && validated.role === "user"
+              ? sanitizeTitle(validated.text)
+              : loaded.session.title,
+        };
 
-      const memoryInputs =
-        validated.role === "system"
-          ? []
-          : createMessageMemoryInputs(id, [validated]).map(input => ({
-              ...input,
-              sourceMessageRange: {
-                start: nextMessages.length - 1,
-                end: nextMessages.length - 1,
-              },
-            }));
+        const memoryInputs =
+          validated.role === "system"
+            ? []
+            : createMessageMemoryInputs(id, [validated]).map(input => ({
+                ...input,
+                sourceMessageRange: {
+                  start: nextMessages.length - 1,
+                  end: nextMessages.length - 1,
+                },
+              }));
 
-      const nextIndex =
-        memoryInputs.length > 0
-          ? upsertMemoryEntries(loaded.index, memoryInputs)
-          : rebuildMemoryLookup(loaded.index.sessionId, loaded.index.entries);
+        const nextIndex =
+          memoryInputs.length > 0
+            ? upsertMemoryEntries(loaded.index, memoryInputs)
+            : rebuildMemoryLookup(loaded.index.sessionId, loaded.index.entries);
 
-      return persistWithIndex(nextSession, nextIndex);
-    },
+        return persistWithIndex(nextSession, nextIndex);
+      }),
     updateSummary: async (id, summary) => {
       const loaded = await ensureSessionWithIndex(id);
       if (!loaded) {
@@ -735,64 +832,67 @@ export const createFileSessionStore = (
       await writeSession(next);
       return next;
     },
-    updateWorkingState: async (id, state) => {
-      const loaded = await ensureSessionWithIndex(id);
-      if (!loaded) {
-        throw new Error(`Session not found: ${id}`);
-      }
-      const next = syncSessionCaches(
-        {
+    updateWorkingState: async (id, state) =>
+      withSessionMutationLock(id, async () => {
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded) {
+          throw new Error(`Session not found: ${id}`);
+        }
+        const next = syncSessionCaches(
+          {
+            ...loaded.session,
+            summary:
+              typeof state.summary === "string"
+                ? state.summary.trim()
+                : loaded.session.summary,
+            pendingDigest:
+              typeof state.pendingDigest === "string"
+                ? state.pendingDigest.trim()
+                : loaded.session.pendingDigest,
+            lastStateUpdate:
+              state.lastStateUpdate === undefined
+                ? loaded.session.lastStateUpdate
+                : state.lastStateUpdate,
+            updatedAt: new Date().toISOString(),
+          },
+          loaded.index
+        );
+        await writeSession(next);
+        return next;
+      }),
+    updateInFlightTurn: async (id, inFlightTurn) =>
+      withSessionMutationLock(id, async () => {
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded) {
+          throw new Error(`Session not found: ${id}`);
+        }
+        const next: SessionRecord = {
           ...loaded.session,
-          summary:
-            typeof state.summary === "string"
-              ? state.summary.trim()
-              : loaded.session.summary,
-          pendingDigest:
-            typeof state.pendingDigest === "string"
-              ? state.pendingDigest.trim()
-              : loaded.session.pendingDigest,
-          lastStateUpdate:
-            state.lastStateUpdate === undefined
-              ? loaded.session.lastStateUpdate
-              : state.lastStateUpdate,
+          inFlightTurn,
           updatedAt: new Date().toISOString(),
-        },
-        loaded.index
-      );
-      await writeSession(next);
-      return next;
-    },
-    updateInFlightTurn: async (id, inFlightTurn) => {
-      const loaded = await ensureSessionWithIndex(id);
-      if (!loaded) {
-        throw new Error(`Session not found: ${id}`);
-      }
-      const next: SessionRecord = {
-        ...loaded.session,
-        inFlightTurn,
-        updatedAt: new Date().toISOString(),
-      };
-      await writeSession(next);
-      return next;
-    },
-    updatePendingChoice: async (id, pendingChoice) => {
-      const loaded = await ensureSessionWithIndex(id);
-      if (!loaded) {
-        throw new Error(`Session not found: ${id}`);
-      }
-      const next: SessionRecord = {
-        ...loaded.session,
-        pendingChoice: pendingChoice
-          ? {
-              ...pendingChoice,
-              options: pendingChoice.options.map(option => ({ ...option })),
-            }
-          : null,
-        updatedAt: new Date().toISOString(),
-      };
-      await writeSession(next);
-      return next;
-    },
+        };
+        await writeSession(next);
+        return next;
+      }),
+    updatePendingChoice: async (id, pendingChoice) =>
+      withSessionMutationLock(id, async () => {
+        const loaded = await ensureSessionWithIndex(id);
+        if (!loaded) {
+          throw new Error(`Session not found: ${id}`);
+        }
+        const next: SessionRecord = {
+          ...loaded.session,
+          pendingChoice: pendingChoice
+            ? {
+                ...pendingChoice,
+                options: pendingChoice.options.map(option => ({ ...option })),
+              }
+            : null,
+          updatedAt: new Date().toISOString(),
+        };
+        await writeSession(next);
+        return next;
+      }),
     updateExecutionPlan: async (id, executionPlan) => {
       const loaded = await ensureSessionWithIndex(id);
       if (!loaded) {

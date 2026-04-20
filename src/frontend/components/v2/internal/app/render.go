@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -136,8 +137,10 @@ var statusSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 var (
 	diffPattern                  = regexp.MustCompile(`^([+-])\s*(\d+)?\s*\|\s?(.*)$`)
+	maskedDiffPattern            = regexp.MustCompile(`^([+-])\s*(\*{3,}.*)$`)
 	numberedDiffPattern          = regexp.MustCompile(`^\s*(\d+)\s*\|\s?(.*)$`)
 	diffStatsPattern             = regexp.MustCompile(`^\s*(?:diff_stats|diff):\s*(\+\d+)\s+(-\d+)\s*$`)
+	diffPreviewOmittedPattern    = regexp.MustCompile(`^\s*diff_preview_omitted:\s*(\d+)\s*$`)
 	fileMutationToolLinePattern  = regexp.MustCompile(`^Tool:\s+(create_file|write_file|edit_file|apply_patch)\s+(.+?)(?:\s+\|\s+.*)?$`)
 	fileMutationReceiptPattern   = regexp.MustCompile(`^(?:Created|Wrote|Edited|Patched) file:\s+(.+)$`)
 	confirmedMutationLinePattern = regexp.MustCompile(`^\[confirmed file mutation\]\s+(create_file|write_file|edit_file|apply_patch)\s+(.+)$`)
@@ -156,6 +159,7 @@ const (
 	diffAddANSIStart    = "\x1b[38;2;126;231;135;48;2;16;63;43m"
 	diffRemoveANSIStart = "\x1b[38;2;255;161;152;48;2;93;30;39m"
 	diffANSIEnd         = "\x1b[0m"
+	composerCountModeAt = 1000
 )
 
 func (m *Model) View() string {
@@ -526,7 +530,10 @@ func (m *Model) renderTranscriptLines(width int) []string {
 
 	lines := append([]string(nil), m.renderStaticTranscriptLines(width)...)
 	if liveLines := m.renderLiveTranscriptLines(width); len(liveLines) > 0 {
-		lines = m.insertLiveTranscriptLines(lines, liveLines, width)
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, liveLines...)
 	}
 	if len(lines) == 0 {
 		lines = append(lines, dimStyle.Render("No transcript yet."))
@@ -593,54 +600,6 @@ func (m *Model) hasAnimatedToolStatus() bool {
 
 func (m *Model) isAnimatedToolStatus(index int, item Message) bool {
 	return m.isAnimatingStatus() && index == len(m.Items)-1 && isRunningToolStatus(item)
-}
-
-func (m *Model) insertLiveTranscriptLines(staticLines, liveLines []string, width int) []string {
-	if len(liveLines) == 0 {
-		return staticLines
-	}
-	start := m.trailingSystemStatusStart()
-	if start >= len(m.Items) {
-		return append(staticLines, liveLines...)
-	}
-
-	head := m.renderTranscriptItemRange(0, start, width)
-	tail := m.renderTranscriptItemRange(start, len(m.Items), width)
-	combined := make([]string, 0, len(head)+len(liveLines)+len(tail))
-	combined = append(combined, head...)
-	if len(combined) > 0 && strings.TrimSpace(combined[len(combined)-1]) != "" {
-		combined = append(combined, "")
-	}
-	combined = append(combined, liveLines...)
-	if len(tail) > 0 && strings.TrimSpace(tail[0]) != "" {
-		combined = append(combined, "")
-	}
-	combined = append(combined, tail...)
-	return combined
-}
-
-func (m *Model) trailingSystemStatusStart() int {
-	start := len(m.Items)
-	for start > 0 {
-		item := m.Items[start-1]
-		if !isTrailingSystemStatus(item) {
-			break
-		}
-		start--
-	}
-	return start
-}
-
-func isTrailingSystemStatus(item Message) bool {
-	if item.Role != "system" {
-		return false
-	}
-	switch item.Kind {
-	case "tool_status", "review_status", "error", "system_hint":
-		return true
-	default:
-		return false
-	}
 }
 
 func (m *Model) renderTranscriptItemRange(start, end, width int) []string {
@@ -880,14 +839,42 @@ func compactToolStatusDisplayText(text string) string {
 	path := ""
 	diffSummary := ""
 	hasFileMutation := false
+	diffPreviewLines := make([]string, 0, len(lines))
+	diffPreviewOmitted := 0
+	inDiffPreview := false
 
 	for _, raw := range lines {
 		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" {
 			continue
 		}
+		if inDiffPreview {
+			if matches := diffPreviewOmittedPattern.FindStringSubmatch(trimmed); len(matches) == 2 {
+				diffPreviewOmitted, _ = strconv.Atoi(matches[1])
+				inDiffPreview = false
+				continue
+			}
+			if isFileMutationMetadataLine(trimmed) {
+				inDiffPreview = false
+				continue
+			}
+			diffPreviewLines = append(diffPreviewLines, trimmed)
+			continue
+		}
 		if matches := diffStatsPattern.FindStringSubmatch(trimmed); len(matches) == 3 {
 			diffSummary = "diff: " + matches[1] + " " + matches[2]
+			continue
+		}
+		if matches := diffPreviewOmittedPattern.FindStringSubmatch(trimmed); len(matches) == 2 {
+			diffPreviewOmitted, _ = strconv.Atoi(matches[1])
+			continue
+		}
+		if trimmed == "[diff preview]" {
+			inDiffPreview = true
+			continue
+		}
+		if isRecognizedDiffPreviewLine(trimmed) {
+			diffPreviewLines = append(diffPreviewLines, trimmed)
 			continue
 		}
 		if matches := fileMutationReceiptPattern.FindStringSubmatch(trimmed); len(matches) == 2 {
@@ -919,7 +906,46 @@ func compactToolStatusDisplayText(text string) string {
 	if diffSummary != "" {
 		summary = append(summary, diffSummary)
 	}
+	if len(diffPreviewLines) > 0 {
+		summary = append(summary, diffPreviewLines...)
+		if diffPreviewOmitted > 0 {
+			summary = append(summary, fmt.Sprintf("... %d more changed line(s)", diffPreviewOmitted))
+		}
+	}
 	return strings.Join(summary, "\n")
+}
+
+func isFileMutationMetadataLine(trimmed string) bool {
+	switch {
+	case diffStatsPattern.MatchString(trimmed),
+		fileMutationReceiptPattern.MatchString(trimmed),
+		confirmedMutationLinePattern.MatchString(trimmed),
+		fileMutationToolLinePattern.MatchString(trimmed),
+		strings.HasPrefix(trimmed, "postcondition:"),
+		strings.HasPrefix(trimmed, "bytes_before:"),
+		strings.HasPrefix(trimmed, "bytes_after:"),
+		strings.HasPrefix(trimmed, "lines_before:"),
+		strings.HasPrefix(trimmed, "lines_after:"),
+		strings.HasPrefix(trimmed, "next:"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecognizedDiffPreviewLine(raw string) bool {
+	_, _, _, ok := parseRenderedDiffLine(raw)
+	return ok
+}
+
+func parseRenderedDiffLine(raw string) (sign, lineNumber, content string, ok bool) {
+	if parts := diffPattern.FindStringSubmatch(raw); len(parts) == 4 {
+		return parts[1], strings.TrimSpace(parts[2]), parts[3], true
+	}
+	if parts := maskedDiffPattern.FindStringSubmatch(strings.TrimSpace(raw)); len(parts) == 3 {
+		return parts[1], "", parts[2], true
+	}
+	return "", "", "", false
 }
 
 func stripLeakedToolProtocolText(text string) string {
@@ -1007,20 +1033,8 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		switch {
 		case diffStatsPattern.MatchString(raw):
 			lines = append(lines, renderDiffStatsLine(raw, width, baseStyle)...)
-		case diffPattern.MatchString(raw):
-			parts := diffPattern.FindStringSubmatch(raw)
-			sign := "+"
-			if len(parts) > 1 && strings.TrimSpace(parts[1]) == "-" {
-				sign = "-"
-			}
-			lineNumber := ""
-			if len(parts) > 2 {
-				lineNumber = strings.TrimSpace(parts[2])
-			}
-			content := ""
-			if len(parts) > 3 {
-				content = parts[3]
-			}
+		case isRecognizedDiffPreviewLine(raw):
+			sign, lineNumber, content, _ := parseRenderedDiffLine(raw)
 			lines = append(lines, renderDiffRows(sign, lineNumber, content, width)...)
 		case strings.HasPrefix(trimmed, "@@"):
 			for _, row := range wrapPlainText(raw, width) {
@@ -1765,17 +1779,14 @@ func (m *Model) renderStatusLine(width int) string {
 }
 
 func (m *Model) renderComposer(width int) string {
-	contentWidth := framedInnerWidth(focusedInputBoxStyle, width)
-	rows := m.visibleComposerRows(contentWidth)
 	promptStyle := promptStyleForStatus(m.Status)
 	style := focusedInputBoxStyle
 	if m.ActivePanel != PanelNone {
 		style = inputBoxStyle
-		contentWidth = framedInnerWidth(style, width)
-		rows = m.visibleComposerRows(contentWidth)
 	}
+	contentWidth := framedInnerWidth(style, width)
 
-	lines := make([]string, 0, len(rows)+8)
+	lines := make([]string, 0, 8)
 	if m.Notice != "" {
 		noticeStyle := dimStyle
 		if m.NoticeIsError {
@@ -1790,6 +1801,15 @@ func (m *Model) renderComposer(width int) string {
 		lines = append(lines, renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection)...)
 	}
 
+	if m.shouldRenderComposerCountSummary() {
+		lines = append(lines, m.renderComposerCountSummary(promptStyle))
+		return style.
+			Width(framedRenderWidth(style, width)).
+			MaxWidth(width).
+			Render(strings.Join(lines, "\n"))
+	}
+
+	rows := m.visibleComposerRows(contentWidth)
 	if len(m.Composition) == 0 {
 		lines = append(lines, m.renderComposerTextarea(contentWidth, promptStyle)...)
 		return style.
@@ -1815,6 +1835,14 @@ func (m *Model) renderComposer(width int) string {
 		Width(framedRenderWidth(style, width)).
 		MaxWidth(width).
 		Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) shouldRenderComposerCountSummary() bool {
+	return len(m.Composition) == 0 && len(m.Input) > composerCountModeAt
+}
+
+func (m *Model) renderComposerCountSummary(promptStyle lipgloss.Style) string {
+	return promptStyle.Render("❯ ") + dimStyle.Render(renderPlainComposerCountSummary(len(m.Input)))
 }
 
 func (m *Model) renderComposerTextarea(width int, promptStyle lipgloss.Style) []string {
@@ -1862,6 +1890,12 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 		prefixLines += len(renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection))
 	}
 
+	if m.shouldRenderComposerCountSummary() {
+		paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
+		prefixWidth := lipgloss.Width("❯ ")
+		return prefixLines, paddingLeft + prefixWidth + lipgloss.Width(renderPlainComposerCountSummary(len(m.Input))), true
+	}
+
 	row, col, ok := m.composerInputCursorPosition(contentWidth)
 	if !ok {
 		return 0, 0, false
@@ -1870,6 +1904,13 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 	paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
 	prefixWidth := lipgloss.Width("❯ ")
 	return prefixLines + row, paddingLeft + prefixWidth + col, true
+}
+
+func renderPlainComposerCountSummary(count int) string {
+	if count == 1 {
+		return "1 char"
+	}
+	return fmt.Sprintf("%d chars", count)
 }
 
 func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
@@ -1941,7 +1982,8 @@ type composerRow struct {
 	Continued   bool
 }
 
-const composerCursorGlyph = "█"
+const composerCursorRune = '█'
+const composerCursorGlyph = string(composerCursorRune)
 
 func (m *Model) visibleComposerRows(width int) []composerRow {
 	if len(m.Input) == 0 && len(m.Composition) == 0 {

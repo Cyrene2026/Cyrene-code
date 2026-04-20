@@ -156,6 +156,8 @@ Prompt priority and customization:
 - `system_prompt` can be set in `.cyrene/config.yaml` (or env fallback: `CYRENE_SYSTEM_PROMPT=...`).
 - `auto_summary_refresh` can be set in `.cyrene/config.yaml` to enable/disable the rolling reducer that updates `summary` + `pendingDigest` inside normal user turns. Default: `true`.
 - `request_temperature` can be set in `.cyrene/config.yaml` to control the HTTP main-request sampling temperature. Default: `0.2`.
+- `debug_capture_anthropic_requests` can be set in `.cyrene/config.yaml` to persist Anthropic request/response debug snapshots. Default: `false`.
+- `debug_capture_anthropic_requests_dir` can be set in `.cyrene/config.yaml` to override the snapshot directory. Absolute paths are used as-is; relative paths resolve from the current app root. Default: global `~/.cyrene/debug/anthropic-requests`.
 - Runtime system prompt commands:
   - `/system` show current system prompt
   - `/system <text>` set current runtime system prompt

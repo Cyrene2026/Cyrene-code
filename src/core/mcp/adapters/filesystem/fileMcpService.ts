@@ -6306,6 +6306,18 @@ export class FileMcpService {
     return buildStatPathsTargets(request.path, request.paths);
   }
 
+  private formatToolRequestLabel(request: ToolRequest) {
+    if (request.action === "read_files") {
+      const targets = this.getReadFilesTargets(request);
+      return `${request.action} ${targets.join(", ")}`.trim();
+    }
+    if (request.action === "stat_paths") {
+      const targets = this.getStatPathsTargets(request);
+      return `${request.action} ${targets.join(", ")}`.trim();
+    }
+    return `${request.action} ${request.path}`;
+  }
+
   private async executeReadFiles(request: ReadFilesToolRequest) {
     const outputs: string[] = [];
 
@@ -6313,7 +6325,12 @@ export class FileMcpService {
       const abs = this.resolvePath(target);
       const info = await stat(abs);
       if (!info.isFile()) {
-        throw new Error(`read_files only supports files: ${target}`);
+        if (info.isDirectory()) {
+          throw new Error(
+            `read_files only supports files; got directory target: ${target}. Use list_dir for directories.`
+          );
+        }
+        throw new Error(`read_files only supports regular files: ${target}`);
       }
       if (info.size > this.rules.maxReadBytes) {
         throw new Error(
@@ -8293,6 +8310,8 @@ export class FileMcpService {
       }
     }
 
+    const requestLabel = this.formatToolRequestLabel(request);
+
     if (
       request.action === "run_command" ||
       request.action === "run_shell" ||
@@ -8329,12 +8348,12 @@ export class FileMcpService {
         const output = await this.execute(request);
         return {
           ok: true,
-          message: `[tool result] ${request.action} ${request.path}\n${output}`,
+          message: `[tool result] ${requestLabel}\n${output}`,
         };
       } catch (error) {
         return {
           ok: false,
-          message: `[tool error] ${request.action} ${request.path}\n${
+          message: `[tool error] ${requestLabel}\n${
             error instanceof Error ? error.message : String(error)
           }`,
         };
@@ -8357,7 +8376,7 @@ export class FileMcpService {
       } catch (error) {
         return {
           ok: false,
-          message: `[tool error] ${request.action} ${request.path}\n${
+          message: `[tool error] ${requestLabel}\n${
             error instanceof Error ? error.message : String(error)
           }`,
         };
@@ -8375,12 +8394,12 @@ export class FileMcpService {
       }
       return {
         ok: true,
-        message: `[tool result] ${request.action} ${request.path}\n${output}`,
+        message: `[tool result] ${requestLabel}\n${output}`,
       };
     } catch (error) {
       return {
         ok: false,
-        message: `[tool error] ${request.action} ${request.path}\n${
+        message: `[tool error] ${requestLabel}\n${
           error instanceof Error ? error.message : String(error)
         }`,
       };

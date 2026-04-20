@@ -20,20 +20,21 @@ import (
 const bridgeShutdownGrace = 8 * time.Second
 
 type bridgeCommand struct {
-	Type            string `json:"type"`
-	Root            string `json:"root,omitempty"`
-	Text            string `json:"text,omitempty"`
-	ID              string `json:"id,omitempty"`
-	Value           string `json:"value,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Profile         string `json:"profile,omitempty"`
-	Format          string `json:"format,omitempty"`
-	ProviderType    string `json:"providerType,omitempty"`
-	Kind            string `json:"kind,omitempty"`
-	Endpoint        string `json:"endpoint,omitempty"`
-	ProviderBaseURL string `json:"providerBaseUrl,omitempty"`
-	APIKey          string `json:"apiKey,omitempty"`
-	Model           string `json:"model,omitempty"`
+	Type            string       `json:"type"`
+	Root            string       `json:"root,omitempty"`
+	Text            string       `json:"text,omitempty"`
+	Attachments     []Attachment `json:"attachments,omitempty"`
+	ID              string       `json:"id,omitempty"`
+	Value           string       `json:"value,omitempty"`
+	Name            string       `json:"name,omitempty"`
+	Profile         string       `json:"profile,omitempty"`
+	Format          string       `json:"format,omitempty"`
+	ProviderType    string       `json:"providerType,omitempty"`
+	Kind            string       `json:"kind,omitempty"`
+	Endpoint        string       `json:"endpoint,omitempty"`
+	ProviderBaseURL string       `json:"providerBaseUrl,omitempty"`
+	APIKey          string       `json:"apiKey,omitempty"`
+	Model           string       `json:"model,omitempty"`
 }
 
 type BridgeReview struct {

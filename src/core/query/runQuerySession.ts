@@ -6,11 +6,15 @@ import {
   type QuerySessionState,
 } from "./sessionMachine";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../../shared/runtimeDefaults";
-import type { QueryTransport } from "./transport";
+import {
+  normalizeQueryInput,
+  type QueryInput,
+  type QueryTransport,
+} from "./transport";
 import type { TokenUsage } from "./tokenUsage";
 
 type RunQuerySessionParams = {
-  query: string;
+  query: string | QueryInput;
   originalTask?: string;
   queryMaxToolSteps?: number;
   transport: QueryTransport;
@@ -22,16 +26,27 @@ type RunQuerySessionParams = {
     toolName: string,
     input: unknown
   ) =>
-    | Promise<{ message: string; reviewMode?: "queue" | "block" }>
-    | { message: string; reviewMode?: "queue" | "block" };
+    | Promise<RunQuerySessionToolCallResult>
+    | RunQuerySessionToolCallResult;
   onError: (message: string) => void;
 };
+
+type RunQuerySessionToolResult = {
+  message: string;
+  metadata?: unknown;
+};
+
+type RunQuerySessionToolCallResult = RunQuerySessionToolResult & {
+  reviewMode?: "queue" | "block";
+};
+
+export type RunQuerySessionResumeInput = string | RunQuerySessionToolResult;
 
 export type RunQuerySessionResult =
   | { status: "completed" }
   | {
       status: "suspended";
-      resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
+      resume: (toolResult: RunQuerySessionResumeInput) => Promise<RunQuerySessionResult>;
     };
 
 const COMPLETED_RESULT: RunQuerySessionResult = { status: "completed" };
@@ -52,6 +67,47 @@ type MultiFileProgressLedger = {
   targetPaths: string[];
   completedPaths: string[];
   lastCompletedPath?: string;
+};
+
+type SemanticProvider = "lsp" | "ts" | "text";
+
+type SemanticRoutingHint = {
+  provider: SemanticProvider;
+  reason:
+    | "lsp_available"
+    | "lsp_unavailable"
+    | "ts_available"
+    | "text_fallback";
+};
+
+type SearchMemory = {
+  scopedBroadDiscoveryBudget: Map<string, number>;
+  searchedScopes: Set<string>;
+  discoveredPaths: Set<string>;
+  evidenceSignatures: Set<string>;
+  semanticRoutingByPath: Map<string, SemanticRoutingHint>;
+};
+
+type FileReadLedgerEntry = {
+  path: string;
+  revision: number;
+  revisionKey: string | null;
+  lastReadStartLine: number | null;
+  lastReadEndLine: number | null;
+  fullyRead: boolean;
+  truncated: boolean;
+  nextSuggestedStartLine: number | null;
+  ranges: Array<{ startLine: number; endLine: number }>;
+};
+
+type ProgressSnapshot = {
+  mutationRevision: number;
+  phase: UncertaintyPhase;
+  analysisSignalCount: number;
+  semanticNavigationCount: number;
+  completedPathCount: number;
+  discoveredPathCount: number;
+  evidenceCount: number;
 };
 
 type RunRoundsOptions = {
@@ -75,6 +131,7 @@ type UncertaintyState = {
   discoverBudgetUsed: number;
   discoverBudgetMax: number;
   analysisSignalCount: number;
+  semanticNavigationCount: number;
   nonProgressAutoContinueUsed: boolean;
   explicitSourceReads: Set<string>;
   explicitTaskPaths: Set<string>;
@@ -84,10 +141,15 @@ type UncertaintyState = {
 
 const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
 const MAX_NON_PROGRESS_CHATTER_CHARS = 240;
+const MAX_NON_PROGRESS_ROUNDS = 3;
+const BROAD_DISCOVERY_SCOPE_BUDGET = 3;
 const ROUND_PROMPT_TASK_CHAR_LIMIT = 12000;
 const ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT = 16000;
 const ROUND_PROMPT_TOOL_RESULT_ITEM_CHAR_LIMIT = 3000;
 const ROUND_PROMPT_TOOL_RESULT_KEEP_LIMIT = 8;
+const SEARCH_MEMORY_SCOPE_LIMIT = 6;
+const SEARCH_MEMORY_PATH_LIMIT = 6;
+const FILE_READ_LEDGER_LIMIT = 8;
 
 const BROAD_DISCOVERY_ACTIONS = new Set([
   "list_dir",
@@ -144,6 +206,36 @@ const PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS = new Set([
   "lsp_document_symbols",
   "lsp_diagnostics",
   "lsp_code_actions",
+]);
+
+const HIGH_VALUE_EVIDENCE_ACTIONS = new Set([
+  ...TARGETED_SOURCE_READ_ACTIONS,
+  ...PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS,
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
+  "lsp_references",
+  "lsp_workspace_symbols",
+  "lsp_document_symbols",
+  "lsp_diagnostics",
+  "lsp_code_actions",
+]);
+
+const SEMANTIC_NAVIGATION_ACTIONS = new Set([
+  "ts_hover",
+  "ts_definition",
+  "ts_references",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_implementation",
+  "lsp_type_definition",
+  "lsp_references",
+  "lsp_workspace_symbols",
+  "lsp_document_symbols",
 ]);
 
 const SIMPLE_MULTI_FILE_TASK_PATTERN =
@@ -316,10 +408,12 @@ const isContentMutatingFileAction = (toolName: string, input: unknown) =>
 const didApplyFileMutation = (
   toolName: string,
   input: unknown,
-  message: string
+  message: string,
+  metadata?: unknown
 ) =>
   isMutatingFileAction(toolName, input) &&
-  MUTATION_RESULT_MARKERS.some(marker => message.includes(marker));
+  (MUTATION_RESULT_MARKERS.some(marker => message.includes(marker)) ||
+    didApplyStructuredFileMutation(metadata));
 
 const normalizeComparedPath = (path: string) =>
   path
@@ -561,10 +655,11 @@ const formatMultiFileProgressLedger = (ledger: MultiFileProgressLedger) => {
 const getConfirmedFileMutation = (
   toolName: string,
   input: unknown,
-  message: string
+  message: string,
+  metadata?: unknown
 ): ConfirmedFileMutation | null => {
   if (
-    !didApplyFileMutation(toolName, input, message) ||
+    !didApplyFileMutation(toolName, input, message, metadata) ||
     !isContentMutatingFileAction(toolName, input)
   ) {
     return null;
@@ -592,6 +687,437 @@ const pushRecentConfirmedFileMutation = (
   );
   return [...filtered, mutation].slice(-4);
 };
+
+const createSearchMemory = (): SearchMemory => ({
+  scopedBroadDiscoveryBudget: new Map(),
+  searchedScopes: new Set(),
+  discoveredPaths: new Set(),
+  evidenceSignatures: new Set(),
+  semanticRoutingByPath: new Map(),
+});
+
+const mergeReadRanges = (ranges: Array<{ startLine: number; endLine: number }>) => {
+  if (ranges.length === 0) {
+    return [];
+  }
+  const sorted = [...ranges].sort((left, right) =>
+    left.startLine === right.startLine
+      ? left.endLine - right.endLine
+      : left.startLine - right.startLine
+  );
+  const merged: Array<{ startLine: number; endLine: number }> = [];
+  for (const current of sorted) {
+    const previous = merged.at(-1);
+    if (!previous || current.startLine > previous.endLine + 1) {
+      merged.push({ ...current });
+      continue;
+    }
+    previous.endLine = Math.max(previous.endLine, current.endLine);
+  }
+  return merged;
+};
+
+const getReadLedgerPath = (input: unknown) => {
+  const path = getToolPath(input);
+  if (!path) {
+    return null;
+  }
+  const normalized = normalizeComparedPath(path);
+  return normalized || null;
+};
+
+const getReadLedgerEntry = (
+  ledger: Map<string, FileReadLedgerEntry>,
+  input: unknown
+) => {
+  const path = getReadLedgerPath(input);
+  return path ? ledger.get(path) ?? null : null;
+};
+
+const getStructuredFileResultMetadata = (metadata: unknown) => {
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+  const record = metadata as Record<string, unknown>;
+  if (record.kind !== "file") {
+    return null;
+  }
+  return record;
+};
+
+const getStructuredFileReadMetadata = (metadata: unknown) => {
+  const fileMetadata = getStructuredFileResultMetadata(metadata);
+  if (!fileMetadata) {
+    return null;
+  }
+  const read = fileMetadata.read;
+  if (!read || typeof read !== "object") {
+    return null;
+  }
+  return {
+    fileMetadata,
+    read: read as Record<string, unknown>,
+  };
+};
+
+const didApplyStructuredFileMutation = (metadata: unknown) => {
+  const fileMetadata = getStructuredFileResultMetadata(metadata);
+  if (!fileMetadata) {
+    return false;
+  }
+  const mutation = fileMetadata.mutation;
+  return (
+    !!mutation &&
+    typeof mutation === "object" &&
+    "applied" in mutation &&
+    (mutation as Record<string, unknown>).applied === true
+  );
+};
+
+const normalizeResumeToolResult = (
+  toolResult: RunQuerySessionResumeInput
+): RunQuerySessionToolResult =>
+  typeof toolResult === "string" ? { message: toolResult } : toolResult;
+
+const updateReadLedgerFromToolResult = (
+  ledger: Map<string, FileReadLedgerEntry>,
+  toolName: string,
+  input: unknown,
+  message: string,
+  metadata: unknown,
+  filesystemMutationRevision: number
+) => {
+  if (toolName !== "file") {
+    return;
+  }
+  const action = getToolAction(toolName, input);
+  if (action !== "read_file" && action !== "read_range") {
+    return;
+  }
+  const structured = getStructuredFileReadMetadata(metadata);
+  const structuredFileMetadata = structured?.fileMetadata;
+  const structuredRead = structured?.read;
+  const path =
+    (typeof structuredFileMetadata?.workspacePath === "string" &&
+    structuredFileMetadata.workspacePath.trim()
+      ? normalizeComparedPath(structuredFileMetadata.workspacePath)
+      : null) ?? getReadLedgerPath(input);
+  if (!path) {
+    return;
+  }
+  if (message.startsWith("[tool error]")) {
+    return;
+  }
+
+  const previous = ledger.get(path);
+  const revisionKey =
+    structuredFileMetadata &&
+    structuredFileMetadata.fileRevision &&
+    typeof structuredFileMetadata.fileRevision === "object" &&
+    "revisionKey" in structuredFileMetadata.fileRevision &&
+    typeof (structuredFileMetadata.fileRevision as Record<string, unknown>).revisionKey ===
+      "string"
+      ? String(
+          (structuredFileMetadata.fileRevision as Record<string, unknown>).revisionKey
+        )
+      : null;
+  if (action === "read_file") {
+    ledger.set(path, {
+      path,
+      revision: filesystemMutationRevision,
+      revisionKey,
+      lastReadStartLine: 1,
+      lastReadEndLine:
+        structuredRead &&
+        typeof structuredRead.endLine === "number" &&
+        Number.isFinite(structuredRead.endLine)
+          ? Number(structuredRead.endLine)
+          : null,
+      fullyRead:
+        structuredRead && typeof structuredRead.fullyRead === "boolean"
+          ? structuredRead.fullyRead
+          : true,
+      truncated: false,
+      nextSuggestedStartLine: null,
+      ranges: [],
+    });
+    return;
+  }
+
+  const record = toRecord(input);
+  const startLine =
+    structuredRead && typeof structuredRead.startLine === "number"
+      ? Number(structuredRead.startLine)
+      : record
+        ? pickFiniteNumber(record, "startLine")
+        : undefined;
+  const endLine =
+    structuredRead && typeof structuredRead.endLine === "number"
+      ? Number(structuredRead.endLine)
+      : record
+        ? pickFiniteNumber(record, "endLine")
+        : undefined;
+  if (typeof startLine !== "number" || typeof endLine !== "number") {
+    return;
+  }
+  const ranges = mergeReadRanges([
+    ...(previous?.revision === filesystemMutationRevision ? previous.ranges : []),
+    { startLine, endLine },
+  ]);
+  const leadingRange = ranges[0];
+  const nextSuggestedStartLine =
+    leadingRange && leadingRange.startLine === 1 ? leadingRange.endLine + 1 : null;
+  ledger.set(path, {
+    path,
+    revision: filesystemMutationRevision,
+    revisionKey,
+    lastReadStartLine: startLine,
+    lastReadEndLine: endLine,
+    fullyRead:
+      structuredRead && typeof structuredRead.fullyRead === "boolean"
+        ? structuredRead.fullyRead
+        : previous?.fullyRead ?? false,
+    truncated:
+      structuredRead && typeof structuredRead.truncated === "boolean"
+        ? structuredRead.truncated
+        : true,
+    nextSuggestedStartLine:
+      structuredRead && typeof structuredRead.nextSuggestedStartLine === "number"
+        ? Number(structuredRead.nextSuggestedStartLine)
+        : nextSuggestedStartLine,
+    ranges,
+  });
+};
+
+const clearReadLedgerForMutation = (
+  ledger: Map<string, FileReadLedgerEntry>,
+  mutation: ConfirmedFileMutation | null
+) => {
+  if (!mutation) {
+    return;
+  }
+  const normalized = normalizeComparedPath(mutation.path);
+  if (!normalized) {
+    return;
+  }
+  ledger.delete(normalized);
+};
+
+const formatFileReadLedger = (
+  ledger: Map<string, FileReadLedgerEntry>,
+  filesystemMutationRevision: number
+) => {
+  const entries = Array.from(ledger.values())
+    .filter(entry => entry.revision === filesystemMutationRevision)
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .slice(0, FILE_READ_LEDGER_LIMIT);
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return entries
+    .map(entry => {
+      if (entry.fullyRead) {
+        return `${entry.path}: fully_read=true; next read only if the file changes`;
+      }
+      const rangePreview = entry.ranges
+        .slice(0, 3)
+        .map(range => `${range.startLine}-${range.endLine}`)
+        .join(", ");
+      const nextHint =
+        typeof entry.nextSuggestedStartLine === "number"
+          ? `; next_suggested_start_line=${entry.nextSuggestedStartLine}`
+          : "";
+      return `${entry.path}: fully_read=false; read_ranges=${rangePreview}${nextHint}`;
+    })
+    .join("\n");
+};
+
+const isReadRangeCoveredByLedger = (
+  entry: FileReadLedgerEntry,
+  startLine: number,
+  endLine: number,
+  filesystemMutationRevision: number
+) =>
+  entry.revision === filesystemMutationRevision &&
+  entry.ranges.some(
+    range => range.startLine <= startLine && range.endLine >= endLine
+  );
+
+const isScopeBudgetedBroadDiscoveryAction = (toolName: string, input: unknown) =>
+  isBroadDiscoveryAction(toolName, input) ||
+  isProjectAnalysisBroadDiscoveryAction(toolName, input);
+
+const getBroadDiscoveryScope = (toolName: string, input: unknown) => {
+  if (!isScopeBudgetedBroadDiscoveryAction(toolName, input)) {
+    return null;
+  }
+  return normalizeComparedPath(getToolPath(input) ?? ".") || ".";
+};
+
+const getScopedBroadDiscoveryBudgetKey = (
+  toolName: string,
+  input: unknown,
+  filesystemMutationRevision: number
+) => {
+  const scope = getBroadDiscoveryScope(toolName, input);
+  return scope ? `${filesystemMutationRevision}:${scope}` : null;
+};
+
+const extractEvidencePaths = (
+  toolName: string,
+  input: unknown,
+  message: string
+) => {
+  const normalized = new Set<string>();
+  const action = getToolAction(toolName, input);
+  const inputPath = getToolPath(input);
+  if (inputPath && HIGH_VALUE_EVIDENCE_ACTIONS.has(action)) {
+    normalized.add(normalizeComparedPath(inputPath));
+  }
+  for (const path of extractPathsFromText(message)) {
+    normalized.add(path);
+  }
+  return Array.from(normalized).filter(Boolean);
+};
+
+const recordSearchObservation = (
+  searchMemory: SearchMemory,
+  toolName: string,
+  input: unknown,
+  message: string
+) => {
+  const action = getToolAction(toolName, input);
+  const scope = getBroadDiscoveryScope(toolName, input);
+  if (scope) {
+    searchMemory.searchedScopes.add(scope);
+  }
+
+  const evidencePaths = extractEvidencePaths(toolName, input, message);
+  for (const path of evidencePaths) {
+    searchMemory.discoveredPaths.add(path);
+    searchMemory.evidenceSignatures.add(`${action}:${path}`);
+    if (isScopeBudgetedBroadDiscoveryAction(toolName, input)) {
+      searchMemory.evidenceSignatures.add(`hit:${path}`);
+    }
+  }
+
+  const directPath = getToolPath(input);
+  if (!directPath) {
+    return;
+  }
+  const normalizedPath = normalizeComparedPath(directPath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  if (action.startsWith("lsp_")) {
+    if (message.startsWith("[tool error]") && isLspConfigUnavailableMessage(message)) {
+      searchMemory.semanticRoutingByPath.set(normalizedPath, {
+        provider: isTypeScriptLikePath(normalizedPath) ? "ts" : "text",
+        reason: "lsp_unavailable",
+      });
+      return;
+    }
+    if (!message.startsWith("[tool error]")) {
+      searchMemory.semanticRoutingByPath.set(normalizedPath, {
+        provider: "lsp",
+        reason: "lsp_available",
+      });
+      return;
+    }
+  }
+
+  if (action.startsWith("ts_") && !message.startsWith("[tool error]")) {
+    searchMemory.semanticRoutingByPath.set(normalizedPath, {
+      provider: "ts",
+      reason: "ts_available",
+    });
+  }
+};
+
+const formatSearchMemory = (searchMemory: SearchMemory) => {
+  const searchedScopes = Array.from(searchMemory.searchedScopes).sort();
+  const discoveredPaths = Array.from(searchMemory.discoveredPaths).sort();
+  const semanticRouting = Array.from(searchMemory.semanticRoutingByPath.entries())
+    .map(([path, hint]) => ({ path, hint }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const budgetUsage = Array.from(searchMemory.scopedBroadDiscoveryBudget.entries())
+    .map(([key, count]) => {
+      const separator = key.indexOf(":");
+      return {
+        scope: separator >= 0 ? key.slice(separator + 1) : key,
+        count,
+      };
+    })
+    .sort((left, right) => left.scope.localeCompare(right.scope));
+
+  if (
+    searchedScopes.length === 0 &&
+    discoveredPaths.length === 0 &&
+    semanticRouting.length === 0 &&
+    budgetUsage.length === 0
+  ) {
+    return "";
+  }
+
+  const lines: string[] = [];
+  if (searchedScopes.length > 0) {
+    lines.push(
+      `searched scopes: ${formatPathList(searchedScopes, SEARCH_MEMORY_SCOPE_LIMIT)}`
+    );
+  }
+  if (discoveredPaths.length > 0) {
+    lines.push(
+      `known hit paths: ${formatPathList(discoveredPaths, SEARCH_MEMORY_PATH_LIMIT)}`
+    );
+  }
+  if (budgetUsage.length > 0) {
+    lines.push(
+      `broad search budgets: ${budgetUsage
+        .slice(0, SEARCH_MEMORY_SCOPE_LIMIT)
+        .map(entry => `${entry.scope} ${entry.count}/${BROAD_DISCOVERY_SCOPE_BUDGET}`)
+        .join(", ")}`
+    );
+  }
+  if (semanticRouting.length > 0) {
+    lines.push(
+      `semantic routing: ${semanticRouting
+        .slice(0, SEARCH_MEMORY_PATH_LIMIT)
+        .map(({ path, hint }) => `${path} -> ${hint.provider}`)
+        .join(", ")}`
+    );
+  }
+
+  return lines.join("\n");
+};
+
+const captureProgressSnapshot = (
+  uncertainty: UncertaintyState,
+  ledger: MultiFileProgressLedger,
+  searchMemory: SearchMemory,
+  filesystemMutationRevision: number
+): ProgressSnapshot => ({
+  mutationRevision: filesystemMutationRevision,
+  phase: uncertainty.phase,
+  analysisSignalCount: uncertainty.analysisSignalCount,
+  semanticNavigationCount: uncertainty.semanticNavigationCount,
+  completedPathCount: ledger.completedPaths.length,
+  discoveredPathCount: searchMemory.discoveredPaths.size,
+  evidenceCount: searchMemory.evidenceSignatures.size,
+});
+
+const didMakeExecutionProgress = (
+  before: ProgressSnapshot,
+  after: ProgressSnapshot
+) =>
+  after.mutationRevision > before.mutationRevision ||
+  after.phase !== before.phase ||
+  after.analysisSignalCount > before.analysisSignalCount ||
+  after.semanticNavigationCount > before.semanticNavigationCount ||
+  after.completedPathCount > before.completedPathCount ||
+  after.discoveredPathCount > before.discoveredPathCount ||
+  after.evidenceCount > before.evidenceCount;
 
 const stableSerialize = (value: unknown): string => {
   if (Array.isArray(value)) {
@@ -1036,6 +1562,9 @@ const isProjectAnalysisBroadDiscoveryAction = (toolName: string, input: unknown)
 const isProjectAnalysisHighSignalAction = (toolName: string, input: unknown) =>
   PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS.has(getToolAction(toolName, input));
 
+const isSemanticNavigationAction = (toolName: string, input: unknown) =>
+  SEMANTIC_NAVIGATION_ACTIONS.has(getToolAction(toolName, input));
+
 const taskSuggestsProjectAnalysis = (task: string) =>
   !taskSuggestsWriting(task) && PROJECT_ANALYSIS_TASK_PATTERN.test(task);
 
@@ -1063,6 +1592,7 @@ const createUncertaintyState = (
     discoverBudgetUsed: 0,
     discoverBudgetMax: mode === "project_analysis" ? 3 : 4,
     analysisSignalCount: 0,
+    semanticNavigationCount: 0,
     nonProgressAutoContinueUsed: false,
     explicitSourceReads: new Set<string>(),
     explicitTaskPaths: new Set(extractExplicitTaskPaths(task)),
@@ -1092,6 +1622,7 @@ const formatExecutionState = (
 
   if (uncertainty.mode === "project_analysis") {
     lines.push(`architecture evidence: ${uncertainty.analysisSignalCount}`);
+    lines.push(`semantic navigation steps: ${uncertainty.semanticNavigationCount}`);
   }
 
   if (uncertainty.mode === "simple_multi_file" && expected > 0) {
@@ -1153,10 +1684,16 @@ const buildInitialExecutionMemo = (
       "- Start with one minimal repo snapshot: README, package/manifest files, and top-level entrypoints only.",
       "- Identify likely entrypoints or primary commands before opening many files.",
       "- Trace one main execution/call path through 2-4 core files before widening out.",
+      "- Prefer semantic navigation when available through the matching provider for that path.",
+      "- If a matching lsp_server covers the path, use lsp_document_symbols/lsp_workspace_symbols/lsp_definition/lsp_references.",
+      "- If the path is TS/JS and no matching lsp_server covers it, use ts_hover/ts_definition/ts_references/ts_diagnostics instead.",
+      "- Once a concrete source anchor is known, try one semantic navigation step through the matching provider before spending more broad discovery budget.",
+      "- Use search_text/find_files mainly for literals, config keys, filenames, or when semantic tools cannot answer the question.",
       "- Prefer read_range, outline_file, and search_text_context over dumping whole large files when they can answer the same question.",
       "- Once entrypoints are known, stop broad directory scans and synthesize the architecture.",
       "- Final summary shape: overall architecture, main execution chain, key modules, and open questions.",
       "- Distinguish confirmed facts from inference. Keep file inventories minimal unless the user explicitly asks for exhaustive coverage.",
+      "- Later rounds may include runtime fact sections derived from structured tool metadata. Treat those sections as authoritative current state; do not restart discovery just because the raw tool text is abbreviated.",
       `Original user task: ${clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT)}`,
     ].join("\n");
   }
@@ -1180,6 +1717,7 @@ const buildInitialExecutionMemo = (
     "- If enough context is already clear, move straight to the remaining writes/edits.",
     "- If several similar writes are needed, emit multiple tool_call actions in the same round before the final answer.",
     "- Keep narration minimal and do not stop after partial progress.",
+    "- Later rounds may include runtime fact sections derived from structured tool metadata. Treat those sections as authoritative current state; do not rerun reads/searches just because the visible tool text is short.",
     `Original user task: ${clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT)}`,
   ]
     .filter(Boolean)
@@ -1193,9 +1731,62 @@ const getRecentDiscoveredPaths = (
   roundToolResults: string[]
 ) => extractPathsFromText([...accumulatedToolResults.slice(-3), ...roundToolResults].join("\n"));
 
+const LIKELY_SEMANTIC_SOURCE_PATH_PATTERN =
+  /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|rb|php|cs|swift|scala|vue|svelte|c|cc|cpp|h|hpp)$/i;
+
+const isLikelySemanticSourcePath = (path: string) =>
+  LIKELY_SEMANTIC_SOURCE_PATH_PATTERN.test(path);
+
+const TYPESCRIPT_LIKE_PATH_PATTERN = /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i;
+
+const isTypeScriptLikePath = (path: string) => TYPESCRIPT_LIKE_PATH_PATTERN.test(path);
+
+const isLspConfigUnavailableMessage = (message: string) =>
+  /LSP config error:/i.test(message) &&
+  /(no configured LSP server matches|no lsp_servers are configured)/i.test(message);
+
+const getSemanticProviderForPath = (
+  path: string,
+  searchMemory: SearchMemory
+): SemanticProvider => {
+  const normalized = normalizeComparedPath(path);
+  const remembered = searchMemory.semanticRoutingByPath.get(normalized);
+  if (remembered) {
+    return remembered.provider;
+  }
+  return isTypeScriptLikePath(normalized) ? "ts" : "lsp";
+};
+
+const describeSemanticProviderRoute = (
+  provider: SemanticProvider,
+  paths: string[]
+) => {
+  const preview = formatPathList(paths, 3);
+  if (provider === "ts") {
+    return `Use ts_hover/ts_definition/ts_references/ts_diagnostics for ${preview}.`;
+  }
+  if (provider === "lsp") {
+    return `Use lsp_document_symbols/lsp_workspace_symbols/lsp_definition/lsp_references for ${preview}.`;
+  }
+  return `Use outline_file/read_range/search_text_context for ${preview}.`;
+};
+
+const getProjectAnalysisSemanticAnchors = (
+  uncertainty: UncertaintyState,
+  searchMemory: SearchMemory,
+  accumulatedToolResults: string[],
+  roundToolResults: string[]
+) =>
+  normalizeUniquePaths([
+    ...uncertainty.explicitTaskPaths,
+    ...searchMemory.discoveredPaths,
+    ...getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults),
+  ]).filter(isLikelySemanticSourcePath);
+
 const shouldAllowTargetedSourceRead = (
   path: string | undefined,
   uncertainty: UncertaintyState,
+  searchMemory: SearchMemory,
   accumulatedToolResults: string[],
   roundToolResults: string[]
 ) => {
@@ -1216,6 +1807,10 @@ const shouldAllowTargetedSourceRead = (
     getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
   );
   if (recentlyDiscovered.has(normalizedPath)) {
+    return true;
+  }
+
+  if (searchMemory.discoveredPaths.has(normalizedPath)) {
     return true;
   }
 
@@ -1242,6 +1837,7 @@ const getBlockedReason = (
   originalTask: string,
   uncertainty: UncertaintyState,
   ledger: MultiFileProgressLedger,
+  searchMemory: SearchMemory,
   accumulatedToolResults: string[],
   roundToolResults: string[]
 ) => {
@@ -1257,6 +1853,7 @@ const getBlockedReason = (
   const expected = getLedgerExpectedFileCount(ledger);
   const knownPaths = new Set([
     ...uncertainty.explicitTaskPaths,
+    ...searchMemory.discoveredPaths,
     ...getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults),
   ]);
   if (expected === 0 && knownPaths.size === 0) {
@@ -1278,6 +1875,9 @@ const maybeAdvanceUncertaintyAfterToolResult = (
       Boolean(getToolPath(input)) || extractPathsFromText(message).length > 0;
     const highSignal =
       isProjectAnalysisHighSignalAction(toolName, input) || hasConcretePath;
+    if (isSemanticNavigationAction(toolName, input)) {
+      uncertainty.semanticNavigationCount += 1;
+    }
 
     if (highSignal) {
       uncertainty.analysisSignalCount += 1;
@@ -1404,7 +2004,8 @@ const buildHeuristicNudges = (
   originalTask: string,
   toolResults: string[],
   recentConfirmedFileMutations: ConfirmedFileMutation[],
-  progressLedger: MultiFileProgressLedger
+  progressLedger: MultiFileProgressLedger,
+  searchMemory: SearchMemory
 ) => {
   if (toolResults.length === 0) {
     return "";
@@ -1482,6 +2083,13 @@ const buildHeuristicNudges = (
     );
   }
 
+  const discoveredPaths = Array.from(searchMemory.discoveredPaths).sort();
+  if (discoveredPaths.length > 0) {
+    nudges.push(
+      `Known search hits already exist: ${formatPathList(discoveredPaths, 4)}. Continue from one of those concrete paths instead of reopening broad search.`
+    );
+  }
+
   if (
     (recentResults.includes("[tool result] run_command ") ||
       recentResults.includes("[tool result] run_shell ")) &&
@@ -1501,18 +2109,27 @@ const buildRoundPrompt = (
   loopCorrection: string,
   recentConfirmedFileMutations: ConfirmedFileMutation[],
   progressLedger: MultiFileProgressLedger,
-  uncertainty: UncertaintyState
+  uncertainty: UncertaintyState,
+  searchMemory: SearchMemory,
+  readLedger: Map<string, FileReadLedgerEntry>,
+  filesystemMutationRevision: number
 ) => {
   const heuristicNudges = buildHeuristicNudges(
     originalTask,
     toolResults,
     recentConfirmedFileMutations,
-    progressLedger
+    progressLedger,
+    searchMemory
   );
   const recentMutationFacts = formatRecentConfirmedFileMutations(
     recentConfirmedFileMutations
   );
   const multiFileProgressFacts = formatMultiFileProgressLedger(progressLedger);
+  const searchMemoryFacts = formatSearchMemory(searchMemory);
+  const fileReadLedgerFacts = formatFileReadLedger(
+    readLedger,
+    filesystemMutationRevision
+  );
   const executionState = formatExecutionState(uncertainty, progressLedger);
   const analysisRules =
     uncertainty.mode === "project_analysis"
@@ -1520,6 +2137,8 @@ const buildRoundPrompt = (
           "Project analysis rules:",
           "- Prefer entrypoints, manifests, and bootstrap/runtime files over exhaustive file inventories.",
           "- After one lightweight repo snapshot, trace one main execution or call chain through a few core files.",
+          "- Prefer lsp_/ts_ semantic tools for symbols, definitions, references, and document structure before falling back to text search.",
+          "- Use search_text/find_files for literals, filenames, or config strings; not as the default way to chase code structure.",
           "- Use targeted reads and structure tools before opening additional unrelated files.",
           "- Once the main chain is clear enough, stop broad exploration and synthesize the architecture.",
           "- Organize the final answer around overall architecture, main chain, key modules, and open questions.",
@@ -1535,6 +2154,10 @@ const buildRoundPrompt = (
     "Do not call list_dir again for the same path immediately after it was already confirmed.",
     "Treat `(empty file)` from read_file as a confirmed result and do not re-read the same file unless something changed it.",
     "Treat successful create_file/write_file/edit_file/apply_patch results as confirmed file mutations. Do not immediately call read_file on the same path just to confirm the write unless the user explicitly asked to inspect or verify that file.",
+    "For symbol lookup, definition lookup, references, call chains, and file structure, prefer lsp_/ts_ semantic tools before broad list_dir/find_files/search_text exploration when those tools can answer the question.",
+    "Use search_text/find_files mainly for literals, filenames, config keys, or as a fallback when semantic navigation cannot answer the request.",
+    "Runtime fact sections below may be synthesized from structured tool metadata, including approved review results. Treat `Recent confirmed file mutations`, `Search memory`, and `File read ledger` as authoritative current state even if the raw tool_result text is abbreviated.",
+    "After an approval resumes, continue from those runtime facts. Do not rerun the same read/search/write only because the approval text itself was short or opaque.",
     "Execution style rules:",
     "- Continue directly from the latest confirmed result; do not re-announce the whole plan each step.",
     "- Keep progress narration minimal and non-repetitive. Avoid repeated lines like 'I will now...'.",
@@ -1547,6 +2170,8 @@ const buildRoundPrompt = (
     multiFileProgressFacts
       ? `Multi-file progress ledger:\n${multiFileProgressFacts}`
       : "",
+    searchMemoryFacts ? `Search memory:\n${searchMemoryFacts}` : "",
+    fileReadLedgerFacts ? `File read ledger:\n${fileReadLedgerFacts}` : "",
     executionState,
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
     loopCorrection ? `\n${loopCorrection}\n` : "",
@@ -1572,14 +2197,18 @@ export const runQuerySession = async ({
   onToolCall,
   onError,
 }: RunQuerySessionParams): Promise<RunQuerySessionResult> => {
+  const normalizedQuery = normalizeQueryInput(query);
   let state = createQuerySessionState();
-  const task = originalTask ?? query;
+  const task = originalTask ?? normalizedQuery.text;
   let filesystemMutationRevision = 0;
   let recentConfirmedFileMutations: ConfirmedFileMutation[] = [];
   let progressLedger = createInitialMultiFileProgressLedger(task);
   const uncertainty = createUncertaintyState(task, progressLedger);
+  const searchMemory = createSearchMemory();
+  const readLedger = new Map<string, FileReadLedgerEntry>();
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
   let repeatedImmediatePostWriteReadCount = 0;
+  let nonProgressRounds = 0;
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
       ? Math.floor(queryMaxToolSteps)
@@ -1593,6 +2222,7 @@ export const runQuerySession = async ({
     toolName: string,
     input: unknown,
     message: string,
+    metadata: unknown,
     accumulatedToolResults: string[],
     roundToolResults: string[]
   ) => {
@@ -1602,13 +2232,15 @@ export const runQuerySession = async ({
     const confirmedFileMutation = getConfirmedFileMutation(
       toolName,
       input,
-      message
+      message,
+      metadata
     );
     if (confirmedFileMutation) {
       recentConfirmedFileMutations = pushRecentConfirmedFileMutation(
         recentConfirmedFileMutations,
         confirmedFileMutation
       );
+      clearReadLedgerForMutation(readLedger, confirmedFileMutation);
       progressLedger = pushCompletedPathToLedger(
         progressLedger,
         confirmedFileMutation.path
@@ -1632,6 +2264,7 @@ export const runQuerySession = async ({
       task,
       uncertainty,
       progressLedger,
+      searchMemory,
       accumulatedToolResults,
       roundToolResults
     );
@@ -1652,7 +2285,10 @@ export const runQuerySession = async ({
   ): Promise<RunQuerySessionResult> => {
     dispatch({ type: "start" });
 
-    const streamUrl = await transport.requestStreamUrl(roundPrompt);
+    const streamUrl = await transport.requestStreamUrl({
+      text: roundPrompt,
+      attachments: normalizedQuery.attachments,
+    });
     let completed = false;
     let sawToolCall = false;
     let streamOpened = false;
@@ -1660,6 +2296,13 @@ export const runQuerySession = async ({
     const toolResults: string[] = [];
     let latestUsage: TokenUsage | null = null;
     let usageReported = false;
+    const roundProgressBefore = captureProgressSnapshot(
+      uncertainty,
+      progressLedger,
+      searchMemory,
+      filesystemMutationRevision
+    );
+    let roundUsedProgressSensitiveTool = false;
     const shouldDeferRoundText =
       uncertainty.mode === "simple_multi_file" &&
       uncertainty.phase === "execute";
@@ -1687,16 +2330,45 @@ export const runQuerySession = async ({
       onTextDelta(text);
     };
 
+    const finalizeRoundProgress = () => {
+      const roundProgressAfter = captureProgressSnapshot(
+        uncertainty,
+        progressLedger,
+        searchMemory,
+        filesystemMutationRevision
+      );
+      if (didMakeExecutionProgress(roundProgressBefore, roundProgressAfter)) {
+        nonProgressRounds = 0;
+        return false;
+      }
+      if (!roundUsedProgressSensitiveTool) {
+        nonProgressRounds = 0;
+        return false;
+      }
+      nonProgressRounds += 1;
+      if (nonProgressRounds < MAX_NON_PROGRESS_ROUNDS) {
+        return false;
+      }
+      emitRoundText(
+        [
+          "[execution paused]",
+          `No new file mutation, high-value evidence, or phase progression was recorded across ${nonProgressRounds} consecutive search/read rounds.`,
+          "Stop broad searching and continue from known paths, or ask for a narrower target.",
+        ].join("\n")
+      );
+      return true;
+    };
+
     const createOneShotResume = (
-      resumeImpl: (toolResultMessage: string) => Promise<RunQuerySessionResult>
+      resumeImpl: (toolResult: RunQuerySessionToolResult) => Promise<RunQuerySessionResult>
     ): RunQuerySessionResult => {
       flushUsage();
       let resumePromise: Promise<RunQuerySessionResult> | null = null;
       return {
         status: "suspended",
-        resume: toolResultMessage => {
+        resume: toolResult => {
           if (!resumePromise) {
-            resumePromise = resumeImpl(toolResultMessage);
+            resumePromise = resumeImpl(normalizeResumeToolResult(toolResult));
           }
           return resumePromise;
         },
@@ -1740,6 +2412,13 @@ export const runQuerySession = async ({
           const action = getToolAction(event.toolName, event.input);
           const toolPath = getToolPath(event.input);
           const displayName = getLoopDisplayName(event.toolName, event.input);
+          if (
+            isScopeBudgetedBroadDiscoveryAction(event.toolName, event.input) ||
+            isTargetedSourceReadAction(event.toolName, event.input) ||
+            isProjectAnalysisHighSignalAction(event.toolName, event.input)
+          ) {
+            roundUsedProgressSensitiveTool = true;
+          }
 
           if (
             uncertainty.mode === "simple_multi_file" &&
@@ -1777,6 +2456,7 @@ export const runQuerySession = async ({
                 task,
                 uncertainty,
                 progressLedger,
+                searchMemory,
                 accumulatedToolResults,
                 toolResults
               );
@@ -1794,6 +2474,34 @@ export const runQuerySession = async ({
             uncertainty.mode === "project_analysis" &&
             isProjectAnalysisBroadDiscoveryAction(event.toolName, event.input)
           ) {
+            const semanticAnchors =
+              uncertainty.semanticNavigationCount === 0
+                ? getProjectAnalysisSemanticAnchors(
+                    uncertainty,
+                    searchMemory,
+                    accumulatedToolResults,
+                    toolResults
+                  )
+                : [];
+            if (semanticAnchors.length > 0) {
+              if (uncertainty.phase === "discover") {
+                uncertainty.phase = "trace";
+              }
+              loopCorrection = [
+                "Project analysis semantic navigation preferred:",
+                `Skipped ${action} ${toolPath ?? "."} because concrete source anchors are already known: ${formatPathList(semanticAnchors, 3)}.`,
+                "Before more broad search, use lsp_document_symbols/lsp_workspace_symbols for structure or lsp_definition/ts_definition/lsp_references/ts_references to trace the main code path.",
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
+                  `Skipped ${action} because semantic navigation should come first once concrete source anchors are known.`,
+                  `Known source anchors: ${formatPathList(semanticAnchors, 3)}.`,
+                  "Try lsp_document_symbols/lsp_workspace_symbols or definition/reference navigation before another broad search.",
+                ].join("\n")
+              );
+              continue;
+            }
             if (uncertainty.phase === "discover") {
               if (uncertainty.discoverBudgetUsed >= uncertainty.discoverBudgetMax) {
                 uncertainty.phase = "trace";
@@ -1833,6 +2541,7 @@ export const runQuerySession = async ({
             !shouldAllowTargetedSourceRead(
               toolPath,
               uncertainty,
+              searchMemory,
               accumulatedToolResults,
               toolResults
             )
@@ -1850,6 +2559,88 @@ export const runQuerySession = async ({
               ].join("\n")
             );
             continue;
+          }
+
+          const readLedgerEntry = getReadLedgerEntry(readLedger, event.input);
+          if (
+            readLedgerEntry &&
+            readLedgerEntry.revision === filesystemMutationRevision &&
+            event.toolName === "file"
+          ) {
+            if (
+              action === "read_file" &&
+              readLedgerEntry.fullyRead &&
+              !taskSuggestsPostWriteVerification(task)
+            ) {
+              const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
+              loopCorrection = [
+                "Repeated full-file read blocked:",
+                `${repeatedPath} was already fully read in the current file revision.`,
+                "Do not read the whole file again unless it changes. Continue from the known content or switch to a different file.",
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] read_file ${repeatedPath}`,
+                  `Skipped read_file for ${repeatedPath} because the current revision was already read completely.`,
+                  "Reuse the previous read result or move to the next concrete file instead of rereading the whole file.",
+                ].join("\n")
+              );
+              continue;
+            }
+
+            if (
+              action === "read_file" &&
+              !readLedgerEntry.fullyRead &&
+              typeof readLedgerEntry.nextSuggestedStartLine === "number"
+            ) {
+              const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
+              loopCorrection = [
+                "Whole-file reread blocked after partial reads:",
+                `${repeatedPath} already has partial read coverage in the current revision.`,
+                `Continue with read_range starting at line ${readLedgerEntry.nextSuggestedStartLine} instead of restarting from the top.`,
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] read_file ${repeatedPath}`,
+                  `Skipped read_file for ${repeatedPath} because this file already has partial read coverage in the current revision.`,
+                  `Use read_range with startLine ${readLedgerEntry.nextSuggestedStartLine} to continue from the next unread region.`,
+                ].join("\n")
+              );
+              continue;
+            }
+
+            if (action === "read_range") {
+              const record = toRecord(event.input);
+              const startLine = record ? pickFiniteNumber(record, "startLine") : undefined;
+              const endLine = record ? pickFiniteNumber(record, "endLine") : undefined;
+              if (
+                typeof startLine === "number" &&
+                typeof endLine === "number" &&
+                isReadRangeCoveredByLedger(
+                  readLedgerEntry,
+                  startLine,
+                  endLine,
+                  filesystemMutationRevision
+                )
+              ) {
+                const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
+                loopCorrection = [
+                  "Repeated range read blocked:",
+                  `${repeatedPath} lines ${startLine}-${endLine} were already read in the current file revision.`,
+                  "Continue from the next unread range or switch to a different target.",
+                ].join("\n");
+                toolResults.push(
+                  [
+                    `[tool skipped] read_range ${repeatedPath}`,
+                    `Skipped read_range ${startLine}-${endLine} for ${repeatedPath} because that exact range is already covered in the current revision.`,
+                    typeof readLedgerEntry.nextSuggestedStartLine === "number"
+                      ? `Continue with read_range starting at line ${readLedgerEntry.nextSuggestedStartLine}.`
+                      : "Continue with a new unread range or another file.",
+                  ].join("\n")
+                );
+                continue;
+              }
+            }
           }
 
           const signature = getLoopSignature(
@@ -1913,6 +2704,45 @@ export const runQuerySession = async ({
               `\n[tool loop detected] ${displayName} was called repeatedly with same input. Stopping to prevent infinite loop.\n`
             );
             return completeRound();
+          }
+          const scopedBudgetKey = getScopedBroadDiscoveryBudgetKey(
+            event.toolName,
+            event.input,
+            filesystemMutationRevision
+          );
+          if (scopedBudgetKey) {
+            const scopedBudgetUsed =
+              searchMemory.scopedBroadDiscoveryBudget.get(scopedBudgetKey) ?? 0;
+            if (scopedBudgetUsed >= BROAD_DISCOVERY_SCOPE_BUDGET) {
+              const repeatedScope = getBroadDiscoveryScope(event.toolName, event.input) ?? ".";
+              if (uncertainty.mode === "simple_multi_file" && uncertainty.phase === "discover") {
+                uncertainty.phase = "collapse";
+              }
+              if (uncertainty.mode === "project_analysis" && uncertainty.phase === "discover") {
+                uncertainty.phase = "trace";
+              }
+              loopCorrection = [
+                "Broad discovery budget exhausted:",
+                `Skipped ${action} ${repeatedScope} because this scope already used ${scopedBudgetUsed}/${BROAD_DISCOVERY_SCOPE_BUDGET} broad discovery steps.`,
+                "Use a known hit path or move to read_range/read_file/outline_file instead of reopening broad search in the same scope.",
+              ].join("\n");
+              toolResults.push(
+                [
+                  `[tool skipped] ${action} ${repeatedScope}`.trim(),
+                  `Skipped ${action} because broad search budget for ${repeatedScope} is already exhausted.`,
+                  "Continue from known paths or switch to targeted reads instead of another broad search.",
+                ].join("\n")
+              );
+              continue;
+            }
+            searchMemory.scopedBroadDiscoveryBudget.set(
+              scopedBudgetKey,
+              scopedBudgetUsed + 1
+            );
+            const broadScope = getBroadDiscoveryScope(event.toolName, event.input);
+            if (broadScope) {
+              searchMemory.searchedScopes.add(broadScope);
+            }
           }
           if (
             isImmediateRedundantPostWriteRead(
@@ -1979,7 +2809,14 @@ export const runQuerySession = async ({
             );
             return completeRound();
           }
-          if (didApplyFileMutation(event.toolName, event.input, toolResult.message)) {
+          if (
+            didApplyFileMutation(
+              event.toolName,
+              event.input,
+              toolResult.message,
+              toolResult.metadata
+            )
+          ) {
             filesystemMutationRevision += 1;
             loopCorrection = "";
           }
@@ -1987,8 +2824,23 @@ export const runQuerySession = async ({
             event.toolName,
             event.input,
             toolResult.message,
+            toolResult.metadata,
             accumulatedToolResults,
             toolResults
+          );
+          updateReadLedgerFromToolResult(
+            readLedger,
+            event.toolName,
+            event.input,
+            toolResult.message,
+            toolResult.metadata,
+            filesystemMutationRevision
+          );
+          recordSearchObservation(
+            searchMemory,
+            event.toolName,
+            event.input,
+            toolResult.message
           );
           if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
             emitRoundText(`${uncertainty.blockedReason}\n`);
@@ -1996,44 +2848,72 @@ export const runQuerySession = async ({
           }
           if (toolResult.reviewMode) {
             dispatch({ type: "suspended" });
-            return createOneShotResume(async (toolResultMessage: string) => {
-                if (didApplyFileMutation(event.toolName, event.input, toolResultMessage)) {
-                  filesystemMutationRevision += 1;
-                  loopCorrection = "";
-                }
-                applyToolResultSideEffects(
+            return createOneShotResume(async resumedToolResult => {
+              if (
+                didApplyFileMutation(
                   event.toolName,
                   event.input,
-                  toolResultMessage,
-                  accumulatedToolResults,
-                  toolResults
-                );
-                if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
-                  emitRoundText(`${uncertainty.blockedReason}\n`);
-                  return completeRound();
-                }
-                const nextToolResults = [
-                  ...accumulatedToolResults,
-                  ...toolResults,
-                  `[tool_result] ${event.toolName}\n${toolResultMessage}`.trim(),
-                ];
-                const nextPrompt = buildRoundPrompt(
-                  task,
-                  nextToolResults,
-                  loopCorrection,
-                  recentConfirmedFileMutations,
-                  progressLedger,
-                  uncertainty
-                );
-                return runRounds(
-                  nextPrompt,
-                  repeatedToolCallCount,
-                  loopCorrection,
-                  nextToolResults,
-                  toolStepsUsed,
-                  { allowSilentPostReviewRetry: true }
-                );
-              });
+                  resumedToolResult.message,
+                  resumedToolResult.metadata,
+                )
+              ) {
+                filesystemMutationRevision += 1;
+                loopCorrection = "";
+              }
+              applyToolResultSideEffects(
+                event.toolName,
+                event.input,
+                resumedToolResult.message,
+                resumedToolResult.metadata,
+                accumulatedToolResults,
+                toolResults
+              );
+              updateReadLedgerFromToolResult(
+                readLedger,
+                event.toolName,
+                event.input,
+                resumedToolResult.message,
+                resumedToolResult.metadata,
+                filesystemMutationRevision
+              );
+              recordSearchObservation(
+                searchMemory,
+                event.toolName,
+                event.input,
+                resumedToolResult.message
+              );
+              if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
+                emitRoundText(`${uncertainty.blockedReason}\n`);
+                return completeRound();
+              }
+              if (finalizeRoundProgress()) {
+                return completeRound();
+              }
+              const nextToolResults = [
+                ...accumulatedToolResults,
+                ...toolResults,
+                `[tool_result] ${event.toolName}\n${resumedToolResult.message}`.trim(),
+              ];
+              const nextPrompt = buildRoundPrompt(
+                task,
+                nextToolResults,
+                loopCorrection,
+                recentConfirmedFileMutations,
+                progressLedger,
+                uncertainty,
+                searchMemory,
+                readLedger,
+                filesystemMutationRevision
+              );
+              return runRounds(
+                nextPrompt,
+                repeatedToolCallCount,
+                loopCorrection,
+                nextToolResults,
+                toolStepsUsed,
+                { allowSilentPostReviewRetry: true }
+              );
+            });
           }
           toolResults.push(
             `[tool_result] ${event.toolName}\n${toolResult.message}`.trim()
@@ -2093,7 +2973,10 @@ export const runQuerySession = async ({
             ].join("\n"),
             recentConfirmedFileMutations,
             progressLedger,
-            uncertainty
+            uncertainty,
+            searchMemory,
+            readLedger,
+            filesystemMutationRevision
           );
           return runRounds(
             nextPrompt,
@@ -2124,7 +3007,10 @@ export const runQuerySession = async ({
             .join("\n\n"),
           recentConfirmedFileMutations,
           progressLedger,
-          uncertainty
+          uncertainty,
+          searchMemory,
+          readLedger,
+          filesystemMutationRevision
         );
         return runRounds(
           nextPrompt,
@@ -2140,13 +3026,19 @@ export const runQuerySession = async ({
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
     flushUsage();
+    if (finalizeRoundProgress()) {
+      return completeRound();
+    }
     const nextPrompt = buildRoundPrompt(
       task,
       accumulatedToolResults,
       loopCorrection,
       recentConfirmedFileMutations,
       progressLedger,
-      uncertainty
+      uncertainty,
+      searchMemory,
+      readLedger,
+      filesystemMutationRevision
     );
     return runRounds(
       nextPrompt,
@@ -2160,7 +3052,12 @@ export const runQuerySession = async ({
 
   try {
     return await runRounds(
-      buildInitialExecutionMemo(query, task, uncertainty, progressLedger),
+      buildInitialExecutionMemo(
+        normalizedQuery.text,
+        task,
+        uncertainty,
+        progressLedger
+      ),
       new Map<string, number>(),
       "",
       [],

@@ -25,6 +25,8 @@ const (
 	mouseRegionModelListScrollbar       mouseRegion = "model_list_scrollbar"
 	mouseRegionProviderList             mouseRegion = "provider_list"
 	mouseRegionProviderListScrollbar    mouseRegion = "provider_list_scrollbar"
+	mouseRegionComposerAttachmentAdd    mouseRegion = "composer_attachment_add"
+	mouseRegionComposerAttachmentRemove mouseRegion = "composer_attachment_remove"
 	mouseRegionComposer                 mouseRegion = "composer"
 	mouseRegionFooter                   mouseRegion = "footer"
 )
@@ -238,6 +240,9 @@ func (m *Model) mouseHitAt(mouseX, mouseY int) mouseHit {
 		}
 		return m.panelMouseHit(layout.Panel, mouseX, mouseY)
 	case layout.Composer.contains(mouseX, mouseY):
+		if hit, ok := m.composerMouseHit(layout.Composer, mouseX, mouseY); ok {
+			return hit
+		}
 		return mouseHit{Region: mouseRegionComposer}
 	case layout.Header.contains(mouseX, mouseY):
 		return mouseHit{Region: mouseRegionHeader}
@@ -246,6 +251,48 @@ func (m *Model) mouseHitAt(mouseX, mouseY int) mouseHit {
 	default:
 		return mouseHit{Region: mouseRegionNone}
 	}
+}
+
+func (m *Model) composerMouseHit(composerRect mouseRect, mouseX, mouseY int) (mouseHit, bool) {
+	style := focusedInputBoxStyle
+	if m.ActivePanel != PanelNone {
+		style = inputBoxStyle
+	}
+	inner := insetRectForStyle(composerRect, style)
+	if !inner.contains(mouseX, mouseY) {
+		return mouseHit{}, false
+	}
+	contentWidth := inner.Width
+	lineIndex := mouseY - inner.Top
+	offset := noticeAndSlashPrefixLinesForComposer(m, contentWidth)
+	if lineIndex != offset {
+		return mouseHit{}, false
+	}
+	column := clampInt(mouseX-inner.Left, 0, maxInt(0, inner.Width-1))
+	line := m.composerAttachmentBarLine(contentWidth)
+	for _, segment := range line.Segments {
+		if column < segment.Start || column >= segment.End {
+			continue
+		}
+		if segment.Kind == "attachment" {
+			return mouseHit{Region: mouseRegionComposerAttachmentRemove, Index: segment.Index}, true
+		}
+		if segment.Kind == "add" {
+			return mouseHit{Region: mouseRegionComposerAttachmentAdd, Index: -1}, true
+		}
+	}
+	return mouseHit{}, false
+}
+
+func noticeAndSlashPrefixLinesForComposer(m *Model, contentWidth int) int {
+	offset := 0
+	if m.Notice != "" {
+		offset += len(wrapPlainText(m.Notice, contentWidth))
+	}
+	if matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
+		offset += len(renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection))
+	}
+	return offset
 }
 
 func (m *Model) scrollbarGeometryByRegion(region mouseRegion) (scrollbarGeometry, bool) {

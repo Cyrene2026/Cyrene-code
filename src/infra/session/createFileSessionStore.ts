@@ -34,6 +34,7 @@ import type {
   SessionRecord,
   SessionStateUpdateDiagnostic,
 } from "../../core/session/types";
+import type { QueryAttachment } from "../../core/query/transport";
 
 type SessionStoreContext = {
   cwd?: string;
@@ -72,6 +73,17 @@ const messageSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
   text: z.string(),
   createdAt: z.string(),
+  attachments: z
+    .array(
+      z.object({
+        id: z.string(),
+        kind: z.literal("image"),
+        path: z.string(),
+        name: z.string(),
+        mimeType: z.string(),
+      })
+    )
+    .optional(),
   kind: z
     .enum([
       "transcript",
@@ -85,6 +97,17 @@ const messageSchema = z.object({
 
 const inFlightTurnSchema: z.ZodType<SessionInFlightTurn> = z.object({
   userText: z.string(),
+  attachments: z
+    .array(
+      z.object({
+        id: z.string(),
+        kind: z.literal("image"),
+        path: z.string(),
+        name: z.string(),
+        mimeType: z.string(),
+      })
+    )
+    .optional(),
   assistantText: z.string(),
   committedVisibleText: z.string().optional(),
   startedAt: z.string(),
@@ -235,9 +258,17 @@ const normalizeInFlightTurn = (turn: SessionInFlightTurn | null | undefined) => 
   }
   return {
     ...turn,
+    attachments: normalizeAttachments(turn.attachments),
     committedVisibleText: turn.committedVisibleText ?? "",
   };
 };
+
+const normalizeAttachments = (
+  attachments: QueryAttachment[] | null | undefined
+) =>
+  Array.isArray(attachments)
+    ? attachments.map(attachment => ({ ...attachment }))
+    : [];
 
 const isEmptyPlaceholderSession = (session: SessionRecord) => {
   const summary = session.summary?.trim() ?? "";
@@ -468,6 +499,10 @@ export const createFileSessionStore = (
         inFlightTurn: normalizeInFlightTurn(normalized.inFlightTurn),
         focus: normalized.focus ?? [],
         tags: normalizeTagSet(normalized.tags ?? []),
+        messages: normalized.messages.map(message => ({
+          ...message,
+          attachments: normalizeAttachments(message.attachments),
+        })),
       };
     } catch {
       return null;
@@ -868,7 +903,12 @@ export const createFileSessionStore = (
         }
         const next: SessionRecord = {
           ...loaded.session,
-          inFlightTurn,
+          inFlightTurn: inFlightTurn
+            ? {
+                ...inFlightTurn,
+                attachments: normalizeAttachments(inFlightTurn.attachments),
+              }
+            : null,
           updatedAt: new Date().toISOString(),
         };
         await writeSession(next);

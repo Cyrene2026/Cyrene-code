@@ -86,8 +86,42 @@ export type McpServerDescriptor = {
 export type McpHandleResult = {
   ok: boolean;
   message: string;
+  metadata?: McpToolResultMetadata;
   pending?: PendingReviewItem;
 };
+
+export type FileToolResultMetadata = {
+  kind: "file";
+  action: ToolRequest["action"];
+  workspacePath?: string;
+  resolvedPath?: string;
+  pathKind?: "file" | "directory" | "other" | "missing";
+  fileRevision?: {
+    sizeBytes: number;
+    mtimeMs: number;
+    revisionKey: string;
+  };
+  read?: {
+    mode: "full" | "range" | "structured";
+    startLine: number | null;
+    endLine: number | null;
+    fullyRead: boolean;
+    truncated: boolean;
+    nextSuggestedStartLine: number | null;
+    empty: boolean;
+    lineCount: number | null;
+  };
+  mutation?: {
+    applied: boolean;
+  };
+};
+
+export type McpToolResultMetadata =
+  | FileToolResultMetadata
+  | {
+      kind: string;
+      [key: string]: unknown;
+    };
 
 export type McpRuntimeSummary = {
   primaryServerId: string;

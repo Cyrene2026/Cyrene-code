@@ -1,4 +1,5 @@
 import type { ChatRole } from "../../shared/types/chat";
+import type { QueryAttachment } from "../query/transport";
 import type { ReducerMode } from "./stateReducer";
 
 export type SessionMessageKind =
@@ -13,10 +14,12 @@ export type SessionMessage = {
   text: string;
   createdAt: string;
   kind?: SessionMessageKind;
+  attachments?: QueryAttachment[];
 };
 
 export type SessionInFlightTurn = {
   userText: string;
+  attachments?: QueryAttachment[];
   assistantText: string;
   committedVisibleText?: string;
   startedAt: string;

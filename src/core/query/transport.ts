@@ -25,6 +25,34 @@ export type ProviderRuntimeInfo = {
   format?: TransportFormat;
 };
 
+export type QueryAttachment = {
+  id: string;
+  kind: "image";
+  path: string;
+  name: string;
+  mimeType: string;
+};
+
+export type QueryInput = {
+  text: string;
+  attachments?: QueryAttachment[];
+};
+
+export const normalizeQueryInput = (
+  input: string | QueryInput
+): { text: string; attachments: QueryAttachment[] } => {
+  if (typeof input === "string") {
+    return {
+      text: input,
+      attachments: [],
+    };
+  }
+  return {
+    text: input.text,
+    attachments: [...(input.attachments ?? [])],
+  };
+};
+
 export type ProviderProfile = "openai" | "gemini" | "anthropic" | "custom";
 export type TransportFormat =
   | "openai_chat"
@@ -193,6 +221,6 @@ export type QueryTransport = {
   listProviders: () => Promise<string[]>;
   setProvider: (provider: string) => Promise<ProviderSetResult>;
   refreshModels: () => Promise<ModelRefreshResult>;
-  requestStreamUrl: (query: string) => Promise<string>;
+  requestStreamUrl: (query: string | QueryInput) => Promise<string>;
   stream: (streamUrl: string) => AsyncGenerator<string>;
 };

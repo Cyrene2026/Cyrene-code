@@ -35,7 +35,8 @@ const createStubTransport = (
     models: [model],
   }),
   refreshModels: async () => ({ ok: true, message: "refreshed", models: [model] }),
-  requestStreamUrl: async query => `stream://${query}`,
+  requestStreamUrl: async query =>
+    `stream://${typeof query === "string" ? query : query.text}`,
   stream: async function* () {},
 });
 

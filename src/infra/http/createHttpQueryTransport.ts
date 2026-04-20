@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import {
   inferProviderType,
@@ -21,6 +21,9 @@ import {
   type ProviderTypeOverrideMap,
   type ProviderTypeSetResult,
   type QueryTransport,
+  type QueryInput,
+  type QueryAttachment,
+  normalizeQueryInput,
   type TransportFormat,
 } from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
@@ -67,6 +70,22 @@ type ParsedProvider = {
   family: ProviderFamily;
 };
 
+type EncodedImageAttachment = QueryAttachment & {
+  absolutePath: string;
+  data: string;
+  dataUrl: string;
+};
+
+const IMAGE_ATTACHMENT_MIME_TYPES: Record<string, string> = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+const MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
 const isManualProviderProfile = (
   value: string
 ): value is ManualProviderProfile =>
@@ -74,6 +93,53 @@ const isManualProviderProfile = (
 
 const isTransportFormat = (value: string): value is TransportFormat =>
   (TRANSPORT_FORMAT_VALUES as readonly string[]).includes(value);
+
+const supportsImageAttachmentsForFormat = (format: TransportFormat) =>
+  format === "openai_responses" ||
+  format === "anthropic_messages" ||
+  format === "gemini_generate_content";
+
+const resolveAttachmentAbsolutePath = (attachment: QueryAttachment, appRoot: string) =>
+  isAbsolute(attachment.path)
+    ? resolve(attachment.path)
+    : resolve(appRoot, attachment.path);
+
+const resolveAttachmentMimeType = (attachment: QueryAttachment) => {
+  const extension = extname(attachment.path).toLowerCase();
+  const resolved = IMAGE_ATTACHMENT_MIME_TYPES[extension];
+  if (!resolved) {
+    throw new Error(
+      `Unsupported image attachment type for ${attachment.path}. Supported extensions: .png, .jpg, .jpeg, .webp, .gif.`
+    );
+  }
+  return resolved;
+};
+
+const encodeImageAttachments = async (
+  attachments: QueryAttachment[],
+  appRoot: string
+): Promise<EncodedImageAttachment[]> =>
+  await Promise.all(
+    attachments.map(async attachment => {
+      const absolutePath = resolveAttachmentAbsolutePath(attachment, appRoot);
+      const mimeType = resolveAttachmentMimeType(attachment);
+      const content = await readFile(absolutePath);
+      if (content.length > MAX_IMAGE_ATTACHMENT_BYTES) {
+        throw new Error(
+          `Image attachment too large: ${attachment.path}. Max size is ${MAX_IMAGE_ATTACHMENT_BYTES / (1024 * 1024)} MB.`
+        );
+      }
+      const data = content.toString("base64");
+      return {
+        ...attachment,
+        name: attachment.name?.trim() || basename(absolutePath),
+        mimeType,
+        absolutePath,
+        data,
+        dataUrl: `data:${mimeType};base64,${data}`,
+      };
+    })
+  );
 
 const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
   (PROVIDER_ENDPOINT_KIND_VALUES as readonly string[]).includes(value);
@@ -456,6 +522,8 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- Use find_files for file discovery by name or glob pattern.",
   "- Use find_symbol when you need to locate symbol definitions such as classes, functions, interfaces, types, or defs.",
   "- Use find_references when you need cross-file symbol usages rather than definitions.",
+  "- Treat lsp_* as the canonical semantic-navigation tool family. When a matching lsp_server is unavailable for a TypeScript/JavaScript file, the filesystem service may satisfy the request through the bundled tsserver backend instead of failing.",
+  "- Treat ts_* as TypeScript/JavaScript compatibility aliases for that semantic backend. Prefer the canonical lsp_* shape when you do not specifically need the TS-only alias.",
   "- Use ts_hover for TypeScript/JavaScript quick info at an exact file position.",
   "- Use ts_definition for TypeScript/JavaScript definition lookup at an exact file position.",
   "- Use ts_references for semantic TypeScript/JavaScript references at an exact file position.",
@@ -785,6 +853,15 @@ type AnthropicTextBlock = {
   cache_control?: AnthropicCacheControl;
 };
 
+type AnthropicImageBlock = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+};
+
 type AnthropicSystemBlock = AnthropicTextBlock;
 
 const buildAnthropicSystemBlocks = (
@@ -838,7 +915,7 @@ type AnthropicMessagesRequestBody = {
   tool_choice: { type: string };
   messages: Array<{
     role: "user";
-    content: AnthropicTextBlock[];
+    content: Array<AnthropicTextBlock | AnthropicImageBlock>;
   }>;
 };
 
@@ -1165,8 +1242,17 @@ const normalizeAnthropicOmittedToolResultsPrefix = (text: string) => {
 
 const buildAnthropicUserBlocks = (
   userText: string,
-  cacheControl: AnthropicCacheControl
-): AnthropicTextBlock[] => {
+  cacheControl: AnthropicCacheControl,
+  attachments: EncodedImageAttachment[]
+): Array<AnthropicTextBlock | AnthropicImageBlock> => {
+  const imageBlocks: AnthropicImageBlock[] = attachments.map(attachment => ({
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: attachment.mimeType,
+      data: attachment.data,
+    },
+  }));
   const toolResultsIndex = userText.indexOf(ANTHROPIC_TOOL_RESULTS_MARKER);
   if (toolResultsIndex >= 0) {
     const prefixText = userText.slice(0, toolResultsIndex).trim();
@@ -1179,7 +1265,7 @@ const buildAnthropicUserBlocks = (
     const { stablePrefix, dynamicPrefix } =
       splitAnthropicContinuationPrefix(prefixText);
     const parsedToolResults = parseAnthropicToolResultBlocks(toolResultsText);
-    const blocks: AnthropicTextBlock[] = [];
+    const blocks: Array<AnthropicTextBlock | AnthropicImageBlock> = [...imageBlocks];
 
     if (stablePrefix) {
       blocks.push({
@@ -1238,6 +1324,7 @@ const buildAnthropicUserBlocks = (
   const querySplit = splitAnthropicUserTextAroundCurrentQuery(userText);
   if (querySplit) {
     return [
+      ...imageBlocks,
       {
         type: "text",
         text: querySplit.stablePrefix,
@@ -1251,6 +1338,7 @@ const buildAnthropicUserBlocks = (
   }
 
   return [
+    ...imageBlocks,
     {
       type: "text",
       text: userText,
@@ -1264,6 +1352,7 @@ const buildAnthropicMessagesRequestBody = (options: {
   temperature: number;
   promptProjection: AnthropicPromptProjection;
   userText: string;
+  attachments?: EncodedImageAttachment[];
   mcpTools: McpToolDescriptor[];
   cacheControl: AnthropicCacheControl;
 }): AnthropicMessagesRequestBody => ({
@@ -1277,7 +1366,11 @@ const buildAnthropicMessagesRequestBody = (options: {
   messages: [
     {
       role: "user",
-      content: buildAnthropicUserBlocks(options.userText, options.cacheControl),
+      content: buildAnthropicUserBlocks(
+        options.userText,
+        options.cacheControl,
+        options.attachments ?? []
+      ),
     },
   ],
 });
@@ -1685,11 +1778,76 @@ const extractVisibleDeltaText = (
   );
 };
 
+const buildOpenAIChatUserContent = (
+  input: QueryInput,
+  attachments: EncodedImageAttachment[]
+) =>
+  attachments.length > 0
+    ? [
+        ...(input.text.trim()
+          ? [
+              {
+                type: "text",
+                text: input.text,
+              },
+            ]
+          : []),
+        ...attachments.map(attachment => ({
+          type: "image_url",
+          image_url: {
+            url: attachment.dataUrl,
+          },
+        })),
+      ]
+    : input.text;
+
+const buildOpenAIResponsesInput = (
+  input: QueryInput,
+  attachments: EncodedImageAttachment[]
+) => [
+  {
+    role: "user",
+    content: [
+      ...(input.text.trim()
+        ? [
+            {
+              type: "input_text",
+              text: input.text,
+            },
+          ]
+        : []),
+      ...attachments.map(attachment => ({
+        type: "input_image",
+        image_url: attachment.dataUrl,
+      })),
+    ],
+  },
+];
+
+const buildGeminiUserParts = (
+  input: QueryInput,
+  attachments: EncodedImageAttachment[]
+) => [
+  ...(input.text.trim()
+    ? [
+        {
+          text: input.text,
+        },
+      ]
+    : []),
+  ...attachments.map(attachment => ({
+    inlineData: {
+      mimeType: attachment.mimeType,
+      data: attachment.data,
+    },
+  })),
+];
+
 async function* streamSseOpenAI(
   baseUrl: string,
   apiKey: string,
   model: string,
-  query: string,
+  input: QueryInput,
   options?: {
     includeReasoning?: boolean;
     temperature?: number;
@@ -1697,8 +1855,13 @@ async function* streamSseOpenAI(
     endpointOverride?: string | null;
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
+    appRoot?: string;
   }
 ): AsyncGenerator<string> {
+  const attachments = await encodeImageAttachments(
+    input.attachments ?? [],
+    options?.appRoot ?? process.cwd()
+  );
   const headers: Record<string, string> = {
     Accept: "text/event-stream",
     "Content-Type": "application/json",
@@ -1728,7 +1891,7 @@ async function* streamSseOpenAI(
       tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
       messages: [
         { role: "system", content: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT },
-        { role: "user", content: query },
+        { role: "user", content: buildOpenAIChatUserContent(input, attachments) },
       ],
     }),
     }
@@ -2061,15 +2224,20 @@ async function* streamSseOpenAIResponses(
   baseUrl: string,
   apiKey: string,
   model: string,
-  query: string,
+  input: QueryInput,
   options?: {
     temperature?: number;
     family?: ProviderFamily;
     endpointOverride?: string | null;
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
+    appRoot?: string;
   }
 ): AsyncGenerator<string> {
+  const attachments = await encodeImageAttachments(
+    input.attachments ?? [],
+    options?.appRoot ?? process.cwd()
+  );
   const headers: Record<string, string> = {
     Accept: "text/event-stream",
     "Content-Type": "application/json",
@@ -2086,7 +2254,7 @@ async function* streamSseOpenAIResponses(
     tool_choice: "auto",
     tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
     instructions: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
-    input: query,
+    input: buildOpenAIResponsesInput(input, attachments),
   });
   const candidateUrls = resolveResponsesUrls(
     baseUrl,
@@ -2570,14 +2738,19 @@ async function* streamSseGeminiGenerateContent(
   baseUrl: string,
   apiKey: string,
   model: string,
-  query: string,
+  input: QueryInput,
   options?: {
     temperature?: number;
     endpointOverride?: string | null;
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
+    appRoot?: string;
   }
 ): AsyncGenerator<string> {
+  const attachments = await encodeImageAttachments(
+    input.attachments ?? [],
+    options?.appRoot ?? process.cwd()
+  );
   const requestUrl = resolveGeminiGenerateContentUrl(
     baseUrl,
     model,
@@ -2599,7 +2772,7 @@ async function* streamSseGeminiGenerateContent(
         contents: [
           {
             role: "user",
-            parts: [{ text: query }],
+            parts: buildGeminiUserParts(input, attachments),
           },
         ],
         tools: [buildGeminiFunctionTools(options?.mcpTools ?? [])],
@@ -2800,7 +2973,7 @@ async function* streamSseAnthropic(
   baseUrl: string,
   apiKey: string,
   model: string,
-  query: string,
+  input: QueryInput,
   options?: {
     temperature?: number;
     endpointOverride?: string | null;
@@ -2813,10 +2986,14 @@ async function* streamSseAnthropic(
     cacheSessionState?: AnthropicPromptCacheSessionState;
   }
 ): AsyncGenerator<string> {
+  const attachments = await encodeImageAttachments(
+    input.attachments ?? [],
+    options?.appRoot ?? process.cwd()
+  );
   const cacheSessionState =
     options?.cacheSessionState ?? createAnthropicPromptCacheSessionState();
   const anthropicPrompt = splitAnthropicPromptForCaching(
-    query,
+    input.text,
     options?.systemPrompt ?? ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT
   );
   const resolvedCacheControl = getAnthropicCacheControl(
@@ -2840,6 +3017,7 @@ async function* streamSseAnthropic(
     temperature: options?.temperature ?? 0.2,
     promptProjection: anthropicPrompt,
     userText: anthropicPrompt.userText,
+    attachments,
     mcpTools: options?.mcpTools ?? [],
     cacheControl: resolvedCacheControl,
   });
@@ -3441,7 +3619,7 @@ export const createHttpQueryTransport = (
   const sessionQueries = new Map<
     string,
     {
-      query: string;
+      input: QueryInput;
       provider: string;
       model: string;
       apiKey: string;
@@ -4568,8 +4746,9 @@ export const createHttpQueryTransport = (
         };
       }
     },
-    requestStreamUrl: async (query: string) => {
+    requestStreamUrl: async query => {
       await modelInit;
+      const normalizedInput = normalizeQueryInput(query);
       const targetProvider = currentProvider ?? resolveProviderBaseUrl(baseUrl);
       if (!targetProvider) {
         throw new Error(
@@ -4595,11 +4774,19 @@ export const createHttpQueryTransport = (
       const providerFormat =
         resolveFormatForProvider(targetProvider, providerFamily) ??
         resolveDefaultFormatForProvider(targetProvider, providerFamily);
+      if (
+        normalizedInput.attachments.length > 0 &&
+        !supportsImageAttachmentsForFormat(providerFormat)
+      ) {
+        throw new Error(
+          `Current provider format ${providerFormat} does not support image attachments. Switch to a provider/model using Responses, Anthropic Messages, or Gemini Generate Content.`
+        );
+      }
       const modelForRequest =
         currentModel || resolveDefaultModelForFamily(providerFamily);
       const sessionId = crypto.randomUUID();
       sessionQueries.set(sessionId, {
-        query,
+        input: normalizedInput,
         provider: targetProvider,
         model: modelForRequest,
         apiKey: targetApiKey,
@@ -4628,7 +4815,7 @@ export const createHttpQueryTransport = (
           session.provider,
           session.apiKey,
           session.model,
-          session.query,
+          session.input,
           {
             temperature: requestTemperature,
             endpointOverride: session.endpointOverrides.anthropic_messages,
@@ -4651,13 +4838,14 @@ export const createHttpQueryTransport = (
           session.provider,
           session.apiKey,
           session.model,
-          session.query,
+          session.input,
           {
             temperature: requestTemperature,
             family: session.family,
             endpointOverride: session.endpointOverrides.responses,
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
+            appRoot,
           }
         )) {
           yield event;
@@ -4670,12 +4858,13 @@ export const createHttpQueryTransport = (
           session.provider,
           session.apiKey,
           session.model,
-          session.query,
+          session.input,
           {
             temperature: requestTemperature,
             endpointOverride: session.endpointOverrides.gemini_generate_content,
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
+            appRoot,
           }
         )) {
           yield event;
@@ -4687,7 +4876,7 @@ export const createHttpQueryTransport = (
         session.provider,
         session.apiKey,
         session.model,
-        session.query,
+        session.input,
           {
             includeReasoning: includeReasoningInTranscript,
             temperature: requestTemperature,
@@ -4695,6 +4884,7 @@ export const createHttpQueryTransport = (
             endpointOverride: session.endpointOverrides.chat_completions,
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
+            appRoot,
           }
         )) {
           yield event;

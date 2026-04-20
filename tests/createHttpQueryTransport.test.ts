@@ -272,6 +272,8 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use outline_file before full reads on large source files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_symbol when you need to locate symbol definitions");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_references when you need cross-file symbol usages");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Treat lsp_* as the canonical semantic-navigation tool family");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Treat ts_* as TypeScript/JavaScript compatibility aliases");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_hover for TypeScript/JavaScript quick info");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_definition for TypeScript/JavaScript definition lookup");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_references for semantic TypeScript/JavaScript references");
@@ -3278,7 +3280,12 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(requestBody.model).toBe("gpt-test");
     expect(requestBody.stream).toBe(true);
     expect(requestBody.tool_choice).toBe("auto");
-    expect(requestBody.input).toBe("hello");
+    expect(requestBody.input).toEqual([
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "hello" }],
+      },
+    ]);
     expect(requestBody.instructions).toBe(TOOL_USAGE_SYSTEM_PROMPT);
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "hello" }),
@@ -3296,6 +3303,99 @@ describe("createHttpQueryTransport streaming usage", () => {
       }),
       JSON.stringify({ type: "done" }),
     ]);
+  });
+
+  test("openai responses format includes image attachments in structured input", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const imagePath = join(root, "sample.png");
+    await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (String(url).includes("/models")) {
+        return Response.json({
+          data: [{ id: "gpt-test" }],
+        });
+      }
+      return new Response("data: [DONE]\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl({
+      text: "describe this image",
+      attachments: [
+        {
+          id: "img-1",
+          kind: "image",
+          path: imagePath,
+          name: "sample.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+    for await (const _event of transport.stream(streamUrl)) {
+      void _event;
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(requestBody.input[0]?.content[0]).toEqual({
+      type: "input_text",
+      text: "describe this image",
+    });
+    expect(requestBody.input[0]?.content[1]?.type).toBe("input_image");
+    expect(requestBody.input[0]?.content[1]?.image_url).toContain("data:image/png;base64,");
+  });
+
+  test("requestStreamUrl rejects image attachments for openai chat format", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    globalThis.fetch = mock(async (url: string) => {
+      if (String(url).includes("/models")) {
+        return Response.json({
+          data: [{ id: "gpt-test" }],
+        });
+      }
+      return new Response("unexpected request", { status: 500 });
+    }) as unknown as typeof fetch;
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await expect(
+      transport.requestStreamUrl({
+        text: "describe this image",
+        attachments: [
+          {
+            id: "img-1",
+            kind: "image",
+            path: join(root, "missing.png"),
+            name: "missing.png",
+            mimeType: "image/png",
+          },
+        ],
+      })
+    ).rejects.toThrow("does not support image attachments");
   });
 
   test("openai responses format falls back to /responses for providers without /v1 suffix", async () => {

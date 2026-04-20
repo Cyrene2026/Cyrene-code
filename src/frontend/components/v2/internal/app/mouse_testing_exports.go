@@ -61,6 +61,44 @@ func (m *Model) ComposerMousePointForTest() (int, int, bool) {
 	return layout.Composer.pointAtLine(maxInt(0, layout.Composer.Height/2))
 }
 
+func (m *Model) ComposerAttachmentAddMousePointForTest() (int, int, bool) {
+	layout := m.mouseLayout()
+	style := focusedInputBoxStyle
+	if m.ActivePanel != PanelNone {
+		style = inputBoxStyle
+	}
+	inner := insetRectForStyle(layout.Composer, style)
+	line := m.composerAttachmentBarLine(inner.Width)
+	for _, segment := range line.Segments {
+		if segment.Kind != "add" {
+			continue
+		}
+		x := inner.Left + segment.Start + maxInt(0, (segment.End-segment.Start)/2)
+		y := inner.Top + noticeAndSlashPrefixLinesForComposer(m, inner.Width)
+		return x, y, true
+	}
+	return 0, 0, false
+}
+
+func (m *Model) ComposerAttachmentRemoveMousePointForTest(index int) (int, int, bool) {
+	layout := m.mouseLayout()
+	style := focusedInputBoxStyle
+	if m.ActivePanel != PanelNone {
+		style = inputBoxStyle
+	}
+	inner := insetRectForStyle(layout.Composer, style)
+	line := m.composerAttachmentBarLine(inner.Width)
+	for _, segment := range line.Segments {
+		if segment.Kind != "attachment" || segment.Index != index {
+			continue
+		}
+		x := inner.Left + segment.Start + maxInt(0, (segment.End-segment.Start)/2)
+		y := inner.Top + noticeAndSlashPrefixLinesForComposer(m, inner.Width)
+		return x, y, true
+	}
+	return 0, 0, false
+}
+
 func (m *Model) scrollbarThumbMousePointForTest(region mouseRegion) (int, int, bool) {
 	geometry, ok := m.scrollbarGeometryByRegion(region)
 	if !ok {

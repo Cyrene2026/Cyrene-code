@@ -44,6 +44,14 @@ func (m *Model) CommitComposerCompositionForTest(text string) {
 	m.commitComposerComposition([]rune(text))
 }
 
+func (m *Model) SetCurrentProviderFormatForTest(format string) {
+	m.CurrentProviderFormat = format
+}
+
+func (m *Model) AttachmentsForTest() []Attachment {
+	return cloneAttachments(m.Attachments)
+}
+
 func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style) []string {
 	return renderMarkdownBodyLines(text, width, base)
 }

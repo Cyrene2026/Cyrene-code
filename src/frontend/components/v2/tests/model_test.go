@@ -1,6 +1,8 @@
 package tests
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -314,6 +316,122 @@ func TestComposerAllowsLiteralSingleBlockRuneInput(t *testing.T) {
 
 	if got := string(model.Input); got != "█" {
 		t.Fatalf("expected literal block rune preserved, got %q", got)
+	}
+}
+
+func TestCtrlOAddsImageAttachmentFromPathInput(t *testing.T) {
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "sample.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 0x50, 0x4e, 0x47}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	model := app.NewModel()
+	model.AppRoot = root
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sample.png")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	attachments := model.AttachmentsForTest()
+	if len(attachments) != 1 {
+		t.Fatalf("expected one attachment, got %+v", attachments)
+	}
+	if attachments[0].Path != imagePath {
+		t.Fatalf("expected attachment path %q, got %+v", imagePath, attachments[0])
+	}
+	if attachments[0].MimeType != "image/png" {
+		t.Fatalf("expected png mime type, got %+v", attachments[0])
+	}
+}
+
+func TestCtrlOControlRuneFallbackOpensAttachmentInput(t *testing.T) {
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "sample.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 0x50, 0x4e, 0x47}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	model := app.NewModel()
+	model.AppRoot = root
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune(15)}})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sample.png")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := len(model.AttachmentsForTest()); got != 1 {
+		t.Fatalf("expected control-rune fallback to add one attachment, got %d", got)
+	}
+}
+
+func TestImageAddSlashCommandAttachesImage(t *testing.T) {
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "sample.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 0x50, 0x4e, 0x47}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	model := app.NewModel()
+	model.AppRoot = root
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/image add sample.png")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	attachments := model.AttachmentsForTest()
+	if len(attachments) != 1 {
+		t.Fatalf("expected slash command to add one attachment, got %+v", attachments)
+	}
+	if attachments[0].Path != imagePath {
+		t.Fatalf("expected slash command path %q, got %+v", imagePath, attachments[0])
+	}
+}
+
+func TestAttachmentAddAndRemoveMouseTargetsWork(t *testing.T) {
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "sample.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 0x50, 0x4e, 0x47}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 28
+	model.AppRoot = root
+
+	addX, addY, ok := model.ComposerAttachmentAddMousePointForTest()
+	if !ok {
+		t.Fatalf("expected attachment add mouse point")
+	}
+	model.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: addX, Y: addY})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sample.png")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	removeX, removeY, ok := model.ComposerAttachmentRemoveMousePointForTest(0)
+	if !ok {
+		t.Fatalf("expected attachment remove mouse point")
+	}
+	model.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: removeX, Y: removeY})
+
+	if got := len(model.AttachmentsForTest()); got != 0 {
+		t.Fatalf("expected attachment removed, got %d", got)
+	}
+}
+
+func TestSubmitBlocksUnsupportedImageProviderFormat(t *testing.T) {
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "sample.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 0x50, 0x4e, 0x47}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	model := app.NewModel()
+	model.AppRoot = root
+	model.SetCurrentProviderFormatForTest("openai_chat")
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("describe this image")})
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sample.png")})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if !strings.Contains(model.Notice, "not supported") {
+		t.Fatalf("expected unsupported image format notice, got %q", model.Notice)
 	}
 }
 
@@ -973,7 +1091,7 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	if strings.Contains(view, "Enter send | Tab complete") {
 		t.Fatalf("expected legacy helper line removed from composer, got %q", view)
 	}
-	promptIndex := strings.Index(view, "❯ Ask Cyrene, use / commands, or mention files with @...")
+	promptIndex := strings.Index(view, "❯ Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @...")
 	statusIndex := strings.Index(view, "SESSION")
 	if promptIndex < 0 || statusIndex < 0 || promptIndex > statusIndex {
 		t.Fatalf("expected prompt block above footer status row, got %q", view)
@@ -997,18 +1115,47 @@ func TestComposerUsesTextareaCursorRendering(t *testing.T) {
 	}
 }
 
-func TestComposerCollapsesToCharacterCountAfterThreshold(t *testing.T) {
+func TestComposerKeepsLongInputVisibleAfterThreshold(t *testing.T) {
 	model := app.NewModel()
-	longInput := strings.Repeat("a", 1001)
+	longInput := strings.Repeat("long input line ", 90)
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(longInput)})
 
 	rendered := model.RenderComposerForTest(40)
 
-	if !strings.Contains(rendered, "1001 chars") {
-		t.Fatalf("expected composer to show character count summary, got %q", rendered)
+	if strings.Contains(rendered, "chars") {
+		t.Fatalf("expected composer to keep long input visible instead of collapsing to a count summary, got %q", rendered)
 	}
-	if strings.Contains(rendered, longInput[:32]) {
-		t.Fatalf("expected long composer input hidden behind count summary, got %q", rendered)
+	if !strings.Contains(rendered, "long input line") {
+		t.Fatalf("expected long composer input to remain visible, got %q", rendered)
+	}
+}
+
+func TestComposerKeepsCursorVisibleWhenMovedUpInLongMultilineInput(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 80
+	model.Height = 24
+	lines := []string{
+		"line 1",
+		"line 2",
+		"line 3",
+		"line 4",
+		"line 5",
+		"line 6",
+		"line 7",
+		"line 8",
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Join(lines, "\n"))})
+	for range 4 {
+		model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	}
+
+	rendered := model.RenderComposerForTest(40)
+
+	if !strings.Contains(rendered, "█") || !strings.Contains(rendered, "line 7") {
+		t.Fatalf("expected composer to still show the cursor window near the current line, got %q", rendered)
+	}
+	if strings.Contains(rendered, "1 char") {
+		t.Fatalf("expected composer not to collapse to a count summary, got %q", rendered)
 	}
 }
 
@@ -1444,7 +1591,7 @@ func TestEscapeClosesPanelWithoutClosedNotice(t *testing.T) {
 	if strings.Contains(view, "Panel closed.") {
 		t.Fatalf("expected panel closed notice hidden from composer, got %q", view)
 	}
-	if !strings.Contains(view, "❯ Ask Cyrene, use / commands, or mention files with @...") {
+	if !strings.Contains(view, "❯ Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @...") {
 		t.Fatalf("expected default composer prompt after closing panel, got %q", view)
 	}
 }

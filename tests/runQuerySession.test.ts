@@ -2,6 +2,16 @@ import { describe, expect, mock, test } from "bun:test";
 import { runQuerySession } from "../src/core/query/runQuerySession";
 import type { QueryTransport } from "../src/core/query/transport";
 
+const promptTextOf = (value: unknown) =>
+  typeof value === "string"
+    ? value
+    : typeof value === "object" &&
+        value !== null &&
+        "text" in value &&
+        typeof (value as { text?: unknown }).text === "string"
+      ? (value as { text: string }).text
+      : String(value ?? "");
+
 const createTransport = (): { transport: QueryTransport; prompts: string[] } => {
   const prompts: string[] = [];
 
@@ -16,7 +26,7 @@ const createTransport = (): { transport: QueryTransport; prompts: string[] } => 
     listModels: async () => ["gpt-test"],
     refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
     requestStreamUrl: async prompt => {
-      prompts.push(prompt);
+      prompts.push(promptTextOf(prompt));
       return `stream://${prompts.length}`;
     },
     stream: async function* (streamUrl: string) {
@@ -136,7 +146,7 @@ const createPromptCaptureTransport = (
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
       requestStreamUrl: async prompt => {
-        prompts.push(prompt);
+        prompts.push(promptTextOf(prompt));
         return `stream://${++streamCount}`;
       },
       stream: async function* (streamUrl: string) {
@@ -289,7 +299,7 @@ const createPromptCaptureRoundSequenceTransport = (
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
       requestStreamUrl: async prompt => {
-        prompts.push(prompt);
+        prompts.push(promptTextOf(prompt));
         return `stream://${++streamCount}`;
       },
       stream: async function* (streamUrl: string) {
@@ -331,7 +341,7 @@ const createPromptCaptureScriptedTransport = (
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
       requestStreamUrl: async prompt => {
-        prompts.push(prompt);
+        prompts.push(promptTextOf(prompt));
         return `stream://${++streamCount}`;
       },
       stream: async function* (streamUrl: string) {
@@ -370,7 +380,7 @@ const createLateToolCallAfterAnswerTransport = (): {
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
       requestStreamUrl: async prompt => {
-        prompts.push(prompt);
+        prompts.push(promptTextOf(prompt));
         return `stream://${++streamCount}`;
       },
       stream: async function* () {
@@ -453,7 +463,7 @@ describe("runQuerySession", () => {
       listModels: async () => ["gpt-test"],
       refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
       requestStreamUrl: async prompt => {
-        prompts.push(prompt);
+        prompts.push(promptTextOf(prompt));
         return `stream://${++streamCount}`;
       },
       stream: async function* (streamUrl: string) {
@@ -507,6 +517,83 @@ describe("runQuerySession", () => {
     expect(prompts).toHaveLength(3);
     expect(prompts[2]).toContain("do not end silently");
     expect(prompts[2]).toContain("[approved] review-1");
+    expect(prompts[2]).toContain(
+      "After an approval resumes, continue from those runtime facts."
+    );
+  });
+
+  test("approval resume uses structured metadata for mutation side effects", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/app.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts and continue editing other files",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        if (action === "write_file") {
+          return {
+            message: "Approval required review-1",
+            reviewMode: "queue" as const,
+          };
+        }
+        return {
+          message: "[tool result] read_file src/app.ts\nshould not run",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("suspended");
+    if (result.status !== "suspended") {
+      throw new Error("expected suspended result");
+    }
+
+    const resumed = await result.resume({
+      message: "[approved] review-1\nopaque approval payload",
+      metadata: {
+        kind: "file",
+        action: "write_file",
+        workspacePath: "src/app.ts",
+        resolvedPath: "/repo/src/app.ts",
+        pathKind: "file",
+        mutation: {
+          applied: true,
+        },
+        fileRevision: {
+          sizeBytes: 8,
+          mtimeMs: 1234,
+          revisionKey: "8:1234",
+        },
+      },
+    });
+
+    expect(resumed.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(prompts[1]).toContain("Recent confirmed file mutations:");
+    expect(prompts[1]).toContain("write_file src/app.ts");
+    expect(prompts[1]).toContain(
+      "Runtime fact sections below may be synthesized from structured tool metadata"
+    );
+    expect(prompts[2]).toContain("[tool skipped] read_file src/app.ts");
+    expect(prompts[2]).toContain("Skipped redundant read_file for src/app.ts");
   });
 
   test("allows more than 6 tool steps before completion", async () => {
@@ -799,7 +886,7 @@ describe("runQuerySession", () => {
     expect(textDeltas.join("")).toContain("This is the final answer.");
   });
 
-  test("suspended resume is one-shot and does not re-enter rounds twice", async () => {
+test("suspended resume is one-shot and does not re-enter rounds twice", async () => {
     const { transport, prompts } = createTransport();
     const onToolCall = mock(async () => ({
       message: "Approval required review-1",
@@ -894,7 +981,17 @@ describe("runQuerySession", () => {
   });
 
   test("stops repeated empty-file read earlier", async () => {
-    const transport = createSameEmptyReadTransport(2);
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "test_files/u5.py" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "test_files/u5.py" },
+      },
+      null,
+    ]);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
 
@@ -916,8 +1013,10 @@ describe("runQuerySession", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(toolCallCount).toBe(2);
-    expect(textDeltas.join("")).toContain("file was already confirmed empty");
+    expect(toolCallCount).toBe(1);
+    expect(prompts[2]).toContain("[tool skipped] read_file test_files/u5.py");
+    expect(prompts[2]).toContain("already read completely");
+    expect(textDeltas.join("")).not.toContain("file was already confirmed empty");
   });
 
   test("injects write nudge after confirmed directory state for create task", async () => {
@@ -1313,6 +1412,225 @@ describe("runQuerySession", () => {
     expect(toolCalls).toEqual(["create_file", "read_file"]);
   });
 
+  test("skips repeated full-file reads once the current revision is already fully read", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/entrypoints/cli.tsx" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/entrypoints/cli.tsx" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "trace the cli startup flow",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: [
+            "[tool result] read_file src/entrypoints/cli.tsx",
+            "export async function main() {",
+            "  return startCli();",
+            "}",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_file"]);
+    expect(prompts[1]).toContain("File read ledger:");
+    expect(prompts[1]).toContain(
+      "src/entrypoints/cli.tsx: fully_read=true; next read only if the file changes"
+    );
+    expect(prompts[2]).toContain("[tool skipped] read_file src/entrypoints/cli.tsx");
+    expect(prompts[2]).toContain("already read completely");
+  });
+
+  test("read ledger uses structured metadata even when tool text is not parseable", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/output.ts" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/output.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "use src/output.ts as context and continue",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] read_file src/output.ts\ncontent hidden",
+          metadata: {
+            kind: "file",
+            action: "read_file",
+            workspacePath: "src/output.ts",
+            resolvedPath: "/repo/src/output.ts",
+            fileRevision: {
+              sizeBytes: 321,
+              mtimeMs: 1234,
+              revisionKey: "321:1234",
+            },
+            read: {
+              mode: "full",
+              startLine: 1,
+              endLine: 120,
+              fullyRead: true,
+              truncated: false,
+              nextSuggestedStartLine: null,
+              empty: false,
+              lineCount: 120,
+            },
+          },
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_file"]);
+    expect(prompts[1]).toContain(
+      "src/output.ts: fully_read=true; next read only if the file changes"
+    );
+    expect(prompts[2]).toContain("[tool skipped] read_file src/output.ts");
+  });
+
+  test("blocks whole-file rereads after partial range coverage and suggests the next range", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: {
+          action: "read_range",
+          path: "src/output.ts",
+          startLine: 1,
+          endLine: 40,
+        },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/output.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "understand how output.ts formats terminal output",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: [
+            "[tool result] read_range src/output.ts",
+            "path: src/output.ts",
+            "lines: 1-40",
+            "1 | export function output() {",
+            "2 |   return renderTerminal();",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_range"]);
+    expect(prompts[1]).toContain("File read ledger:");
+    expect(prompts[1]).toContain(
+      "src/output.ts: fully_read=false; read_ranges=1-40; next_suggested_start_line=41"
+    );
+    expect(prompts[2]).toContain("[tool skipped] read_file src/output.ts");
+    expect(prompts[2]).toContain("Use read_range with startLine 41");
+  });
+
+  test("skips repeated read_range coverage that is already in the ledger", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: {
+          action: "read_range",
+          path: "src/output.ts",
+          startLine: 1,
+          endLine: 20,
+        },
+      },
+      {
+        toolName: "file",
+        input: {
+          action: "read_range",
+          path: "src/output.ts",
+          startLine: 1,
+          endLine: 20,
+        },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "walk through output.ts incrementally",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: [
+            "[tool result] read_range src/output.ts",
+            "path: src/output.ts",
+            "lines: 1-20",
+            "1 | export function output() {",
+          ].join("\n"),
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_range"]);
+    expect(prompts[2]).toContain("[tool skipped] read_range src/output.ts");
+    expect(prompts[2]).toContain("already covered");
+    expect(prompts[2]).toContain("read_range starting at line 21");
+  });
+
   test("stops repeated failed run_command earlier than generic loop guard", async () => {
     const transport = createRepeatedRunCommandTransport(2);
     const textDeltas: string[] = [];
@@ -1478,6 +1796,104 @@ describe("runQuerySession", () => {
     expect(textDeltas.join("")).not.toContain("[tool loop detected]");
   });
 
+  test("shared broad discovery budget collapses mixed search tools in the same scope", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "list_dir", path: "src" },
+      },
+      {
+        toolName: "file",
+        input: { action: "find_files", path: "src", pattern: "output.ts" },
+      },
+      {
+        toolName: "file",
+        input: { action: "search_text", path: "src", query: "output(" },
+      },
+      {
+        toolName: "file",
+        input: { action: "search_text_context", path: "src", query: "output(" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "find the output implementation and continue from the concrete file",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        switch (action) {
+          case "list_dir":
+            return {
+              message: "[tool result] list_dir src\n[confirmed directory state] src\n[F] src/index.ts",
+            };
+          case "find_files":
+            return {
+              message: "[tool result] find_files src\nFound 1 match(es):\nsrc/output.ts",
+            };
+          default:
+            return {
+              message:
+                "[tool result] search_text src\nFound 1 match(es):\nsrc/output.ts:12 | export function output()",
+            };
+        }
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["list_dir", "find_files", "search_text"]);
+    expect(prompts[3]).toContain("Search memory:");
+    expect(prompts[3]).toContain("searched scopes: src");
+    expect(prompts[3]).toContain("known hit paths: src/index.ts, src/output.ts");
+    expect(prompts[4]).toContain("[tool skipped] search_text_context src");
+    expect(prompts[4]).toContain("Broad discovery budget exhausted:");
+  });
+
+  test("pauses after consecutive search rounds without new evidence", async () => {
+    const transport = createRoundSequenceTransport([
+      { toolName: "file", input: { action: "list_dir", path: "pkg-a" } },
+      { toolName: "file", input: { action: "list_dir", path: "pkg-b" } },
+      { toolName: "file", input: { action: "list_dir", path: "pkg-c" } },
+      { toolName: "file", input: { action: "list_dir", path: "pkg-d" } },
+      null,
+    ]);
+    const textDeltas: string[] = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "keep searching until the right package is obvious",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => {
+        toolCallCount += 1;
+        return {
+          message: "[tool result] list_dir\n(no useful findings)",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCallCount).toBe(3);
+    expect(textDeltas.join("")).toContain("[execution paused]");
+    expect(textDeltas.join("")).toContain(
+      "No new file mutation, high-value evidence, or phase progression"
+    );
+  });
+
   test("injects a simple multi-file execution memo into the first round only for matching tasks", async () => {
     const { transport, prompts } = createPromptCaptureTransport({
       toolName: "file",
@@ -1552,6 +1968,13 @@ describe("runQuerySession", () => {
     expect(prompts[0]).toContain("Project analysis memo:");
     expect(prompts[0]).toContain("Start with one minimal repo snapshot");
     expect(prompts[0]).toContain("Trace one main execution/call path through 2-4 core files");
+    expect(prompts[0]).toContain("Prefer semantic navigation when available");
+    expect(prompts[0]).toContain(
+      "Once a concrete source anchor is known, try one semantic navigation step through the matching provider before spending more broad discovery budget."
+    );
+    expect(prompts[0]).toContain(
+      "Use search_text/find_files mainly for literals, config keys, filenames"
+    );
     expect(prompts[0]).toContain(
       "Final summary shape: overall architecture, main execution chain, key modules, and open questions."
     );
@@ -1613,8 +2036,16 @@ describe("runQuerySession", () => {
 
     expect(result.status).toBe("completed");
     expect(toolCalls).toEqual(["list_dir", "read_file"]);
+    expect(prompts[1]).toContain(
+      "For symbol lookup, definition lookup, references, call chains, and file structure, prefer lsp_/ts_ semantic tools"
+    );
+    expect(prompts[1]).toContain(
+      "Use search_text/find_files mainly for literals, filenames, config keys"
+    );
+    expect(prompts[2]).toContain("semantic navigation steps: 0");
     expect(prompts[3]).toContain("[tool skipped] list_dir src");
-    expect(prompts[3]).toContain("Project analysis exploration collapsed:");
+    expect(prompts[3]).toContain("Project analysis semantic navigation preferred:");
+    expect(prompts[3]).toContain("Known source anchors: src/index.ts.");
     expect(prompts[3]).toContain("Project analysis rules:");
   });
 
@@ -1819,5 +2250,74 @@ describe("runQuerySession", () => {
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain("...[truncated for round prompt budget]...");
     expect(prompts[1]?.length ?? 0).toBeLessThan(30000);
+  });
+});
+
+test("replays image attachments on follow-up rounds", async () => {
+  const prompts: Array<unknown> = [];
+  let streamCount = 0;
+  const attachments = [
+    {
+      id: "img-1",
+      kind: "image" as const,
+      path: "/tmp/mock.png",
+      name: "mock.png",
+      mimeType: "image/png",
+    },
+  ];
+  const transport: QueryTransport = {
+    getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["gpt-test"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["gpt-test"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+    requestStreamUrl: async prompt => {
+      prompts.push(prompt);
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: {
+      text: "describe this screenshot",
+      attachments,
+    },
+    transport,
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(prompts).toHaveLength(2);
+  expect(prompts[0]).toEqual({
+    text: expect.any(String),
+    attachments,
+  });
+  expect(prompts[1]).toEqual({
+    text: expect.any(String),
+    attachments,
   });
 });

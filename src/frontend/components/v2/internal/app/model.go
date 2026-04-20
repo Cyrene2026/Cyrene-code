@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +67,8 @@ const (
 	mouseActivationDedup     = 150 * time.Millisecond
 	statusSpinnerInterval    = 120 * time.Millisecond
 	slashSuggestionLimit     = 4
+	maxImageAttachments      = 4
+	maxImageAttachmentBytes  = 10 * 1024 * 1024
 )
 
 type statusSpinnerTickMsg struct{}
@@ -80,6 +84,14 @@ type ComposerCompositionCommitMsg struct {
 
 type ComposerCompositionClearMsg struct{}
 
+type Attachment struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Path     string `json:"path"`
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType"`
+}
+
 type TerminalCursorAnchor struct {
 	Active       bool
 	RowsUp       int
@@ -88,6 +100,10 @@ type TerminalCursorAnchor struct {
 
 var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/help", Description: "show command list"},
+	{Command: "/image", Description: "show image attachment help"},
+	{Command: "/image add <path>", Description: "attach one local image by path"},
+	{Command: "/image remove <index>", Description: "remove one attached image by 1-based index"},
+	{Command: "/image list", Description: "list currently attached images"},
 	{Command: "/login", Description: "open HTTP login panel"},
 	{Command: "/logout", Description: "remove managed user auth and rebuild transport"},
 	{Command: "/auth", Description: "show auth mode, source, and persistence target"},
@@ -204,9 +220,10 @@ func init() {
 }
 
 type Message struct {
-	Role string `json:"role"`
-	Kind string `json:"kind"`
-	Text string `json:"text"`
+	Role        string       `json:"role"`
+	Kind        string       `json:"kind"`
+	Text        string       `json:"text"`
+	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
 type ExecutionPlanStep struct {
@@ -244,6 +261,10 @@ type Model struct {
 	LiveText                   string
 	Input                      []rune
 	Cursor                     int
+	Attachments                []Attachment
+	AttachmentInput            []rune
+	AttachmentCursor           int
+	AttachmentInputActive      bool
 	Composer                   textarea.Model
 	Composition                []rune
 	CompositionCursor          int
@@ -360,7 +381,7 @@ func NewModel() *Model {
 func newComposerTextarea() textarea.Model {
 	input := textarea.New()
 	input.Prompt = "❯ "
-	input.Placeholder = "Ask Cyrene, use / commands, or mention files with @..."
+	input.Placeholder = "Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @..."
 	input.ShowLineNumbers = false
 	input.EndOfBufferCharacter = ' '
 	input.MaxHeight = 6
@@ -416,7 +437,7 @@ func (m *Model) configureComposerTextarea(width, height int, promptStyle lipglos
 	})
 	m.Composer.SetHeight(clampInt(height, 1, 6))
 	m.Composer.SetWidth(maxInt(1, width))
-	if len(m.Input) == 0 {
+	if m.AttachmentInputActive || len(m.Input) == 0 {
 		_ = m.Composer.Cursor.SetMode(cursor.CursorHide)
 	} else {
 		_ = m.Composer.Cursor.SetMode(cursor.CursorStatic)
@@ -874,6 +895,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleClipboardPaste()
 	}
 
+	if m.AttachmentInputActive {
+		return m.handleAttachmentInputKey(msg)
+	}
 	if m.ActivePanel != PanelNone {
 		return m.handlePanelKey(msg)
 	}
@@ -892,7 +916,11 @@ func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
 
 	switch m.ActivePanel {
 	case PanelNone:
-		m.insertRunes([]rune(text))
+		if m.AttachmentInputActive {
+			m.insertAttachmentInputRunes([]rune(text))
+		} else {
+			m.insertRunes([]rune(text))
+		}
 	case PanelAuth:
 		m.insertAuthRunes(filterAuthInputRunes([]rune(text)))
 	default:
@@ -901,8 +929,53 @@ func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) handleAttachmentInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.cancelAttachmentInput()
+		return m, nil
+	case tea.KeyEnter:
+		m.addImageAttachmentFromInput()
+		return m, nil
+	case tea.KeyHome:
+		m.AttachmentCursor = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.AttachmentCursor = len(m.AttachmentInput)
+		return m, nil
+	case tea.KeyBackspace:
+		m.deleteAttachmentInputBackward()
+		return m, nil
+	case tea.KeyDelete:
+		m.deleteAttachmentInputForward()
+		return m, nil
+	case tea.KeyLeft:
+		if m.AttachmentCursor > 0 {
+			m.AttachmentCursor--
+		}
+		return m, nil
+	case tea.KeyRight:
+		if m.AttachmentCursor < len(m.AttachmentInput) {
+			m.AttachmentCursor++
+		}
+		return m, nil
+	case tea.KeyCtrlU:
+		m.AttachmentInput = m.AttachmentInput[:0]
+		m.AttachmentCursor = 0
+		return m, nil
+	case tea.KeyRunes:
+		m.insertAttachmentInputRunes(msg.Runes)
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
 func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
+	case tea.KeyCtrlO:
+		m.openAttachmentInput()
+		return m, nil
 	case tea.KeyEnter:
 		if m.applySelectedSlashCompletion() {
 			return m, nil
@@ -968,6 +1041,10 @@ func (m *Model) handleComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.applySlashCompletion()
 		return m, nil
 	case tea.KeyRunes:
+		if len(msg.Runes) == 1 && msg.Runes[0] == rune(15) {
+			m.openAttachmentInput()
+			return m, nil
+		}
 		m.insertRunes(msg.Runes)
 		return m, nil
 	default:
@@ -1050,6 +1127,12 @@ func (m *Model) transcriptViewportMetrics() (int, int) {
 
 func (m *Model) handleMouseLeftClick(hit mouseHit) (tea.Model, tea.Cmd) {
 	if m.ActivePanel == PanelNone {
+		switch hit.Region {
+		case mouseRegionComposerAttachmentAdd:
+			m.openAttachmentInput()
+		case mouseRegionComposerAttachmentRemove:
+			m.removeAttachmentAt(hit.Index)
+		}
 		return m, nil
 	}
 
@@ -1803,13 +1886,34 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) submitInput() tea.Cmd {
 	query := strings.TrimSpace(string(m.Input))
-	if query == "" {
+	if query == "" && len(m.Attachments) == 0 {
 		return nil
+	}
+	if len(m.Attachments) > 0 {
+		if query == "" {
+			m.setNotice("Add a text prompt before sending images.", true)
+			return nil
+		}
+		if strings.HasPrefix(query, "/") {
+			m.setNotice("Image attachments cannot be sent with slash commands.", true)
+			return nil
+		}
+		if !composerFormatSupportsImageAttachments(m.CurrentProviderFormat) {
+			formatLabel := m.CurrentProviderFormat
+			if strings.TrimSpace(formatLabel) == "" {
+				formatLabel = "current provider format"
+			}
+			m.setNotice(fmt.Sprintf("Image attachments are not supported by %s. Switch to a Responses, Anthropic Messages, or Gemini model.", formatLabel), true)
+			return nil
+		}
 	}
 
 	m.TranscriptOffset = 0
+	attachments := cloneAttachments(m.Attachments)
 	m.Input = m.Input[:0]
 	m.Cursor = 0
+	m.Attachments = nil
+	m.cancelAttachmentInput()
 	m.clearComposerComposition()
 
 	handled, cmd := m.handleSlashCommand(query)
@@ -1843,7 +1947,11 @@ func (m *Model) submitInput() tea.Cmd {
 	} else {
 		m.setNotice("Submitting query...", false)
 	}
-	return sendBridgeCommand(m.bridge, bridgeCommand{Type: "submit", Text: query})
+	return sendBridgeCommand(m.bridge, bridgeCommand{
+		Type:        "submit",
+		Text:        query,
+		Attachments: attachments,
+	})
 }
 
 func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
@@ -1863,6 +1971,56 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		})
 		m.invalidateTranscriptCache()
 		m.setNotice("Command reference appended to transcript.", false)
+		return true, nil
+	case query == "/image":
+		m.setNotice("Usage: /image add <path> | /image remove <index> | /image list", false)
+		return true, nil
+	case query == "/image list":
+		if len(m.Attachments) == 0 {
+			m.setNotice("No images attached.", false)
+			return true, nil
+		}
+		lines := make([]string, 0, len(m.Attachments)+1)
+		lines = append(lines, "Attached images:")
+		for index, attachment := range m.Attachments {
+			name := strings.TrimSpace(attachment.Name)
+			if name == "" {
+				name = filepath.Base(strings.TrimSpace(attachment.Path))
+			}
+			lines = append(lines, fmt.Sprintf("%d. %s  (%s)", index+1, name, attachment.Path))
+		}
+		m.Items = append(m.Items, Message{
+			Role: "system",
+			Kind: "system_hint",
+			Text: strings.Join(lines, "\n"),
+		})
+		m.invalidateTranscriptCache()
+		m.setNotice("Attachment list appended to transcript.", false)
+		return true, nil
+	case strings.HasPrefix(query, "/image add "):
+		path := strings.TrimSpace(strings.TrimPrefix(query, "/image add "))
+		if path == "" {
+			m.setNotice("Usage: /image add <path>", true)
+			return true, nil
+		}
+		m.addImageAttachmentFromPath(path)
+		return true, nil
+	case strings.HasPrefix(query, "/image remove "):
+		rawIndex := strings.TrimSpace(strings.TrimPrefix(query, "/image remove "))
+		if rawIndex == "" {
+			m.setNotice("Usage: /image remove <index>", true)
+			return true, nil
+		}
+		index, err := strconv.Atoi(rawIndex)
+		if err != nil || index <= 0 {
+			m.setNotice("Attachment index must be a positive integer.", true)
+			return true, nil
+		}
+		if index > len(m.Attachments) {
+			m.setNotice("Attachment index is out of range.", true)
+			return true, nil
+		}
+		m.removeAttachmentAt(index - 1)
 		return true, nil
 	case query == "/cancel":
 		m.setNotice("No cancellable in-flight operation in v2 bridge mode.", true)
@@ -2670,6 +2828,198 @@ func normalizeComposerRunes(values []rune) []rune {
 	return normalized
 }
 
+func normalizeAttachmentInputRunes(values []rune) []rune {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make([]rune, 0, len(values))
+	for index := 0; index < len(values); index++ {
+		value := values[index]
+		switch value {
+		case '\r':
+			if index+1 < len(values) && values[index+1] == '\n' {
+				continue
+			}
+			continue
+		case '\n', '\t':
+			continue
+		default:
+			if isWindowsIgnoredInputRune(value) || unicode.IsControl(value) {
+				continue
+			}
+			normalized = append(normalized, value)
+		}
+	}
+	return normalized
+}
+
+func cloneAttachments(values []Attachment) []Attachment {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]Attachment, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func resolveImageAttachmentMimeType(path string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(path))) {
+	case ".png":
+		return "image/png", true
+	case ".jpg", ".jpeg":
+		return "image/jpeg", true
+	case ".webp":
+		return "image/webp", true
+	case ".gif":
+		return "image/gif", true
+	default:
+		return "", false
+	}
+}
+
+func composerFormatSupportsImageAttachments(format string) bool {
+	switch strings.TrimSpace(format) {
+	case "openai_responses", "anthropic_messages", "gemini_generate_content":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Model) attachmentBaseDir() string {
+	if strings.TrimSpace(m.AppRoot) != "" {
+		return m.AppRoot
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return cwd
+}
+
+func (m *Model) openAttachmentInput() {
+	m.AttachmentInputActive = true
+	m.AttachmentInput = m.AttachmentInput[:0]
+	m.AttachmentCursor = 0
+	m.setNotice("Add an image path. Enter confirms, Esc cancels.", false)
+}
+
+func (m *Model) cancelAttachmentInput() {
+	m.AttachmentInputActive = false
+	m.AttachmentInput = m.AttachmentInput[:0]
+	m.AttachmentCursor = 0
+}
+
+func (m *Model) insertAttachmentInputRunes(values []rune) {
+	values = normalizeAttachmentInputRunes(values)
+	if len(values) == 0 {
+		return
+	}
+	cursor := clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))
+	next := make([]rune, 0, len(m.AttachmentInput)+len(values))
+	next = append(next, m.AttachmentInput[:cursor]...)
+	next = append(next, values...)
+	next = append(next, m.AttachmentInput[cursor:]...)
+	m.AttachmentInput = next
+	m.AttachmentCursor = cursor + len(values)
+}
+
+func (m *Model) deleteAttachmentInputBackward() {
+	cursor := clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))
+	if cursor == 0 {
+		return
+	}
+	next := make([]rune, 0, len(m.AttachmentInput)-1)
+	next = append(next, m.AttachmentInput[:cursor-1]...)
+	next = append(next, m.AttachmentInput[cursor:]...)
+	m.AttachmentInput = next
+	m.AttachmentCursor = cursor - 1
+}
+
+func (m *Model) deleteAttachmentInputForward() {
+	cursor := clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))
+	if cursor >= len(m.AttachmentInput) {
+		return
+	}
+	next := make([]rune, 0, len(m.AttachmentInput)-1)
+	next = append(next, m.AttachmentInput[:cursor]...)
+	next = append(next, m.AttachmentInput[cursor+1:]...)
+	m.AttachmentInput = next
+}
+
+func (m *Model) addImageAttachmentFromInput() {
+	raw := strings.TrimSpace(string(m.AttachmentInput))
+	if raw == "" {
+		m.setNotice("Image path cannot be empty.", true)
+		return
+	}
+	if len(m.Attachments) >= maxImageAttachments {
+		m.setNotice(fmt.Sprintf("You can attach up to %d images per message.", maxImageAttachments), true)
+		return
+	}
+
+	absolutePath := raw
+	if !filepath.IsAbs(absolutePath) {
+		absolutePath = filepath.Join(m.attachmentBaseDir(), raw)
+	}
+	absolutePath = filepath.Clean(absolutePath)
+	mimeType, ok := resolveImageAttachmentMimeType(absolutePath)
+	if !ok {
+		m.setNotice("Unsupported image type. Use .png, .jpg, .jpeg, .webp, or .gif.", true)
+		return
+	}
+
+	info, err := os.Stat(absolutePath)
+	if err != nil {
+		m.setNotice(fmt.Sprintf("Image path is not readable: %v", err), true)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		m.setNotice("Image path must point to a regular file.", true)
+		return
+	}
+	if info.Size() > maxImageAttachmentBytes {
+		m.setNotice("Image file is too large. Max size is 10 MB.", true)
+		return
+	}
+	for _, attachment := range m.Attachments {
+		if strings.EqualFold(filepath.Clean(attachment.Path), absolutePath) {
+			m.setNotice("That image is already attached.", false)
+			m.cancelAttachmentInput()
+			return
+		}
+	}
+
+	name := filepath.Base(absolutePath)
+	m.Attachments = append(m.Attachments, Attachment{
+		ID:       fmt.Sprintf("img-%d", time.Now().UnixNano()),
+		Kind:     "image",
+		Path:     absolutePath,
+		Name:     name,
+		MimeType: mimeType,
+	})
+	m.cancelAttachmentInput()
+	m.setNotice(fmt.Sprintf("Attached image: %s", name), false)
+}
+
+func (m *Model) removeAttachmentAt(index int) {
+	if index < 0 || index >= len(m.Attachments) {
+		return
+	}
+	name := m.Attachments[index].Name
+	next := make([]Attachment, 0, len(m.Attachments)-1)
+	next = append(next, m.Attachments[:index]...)
+	next = append(next, m.Attachments[index+1:]...)
+	m.Attachments = next
+	m.setNotice(fmt.Sprintf("Removed image: %s", name), false)
+}
+
+func (m *Model) addImageAttachmentFromPath(path string) {
+	m.AttachmentInput = []rune(strings.TrimSpace(path))
+	m.AttachmentCursor = len(m.AttachmentInput)
+	m.addImageAttachmentFromInput()
+}
+
 func defaultClipboardTextReader() (string, error) {
 	switch runtime.GOOS {
 	case "windows":
@@ -2821,7 +3171,10 @@ func cloneMessages(items []Message) []Message {
 		return nil
 	}
 	cloned := make([]Message, len(items))
-	copy(cloned, items)
+	for index := range items {
+		cloned[index] = items[index]
+		cloned[index].Attachments = cloneAttachments(items[index].Attachments)
+	}
 	return cloned
 }
 

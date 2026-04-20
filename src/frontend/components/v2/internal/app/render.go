@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -90,6 +91,13 @@ var (
 	compositionStyle = lipgloss.NewStyle().
 				Underline(true).
 				Foreground(lipgloss.Color("#E6EDF3"))
+	attachmentChipStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E6EDF3")).
+				Background(lipgloss.Color("#1F2A37")).
+				ColorWhitespace(true)
+	attachmentAddStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("14")).
+				Bold(true)
 
 	focusedInputBoxStyle = inputBoxStyle.Copy()
 
@@ -152,14 +160,14 @@ var (
 )
 
 const (
-	toolStatusANSIStart = "\x1b[38;2;139;148;158m"
-	toolStatusANSIEnd   = "\x1b[0m"
-	diffAddSignANSI     = "\x1b[38;2;126;231;135m"
-	diffRemoveSignANSI  = "\x1b[38;2;255;161;152m"
-	diffAddANSIStart    = "\x1b[38;2;126;231;135;48;2;16;63;43m"
-	diffRemoveANSIStart = "\x1b[38;2;255;161;152;48;2;93;30;39m"
-	diffANSIEnd         = "\x1b[0m"
-	composerCountModeAt = 1000
+	toolStatusANSIStart     = "\x1b[38;2;139;148;158m"
+	toolStatusANSIEnd       = "\x1b[0m"
+	diffAddSignANSI         = "\x1b[38;2;126;231;135m"
+	diffRemoveSignANSI      = "\x1b[38;2;255;161;152m"
+	diffAddANSIStart        = "\x1b[38;2;126;231;135;48;2;16;63;43m"
+	diffRemoveANSIStart     = "\x1b[38;2;255;161;152;48;2;93;30;39m"
+	diffANSIEnd             = "\x1b[0m"
+	composerVisibleRowLimit = 6
 )
 
 func (m *Model) View() string {
@@ -581,7 +589,7 @@ func (m *Model) renderCachedMessageLines(index int, item Message, width int) []s
 	}
 
 	entry := &m.transcriptMessageCache[index]
-	if entry.width == width && entry.lines != nil && entry.message == item {
+	if entry.width == width && entry.lines != nil && transcriptCacheMessageEqual(entry.message, item) {
 		return entry.lines
 	}
 
@@ -589,6 +597,21 @@ func (m *Model) renderCachedMessageLines(index int, item Message, width int) []s
 	entry.message = item
 	entry.lines = renderMessageLines(item, width)
 	return entry.lines
+}
+
+func transcriptCacheMessageEqual(left, right Message) bool {
+	if left.Role != right.Role || left.Kind != right.Kind || left.Text != right.Text {
+		return false
+	}
+	if len(left.Attachments) != len(right.Attachments) {
+		return false
+	}
+	for index := range left.Attachments {
+		if left.Attachments[index] != right.Attachments[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Model) hasAnimatedToolStatus() bool {
@@ -787,6 +810,13 @@ func renderUserTranscriptLines(message Message, width int) []string {
 	bodyLines := renderMarkdownBodyLines(sanitizeTranscriptDisplayText(message), contentWidth, transcriptBodyStyle(message))
 	if len(bodyLines) == 0 {
 		bodyLines = []string{""}
+	}
+	for _, attachment := range message.Attachments {
+		name := strings.TrimSpace(attachment.Name)
+		if name == "" {
+			name = filepath.Base(strings.TrimSpace(attachment.Path))
+		}
+		bodyLines = append(bodyLines, dimStyle.Render("[image] "+name))
 	}
 
 	lines := make([]string, 0, len(bodyLines))
@@ -1778,6 +1808,101 @@ func (m *Model) renderStatusLine(width int) string {
 	return ""
 }
 
+func composerPlaceholder(panel Panel) string {
+	if panel != PanelNone {
+		return fmt.Sprintf("Panel %s active. Esc to close, then continue typing.", panel)
+	}
+	return "Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @..."
+}
+
+type attachmentBarSegment struct {
+	Kind  string
+	Index int
+	Start int
+	End   int
+	Text  string
+}
+
+type attachmentBarLine struct {
+	Text     string
+	Segments []attachmentBarSegment
+}
+
+func (m *Model) composerAttachmentBarLine(width int) attachmentBarLine {
+	segments := make([]attachmentBarSegment, 0, len(m.Attachments)+1)
+	column := 0
+	appendSegment := func(kind string, index int, text string) {
+		if len(segments) > 0 {
+			column++
+		}
+		start := column
+		column += lipgloss.Width(text)
+		segments = append(segments, attachmentBarSegment{
+			Kind:  kind,
+			Index: index,
+			Start: start,
+			End:   column,
+			Text:  text,
+		})
+	}
+
+	for index, attachment := range m.Attachments {
+		name := strings.TrimSpace(attachment.Name)
+		if name == "" {
+			name = filepath.Base(strings.TrimSpace(attachment.Path))
+		}
+		chip := fmt.Sprintf("[img %s x]", truncatePlain(name, maxInt(8, minInt(18, maxInt(8, width/5)))))
+		appendSegment("attachment", index, chip)
+	}
+	appendSegment("add", -1, "[+ image]")
+
+	plain := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		plain = append(plain, segment.Text)
+	}
+	return attachmentBarLine{
+		Text:     strings.Join(plain, " "),
+		Segments: segments,
+	}
+}
+
+func (m *Model) renderComposerAttachmentBar(width int) []string {
+	line := m.composerAttachmentBarLine(width)
+	rendered := make([]string, 0, len(line.Segments))
+	for _, segment := range line.Segments {
+		switch segment.Kind {
+		case "attachment":
+			rendered = append(rendered, attachmentChipStyle.Render(segment.Text))
+		default:
+			rendered = append(rendered, attachmentAddStyle.Render(segment.Text))
+		}
+	}
+	return []string{strings.Join(rendered, " ")}
+}
+
+func (m *Model) renderAttachmentInputLine() string {
+	value := string(m.AttachmentInput)
+	if value == "" {
+		value = "Paste or type an image path"
+	}
+	body := value
+	if m.AttachmentInputActive {
+		cursor := clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))
+		before := string(m.AttachmentInput[:cursor])
+		after := string(m.AttachmentInput[cursor:])
+		if len(m.AttachmentInput) == 0 {
+			body = composerCursorGlyph + "Paste or type an image path"
+		} else {
+			body = before + composerCursorGlyph + after
+		}
+	}
+	prefix := attachmentAddStyle.Render("img> ")
+	if len(m.AttachmentInput) == 0 {
+		return prefix + dimStyle.Render(body)
+	}
+	return prefix + body
+}
+
 func (m *Model) renderComposer(width int) string {
 	promptStyle := promptStyleForStatus(m.Status)
 	style := focusedInputBoxStyle
@@ -1801,23 +1926,12 @@ func (m *Model) renderComposer(width int) string {
 		lines = append(lines, renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection)...)
 	}
 
-	if m.shouldRenderComposerCountSummary() {
-		lines = append(lines, m.renderComposerCountSummary(promptStyle))
-		return style.
-			Width(framedRenderWidth(style, width)).
-			MaxWidth(width).
-			Render(strings.Join(lines, "\n"))
+	lines = append(lines, m.renderComposerAttachmentBar(contentWidth)...)
+	if m.AttachmentInputActive {
+		lines = append(lines, m.renderAttachmentInputLine())
 	}
 
 	rows := m.visibleComposerRows(contentWidth)
-	if len(m.Composition) == 0 {
-		lines = append(lines, m.renderComposerTextarea(contentWidth, promptStyle)...)
-		return style.
-			Width(framedRenderWidth(style, width)).
-			MaxWidth(width).
-			Render(strings.Join(lines, "\n"))
-	}
-
 	for _, row := range rows {
 		prefix := "❯ "
 		if row.Continued {
@@ -1837,19 +1951,8 @@ func (m *Model) renderComposer(width int) string {
 		Render(strings.Join(lines, "\n"))
 }
 
-func (m *Model) shouldRenderComposerCountSummary() bool {
-	return len(m.Composition) == 0 && len(m.Input) > composerCountModeAt
-}
-
-func (m *Model) renderComposerCountSummary(promptStyle lipgloss.Style) string {
-	return promptStyle.Render("❯ ") + dimStyle.Render(renderPlainComposerCountSummary(len(m.Input)))
-}
-
 func (m *Model) renderComposerTextarea(width int, promptStyle lipgloss.Style) []string {
-	placeholder := "Ask Cyrene, use / commands, or mention files with @..."
-	if m.ActivePanel != PanelNone {
-		placeholder = fmt.Sprintf("Panel %s active. Esc to close, then continue typing.", m.ActivePanel)
-	}
+	placeholder := composerPlaceholder(m.ActivePanel)
 
 	rowCount := len(m.visibleComposerRows(width))
 	m.configureComposerTextarea(width, rowCount, promptStyle, placeholder)
@@ -1889,11 +1992,12 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 	if matches := m.composerSlashSuggestionsForDisplay(slashSuggestionLimit); len(matches) > 0 && strings.HasPrefix(strings.TrimSpace(string(m.Input)), "/") {
 		prefixLines += len(renderSlashSuggestionBlock(matches, contentWidth, m.SlashSelection))
 	}
+	prefixLines += len(m.renderComposerAttachmentBar(contentWidth))
 
-	if m.shouldRenderComposerCountSummary() {
+	if m.AttachmentInputActive {
 		paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
-		prefixWidth := lipgloss.Width("❯ ")
-		return prefixLines, paddingLeft + prefixWidth + lipgloss.Width(renderPlainComposerCountSummary(len(m.Input))), true
+		prefixWidth := lipgloss.Width("img> ")
+		return prefixLines, paddingLeft + prefixWidth + lipgloss.Width(string(m.AttachmentInput[:clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))])), true
 	}
 
 	row, col, ok := m.composerInputCursorPosition(contentWidth)
@@ -1904,13 +2008,6 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 	paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
 	prefixWidth := lipgloss.Width("❯ ")
 	return prefixLines + row, paddingLeft + prefixWidth + col, true
-}
-
-func renderPlainComposerCountSummary(count int) string {
-	if count == 1 {
-		return "1 char"
-	}
-	return fmt.Sprintf("%d chars", count)
 }
 
 func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
@@ -1950,9 +2047,10 @@ func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
 		advance(m.Input[cursor:])
 	}
 
-	firstVisibleRow := maxInt(0, row+1-6)
+	totalRows := row + 1
+	firstVisibleRow := clampInt(cursorRow-2, 0, maxInt(0, totalRows-composerVisibleRowLimit))
 	visibleCursorRow := cursorRow - firstVisibleRow
-	if visibleCursorRow < 0 || visibleCursorRow >= 6 {
+	if visibleCursorRow < 0 || visibleCursorRow >= composerVisibleRowLimit {
 		return 0, 0, false
 	}
 	return visibleCursorRow, cursorCol, true
@@ -1987,10 +2085,7 @@ const composerCursorGlyph = string(composerCursorRune)
 
 func (m *Model) visibleComposerRows(width int) []composerRow {
 	if len(m.Input) == 0 && len(m.Composition) == 0 {
-		placeholder := "Ask Cyrene, use / commands, or mention files with @..."
-		if m.ActivePanel != PanelNone {
-			placeholder = fmt.Sprintf("Panel %s active. Esc to close, then continue typing.", m.ActivePanel)
-		}
+		placeholder := composerPlaceholder(m.ActivePanel)
 		return []composerRow{{
 			Text:        placeholder,
 			Placeholder: true,
@@ -1998,11 +2093,18 @@ func (m *Model) visibleComposerRows(width int) []composerRow {
 	}
 
 	rows := renderComposerSegments(m.composerDisplaySegments(), maxInt(1, width-2))
-
-	if len(rows) <= 6 {
+	if len(rows) <= composerVisibleRowLimit {
 		return rows
 	}
-	return rows[len(rows)-6:]
+	cursorRow := 0
+	for index, row := range rows {
+		if strings.Contains(row.Text, composerCursorGlyph) {
+			cursorRow = index
+			break
+		}
+	}
+	start := clampInt(cursorRow-2, 0, maxInt(0, len(rows)-composerVisibleRowLimit))
+	return rows[start : start+composerVisibleRowLimit]
 }
 
 type composerSegment struct {

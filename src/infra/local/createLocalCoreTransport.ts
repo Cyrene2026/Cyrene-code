@@ -1,4 +1,7 @@
-import type { QueryTransport } from "../../core/query/transport";
+import {
+  normalizeQueryInput,
+  type QueryTransport,
+} from "../../core/query/transport";
 
 const buildAssistantReply = (query: string) => {
   const normalized = query.trim().toLowerCase();
@@ -88,9 +91,13 @@ export const createLocalCoreTransport = (): QueryTransport => {
       message: "Local transport uses static model; nothing to refresh.",
       models: [currentModel],
     }),
-    requestStreamUrl: async (query: string) => {
+    requestStreamUrl: async query => {
+      const normalized = normalizeQueryInput(query);
+      if (normalized.attachments.length > 0) {
+        throw new Error("Local core transport does not support image attachments.");
+      }
       const id = crypto.randomUUID();
-      sessionQueries.set(id, query);
+      sessionQueries.set(id, normalized.text);
       return `local://${id}`;
     },
     stream: async function* (streamUrl: string) {

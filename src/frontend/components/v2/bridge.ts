@@ -32,7 +32,11 @@ import {
   formatExecutionPlan,
   parseAssistantPlanUpdate,
 } from "../../../core/session/executionPlan";
-import { runQuerySession, type RunQuerySessionResult } from "../../../core/query/runQuerySession";
+import {
+  runQuerySession,
+  type RunQuerySessionResult,
+  type RunQuerySessionResumeInput,
+} from "../../../core/query/runQuerySession";
 import {
   PROVIDER_ENDPOINT_KINDS,
   type ProviderEndpointKind,
@@ -40,6 +44,8 @@ import {
   type ProviderProfile,
   type ProviderProfileOverrideMap,
   type ProviderType,
+  type QueryAttachment,
+  type QueryInput,
   type QueryTransport,
   type TransportFormat,
 } from "../../../core/query/transport";
@@ -77,7 +83,7 @@ import { formatReadToolResultDisplay } from "./toolResultFormatting";
 type BridgeCommand =
   | { type: "init"; root?: string }
   | { type: "command"; text: string }
-  | { type: "submit"; text: string }
+  | { type: "submit"; text: string; attachments?: QueryAttachment[] }
   | { type: "new_session" }
   | { type: "list_sessions" }
   | { type: "load_session"; id: string }
@@ -134,6 +140,7 @@ type BridgeItem = {
   role: "user" | "assistant" | "system";
   kind: SessionMessageKind;
   text: string;
+  attachments?: QueryAttachment[];
 };
 
 type BridgeReview = {
@@ -266,14 +273,16 @@ type BridgeEvent =
 type SuspendedRun = {
   sessionId: string;
   userText: string;
+  attachments: QueryAttachment[];
   startedAt: string;
   assistantBufferRef: { current: string };
   assistantStreamRef: { committedVisibleText: string };
-  resume: (toolResultMessage: string) => Promise<RunQuerySessionResult>;
+  resume: (toolResult: RunQuerySessionResumeInput) => Promise<RunQuerySessionResult>;
 };
 
 type PendingInFlightSnapshot = {
   userText: string;
+  attachments: QueryAttachment[];
   assistantText: string;
   committedVisibleText: string;
   startedAt: string;
@@ -283,6 +292,7 @@ type PendingInFlightSnapshot = {
 type ActiveStreamingTurn = {
   sessionId: string;
   userText: string;
+  attachments: QueryAttachment[];
   startedAt: string;
   assistantBufferRef: { current: string };
   assistantStreamRef: { committedVisibleText: string };
@@ -309,6 +319,16 @@ const PERSISTED_SESSION_ITEM_KINDS = new Set<SessionMessageKind>([
   "system_hint",
   "error",
 ]);
+
+const cloneAttachments = (attachments: QueryAttachment[] | null | undefined) =>
+  Array.isArray(attachments)
+    ? attachments.map(attachment => ({ ...attachment }))
+    : [];
+
+const supportsImageAttachmentsForFormat = (format: BridgeTransportFormat | "") =>
+  format === "openai_responses" ||
+  format === "anthropic_messages" ||
+  format === "gemini_generate_content";
 
 const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
   (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
@@ -547,7 +567,7 @@ export class BubbleTeaBridge {
         await this.executeSlashCommand(command.text);
         return;
       case "submit":
-        await this.submit(command.text);
+        await this.submit(command.text, cloneAttachments(command.attachments));
         return;
       case "new_session":
         await this.newSession();
@@ -1164,6 +1184,7 @@ export class BubbleTeaBridge {
         role: item.role,
         kind: item.kind,
         text: item.text,
+        attachments: cloneAttachments(item.attachments),
         createdAt: new Date().toISOString(),
       });
     });
@@ -1197,13 +1218,14 @@ export class BubbleTeaBridge {
 
   private async appendUserMessage(
     sessionId: string,
-    userText: string,
+    input: QueryInput,
     createdAt: string
   ) {
     await this.queueSessionMutation(sessionId, async () => {
       await this.sessionStore!.appendMessage(sessionId, {
         role: "user",
-        text: userText,
+        text: input.text,
+        attachments: cloneAttachments(input.attachments),
         createdAt,
       });
     });
@@ -1296,6 +1318,7 @@ export class BubbleTeaBridge {
   private scheduleInFlightSnapshot(input: {
     sessionId: string;
     userText: string;
+    attachments: QueryAttachment[];
     startedAt: string;
     assistantBufferRef: { current: string };
     assistantStreamRef: { committedVisibleText: string };
@@ -1306,6 +1329,7 @@ export class BubbleTeaBridge {
 
     this.pendingInFlightSnapshots.set(input.sessionId, {
       userText: input.userText,
+      attachments: cloneAttachments(input.attachments),
       assistantText: input.assistantBufferRef.current,
       committedVisibleText: input.assistantStreamRef.committedVisibleText,
       startedAt: input.startedAt,
@@ -1339,6 +1363,7 @@ export class BubbleTeaBridge {
     this.scheduleInFlightSnapshot({
       sessionId: active.sessionId,
       userText: active.userText,
+      attachments: active.attachments,
       startedAt: active.startedAt,
       assistantBufferRef: active.assistantBufferRef,
       assistantStreamRef: active.assistantStreamRef,
@@ -2029,10 +2054,12 @@ export class BubbleTeaBridge {
           return;
         }
         await this.submitPrepared({
-          userText:
-            selector && selector !== target.id
-              ? `/plan run ${selector}`
-              : `/plan run ${target.id}`,
+          userInput: {
+            text:
+              selector && selector !== target.id
+                ? `/plan run ${selector}`
+                : `/plan run ${target.id}`,
+          },
           promptText: executionPrompt.prompt,
           originalTask: refreshed.executionPlan.objective || target.title,
         });
@@ -2257,7 +2284,7 @@ export class BubbleTeaBridge {
           return;
         }
         await this.submitPrepared({
-          userText: `/plan revise ${instruction}`,
+          userInput: { text: `/plan revise ${instruction}` },
           promptText: this.buildPlanRevisionPrompt(session.executionPlan, instruction),
           originalTask: session.executionPlan.objective || instruction,
         });
@@ -2294,7 +2321,7 @@ export class BubbleTeaBridge {
         return;
       }
       await this.submitPrepared({
-        userText: `/plan create ${rawTask}`,
+        userInput: { text: `/plan create ${rawTask}` },
         promptText: this.buildPlanCreationPrompt(task, session?.executionPlan ?? null),
         originalTask: task,
       });
@@ -2327,7 +2354,7 @@ export class BubbleTeaBridge {
         return;
       }
       await this.submitPrepared({
-        userText: query,
+        userInput: { text: query },
         promptText: this.buildSkillCreationPrompt(task),
         originalTask: task,
       });
@@ -2437,6 +2464,7 @@ export class BubbleTeaBridge {
               (message.kind ?? "transcript") === "transcript"
                 ? this.extractVisibleAssistantText(message.text)
                 : message.text,
+            attachments: cloneAttachments(message.attachments),
           }))
         : [DEFAULT_EMPTY_STATE];
     this.items = this.recoverCommittedInFlightAssistantText(items, record);
@@ -2477,11 +2505,12 @@ export class BubbleTeaBridge {
     if (committedVisibleText.startsWith(persistedVisibleText)) {
       const missingText = committedVisibleText.slice(persistedVisibleText.length);
       if (missingText.trim()) {
-        const recoveredItem: BridgeItem = {
-          role: "assistant",
-          kind: "transcript",
-          text: missingText,
-        };
+      const recoveredItem: BridgeItem = {
+        role: "assistant",
+        kind: "transcript",
+        text: missingText,
+        attachments: [],
+      };
         return [
           ...items,
           recoveredItem,
@@ -2494,6 +2523,7 @@ export class BubbleTeaBridge {
       role: "assistant",
       kind: "transcript",
       text: committedVisibleText,
+      attachments: [],
     };
     return [
       ...items,
@@ -2585,10 +2615,14 @@ export class BubbleTeaBridge {
     this.emitInit();
   }
 
-  private async submit(rawText: string) {
+  private async submit(rawText: string, attachments: QueryAttachment[] = []) {
     const normalized = rawText.trim();
     const bareSkillCreate = normalized.match(/^skills?\s+create(?:\s+([\s\S]+))?$/i);
     if (bareSkillCreate) {
+      if (attachments.length > 0) {
+        this.emitError("Image attachments cannot be used with slash-style commands.");
+        return;
+      }
       const task = bareSkillCreate[1]?.trim() ?? "";
       const canonicalPrefix = /^skills\s+/i.test(normalized)
         ? "/skills create"
@@ -2600,19 +2634,23 @@ export class BubbleTeaBridge {
     }
 
     await this.submitPrepared({
-      userText: rawText,
+      userInput: {
+        text: rawText,
+        attachments,
+      },
       promptText: rawText,
       originalTask: rawText,
     });
   }
 
   private async submitPrepared(input: {
-    userText: string;
+    userInput: QueryInput;
     promptText: string;
     originalTask?: string;
   }) {
-    const userText = input.userText.trim();
+    const userText = input.userInput.text.trim();
     const promptText = input.promptText.trim();
+    const attachments = cloneAttachments(input.userInput.attachments);
     if (!userText || !promptText) {
       return;
     }
@@ -2626,6 +2664,20 @@ export class BubbleTeaBridge {
     }
 
     await this.ensureRuntime();
+    await this.refreshRuntimeMetadata();
+    if (attachments.length > 0) {
+      if (userText.startsWith("/")) {
+        this.emitError("Image attachments cannot be sent with slash commands.");
+        return;
+      }
+      if (!supportsImageAttachmentsForFormat(this.currentProviderFormat)) {
+        const formatLabel = this.currentProviderFormat || "current provider format";
+        this.emitError(
+          `Image attachments are not supported by ${formatLabel}. Switch to a Responses, Anthropic Messages, or Gemini model first.`
+        );
+        return;
+      }
+    }
     const session = await this.ensureActiveSession(userText);
     const promptContext = await this.sessionStore!.getPromptContext(session.id, promptText);
     const manualSkillIds = this.getSessionSkillUseIds(session.id);
@@ -2661,9 +2713,17 @@ export class BubbleTeaBridge {
     );
 
     const startedAt = new Date().toISOString();
-    await this.appendUserMessage(session.id, userText, startedAt);
+    await this.appendUserMessage(
+      session.id,
+      {
+        text: userText,
+        attachments,
+      },
+      startedAt
+    );
     await this.updateInFlightTurn(session.id, {
       userText,
+      attachments,
       assistantText: "",
       committedVisibleText: "",
       startedAt,
@@ -2675,22 +2735,30 @@ export class BubbleTeaBridge {
     this.suspended = null;
     this.status = "preparing";
     this.emitStatus();
-    this.pushItem({ role: "user", kind: "transcript", text: userText });
+    this.pushItem({
+      role: "user",
+      kind: "transcript",
+      text: userText,
+      attachments,
+    });
     await this.refreshSessions();
-    await this.refreshRuntimeMetadata();
 
     const assistantBufferRef = { current: "" };
     const assistantStreamRef = { committedVisibleText: "" };
     this.activeStreamingTurn = {
       sessionId: session.id,
       userText,
+      attachments,
       startedAt,
       assistantBufferRef,
       assistantStreamRef,
     };
     try {
       const result = await runQuerySession({
-        query: prompt,
+        query: {
+          text: prompt,
+          attachments,
+        },
         originalTask: input.originalTask?.trim() || userText,
         queryMaxToolSteps: this.config!.queryMaxToolSteps,
         transport: this.transport!,
@@ -2707,6 +2775,7 @@ export class BubbleTeaBridge {
           this.scheduleInFlightSnapshot({
             sessionId: session.id,
             userText,
+            attachments,
             startedAt,
             assistantBufferRef,
             assistantStreamRef,
@@ -2725,6 +2794,7 @@ export class BubbleTeaBridge {
             this.scheduleInFlightSnapshot({
               sessionId: session.id,
               userText,
+              attachments,
               startedAt,
               assistantBufferRef,
               assistantStreamRef,
@@ -2739,6 +2809,7 @@ export class BubbleTeaBridge {
           this.scheduleInFlightSnapshot({
             sessionId: session.id,
             userText,
+            attachments,
             startedAt,
             assistantBufferRef,
             assistantStreamRef,
@@ -2754,6 +2825,7 @@ export class BubbleTeaBridge {
             this.scheduleInFlightSnapshot({
               sessionId: session.id,
               userText,
+              attachments,
               startedAt,
               assistantBufferRef,
               assistantStreamRef,
@@ -2769,6 +2841,7 @@ export class BubbleTeaBridge {
           this.scheduleInFlightSnapshot({
             sessionId: session.id,
             userText,
+            attachments,
             startedAt,
             assistantBufferRef,
             assistantStreamRef,
@@ -2814,13 +2887,14 @@ export class BubbleTeaBridge {
             toolInput: input,
             message: result.message,
           });
-          return { message: result.message };
+          return { message: result.message, metadata: result.metadata };
         },
         onError: message => {
           if (this.isShuttingDown) {
             this.scheduleInFlightSnapshot({
               sessionId: session.id,
               userText,
+              attachments,
               startedAt,
               assistantBufferRef,
               assistantStreamRef,
@@ -2836,6 +2910,7 @@ export class BubbleTeaBridge {
           this.scheduleInFlightSnapshot({
             sessionId: session.id,
             userText,
+            attachments,
             startedAt,
             assistantBufferRef,
             assistantStreamRef,
@@ -2854,6 +2929,7 @@ export class BubbleTeaBridge {
       await this.consumeRunResult({
         sessionId: session.id,
         userText,
+        attachments,
         startedAt,
         assistantBufferRef,
         assistantStreamRef,
@@ -2880,6 +2956,7 @@ export class BubbleTeaBridge {
   private async consumeRunResult(input: {
     sessionId: string;
     userText: string;
+    attachments: QueryAttachment[];
     startedAt: string;
     assistantBufferRef: { current: string };
     assistantStreamRef: { committedVisibleText: string };
@@ -2897,6 +2974,7 @@ export class BubbleTeaBridge {
     this.suspended = {
       sessionId: input.sessionId,
       userText: input.userText,
+      attachments: cloneAttachments(input.attachments),
       startedAt: input.startedAt,
       assistantBufferRef: input.assistantBufferRef,
       assistantStreamRef: input.assistantStreamRef,
@@ -2906,6 +2984,7 @@ export class BubbleTeaBridge {
     await this.waitForSessionMutations(input.sessionId);
     await this.updateInFlightTurn(input.sessionId, {
       userText: input.userText,
+      attachments: cloneAttachments(input.attachments),
       assistantText: input.assistantBufferRef.current,
       committedVisibleText: input.assistantStreamRef.committedVisibleText,
       startedAt: input.startedAt,
@@ -3225,10 +3304,14 @@ export class BubbleTeaBridge {
     }
 
     this.suspended = null;
-    const nextResult = await suspended.resume(result.message);
+    const nextResult = await suspended.resume({
+      message: result.message,
+      metadata: result.metadata,
+    });
     await this.consumeRunResult({
       sessionId: suspended.sessionId,
       userText: suspended.userText,
+      attachments: suspended.attachments,
       startedAt: suspended.startedAt,
       assistantBufferRef: suspended.assistantBufferRef,
       assistantStreamRef: suspended.assistantStreamRef,

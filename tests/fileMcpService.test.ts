@@ -861,6 +861,26 @@ describe("FileMcpService", () => {
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] read_file hello.txt");
     expect(result.message).toContain("hello world");
+    expect(result.metadata).toEqual(
+      expect.objectContaining({
+        kind: "file",
+        action: "read_file",
+        workspacePath: "hello.txt",
+        resolvedPath: join(root, "hello.txt"),
+        pathKind: "file",
+        fileRevision: expect.objectContaining({
+          sizeBytes: 11,
+          revisionKey: expect.any(String),
+        }),
+        read: expect.objectContaining({
+          mode: "full",
+          fullyRead: true,
+          truncated: false,
+          empty: false,
+          lineCount: 1,
+        }),
+      })
+    );
   });
 
   test("read_files executes immediately and returns multiple file bodies", async () => {
@@ -997,6 +1017,18 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.message).toContain("(empty file)");
+    expect(result.metadata).toEqual(
+      expect.objectContaining({
+        kind: "file",
+        action: "read_file",
+        workspacePath: "empty.txt",
+        resolvedPath: join(root, "empty.txt"),
+        read: expect.objectContaining({
+          empty: true,
+          lineCount: 0,
+        }),
+      })
+    );
   });
 
   test("create_file enters review queue and approve writes file", async () => {
@@ -1022,6 +1054,21 @@ describe("FileMcpService", () => {
     expect(approved.message).toContain("diff_stats: +1 -0");
     expect(approved.message).toContain("[diff preview]");
     expect(approved.message).toContain("+    1 | print('ok')");
+    expect(approved.metadata).toEqual(
+      expect.objectContaining({
+        kind: "file",
+        action: "create_file",
+        workspacePath: "nested/example.py",
+        resolvedPath: join(root, "nested", "example.py"),
+        pathKind: "file",
+        mutation: {
+          applied: true,
+        },
+        fileRevision: expect.objectContaining({
+          revisionKey: expect.any(String),
+        }),
+      })
+    );
     expect(service.listPending()).toHaveLength(0);
 
     const content = await readFile(join(root, "nested", "example.py"), "utf8");
@@ -1698,6 +1745,23 @@ describe("FileMcpService", () => {
     expect(result.message).toContain("2 | beta");
     expect(result.message).toContain("3 | gamma");
     expect(result.message).not.toContain("1 | alpha");
+    expect(result.metadata).toEqual(
+      expect.objectContaining({
+        kind: "file",
+        action: "read_range",
+        workspacePath: "range.txt",
+        resolvedPath: join(root, "range.txt"),
+        read: expect.objectContaining({
+          mode: "range",
+          startLine: 2,
+          endLine: 3,
+          fullyRead: false,
+          truncated: true,
+          nextSuggestedStartLine: 4,
+          lineCount: 2,
+        }),
+      })
+    );
   });
 
   test("read_range rejects invalid ranges", async () => {
@@ -2250,6 +2314,86 @@ describe("FileMcpService", () => {
         expect.objectContaining({ method: "rename" }),
       ])
     );
+  });
+
+  test("lsp semantic file actions fall back to tsserver for TS files when no matching lsp_server exists", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.ts"),
+      [
+        "export function greet(name: string) {",
+        "  return `hello ${name}`;",
+        "}",
+        "",
+        "console.log(greet('Cyrene'));",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const definitionResult = await service.handleToolCall("file", {
+      action: "lsp_definition",
+      path: "src/demo.ts",
+      line: 5,
+      column: 13,
+    });
+    const diagnosticsResult = await service.handleToolCall("file", {
+      action: "lsp_diagnostics",
+      path: "src/demo.ts",
+      maxResults: 1,
+    });
+
+    expect(definitionResult.ok).toBe(true);
+    expect(definitionResult.message).toContain("[tool result] lsp_definition src/demo.ts");
+    expect(definitionResult.message).toContain("provider: tsserver");
+    expect(definitionResult.message).toContain("Found 1 TypeScript definition(s):");
+
+    expect(diagnosticsResult.ok).toBe(true);
+    expect(diagnosticsResult.message).toContain("[tool result] lsp_diagnostics src/demo.ts");
+    expect(diagnosticsResult.message).toContain("provider: tsserver");
+    expect(diagnosticsResult.message).toContain("Found 1 TypeScript diagnostic(s):");
+
+    expect(tsServerClient.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "definition" }),
+        expect.objectContaining({ method: "diagnostics" }),
+      ])
+    );
+  });
+
+  test("lspdocumentsymbols normalizes to lsp_document_symbols and falls back to outline for TS files", async () => {
+    const tsServerClient = createFakeTsServerClient();
+    const { root, service } = await createService({ tsServerClient });
+    await mkdir(join(root, "src", "entrypoints"), { recursive: true });
+    await writeFile(
+      join(root, "src", "entrypoints", "cli.tsx"),
+      [
+        "export function main() {",
+        "  return null;",
+        "}",
+        "",
+        "export const App = () => <div />;",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "lspdocumentsymbols",
+      path: "src/entrypoints/cli.tsx",
+      maxResults: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain(
+      "[tool result] lsp_document_symbols src/entrypoints/cli.tsx"
+    );
+    expect(result.message).toContain("provider: tsserver");
+    expect(result.message).toContain("fallback: outline_file");
+    expect(result.message).toContain("Outline for src/entrypoints/cli.tsx");
+    expect(result.message).toContain("note: showing first 1 outline entries");
+    expect(result.message).toContain("export function main() {");
+    expect(tsServerClient.calls).toEqual([]);
   });
 
   test("lsp_hover delegates to the configured LSP manager and passes serverId", async () => {

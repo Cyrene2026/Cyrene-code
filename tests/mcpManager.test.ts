@@ -118,6 +118,34 @@ describe("McpManager", () => {
     });
   });
 
+  test("preserves structured metadata from routed tool results", async () => {
+    const adapter = createAdapter({
+      handleToolCall: mock(async () => ({
+        ok: true,
+        message: "[tool result] read_file src/example.ts\nok",
+        metadata: {
+          kind: "file",
+          action: "read_file",
+          workspacePath: "src/example.ts",
+          resolvedPath: "/workspace/src/example.ts",
+        },
+      })),
+    });
+    const manager = new McpManager([adapter]);
+
+    const result = await manager.handleToolCall("file", {
+      action: "read_file",
+      path: "src/example.ts",
+    });
+
+    expect(result.metadata).toEqual(
+      expect.objectContaining({
+        kind: "file",
+        resolvedPath: "/workspace/src/example.ts",
+      })
+    );
+  });
+
   test("routes namespaced tool ids to the owning adapter", async () => {
     const adapter = createAdapter({
       descriptor: {

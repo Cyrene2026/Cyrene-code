@@ -71,8 +71,10 @@ import {
   type TsServerFileSpan,
   type TsServerRenameLocation,
 } from "./tsserverClient";
+import type { McpToolResultMetadata } from "../../runtimeTypes";
 import {
   LspManager,
+  isLspConfigError,
   pathFromLspUri,
   type LspCodeAction,
   type LspDiagnostic,
@@ -91,6 +93,7 @@ import { buildRestrictedSubprocessEnvFromBase } from "./subprocessEnv";
 type HandleResult = {
   ok: boolean;
   message: string;
+  metadata?: McpToolResultMetadata;
   pending?: PendingReviewItem;
 };
 
@@ -229,6 +232,11 @@ type WalkFilesResult = {
   fileLimitHit: boolean;
 };
 
+type OutlineFileSummary = {
+  header: string[];
+  entries: string[];
+};
+
 type PathConflict = {
   action: ToolRequest["action"];
   path: string;
@@ -275,6 +283,21 @@ type ResolvedLspFormatDocumentPlan = {
   edits: LspTextEdit[];
   plan: LspWorkspaceEditPlan;
 };
+
+type SemanticProviderKind = "lsp" | "tsserver";
+
+type SemanticRoutingPreference = "prefer_lsp" | "prefer_tsserver";
+
+type SemanticFileRoute =
+  | {
+      provider: "lsp";
+      absolutePath: string;
+      session: LspWorkspaceLike;
+    }
+  | {
+      provider: "tsserver";
+      absolutePath: string;
+    };
 
 type PendingApprovalGuard =
   | {
@@ -875,27 +898,34 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "blame_git":
       return "git_blame";
     case "ts_hover":
-    case "hover":
     case "quickinfo":
       return "ts_hover";
+    case "lsp_hover":
+    case "hover":
+      return "lsp_hover";
     case "ts_definition":
-    case "definition":
     case "go_to_definition":
       return "ts_definition";
+    case "lsp_definition":
+    case "definition":
+      return "lsp_definition";
     case "ts_references":
-    case "semantic_references":
       return "ts_references";
+    case "lsp_references":
+    case "semantic_references":
+    case "references":
+      return "lsp_references";
     case "ts_diagnostics":
-    case "diagnostics":
       return "ts_diagnostics";
+    case "lsp_diagnostics":
+    case "diagnostics":
+      return "lsp_diagnostics";
     case "ts_prepare_rename":
+      return "ts_prepare_rename";
+    case "lsp_prepare_rename":
     case "prepare_rename":
     case "rename_preview":
-      return "ts_prepare_rename";
-    case "lsp_hover":
-      return "lsp_hover";
-    case "lsp_definition":
-      return "lsp_definition";
+      return "lsp_prepare_rename";
     case "lsp_implementation":
     case "implementation":
     case "go_to_implementation":
@@ -904,8 +934,6 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "type_definition":
     case "go_to_type_definition":
       return "lsp_type_definition";
-    case "lsp_references":
-      return "lsp_references";
     case "lsp_workspace_symbols":
     case "workspace_symbols":
       return "lsp_workspace_symbols";
@@ -913,9 +941,6 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "document_symbols":
     case "lsp_symbols":
       return "lsp_document_symbols";
-    case "lsp_diagnostics":
-      return "lsp_diagnostics";
-    case "lsp_prepare_rename":
     case "lsp_rename_preview":
       return "lsp_prepare_rename";
     case "lsp_rename":
@@ -954,6 +979,50 @@ const normalizeAction = (raw: unknown): ToolRequest["action"] | null => {
     case "close_shell":
     case "shell_close":
       return "close_shell";
+    default:
+      break;
+  }
+
+  const compactValue = value.replace(/[_\s-]+/g, "");
+  switch (compactValue) {
+    case "outlinefile":
+      return "outline_file";
+    case "tshover":
+      return "ts_hover";
+    case "tsdefinition":
+      return "ts_definition";
+    case "tsreferences":
+      return "ts_references";
+    case "tsdiagnostics":
+      return "ts_diagnostics";
+    case "tspreparerename":
+    case "tsrenamepreview":
+      return "ts_prepare_rename";
+    case "lsphover":
+      return "lsp_hover";
+    case "lspdefinition":
+      return "lsp_definition";
+    case "lspreferences":
+      return "lsp_references";
+    case "lspdiagnostics":
+      return "lsp_diagnostics";
+    case "lsppreparerename":
+    case "lsprenamepreview":
+      return "lsp_prepare_rename";
+    case "lspimplementation":
+      return "lsp_implementation";
+    case "lsptypedefinition":
+      return "lsp_type_definition";
+    case "lspworkspacesymbols":
+      return "lsp_workspace_symbols";
+    case "lspdocumentsymbols":
+      return "lsp_document_symbols";
+    case "lsprename":
+      return "lsp_rename";
+    case "lspcodeactions":
+      return "lsp_code_actions";
+    case "lspformatdocument":
+      return "lsp_format_document";
     default:
       return null;
   }
@@ -2976,6 +3045,128 @@ export class FileMcpService {
     return normalized || ".";
   }
 
+  private detectPathKind(info: Awaited<ReturnType<typeof stat>> | null) {
+    if (!info) {
+      return "missing" as const;
+    }
+    if (info.isFile()) {
+      return "file" as const;
+    }
+    if (info.isDirectory()) {
+      return "directory" as const;
+    }
+    return "other" as const;
+  }
+
+  private buildFileRevisionMetadata(info: Awaited<ReturnType<typeof stat>>) {
+    const mtimeMs = Number(info.mtimeMs);
+    return {
+      sizeBytes: info.size,
+      mtimeMs,
+      revisionKey: `${info.size}:${Math.round(mtimeMs)}`,
+    };
+  }
+
+  private async statForMetadata(
+    absolutePath: string
+  ): Promise<Awaited<ReturnType<typeof stat>> | null> {
+    try {
+      return await stat(absolutePath);
+    } catch {
+      return null;
+    }
+  }
+
+  private countNumberedOutputLines(output: string) {
+    const matches = output.match(/^\s*\d+\s+\|/gm);
+    return matches ? matches.length : 0;
+  }
+
+  private async buildStructuredToolMetadata(
+    request: ToolRequest,
+    output: string
+  ): Promise<McpToolResultMetadata | undefined> {
+    if (
+      request.action === "run_command" ||
+      request.action === "run_shell" ||
+      isPersistentShellAction(request.action)
+    ) {
+      return undefined;
+    }
+
+    const absolutePath = this.resolvePath(request.path);
+    const info =
+      request.action === "delete_file"
+        ? null
+        : await this.statForMetadata(absolutePath);
+
+    const metadata: McpToolResultMetadata = {
+      kind: "file",
+      action: request.action,
+      workspacePath: this.normalizeWorkspacePathFromAbsolute(absolutePath),
+      resolvedPath: absolutePath,
+      pathKind: this.detectPathKind(info),
+      ...(info ? { fileRevision: this.buildFileRevisionMetadata(info) } : {}),
+    };
+
+    if (
+      request.action === "create_file" ||
+      request.action === "write_file" ||
+      request.action === "edit_file" ||
+      request.action === "apply_patch" ||
+      request.action === "delete_file" ||
+      request.action === "move_path" ||
+      request.action === "copy_path"
+    ) {
+      metadata.mutation = { applied: true };
+    }
+
+    if (request.action === "read_file") {
+      const lineCount = output === "(empty file)" ? 0 : splitFileLines(output).length;
+      metadata.read = {
+        mode: "full",
+        startLine: lineCount > 0 ? 1 : null,
+        endLine: lineCount > 0 ? lineCount : null,
+        fullyRead: true,
+        truncated: false,
+        nextSuggestedStartLine: null,
+        empty: output === "(empty file)",
+        lineCount,
+      };
+      return metadata;
+    }
+
+    if (request.action === "read_range") {
+      metadata.read = {
+        mode: "range",
+        startLine: request.startLine,
+        endLine: request.endLine,
+        fullyRead: false,
+        truncated: true,
+        nextSuggestedStartLine: request.endLine + 1,
+        empty: output.includes("(no lines in requested range)"),
+        lineCount: this.countNumberedOutputLines(output),
+      };
+      return metadata;
+    }
+
+    if (request.action === "read_json" || request.action === "read_yaml") {
+      metadata.read = {
+        mode: "structured",
+        startLine: null,
+        endLine: null,
+        fullyRead: true,
+        truncated: false,
+        nextSuggestedStartLine: null,
+        empty: false,
+        lineCount: null,
+      };
+      return metadata;
+    }
+
+    return metadata;
+  }
+
   private getTsServerClient() {
     if (!this.tsServerClient) {
       this.tsServerClient = new TsServerClient({
@@ -3011,6 +3202,85 @@ export class FileMcpService {
         `TypeScript semantic tools only support TS/JS files: ${path}`
       );
     }
+  }
+
+  private shouldAllowTsSemanticFallback(
+    path: string,
+    serverId: string | undefined
+  ) {
+    return !serverId && TYPESCRIPT_LANGUAGE_EXTENSIONS.test(path);
+  }
+
+  private shouldFallbackSemanticRouteToTsServer(
+    error: unknown,
+    path: string,
+    serverId: string | undefined
+  ) {
+    return (
+      this.shouldAllowTsSemanticFallback(path, serverId) &&
+      isLspConfigError(error) &&
+      (error.code === "no_configured_servers" ||
+        error.code === "no_matching_server" ||
+        error.code === "path_mismatch")
+    );
+  }
+
+  private async resolveSemanticFileRoute(
+    request: { path: string; serverId?: string },
+    preference: SemanticRoutingPreference
+  ): Promise<SemanticFileRoute> {
+    const absolutePath = this.resolvePath(request.path);
+    await this.ensureRegularFile(request.path, absolutePath, "Semantic tools");
+
+    if (preference === "prefer_tsserver") {
+      await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+      return {
+        provider: "tsserver",
+        absolutePath,
+      };
+    }
+
+    try {
+      const session = await this.getLspManager().getSession(absolutePath, {
+        serverId: request.serverId,
+      });
+      return {
+        provider: "lsp",
+        absolutePath,
+        session,
+      };
+    } catch (error) {
+      if (!this.shouldFallbackSemanticRouteToTsServer(error, request.path, request.serverId)) {
+        throw error;
+      }
+      await this.ensureTypescriptLanguageFile(request.path, absolutePath);
+      return {
+        provider: "tsserver",
+        absolutePath,
+      };
+    }
+  }
+
+  private formatSemanticProviderLine(
+    action: ToolRequest["action"],
+    provider: SemanticProviderKind
+  ) {
+    if (provider === "tsserver" && action.startsWith("lsp_")) {
+      return "provider: tsserver";
+    }
+    if (provider === "lsp" && action.startsWith("ts_")) {
+      return "provider: lsp";
+    }
+    return "";
+  }
+
+  private prependSemanticProviderLine(
+    action: ToolRequest["action"],
+    provider: SemanticProviderKind,
+    body: string
+  ) {
+    const providerLine = this.formatSemanticProviderLine(action, provider);
+    return providerLine ? `${providerLine}\n${body}` : body;
   }
 
   private formatTsLocation(location: { line: number; offset: number }) {
@@ -6522,12 +6792,24 @@ export class FileMcpService {
   }
 
   private async executeOutlineFile(request: OutlineFileToolRequest) {
-    const abs = this.resolvePath(request.path);
+    const summary = await this.buildOutlineFileSummary(request.path);
+    return this.formatOutlineFileSummary(summary);
+  }
+
+  private async buildOutlineFileSummary(
+    path: string,
+    options?: { maxEntries?: number }
+  ): Promise<OutlineFileSummary> {
+    const abs = this.resolvePath(path);
     const info = await stat(abs);
     if (!info.isFile()) {
-      throw new Error(`outline_file only supports files: ${request.path}`);
+      throw new Error(`outline_file only supports files: ${path}`);
     }
 
+    const entryLimit = Math.max(
+      1,
+      Math.min(MAX_OUTLINE_ENTRIES, options?.maxEntries ?? MAX_OUTLINE_ENTRIES)
+    );
     let entries: string[] = [];
     let partialScan = false;
     let entryLimitHit = false;
@@ -6544,19 +6826,19 @@ export class FileMcpService {
           return formatOutlineEntry(entry, index + 1);
         })
         .filter((entry): entry is string => Boolean(entry));
-      if (entries.length > MAX_OUTLINE_ENTRIES) {
-        entries = entries.slice(0, MAX_OUTLINE_ENTRIES);
+      if (entries.length > entryLimit) {
+        entries = entries.slice(0, entryLimit);
         entryLimitHit = true;
       }
     } else {
       scanBytes = this.getLargeFileScanByteLimit(info.size);
       partialScan = scanBytes < info.size;
-      const scanned = await this.scanOutlineEntries(abs, scanBytes);
+      const scanned = await this.scanOutlineEntries(abs, scanBytes, entryLimit);
       entries = scanned.entries;
       entryLimitHit = scanned.entryLimitHit;
     }
 
-    const header = [`Outline for ${request.path}`];
+    const header = [`Outline for ${path}`];
     if (info.size > this.rules.maxReadBytes) {
       header.push(
         `large-file mode: scanned ${scanBytes} of ${info.size} bytes (max_read_bytes=${this.rules.maxReadBytes})`
@@ -6569,11 +6851,28 @@ export class FileMcpService {
       header.push(`note: showing first ${entries.length} outline entries`);
     }
 
-    if (entries.length === 0) {
-      return [...header, "(no outline symbols found)"].join("\n");
+    return { header, entries };
+  }
+
+  private formatOutlineFileSummary(summary: OutlineFileSummary) {
+    if (summary.entries.length === 0) {
+      return [...summary.header, "(no outline symbols found)"].join("\n");
     }
 
-    return [...header, ...entries].join("\n");
+    return [...summary.header, ...summary.entries].join("\n");
+  }
+
+  private async executeSemanticDocumentSymbolsOutlineFallback(
+    request: Pick<LspDocumentSymbolsToolRequest, "action" | "path" | "maxResults">
+  ) {
+    const summary = await this.buildOutlineFileSummary(request.path, {
+      maxEntries: request.maxResults,
+    });
+    return this.prependSemanticProviderLine(
+      request.action,
+      "tsserver",
+      `fallback: outline_file\n${this.formatOutlineFileSummary(summary)}`
+    );
   }
 
   private getLargeFileScanByteLimit(fileSize: number) {
@@ -6617,7 +6916,8 @@ export class FileMcpService {
 
   private async scanOutlineEntries(
     absolutePath: string,
-    byteLimit: number
+    byteLimit: number,
+    maxEntries = MAX_OUTLINE_ENTRIES
   ): Promise<{ entries: string[]; entryLimitHit: boolean }> {
     const entries: string[] = [];
     let entryLimitHit = false;
@@ -6628,7 +6928,7 @@ export class FileMcpService {
         return false;
       }
       entries.push(formatOutlineEntry(entry, lineNumber));
-      if (entries.length >= MAX_OUTLINE_ENTRIES) {
+      if (entries.length >= maxEntries) {
         entryLimitHit = true;
         return true;
       }
@@ -7083,18 +7383,23 @@ export class FileMcpService {
   }
 
   private async executeLspHover(request: LspHoverToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const info = await session.hover(absolutePath, request.line, request.column);
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      const body = await this.executeTsHover({
+        action: "ts_hover",
+        path: request.path,
+        line: request.line,
+        column: request.column,
+      });
+      return this.prependSemanticProviderLine(request.action, route.provider, body);
+    }
+    const info = await route.session.hover(route.absolutePath, request.line, request.column);
     if (!info) {
       return `(no LSP hover at: ${request.path}:${request.line}:${request.column})`;
     }
 
     return [
-      `server: ${session.getInfo().serverId}`,
+      `server: ${route.session.getInfo().serverId}`,
       info.range ? `range: ${request.path}:${this.formatLspRange(info.range)}` : "",
       `contents:\n${info.contents}`,
     ]
@@ -7103,12 +7408,21 @@ export class FileMcpService {
   }
 
   private async executeLspDefinition(request: LspDefinitionToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const definitions = await session.definition(absolutePath, request.line, request.column);
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      const body = await this.executeTsDefinition({
+        action: "ts_definition",
+        path: request.path,
+        line: request.line,
+        column: request.column,
+      });
+      return this.prependSemanticProviderLine(request.action, route.provider, body);
+    }
+    const definitions = await route.session.definition(
+      route.absolutePath,
+      request.line,
+      request.column
+    );
     const limitedDefinitions = definitions.slice(0, DEFAULT_SEARCH_RESULTS);
     if (limitedDefinitions.length === 0) {
       return `(no LSP definitions at: ${request.path}:${request.line}:${request.column})`;
@@ -7118,7 +7432,7 @@ export class FileMcpService {
     );
     return [
       `Found ${formattedDefinitions.length} LSP definition(s):`,
-      `server: ${session.getInfo().serverId}`,
+      `server: ${route.session.getInfo().serverId}`,
       ...formattedDefinitions,
     ].join("\n");
   }
@@ -7184,12 +7498,22 @@ export class FileMcpService {
   }
 
   private async executeLspReferences(request: LspReferencesToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const references = await session.references(absolutePath, request.line, request.column);
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      const body = await this.executeTsReferences({
+        action: "ts_references",
+        path: request.path,
+        line: request.line,
+        column: request.column,
+        maxResults: request.maxResults,
+      });
+      return this.prependSemanticProviderLine(request.action, route.provider, body);
+    }
+    const references = await route.session.references(
+      route.absolutePath,
+      request.line,
+      request.column
+    );
     const limitedReferences = references.slice(
       0,
       request.maxResults ?? DEFAULT_SEARCH_RESULTS
@@ -7202,7 +7526,7 @@ export class FileMcpService {
     );
     return [
       `Found ${formattedReferences.length} LSP reference(s):`,
-      `server: ${session.getInfo().serverId}`,
+      `server: ${route.session.getInfo().serverId}`,
       ...formattedReferences,
     ].join("\n");
   }
@@ -7229,12 +7553,11 @@ export class FileMcpService {
   }
 
   private async executeLspDocumentSymbols(request: LspDocumentSymbolsToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const symbols = await session.documentSymbols(absolutePath);
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      return this.executeSemanticDocumentSymbolsOutlineFallback(request);
+    }
+    const symbols = await route.session.documentSymbols(route.absolutePath);
     const flattened = this.flattenLspDocumentSymbols(symbols).slice(
       0,
       request.maxResults ?? DEFAULT_SEARCH_RESULTS
@@ -7244,7 +7567,7 @@ export class FileMcpService {
     }
     return [
       `Found ${flattened.length} LSP document symbol(s):`,
-      `server: ${session.getInfo().serverId}`,
+      `server: ${route.session.getInfo().serverId}`,
       ...flattened.map(entry =>
         this.formatLspDocumentSymbolEntry(entry.symbol, entry.depth)
       ),
@@ -7252,12 +7575,16 @@ export class FileMcpService {
   }
 
   private async executeLspDiagnostics(request: LspDiagnosticsToolRequest) {
-    const absolutePath = this.resolvePath(request.path);
-    await this.ensureRegularFile(request.path, absolutePath, "LSP tools");
-    const session = await this.getLspManager().getSession(absolutePath, {
-      serverId: request.serverId,
-    });
-    const diagnostics = await session.diagnostics(absolutePath);
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      const body = await this.executeTsDiagnostics({
+        action: "ts_diagnostics",
+        path: request.path,
+        maxResults: request.maxResults,
+      });
+      return this.prependSemanticProviderLine(request.action, route.provider, body);
+    }
+    const diagnostics = await route.session.diagnostics(route.absolutePath);
     const limitedDiagnostics = diagnostics.slice(
       0,
       request.maxResults ?? DEFAULT_SEARCH_RESULTS
@@ -7267,14 +7594,26 @@ export class FileMcpService {
     }
     return [
       `Found ${limitedDiagnostics.length} LSP diagnostic(s):`,
-      `server: ${session.getInfo().serverId}`,
+      `server: ${route.session.getInfo().serverId}`,
       ...limitedDiagnostics.map(diagnostic =>
-        this.formatLspDiagnostic(absolutePath, diagnostic)
+        this.formatLspDiagnostic(route.absolutePath, diagnostic)
       ),
     ].join("\n");
   }
 
   private async executeLspPrepareRename(request: LspPrepareRenameToolRequest) {
+    const route = await this.resolveSemanticFileRoute(request, "prefer_lsp");
+    if (route.provider === "tsserver") {
+      const body = await this.executeTsPrepareRename({
+        action: "ts_prepare_rename",
+        path: request.path,
+        line: request.line,
+        column: request.column,
+        newName: request.newName,
+        maxResults: request.maxResults,
+      });
+      return this.prependSemanticProviderLine(request.action, route.provider, body);
+    }
     const resolved = await this.resolveLspRenamePlan(request);
     const { session, prepare, workspaceEdit, plan } = resolved;
     if (!prepare) {
@@ -8364,6 +8703,10 @@ export class FileMcpService {
       try {
         const cachedSnapshot = await this.getRecentListDirSnapshot(request.path);
         if (cachedSnapshot) {
+          const metadata = await this.buildStructuredToolMetadata(
+            request,
+            cachedSnapshot.output
+          );
           return {
             ok: true,
             message: this.formatListDirToolResult(
@@ -8371,6 +8714,7 @@ export class FileMcpService {
               cachedSnapshot.output,
               true
             ),
+            metadata,
           };
         }
       } catch (error) {
@@ -8387,14 +8731,18 @@ export class FileMcpService {
       const output = await this.execute(request);
       if (request.action === "list_dir") {
         await this.storeRecentListDirSnapshot(request.path, output);
+        const metadata = await this.buildStructuredToolMetadata(request, output);
         return {
           ok: true,
           message: this.formatListDirToolResult(request.path, output),
+          metadata,
         };
       }
+      const metadata = await this.buildStructuredToolMetadata(request, output);
       return {
         ok: true,
         message: `[tool result] ${requestLabel}\n${output}`,
+        metadata,
       };
     } catch (error) {
       return {
@@ -8455,9 +8803,11 @@ export class FileMcpService {
       );
       this.pending.delete(id);
       this.pendingApprovalGuards.delete(id);
+      const metadata = await this.buildStructuredToolMetadata(pending.request, output);
       return {
         ok: true,
         message: `[approved] ${id}\n${output}`,
+        metadata,
       };
     } catch (error) {
       return {

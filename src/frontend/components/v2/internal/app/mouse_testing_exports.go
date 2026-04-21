@@ -152,19 +152,19 @@ func (m *Model) panelItemLineForTest(panelRect mouseRect, index, rowOffset int) 
 		if index < page.Start || index >= page.End {
 			return 0, false
 		}
-		return 2 + ((index - page.Start) * 2) + clampInt(rowOffset, 0, 1), true
+		return 2 + sessionPanelLeadRows(bodyWidth) + ((index - page.Start) * 2) + clampInt(rowOffset, 0, 1), true
 	case PanelModels:
 		page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
 		if index < page.Start || index >= page.End {
 			return 0, false
 		}
-		return 2 + ((index - page.Start) * 2) + clampInt(rowOffset, 0, 1), true
+		return 2 + modelPanelLeadRows(bodyWidth) + ((index - page.Start) * 2) + clampInt(rowOffset, 0, 1), true
 	case PanelProviders:
 		page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
 		if index < page.Start || index >= page.End {
 			return 0, false
 		}
-		return 2 + providerPanelCommandRows(bodyWidth) + ((index - page.Start) * 3) + clampInt(rowOffset, 0, 2), true
+		return 2 + providerPanelLeadRows(bodyWidth) + ((index - page.Start) * 3) + clampInt(rowOffset, 0, 2), true
 	default:
 		return 0, false
 	}

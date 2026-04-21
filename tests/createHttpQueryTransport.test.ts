@@ -299,6 +299,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_show to inspect one revision in detail");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_blame to inspect who last changed specific lines");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_files, set `path` to the first file");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "When the task explicitly asks for code changes and the target path is already known"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_file, provide `path` only. Do not send `paths`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For stat_paths, set `path` to the first target");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For stat_path, provide `path` only. Do not send `paths`");
@@ -4386,6 +4389,136 @@ describe("createHttpQueryTransport streaming usage", () => {
     );
   });
 
+  test("openai chat stream surfaces non-stop finish reasons instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"partial answer"}}]}',
+              "",
+              'data: {"choices":[{"finish_reason":"length"}]}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const interruptionEvent = parsedEvents.find(
+      event =>
+        event.type === "text_delta" &&
+        event.text.includes("[model stream interrupted]")
+    );
+
+    expect(interruptionEvent).toEqual({
+      type: "text_delta",
+      text: expect.stringContaining("output limit"),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
+  });
+
+  test("openai chat stream surfaces unexpected socket closes instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[{"delta":{"content":"partial answer"}}]}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const interruptionEvent = parsedEvents.find(
+      event =>
+        event.type === "text_delta" &&
+        event.text.includes("[model stream interrupted]")
+    );
+
+    expect(interruptionEvent).toEqual({
+      type: "text_delta",
+      text: expect.stringContaining(
+        "stream closed before the provider sent an explicit completion signal"
+      ),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
+  });
+
   test("openai responses stream recovers write_file calls that use `body` instead of `content`", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     const service = createRelaxedFileService(root);
@@ -4464,6 +4597,144 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(await readFile(join(root, "notes.txt"), "utf8")).toBe(
       "hello from responses\n"
     );
+  });
+
+  test("openai responses stream surfaces incomplete responses instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"partial answer"}',
+              "",
+              'data: {"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const formatResult = await transport.setProviderFormat?.(
+      "https://example.test/v1",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const interruptionEvent = parsedEvents.find(
+      event =>
+        event.type === "text_delta" &&
+        event.text.includes("[model stream interrupted]")
+    );
+
+    expect(interruptionEvent).toEqual({
+      type: "text_delta",
+      text: expect.stringContaining("max_output_tokens"),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
+  });
+
+  test("anthropic stream surfaces non-terminal stop reasons instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}',
+              "",
+              'event: message_delta',
+              'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}',
+              "",
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const interruptionEvent = parsedEvents.find(
+      event =>
+        event.type === "text_delta" &&
+        event.text.includes("[model stream interrupted]")
+    );
+
+    expect(interruptionEvent).toEqual({
+      type: "text_delta",
+      text: expect.stringContaining("output limit"),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
   });
 
   test("anthropic stream recovers edit_file calls that use oldText/newText aliases", async () => {

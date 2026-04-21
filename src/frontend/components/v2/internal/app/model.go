@@ -1,6 +1,9 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -212,6 +215,9 @@ var slashCommandCatalog = []slashCommandSpec{
 var slashPinnedDisplayCommands = []string{"/resume", "/clear"}
 
 var readClipboardText = defaultClipboardTextReader
+var readClipboardImage = defaultClipboardImageReader
+
+var errClipboardNoImage = errors.New("clipboard has no image")
 
 func init() {
 	for index := range slashCommandCatalog {
@@ -224,6 +230,12 @@ type Message struct {
 	Kind        string       `json:"kind"`
 	Text        string       `json:"text"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+type ClipboardImage struct {
+	Bytes    []byte
+	MimeType string
+	Name     string
 }
 
 type ExecutionPlanStep struct {
@@ -318,12 +330,16 @@ type Model struct {
 	ManagedSkills            []BridgeManagedSkill
 	ManagedMcpServers        []BridgeManagedMcpServer
 	UsageSummary             BridgeUsageSummary
+	RequestTimingActive      bool
+	RequestTimingStartedAt   time.Time
+	RequestTimingElapsedMs   int64
 	CurrentModel             string
 	CurrentProvider          string
 	CurrentProviderFormat    string
 	CurrentProviderKeySource string
 	Auth                     BridgeAuthStatus
 	AppRoot                  string
+	GitBranch                string
 
 	AuthStep          AuthStep
 	AuthProvider      []rune
@@ -523,11 +539,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.withStatusSpinner(waitForBridgeEvent(m.bridge))
 	case bridgeErrorMsg:
+		m.freezeRequestTiming(time.Now())
 		m.Status = StatusError
 		m.AuthSaving = false
 		m.setNotice(value.Message, true)
 		return m, m.withStatusSpinner(nil)
 	case bridgeExitedMsg:
+		m.freezeRequestTiming(time.Now())
 		m.BridgeReady = false
 		m.bridge = nil
 		m.AuthSaving = false
@@ -611,6 +629,9 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	case "set_status":
 		m.BridgeReady = true
 		m.Status = parseStatus(event.Status)
+	case "set_request_timing":
+		m.BridgeReady = true
+		m.applyBridgeRequestTiming(event.RequestTiming)
 	case "set_live_text":
 		m.BridgeReady = true
 		if m.LiveText != event.LiveText {
@@ -691,6 +712,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 			m.AuthCursor = 0
 		}
 	case "error":
+		m.freezeRequestTiming(time.Now())
 		m.Status = StatusError
 		m.AuthSaving = false
 		m.setNotice(event.Message, true)
@@ -728,6 +750,34 @@ func (m *Model) withStatusSpinner(cmd tea.Cmd) tea.Cmd {
 	return tea.Batch(cmd, statusSpinnerTickCmd())
 }
 
+func (m *Model) applyBridgeRequestTiming(timing BridgeRequestTiming) {
+	m.RequestTimingActive = timing.Active
+	if timing.ElapsedMs > 0 {
+		m.RequestTimingElapsedMs = timing.ElapsedMs
+	} else {
+		m.RequestTimingElapsedMs = 0
+	}
+	m.RequestTimingStartedAt = time.Time{}
+	if strings.TrimSpace(timing.StartedAt) != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, timing.StartedAt); err == nil {
+			m.RequestTimingStartedAt = parsed
+		}
+	}
+}
+
+func (m *Model) freezeRequestTiming(now time.Time) {
+	if !m.RequestTimingActive {
+		return
+	}
+	if !m.RequestTimingStartedAt.IsZero() {
+		elapsed := now.Sub(m.RequestTimingStartedAt).Milliseconds()
+		if elapsed > m.RequestTimingElapsedMs {
+			m.RequestTimingElapsedMs = elapsed
+		}
+	}
+	m.RequestTimingActive = false
+}
+
 func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	if snapshot == nil {
 		return
@@ -736,6 +786,7 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.BridgeReady = true
 	m.Items = cloneMessages(snapshot.Items)
 	m.LiveText = snapshot.LiveText
+	m.applyBridgeRequestTiming(snapshot.RequestTiming)
 	m.ExecutionPlan = cloneExecutionPlan(snapshot.ExecutionPlan)
 	m.resetTranscriptMessageCache()
 	m.PendingReviews = cloneReviews(snapshot.PendingReviews)
@@ -758,6 +809,7 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.CurrentProviderKeySource = snapshot.CurrentProviderKeySource
 	m.Auth = snapshot.Auth
 	m.AppRoot = snapshot.AppRoot
+	m.refreshGitBranch(snapshot.AppRoot)
 	m.invalidateTranscriptCache()
 	m.normalizeBridgeSelections()
 	m.handleAuthRefreshSideEffects()
@@ -783,9 +835,14 @@ func (m *Model) applyRuntimeMetadata(event bridgeEvent) {
 	m.Auth = event.Auth
 	if strings.TrimSpace(event.AppRoot) != "" {
 		m.AppRoot = event.AppRoot
+		m.refreshGitBranch(event.AppRoot)
 	}
 	m.normalizeRuntimeMetadataState()
 	m.handleAuthRefreshSideEffects()
+}
+
+func (m *Model) refreshGitBranch(appRoot string) {
+	m.GitBranch = detectGitBranch(appRoot)
 }
 
 func (m *Model) normalizeBridgeSelections() {
@@ -862,6 +919,29 @@ func syncProcessAppRoot(appRoot string) error {
 	return nil
 }
 
+func detectGitBranch(appRoot string) string {
+	root := strings.TrimSpace(appRoot)
+	if root == "" {
+		return "none"
+	}
+
+	branchCmd := exec.Command("git", "-C", root, "symbolic-ref", "--short", "HEAD")
+	if output, err := branchCmd.Output(); err == nil {
+		if branch := strings.TrimSpace(string(output)); branch != "" {
+			return branch
+		}
+	}
+
+	headCmd := exec.Command("git", "-C", root, "rev-parse", "--short", "HEAD")
+	if output, err := headCmd.Output(); err == nil {
+		if head := strings.TrimSpace(string(output)); head != "" {
+			return head
+		}
+	}
+
+	return "none"
+}
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
@@ -905,6 +985,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
+	if m.ActivePanel == PanelNone {
+		if image, err := readClipboardImage(); err == nil {
+			m.addImageAttachmentFromClipboard(image)
+			return m, nil
+		} else if err != nil && !errors.Is(err, errClipboardNoImage) {
+			m.setNotice(fmt.Sprintf("Clipboard image paste failed: %v", err), true)
+			return m, nil
+		}
+	}
+
 	text, err := readClipboardText()
 	if err != nil {
 		m.setNotice(fmt.Sprintf("Clipboard paste failed: %v. Press F6 for terminal paste.", err), true)
@@ -919,7 +1009,7 @@ func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
 		if m.AttachmentInputActive {
 			m.insertAttachmentInputRunes([]rune(text))
 		} else {
-			m.insertRunes([]rune(text))
+			m.insertPastedRunes([]rune(text))
 		}
 	case PanelAuth:
 		m.insertAuthRunes(filterAuthInputRunes([]rune(text)))
@@ -1112,6 +1202,10 @@ func (m *Model) transcriptViewportMetrics() (int, int) {
 
 	if m.ActivePanel == PanelNone {
 		return maxInt(1, framedInnerWidth(activeFrameStyle, contentWidth)-2), maxInt(1, framedInnerHeight(activeFrameStyle, contentAreaHeight))
+	}
+
+	if usesPagePanelLayout(m.ActivePanel) {
+		return maxInt(1, framedInnerWidth(panelBoxStyle, contentWidth)-2), maxInt(1, framedInnerHeight(panelBoxStyle, contentAreaHeight))
 	}
 
 	if contentWidth >= 96 {
@@ -1381,8 +1475,9 @@ func (m *Model) sessionPanelPageSize() int {
 }
 
 func (m *Model) sessionPanelPageSizeForDimensions(width, height int) int {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	return dynamicPanelPageSize(bodyHeight, 9, 2)
+	return dynamicPanelPageSize(bodyHeight, 9+sessionPanelLeadRows(bodyWidth), 2)
 }
 
 func (m *Model) modelPanelPageSize() int {
@@ -1394,8 +1489,9 @@ func (m *Model) modelPanelPageSize() int {
 }
 
 func (m *Model) modelPanelPageSizeForDimensions(width, height int) int {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	return dynamicPanelPageSize(bodyHeight, 8, 2)
+	return dynamicPanelPageSize(bodyHeight, 8+modelPanelLeadRows(bodyWidth), 2)
 }
 
 func (m *Model) providerPanelPageSize() int {
@@ -1409,7 +1505,7 @@ func (m *Model) providerPanelPageSize() int {
 func (m *Model) providerPanelPageSizeForDimensions(width, height int) int {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
-	return dynamicPanelPageSize(bodyHeight, 10+providerPanelCommandRows(bodyWidth), 3)
+	return dynamicPanelPageSize(bodyHeight, 10+providerPanelLeadRows(bodyWidth), 3)
 }
 
 func (m *Model) planPanelPageSize() int {
@@ -1462,8 +1558,16 @@ func dynamicPanelPageSize(bodyHeight, reservedRows, rowsPerItem int) int {
 	return maxInt(1, usableRows/rowsPerItem)
 }
 
-func providerPanelCommandRows(bodyWidth int) int {
-	return 0
+func sessionPanelLeadRows(bodyWidth int) int {
+	return 1 + len(wrapPlainText("Enter load | arrows navigate | Esc back", bodyWidth))
+}
+
+func modelPanelLeadRows(bodyWidth int) int {
+	return 1 + len(wrapPlainText(modelCustomHint, bodyWidth))
+}
+
+func providerPanelLeadRows(bodyWidth int) int {
+	return 1 + len(wrapPlainText("Enter switch | refresh reloads providers and models | Esc back", bodyWidth))
 }
 
 func listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataStartLine int) (int, bool) {
@@ -2692,8 +2796,60 @@ func (m *Model) clearAuthField() {
 }
 
 func (m *Model) setNotice(text string, isError bool) {
-	m.Notice = strings.TrimSpace(text)
+	text = strings.TrimSpace(text)
+	if !isError && shouldSuppressNotice(text) {
+		text = ""
+	}
+	m.Notice = text
 	m.NoticeIsError = isError
+}
+
+func shouldSuppressNotice(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, prefix := range []string{
+		"Loading ",
+		"Switching ",
+		"Refreshing ",
+		"Saving ",
+		"Approving ",
+		"Rejecting ",
+		"Running ",
+		"Building ",
+		"Revising ",
+		"Updating ",
+		"Adding ",
+		"Removing ",
+		"Clearing ",
+		"Accepting ",
+		"Creating ",
+		"Starting ",
+		"Bridge starting, queued ",
+	} {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+
+	switch text {
+	case "Submitting query...",
+		"Running command...",
+		"Plan panel opened.",
+		"Sessions panel opened.",
+		"Approval panel opened.",
+		"Approval panel opened for selected item.",
+		"Model picker opened.",
+		"Provider picker opened.",
+		"Login panel opened. Loading saved credential...",
+		"Command reference appended to transcript.",
+		"Attachment list appended to transcript.",
+		"No images attached.",
+		"Bubble Tea bridge started.":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Model) shouldSuppressPaste(values []rune) bool {
@@ -2742,6 +2898,18 @@ func (m *Model) insertRunes(values []rune) {
 	if len(values) == 0 {
 		return
 	}
+	m.insertNormalizedRunes(values)
+}
+
+func (m *Model) insertPastedRunes(values []rune) {
+	values = normalizeComposerRunes(values)
+	if len(values) == 0 {
+		return
+	}
+	m.insertNormalizedRunes(values)
+}
+
+func (m *Model) insertNormalizedRunes(values []rune) {
 	if m.Cursor < 0 {
 		m.Cursor = 0
 	}
@@ -3020,6 +3188,52 @@ func (m *Model) addImageAttachmentFromPath(path string) {
 	m.addImageAttachmentFromInput()
 }
 
+func (m *Model) addImageAttachmentFromClipboard(image *ClipboardImage) {
+	if image == nil {
+		m.setNotice("Clipboard image is empty.", true)
+		return
+	}
+	if len(image.Bytes) == 0 {
+		m.setNotice("Clipboard image is empty.", true)
+		return
+	}
+	if len(m.Attachments) >= maxImageAttachments {
+		m.setNotice(fmt.Sprintf("You can attach up to %d images per message.", maxImageAttachments), true)
+		return
+	}
+	if len(image.Bytes) > maxImageAttachmentBytes {
+		m.setNotice("Image file is too large. Max size is 10 MB.", true)
+		return
+	}
+
+	path, err := storeClipboardImage(image)
+	if err != nil {
+		m.setNotice(fmt.Sprintf("Clipboard image could not be stored: %v", err), true)
+		return
+	}
+	for _, attachment := range m.Attachments {
+		if strings.EqualFold(filepath.Clean(attachment.Path), path) {
+			m.setNotice("That image is already attached.", false)
+			m.cancelAttachmentInput()
+			return
+		}
+	}
+
+	name := strings.TrimSpace(image.Name)
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	m.Attachments = append(m.Attachments, Attachment{
+		ID:       fmt.Sprintf("img-%d", time.Now().UnixNano()),
+		Kind:     "image",
+		Path:     path,
+		Name:     name,
+		MimeType: image.MimeType,
+	})
+	m.cancelAttachmentInput()
+	m.setNotice(fmt.Sprintf("Attached image: %s", name), false)
+}
+
 func defaultClipboardTextReader() (string, error) {
 	switch runtime.GOOS {
 	case "windows":
@@ -3038,6 +3252,169 @@ func defaultClipboardTextReader() (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported platform %s", runtime.GOOS)
 	}
+}
+
+func defaultClipboardImageReader() (*ClipboardImage, error) {
+	switch runtime.GOOS {
+	case "windows":
+		return readWindowsClipboardImage()
+	case "darwin":
+		return readMacClipboardImage()
+	default:
+		return readLinuxClipboardImage()
+	}
+}
+
+func readWindowsClipboardImage() (*ClipboardImage, error) {
+	command := exec.Command(
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		`Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $img = Get-Clipboard -Format Image; if ($null -eq $img) { exit 3 }; $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Console]::OpenStandardOutput().Write($ms.ToArray(), 0, $ms.Length)`,
+	)
+	output, err := command.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 3 {
+			return nil, errClipboardNoImage
+		}
+		return nil, err
+	}
+	if len(output) == 0 {
+		return nil, errClipboardNoImage
+	}
+	return &ClipboardImage{Bytes: output, MimeType: "image/png", Name: "clipboard.png"}, nil
+}
+
+func readMacClipboardImage() (*ClipboardImage, error) {
+	pngpastePath, err := exec.LookPath("pngpaste")
+	if err != nil {
+		return nil, errClipboardNoImage
+	}
+	tempFile, err := os.CreateTemp("", "cyrene-clipboard-*.png")
+	if err != nil {
+		return nil, err
+	}
+	tempPath := tempFile.Name()
+	tempFile.Close()
+	defer os.Remove(tempPath)
+
+	command := exec.Command(pngpastePath, tempPath)
+	if err := command.Run(); err != nil {
+		return nil, errClipboardNoImage
+	}
+	output, err := os.ReadFile(tempPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(output) == 0 {
+		return nil, errClipboardNoImage
+	}
+	return &ClipboardImage{Bytes: output, MimeType: "image/png", Name: "clipboard.png"}, nil
+}
+
+func readLinuxClipboardImage() (*ClipboardImage, error) {
+	if image, err := readWaylandClipboardImage(); err == nil || !errors.Is(err, errClipboardNoImage) {
+		return image, err
+	}
+	return readXclipClipboardImage()
+}
+
+func readWaylandClipboardImage() (*ClipboardImage, error) {
+	wlPastePath, err := exec.LookPath("wl-paste")
+	if err != nil {
+		return nil, errClipboardNoImage
+	}
+	listCommand := exec.Command(wlPastePath, "--list-types")
+	output, err := listCommand.Output()
+	if err != nil {
+		return nil, errClipboardNoImage
+	}
+	mimeType := preferredClipboardImageMimeType(strings.Fields(string(output)))
+	if mimeType == "" {
+		return nil, errClipboardNoImage
+	}
+	readCommand := exec.Command(wlPastePath, "--no-newline", "--type", mimeType)
+	imageBytes, err := readCommand.Output()
+	if err != nil || len(imageBytes) == 0 {
+		return nil, errClipboardNoImage
+	}
+	return &ClipboardImage{Bytes: imageBytes, MimeType: mimeType, Name: clipboardImageDefaultName(mimeType)}, nil
+}
+
+func readXclipClipboardImage() (*ClipboardImage, error) {
+	xclipPath, err := exec.LookPath("xclip")
+	if err != nil {
+		return nil, errClipboardNoImage
+	}
+	listCommand := exec.Command(xclipPath, "-selection", "clipboard", "-t", "TARGETS", "-o")
+	output, err := listCommand.Output()
+	if err != nil {
+		return nil, errClipboardNoImage
+	}
+	mimeType := preferredClipboardImageMimeType(strings.Fields(string(output)))
+	if mimeType == "" {
+		return nil, errClipboardNoImage
+	}
+	readCommand := exec.Command(xclipPath, "-selection", "clipboard", "-t", mimeType, "-o")
+	imageBytes, err := readCommand.Output()
+	if err != nil || len(imageBytes) == 0 {
+		return nil, errClipboardNoImage
+	}
+	return &ClipboardImage{Bytes: imageBytes, MimeType: mimeType, Name: clipboardImageDefaultName(mimeType)}, nil
+}
+
+func preferredClipboardImageMimeType(values []string) string {
+	supported := []string{"image/png", "image/jpeg", "image/webp", "image/gif"}
+	for _, mimeType := range supported {
+		for _, value := range values {
+			if strings.EqualFold(strings.TrimSpace(value), mimeType) {
+				return mimeType
+			}
+		}
+	}
+	return ""
+}
+
+func clipboardImageDefaultName(mimeType string) string {
+	ext, ok := imageMimeTypeExtension(mimeType)
+	if !ok {
+		ext = ".png"
+	}
+	return "clipboard" + ext
+}
+
+func imageMimeTypeExtension(mimeType string) (string, bool) {
+	switch strings.TrimSpace(strings.ToLower(mimeType)) {
+	case "image/png":
+		return ".png", true
+	case "image/jpeg":
+		return ".jpg", true
+	case "image/webp":
+		return ".webp", true
+	case "image/gif":
+		return ".gif", true
+	default:
+		return "", false
+	}
+}
+
+func storeClipboardImage(image *ClipboardImage) (string, error) {
+	ext, ok := imageMimeTypeExtension(image.MimeType)
+	if !ok {
+		return "", fmt.Errorf("unsupported image type %q", image.MimeType)
+	}
+	sum := sha256.Sum256(image.Bytes)
+	fileName := "clipboard-" + hex.EncodeToString(sum[:]) + ext
+	baseDir := filepath.Join(os.TempDir(), "cyrene-clipboard-images")
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(baseDir, fileName)
+	if err := os.WriteFile(path, image.Bytes, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func isWindowsIgnoredInputRune(value rune) bool {

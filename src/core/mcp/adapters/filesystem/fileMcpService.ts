@@ -4977,42 +4977,47 @@ export class FileMcpService {
       return this.options.ptyFactory;
     }
     this.ptyFactoryPromise ??= (async () => {
-      try {
-        const module = await import("node-pty");
-        return options => {
-          const handle = module.spawn(options.file, options.args, {
-            cwd: options.cwd,
-            env: options.env,
-            name: options.name,
-            cols: options.cols,
-            rows: options.rows,
-          });
-          return {
-            write: data => handle.write(data),
-            kill: signal => handle.kill(signal),
-            onData: listener => {
-              const disposable = handle.onData(listener);
-              return { dispose: () => disposable.dispose() };
-            },
-            onExit: listener => {
-              const disposable = handle.onExit(event =>
-                listener({
-                  exitCode: event.exitCode,
-                  signal: event.signal,
-                })
-              );
-              return { dispose: () => disposable.dispose() };
-            },
-          } satisfies PtyProcess;
-        };
-      } catch (error) {
-        this.ptyFactoryPromise = null;
-        throw new Error(
-          `Persistent shell support requires node-pty. ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
+      const loadCandidates = ["@lydell/node-pty", "node-pty"];
+      let lastError: unknown = null;
+      for (const candidate of loadCandidates) {
+        try {
+          const module = await import(candidate);
+          return options => {
+            const handle = module.spawn(options.file, options.args, {
+              cwd: options.cwd,
+              env: options.env,
+              name: options.name,
+              cols: options.cols,
+              rows: options.rows,
+            });
+            return {
+              write: data => handle.write(data),
+              kill: signal => handle.kill(signal),
+              onData: listener => {
+                const disposable = handle.onData(listener);
+                return { dispose: () => disposable.dispose() };
+              },
+              onExit: listener => {
+                const disposable = handle.onExit((event: { exitCode: number; signal: number }) =>
+                  listener({
+                    exitCode: event.exitCode,
+                    signal: event.signal,
+                  })
+                );
+                return { dispose: () => disposable.dispose() };
+              },
+            } satisfies PtyProcess;
+          };
+        } catch (error) {
+          lastError = error;
+        }
       }
+      this.ptyFactoryPromise = null;
+      throw new Error(
+        `Persistent shell support requires @lydell/node-pty or node-pty. ${
+          lastError instanceof Error ? lastError.message : String(lastError)
+        }`
+      );
     })();
     return await this.ptyFactoryPromise;
   }

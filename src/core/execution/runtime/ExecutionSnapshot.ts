@@ -71,11 +71,14 @@ export type UncertaintyPhase =
 export type UncertaintyState = {
   mode: UncertaintyMode;
   phase: UncertaintyPhase;
+  writeFocus: boolean;
+  mutationStarted: boolean;
   discoverBudgetUsed: number;
   discoverBudgetMax: number;
   analysisSignalCount: number;
   semanticNavigationCount: number;
   nonProgressAutoContinueUsed: boolean;
+  nonProgressAutoContinueCount: number;
   explicitSourceReads: Set<string>;
   explicitTaskPaths: Set<string>;
   verifyRequested: boolean;

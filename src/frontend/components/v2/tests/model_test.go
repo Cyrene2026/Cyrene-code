@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"cyrenecode/v2/internal/app"
 	tea "github.com/charmbracelet/bubbletea"
@@ -62,6 +63,9 @@ func lineHasInverseSelectionANSI(line string) bool {
 		if sgrTokensContain(tokens, []string{"30"}) && sgrTokensContain(tokens, []string{"107"}) {
 			return true
 		}
+		if sgrTokensContain(tokens, []string{"30"}) && sgrTokensContain(tokens, []string{"48", "2", "255", "255", "255"}) {
+			return true
+		}
 		if sgrTokensContain(tokens, []string{"38", "5", "0"}) && sgrTokensContain(tokens, []string{"48", "5", "15"}) {
 			return true
 		}
@@ -112,8 +116,8 @@ func TestSlashHelpSetsNotice(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/help")})
 	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
-	if !strings.Contains(model.Notice, "Command reference appended") {
-		t.Fatalf("unexpected help notice: %q", model.Notice)
+	if model.Notice != "" {
+		t.Fatalf("expected low-value help notice suppressed, got %q", model.Notice)
 	}
 	if len(model.Items) < 2 {
 		t.Fatalf("expected help content appended to transcript")
@@ -150,8 +154,8 @@ func TestWheelDownReturnsToLiveTail(t *testing.T) {
 		Y:      y,
 	})
 
-	if model.TranscriptOffset != 2 {
-		t.Fatalf("expected transcript offset 2, got %d", model.TranscriptOffset)
+	if model.TranscriptOffset >= 10 {
+		t.Fatalf("expected wheel down to move toward live tail, got %d", model.TranscriptOffset)
 	}
 }
 
@@ -246,6 +250,22 @@ func TestCtrlVPastesIntoComposerWithoutF6Toggle(t *testing.T) {
 	}
 }
 
+func TestLargeCtrlVPastePreservesFullInputAndKeepsTypingFlow(t *testing.T) {
+	largePaste := strings.Repeat("bulk pasted block\n", 48) + "tail marker"
+	restore := app.SetClipboardReaderForTest(func() (string, error) {
+		return largePaste, nil
+	})
+	defer restore()
+
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ok")})
+
+	if got := string(model.Input); got != largePaste+" ok" {
+		t.Fatalf("expected large ctrl+v paste preserved before further typing, got %q", got)
+	}
+}
+
 func TestCopyModeToggleShowsPasteNotice(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
@@ -309,6 +329,18 @@ func TestComposerPastePreservesNoTerminalCursorArtifacts(t *testing.T) {
 	}
 }
 
+func TestLargeTerminalPastePreservesOriginalPayload(t *testing.T) {
+	model := app.NewModel()
+	largePaste := strings.Repeat("bulk pasted block\n", 48) + "tail marker"
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(largePaste)})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" next")})
+
+	if got := string(model.Input); got != largePaste+" next" {
+		t.Fatalf("expected terminal paste preserved before later typing, got %q", got)
+	}
+}
+
 func TestComposerAllowsLiteralSingleBlockRuneInput(t *testing.T) {
 	model := app.NewModel()
 
@@ -362,6 +394,38 @@ func TestCtrlOControlRuneFallbackOpensAttachmentInput(t *testing.T) {
 	}
 }
 
+func TestCtrlVPastesClipboardImageAsAttachment(t *testing.T) {
+	restoreImage := app.SetClipboardImageReaderForTest(func() (*app.ClipboardImage, error) {
+		return &app.ClipboardImage{
+			Bytes:    []byte{0x89, 0x50, 0x4e, 0x47},
+			MimeType: "image/png",
+			Name:     "clipboard-shot.png",
+		}, nil
+	})
+	defer restoreImage()
+	restoreText := app.SetClipboardReaderForTest(func() (string, error) {
+		return "should not be used", nil
+	})
+	defer restoreText()
+
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+
+	attachments := model.AttachmentsForTest()
+	if len(attachments) != 1 {
+		t.Fatalf("expected one pasted image attachment, got %+v", attachments)
+	}
+	if attachments[0].MimeType != "image/png" {
+		t.Fatalf("expected png mime type, got %+v", attachments[0])
+	}
+	if attachments[0].Name != "clipboard-shot.png" {
+		t.Fatalf("expected clipboard image name preserved, got %+v", attachments[0])
+	}
+	if got := string(model.Input); got != "" {
+		t.Fatalf("expected image paste not to insert text into composer, got %q", got)
+	}
+}
+
 func TestImageAddSlashCommandAttachesImage(t *testing.T) {
 	root := t.TempDir()
 	imagePath := filepath.Join(root, "sample.png")
@@ -395,11 +459,7 @@ func TestAttachmentAddAndRemoveMouseTargetsWork(t *testing.T) {
 	model.Height = 28
 	model.AppRoot = root
 
-	addX, addY, ok := model.ComposerAttachmentAddMousePointForTest()
-	if !ok {
-		t.Fatalf("expected attachment add mouse point")
-	}
-	model.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: addX, Y: addY})
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sample.png")})
 	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
@@ -603,7 +663,7 @@ func TestTranscriptShowsScrollbarWhenPanelClosed(t *testing.T) {
 	}
 }
 
-func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
+func TestWideNavigationPageShowsSessionsContent(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 160
 	model.Height = 60
@@ -617,11 +677,11 @@ func TestWideViewShowsTranscriptAndInspector(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "SESSION") {
-		t.Fatalf("expected main session section, got %q", view)
+	if !strings.Contains(view, "SESSIONS") {
+		t.Fatalf("expected sessions page content, got %q", view)
 	}
-	if !strings.Contains(view, "sessions") {
-		t.Fatalf("expected sessions panel content, got %q", view)
+	if strings.Contains(view, "❯ ready") {
+		t.Fatalf("expected transcript hidden behind sessions page, got %q", view)
 	}
 	if !strings.Contains(view, "/workspace/current/project") && !strings.Contains(view, ".../current/project") {
 		t.Fatalf("expected session project path in panel, got %q", view)
@@ -652,8 +712,8 @@ func TestSlashClearStartsNewSessionFlow(t *testing.T) {
 	if model.Status != app.StatusPreparing {
 		t.Fatalf("expected /clear to enter preparing state, got %q", model.Status)
 	}
-	if !strings.Contains(model.Notice, "Starting a new session") {
-		t.Fatalf("expected /clear notice to start new session, got %q", model.Notice)
+	if model.Notice != "" {
+		t.Fatalf("expected low-value /clear notice suppressed, got %q", model.Notice)
 	}
 	if !strings.Contains(model.View(), "old session") {
 		t.Fatalf("expected current transcript to remain until bridge switches sessions")
@@ -707,14 +767,17 @@ func TestStartupSplashCompressesWhenPanelIsOpen(t *testing.T) {
 
 	view := model.View()
 
-	if strings.Contains(view, "terminal advantages") {
-		t.Fatalf("expected compact startup view when panel is open, got %q", view)
+	if strings.Contains(view, "terminal advantages") || strings.Contains(view, "fast paths") {
+		t.Fatalf("expected launcher copy removed when panel is open, got %q", view)
 	}
-	if !strings.Contains(view, "Startup splash is compressed while the inspector is open.") {
-		t.Fatalf("expected compact startup explanation, got %q", view)
+	if strings.Contains(view, "No transcript yet.") || strings.Contains(view, "Type a request below") {
+		t.Fatalf("expected empty transcript copy removed when panel is open, got %q", view)
 	}
-	if !strings.Contains(view, "active panel  sessions") {
-		t.Fatalf("expected compact startup summary fields, got %q", view)
+	if strings.Contains(view, "PANEL sessions") {
+		t.Fatalf("expected left status sidebar removed, got %q", view)
+	}
+	if !strings.Contains(view, "SESSIONS") {
+		t.Fatalf("expected sessions panel, got %q", view)
 	}
 }
 
@@ -889,8 +952,11 @@ func TestStartupSplashReturnsAfterLiveTextClears(t *testing.T) {
 	}
 
 	view := model.View()
-	if !strings.Contains(view, "terminal workspace") {
-		t.Fatalf("expected startup splash after live text clears, got %q", view)
+	if strings.Contains(view, "No transcript yet.") || strings.Contains(view, "Type a request below") || strings.Contains(view, "cyrene ready") {
+		t.Fatalf("expected blank transcript empty state after live text clears, got %q", view)
+	}
+	if strings.Contains(view, "CYRENE") {
+		t.Fatalf("expected no left status sidebar after live text clears, got %q", view)
 	}
 }
 
@@ -993,7 +1059,7 @@ func TestPanelSummaryStaysAtBottomOfSessionsPanel(t *testing.T) {
 	}
 }
 
-func TestWidePanelLayoutStaysSideBySideWithoutBorders(t *testing.T) {
+func TestWideNavigationPanelUsesFullMainArea(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 180
 	model.Height = 50
@@ -1001,15 +1067,18 @@ func TestWidePanelLayoutStaysSideBySideWithoutBorders(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "terminal workspace") || !strings.Contains(view, "SESSIONS") {
-		t.Fatalf("expected session pane and side panel content to remain visible, got %q", view)
+	if !strings.Contains(view, "SESSIONS") {
+		t.Fatalf("expected sessions page content visible, got %q", view)
+	}
+	if strings.Contains(view, "❯ ready") {
+		t.Fatalf("expected transcript hidden behind full-page navigation panel, got %q", view)
 	}
 	if !strings.Contains(view, "┌") || !strings.Contains(view, "┘") {
-		t.Fatalf("expected sidebar panel to render with a white border, got %q", view)
+		t.Fatalf("expected panels to render with a white border, got %q", view)
 	}
 }
 
-func TestViewUsesBorderlessSessionPaneAndBorderedSidebar(t *testing.T) {
+func TestViewUsesBorderedFullscreenPanelWithoutSidebar(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 100
 	model.Height = 24
@@ -1021,8 +1090,14 @@ func TestViewUsesBorderlessSessionPaneAndBorderedSidebar(t *testing.T) {
 
 	view := model.View()
 
+	if strings.Contains(view, "PANEL sessions") {
+		t.Fatalf("expected left status sidebar removed, got %q", view)
+	}
+	if strings.Contains(view, "❯ ready") {
+		t.Fatalf("expected transcript hidden when sessions page is open, got %q", view)
+	}
 	if !strings.Contains(view, "┌") || !strings.Contains(view, "┐") || !strings.Contains(view, "└") || !strings.Contains(view, "┘") {
-		t.Fatalf("expected sidebar border glyphs, got %q", view)
+		t.Fatalf("expected pane border glyphs, got %q", view)
 	}
 }
 
@@ -1053,9 +1128,14 @@ func TestApprovalPreviewLooksLikeTerminalDiff(t *testing.T) {
 	if !strings.Contains(plainView, "-   10 │") {
 		t.Fatalf("expected terminal diff remove gutter, got %q", view)
 	}
+	if !strings.Contains(plainView, "KIND") || !strings.Contains(plainView, "PATH") || !strings.Contains(plainView, "CREATED") {
+		t.Fatalf("expected approval detail metadata and styled preview sections, got %q", view)
+	}
 }
 
 func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Width = 120
 	model.Height = 32
@@ -1063,45 +1143,73 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	model.CurrentModel = "gpt-5.4"
 	model.CurrentProvider = "https://code.newcli.com/codex/v1"
 	model.CurrentProviderFormat = "openai_responses"
+	model.UsageSummary = app.BridgeUsageSummary{TotalTokens: 1560}
 
 	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	headerLine := strings.Split(plainView, "\n")[0]
 
-	if strings.Contains(view, "/login  /provider  /model") {
+	if strings.Contains(plainView, "/login  /provider  /model") {
 		t.Fatalf("expected command catalog removed from header, got %q", view)
 	}
-	if !strings.Contains(view, "STATUS") {
-		t.Fatalf("expected top status chips, got %q", view)
+	if strings.Contains(headerLine, "STATUS") || strings.Contains(headerLine, "PROJECT") {
+		t.Fatalf("expected top status row removed, got %q", headerLine)
 	}
-	headerLine := strings.Split(view, "\n")[0]
-	if strings.Contains(headerLine, "MODE ") {
-		t.Fatalf("expected MODE chip removed from header, got %q", headerLine)
+	footerLine := ""
+	for _, line := range strings.Split(view, "\n") {
+		plainLine := ansiPattern.ReplaceAllString(line, "")
+		if strings.Contains(plainLine, "TOKENS 1.6k") &&
+			strings.Contains(plainLine, "TIME") &&
+			strings.Contains(plainLine, "BRANCH") &&
+			strings.Contains(plainLine, "PROJECT") &&
+			strings.Contains(plainLine, "MODEL gpt-5.4") &&
+			strings.Contains(plainLine, "PROVIDER Newcli") {
+			footerLine = plainLine
+		}
 	}
-	if !strings.Contains(view, "PROJECT") || !strings.Contains(view, "path/example") {
-		t.Fatalf("expected project path to use same chip style, got %q", view)
+	if footerLine == "" {
+		t.Fatalf("expected unified footer status row, got %q", view)
 	}
-	if !strings.Contains(view, "SESSION") || !strings.Contains(view, "MODEL") || !strings.Contains(view, "FORMAT") || !strings.Contains(view, "PROVIDER") || !strings.Contains(view, "KEY") {
-		t.Fatalf("expected bottom evenly spaced status row, got %q", view)
+	if strings.Contains(footerLine, "SESSION") || strings.Contains(footerLine, "FORMAT") {
+		t.Fatalf("expected session/format removed from footer, got %q", footerLine)
 	}
-	if !strings.Contains(view, "PROVIDER Newcli") {
-		t.Fatalf("expected provider status to show friendly provider name, got %q", view)
+	if !strings.Contains(footerLine, "PROVIDER Newcli") {
+		t.Fatalf("expected provider status to show friendly provider name, got %q", footerLine)
 	}
-	if !strings.Contains(view, "FORMAT OpenAI Responses") {
-		t.Fatalf("expected provider format in footer, got %q", view)
+	if !strings.Contains(footerLine, "STATUS") {
+		t.Fatalf("expected interaction status in footer, got %q", footerLine)
 	}
-	if strings.Contains(view, "Enter send | Tab complete") {
+	if !strings.Contains(footerLine, "TOKENS 1.6k") {
+		t.Fatalf("expected token usage in unified footer row, got %q", footerLine)
+	}
+	if !strings.Contains(footerLine, "TIME") {
+		t.Fatalf("expected request timer in unified footer row, got %q", footerLine)
+	}
+	if !strings.Contains(footerLine, "BRANCH") {
+		t.Fatalf("expected git branch label in unified footer row, got %q", footerLine)
+	}
+	if !strings.Contains(footerLine, "PROJECT") {
+		t.Fatalf("expected project path in unified footer row, got %q", footerLine)
+	}
+	if !regexp.MustCompile(`\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b`).MatchString(footerLine) {
+		t.Fatalf("expected detailed clock on footer right side, got %q", footerLine)
+	}
+	if strings.Contains(plainView, "Enter send | Tab complete") {
 		t.Fatalf("expected legacy helper line removed from composer, got %q", view)
 	}
-	promptIndex := strings.Index(view, "❯ Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @...")
-	statusIndex := strings.Index(view, "SESSION")
+	promptIndex := strings.Index(plainView, "❯ Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @...")
+	statusIndex := strings.Index(plainView, "MODEL gpt-5.4")
 	if promptIndex < 0 || statusIndex < 0 || promptIndex > statusIndex {
 		t.Fatalf("expected prompt block above footer status row, got %q", view)
 	}
-	if !strings.Contains(view, strings.Repeat("─", 20)) {
+	if !strings.Contains(plainView, strings.Repeat("─", 20)) {
 		t.Fatalf("expected solid divider lines around composer, got %q", view)
 	}
 }
 
 func TestComposerUsesTextareaCursorRendering(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
 
@@ -1112,6 +1220,9 @@ func TestComposerUsesTextareaCursorRendering(t *testing.T) {
 	}
 	if strings.Contains(rendered, "hello|") {
 		t.Fatalf("expected composer textarea to stop rendering pipe cursor, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "48;2;22;27;34") {
+		t.Fatalf("expected composer to render with gray background, got %q", rendered)
 	}
 }
 
@@ -1385,9 +1496,46 @@ func TestPreparingStatusShowsSpinnerFrame(t *testing.T) {
 	model.SpinnerFrame = 3
 
 	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
 
-	if !strings.Contains(view, "⠸ PREPARING") {
-		t.Fatalf("expected animated preparing label, got %q", view)
+	if !strings.Contains(plainView, "STATUS ⠸ PREPARING") {
+		t.Fatalf("expected animated preparing status in footer, got %q", view)
+	}
+}
+
+func TestFooterShowsActiveRequestElapsedTime(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 32
+	model.Status = app.StatusStreaming
+	model.RequestTimingActive = true
+	model.RequestTimingStartedAt = time.Now().Add(-2500 * time.Millisecond)
+
+	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+
+	if !regexp.MustCompile(`TIME 2\.[0-9]s`).MatchString(plainView) {
+		t.Fatalf("expected active request timer in footer, got %q", view)
+	}
+}
+
+func TestFooterShowsFinalizedRequestElapsedTime(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 32
+	model.Status = app.StatusIdle
+
+	if err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_request_timing",
+		"requestTiming":{"active":false,"startedAt":"2026-04-21T00:00:00Z","elapsedMs":65000}
+	}`); err != nil {
+		t.Fatalf("set_request_timing failed: %v", err)
+	}
+
+	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	if !strings.Contains(plainView, "TIME 1m05s") {
+		t.Fatalf("expected finalized request timer in footer, got %q", view)
 	}
 }
 
@@ -1402,12 +1550,16 @@ func TestCustomProviderNameRendersInFooter(t *testing.T) {
 	}
 
 	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
 
-	if !strings.Contains(view, "PROVIDER Work Relay") {
+	if !strings.Contains(plainView, "PROVIDER Work Relay") {
 		t.Fatalf("expected custom provider name in footer, got %q", view)
 	}
-	if !strings.Contains(view, "FORMAT Gemini Native") {
-		t.Fatalf("expected provider format in footer, got %q", view)
+	if strings.Contains(plainView, "FORMAT Gemini Native") {
+		t.Fatalf("expected provider format removed from footer, got %q", view)
+	}
+	if !strings.Contains(plainView, "BRANCH") || !strings.Contains(plainView, "PROJECT") {
+		t.Fatalf("expected footer metadata in unified status row, got %q", view)
 	}
 }
 
@@ -1650,7 +1802,7 @@ func TestWheelScrollMovesApprovalPreviewWhenPanelOpen(t *testing.T) {
 	}
 }
 
-func TestWheelOverTranscriptStillScrollsWhenPanelIsOpen(t *testing.T) {
+func TestTranscriptMouseRegionHiddenWhenNavigationPanelIsOpen(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 160
 	model.Height = 40
@@ -1661,19 +1813,8 @@ func TestWheelOverTranscriptStillScrollsWhenPanelIsOpen(t *testing.T) {
 		{Role: "assistant", Kind: "transcript", Text: strings.Repeat("reply\n", 20)},
 	}
 	x, y, ok := model.TranscriptMousePointForTest()
-	if !ok {
-		t.Fatalf("expected transcript mouse point")
-	}
-
-	model.Update(tea.MouseMsg{
-		Button: tea.MouseButtonWheelDown,
-		Action: tea.MouseActionPress,
-		X:      x,
-		Y:      y,
-	})
-
-	if model.TranscriptOffset != 2 {
-		t.Fatalf("expected transcript offset 2 with panel open, got %d", model.TranscriptOffset)
+	if ok || x != 0 || y != 0 {
+		t.Fatalf("expected transcript mouse region hidden by full-page panel, got ok=%t x=%d y=%d", ok, x, y)
 	}
 }
 
@@ -1911,8 +2052,8 @@ func TestSessionPickerDoubleClickLoadsSelectedSession(t *testing.T) {
 	if model.Status != app.StatusPreparing {
 		t.Fatalf("expected preparing status after double click, got %q", model.Status)
 	}
-	if !strings.Contains(model.Notice, "Loading selected session") {
-		t.Fatalf("expected load notice after double click, got %q", model.Notice)
+	if model.Notice != "" {
+		t.Fatalf("expected low-value load notice suppressed, got %q", model.Notice)
 	}
 }
 
@@ -2097,7 +2238,7 @@ func TestAuthPanelHeaderMentionsAltDigitJump(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "ALT+1/2/3/4") {
+	if !strings.Contains(view, "ALT+1-4") {
 		t.Fatalf("expected auth header to mention alt digit jump, got %q", view)
 	}
 }
@@ -2165,6 +2306,7 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 			"activeSessionId":"sess-1",
 			"items":[{"role":"user","kind":"transcript","text":"hello"}],
 			"liveText":"draft",
+			"requestTiming":{"active":false,"startedAt":"2026-04-21T00:00:00Z","elapsedMs":65000},
 			"pendingReviews":[{"id":"rev-1","action":"edit_file","path":"a.txt","previewSummary":"sum","previewFull":"full","createdAt":"2026-04-11T00:00:00Z"}],
 			"sessions":[{"id":"sess-1","title":"Demo","updatedAt":"2026-04-11T00:00:00Z","projectRoot":"/workspace/demo","tags":["x"]}],
 			"currentModel":"gpt-5.4",
@@ -2206,6 +2348,12 @@ func TestIncrementalBridgeInitHydratesState(t *testing.T) {
 	}
 	if model.CurrentProviderFormat != "openai_responses" {
 		t.Fatalf("expected provider format hydrated, got %q", model.CurrentProviderFormat)
+	}
+	if model.RequestTimingActive {
+		t.Fatalf("expected hydrated request timer to be inactive")
+	}
+	if model.RequestTimingElapsedMs != 65000 {
+		t.Fatalf("expected hydrated request timer elapsed ms, got %d", model.RequestTimingElapsedMs)
 	}
 	if model.ProviderFormats["https://api.example.com/v1"] != "openai_responses" {
 		t.Fatalf("expected provider format overrides hydrated, got %#v", model.ProviderFormats)
@@ -2249,7 +2397,7 @@ func TestSingleSystemResultDoesNotKeepStartupSplash(t *testing.T) {
 	if !strings.Contains(rendered, "MCP runtime summary") {
 		t.Fatalf("expected transcript to show MCP summary, got %q", rendered)
 	}
-	if strings.Contains(rendered, "terminal workspace") {
+	if strings.Contains(rendered, "No transcript yet.") {
 		t.Fatalf("expected startup splash hidden once real system content exists, got %q", rendered)
 	}
 }

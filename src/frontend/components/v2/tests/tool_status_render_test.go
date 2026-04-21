@@ -8,7 +8,30 @@ import (
 	"cyrenecode/v2/internal/app"
 )
 
-func TestToolStatusUsesGrayTranscriptColor(t *testing.T) {
+func TestToolStatusUsesNeutralColorForUnknownActions(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Tool: mystery_tool foo | waiting"},
+	}
+
+	rendered := model.RenderTranscriptForTest(56, 2)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "Tool: mystery_tool foo | waiting") {
+		t.Fatalf("expected tool status text preserved, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;139;147;158") {
+		t.Fatalf("expected neutral ANSI foreground for unknown tool status, got %q", rendered)
+	}
+}
+
+func TestToolStatusUsesExploreColorForListDir(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Status = app.StatusIdle
 	model.Items = []app.Message{
@@ -16,12 +39,38 @@ func TestToolStatusUsesGrayTranscriptColor(t *testing.T) {
 	}
 
 	rendered := model.RenderTranscriptForTest(56, 2)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
 
-	if !strings.Contains(rendered, "Running list_dir | workspace...") {
-		t.Fatalf("expected tool status text preserved, got %q", rendered)
+	if !strings.Contains(plain, "Running list_dir | workspace...") {
+		t.Fatalf("expected list_dir status preserved, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "38;2;139;148;158") {
-		t.Fatalf("expected gray ANSI foreground for tool status, got %q", rendered)
+	if !strings.Contains(rendered, "38;2;227;179;65") {
+		t.Fatalf("expected explore ANSI foreground for list_dir, got %q", rendered)
+	}
+}
+
+func TestToolStatusUsesSemanticColorForCompactedAliases(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Tool error: lspdocumentsymbols src/entrypoints/cli.tsx | LSP config error"},
+	}
+
+	rendered := model.RenderTranscriptForTest(120, 2)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "lspdocumentsymbols") {
+		t.Fatalf("expected compact lsp alias canonicalized, got %q", plain)
+	}
+	if !strings.Contains(plain, "Tool error: lsp_document_symbols src/entrypoints/cli.tsx | LSP config error") {
+		t.Fatalf("expected tool error text preserved, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;94;215;200") {
+		t.Fatalf("expected semantic ANSI foreground for lsp compact alias, got %q", rendered)
 	}
 }
 
@@ -40,7 +89,51 @@ func TestLatestRunningToolStatusShowsSpinner(t *testing.T) {
 	}
 }
 
+func TestToolStatusNormalizesCompactedToolNamesForDisplay(t *testing.T) {
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Running outlinefile | agent/promptbuilder.py..."},
+		{Role: "system", Kind: "tool_status", Text: "Tool: readrange agent/promptbuilder.py | range content hidden"},
+		{Role: "system", Kind: "tool_status", Text: strings.Join([]string{
+			"Tool: readrange agent/context.py | range content hidden",
+			"Tool: outlinefile cli.py | Outline for cli.py",
+		}, "\n")},
+		{Role: "system", Kind: "system_hint", Text: "Tool: readrange agent/promptbuilder.py | range content hidden"},
+		{Role: "assistant", Kind: "transcript", Text: strings.Join([]string{
+			"❯ Tool: outlinefile agent/promptbuilder.py | Outline for agent/prompt_builder.py",
+			"❯ Tool: readrange agent/promptbuilder.py | range content hidden",
+			"Tool:readrange cli.py | range content hidden",
+		}, "\n")},
+	}
+
+	rendered := model.RenderTranscriptForTest(112, 12)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "outlinefile") || strings.Contains(plain, "readrange") {
+		t.Fatalf("expected compact tool aliases canonicalized, got %q", plain)
+	}
+	if !strings.Contains(plain, "Running outline_file | agent/promptbuilder.py...") {
+		t.Fatalf("expected running outline_file display, got %q", plain)
+	}
+	if !strings.Contains(plain, "Tool: read_range agent/promptbuilder.py | range content hidden") {
+		t.Fatalf("expected read_range tool display, got %q", plain)
+	}
+	if !strings.Contains(plain, "Tool: read_range agent/context.py | range content hidden") ||
+		!strings.Contains(plain, "Tool: outline_file cli.py | Outline for cli.py") {
+		t.Fatalf("expected every tool line in a multi-line message canonicalized, got %q", plain)
+	}
+	if !strings.Contains(plain, "❯ Tool: outline_file agent/promptbuilder.py | Outline for agent/prompt_builder.py") ||
+		!strings.Contains(plain, "❯ Tool: read_range agent/promptbuilder.py | range content hidden") ||
+		!strings.Contains(plain, "Tool: read_range cli.py | range content hidden") {
+		t.Fatalf("expected prompted and compact tool lines canonicalized, got %q", plain)
+	}
+}
+
 func TestToolStatusDiffStatsRendersAsColoredSummary(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Status = app.StatusIdle
 	model.Items = []app.Message{
@@ -66,6 +159,8 @@ func TestToolStatusDiffStatsRendersAsColoredSummary(t *testing.T) {
 }
 
 func TestToolStatusConfirmedWriteFileCollapsesToPathAndDiffOnly(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Status = app.StatusIdle
 	model.Items = []app.Message{
@@ -107,9 +202,14 @@ func TestToolStatusConfirmedWriteFileCollapsesToPathAndDiffOnly(t *testing.T) {
 			t.Fatalf("expected %q to be hidden, got %q", hidden, plain)
 		}
 	}
+	if !strings.Contains(rendered, "38;2;126;231;135") {
+		t.Fatalf("expected mutation ANSI foreground for write_file summary, got %q", rendered)
+	}
 }
 
 func TestToolStatusConfirmedWriteFileShowsDiffPreviewWhenAvailable(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Status = app.StatusIdle
 	model.Items = []app.Message{
@@ -170,6 +270,8 @@ func TestToolStatusConfirmedWriteFileShowsDiffPreviewWhenAvailable(t *testing.T)
 }
 
 func TestToolStatusConfirmedWriteFileShowsMaskedDiffPreviewWhenAvailable(t *testing.T) {
+	enableColorRenderingForTest(t)
+
 	model := app.NewModel()
 	model.Status = app.StatusIdle
 	model.Items = []app.Message{

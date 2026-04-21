@@ -1858,7 +1858,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[4]).toContain("Broad discovery budget exhausted:");
   });
 
-  test("pauses after consecutive search rounds without new evidence", async () => {
+  test("does not auto-pause after consecutive search rounds without new evidence", async () => {
     const transport = createRoundSequenceTransport([
       { toolName: "file", input: { action: "list_dir", path: "pkg-a" } },
       { toolName: "file", input: { action: "list_dir", path: "pkg-b" } },
@@ -1887,9 +1887,9 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
-    expect(toolCallCount).toBe(3);
-    expect(textDeltas.join("")).toContain("[execution paused]");
-    expect(textDeltas.join("")).toContain(
+    expect(toolCallCount).toBe(4);
+    expect(textDeltas.join("")).not.toContain("[execution paused]");
+    expect(textDeltas.join("")).not.toContain(
       "No new file mutation, high-value evidence, or phase progression"
     );
   });
@@ -1985,7 +1985,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[0]).toContain("Original user task:");
   });
 
-  test("single-file tasks do not get the simple multi-file execution memo", async () => {
+  test("single-file write tasks get a write-focused execution memo without multi-file wording", async () => {
     const { transport, prompts } = createPromptCaptureTransport({
       toolName: "file",
       input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
@@ -2004,7 +2004,11 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
-    expect(prompts[0]).not.toContain("Execution memo:");
+    expect(prompts[0]).toContain("Execution memo:");
+    expect(prompts[0]).toContain("explicit code-change task");
+    expect(prompts[0]).toContain("focused write/edit task");
+    expect(prompts[0]).toContain("explicit task paths: src/app.ts");
+    expect(prompts[0]).not.toContain("simple multi-file task");
   });
 
   test("injects a project analysis memo into the first round for repo analysis tasks", async () => {
@@ -2142,6 +2146,49 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[1]).toContain("broad discovery budget: 0/4");
   });
 
+  test("single-file write focus blocks a second targeted read before any mutation", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/app.ts" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_file", path: "src/app.ts" },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] read_file src/app.ts\nexport const current = true;\n",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_file"]);
+    expect(prompts[1]).toContain("write focus: pre_mutation");
+    expect(prompts[1]).toContain(
+      "use at most one targeted source read, then move directly to the next write/edit step"
+    );
+    expect(prompts[2]).toContain("[tool skipped] read_file src/app.ts");
+    expect(prompts[2]).toContain("Reuse the previous read result or move to the next concrete file");
+  });
+
   test("repeated broad discovery collapses early and blocks when a split task still lacks concrete facts", async () => {
     const { transport } = createPromptCaptureRoundSequenceTransport([
       { toolName: "file", input: { action: "list_dir", path: "." } },
@@ -2216,7 +2263,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
       "write remaining files directly; do not reread completed files or re-open broad discovery"
     );
     expect(prompts[2]).toContain("[tool skipped] search_text src");
-    expect(prompts[2]).toContain("remaining files are already known");
+    expect(prompts[2]).toContain("a confirmed code mutation already exists");
   });
 
   test("short non-progress chatter auto-continues once and drops the chatter from visible output", async () => {
@@ -2254,6 +2301,52 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[2]).toContain(
       "The previous reply narrated progress without completing the remaining files."
     );
+  });
+
+  test("single-file write focus auto-continues one short narration before any mutation", async () => {
+    const { transport, prompts } = createPromptCaptureScriptedTransport([
+      [{ type: "text_delta", text: "我来继续修改这个文件" }],
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "done" }],
+    ]);
+    const toolCalls: string[] = [];
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] write_file src/app.ts\nWrote file: src/app.ts\n[confirmed file mutation] write_file src/app.ts",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(textDeltas.join("")).toBe("done");
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain(
+      "The previous reply narrated progress before taking a concrete code step."
+    );
+    expect(prompts[1]).toContain("Do not narrate. Use the next concrete read/edit/write action now.");
   });
 
   test("a second short non-progress chatter stops with an explicit remaining-files pause message", async () => {

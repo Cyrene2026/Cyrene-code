@@ -207,12 +207,19 @@ type BridgeManagedMcpServer = {
 
 type BridgeExecutionPlan = SessionExecutionPlan;
 
+type BridgeRequestTiming = {
+  active: boolean;
+  startedAt: string;
+  elapsedMs: number;
+};
+
 type BridgeSnapshot = {
   appRoot: string;
   status: BridgeStatus;
   activeSessionId: string | null;
   items: BridgeItem[];
   liveText: string;
+  requestTiming: BridgeRequestTiming;
   executionPlan: BridgeExecutionPlan | null;
   pendingReviews: BridgeReview[];
   sessions: BridgeSession[];
@@ -236,6 +243,7 @@ type BridgeSnapshot = {
 type BridgeEvent =
   | { type: "init"; snapshot: BridgeSnapshot }
   | { type: "set_status"; status: BridgeStatus }
+  | { type: "set_request_timing"; requestTiming: BridgeRequestTiming }
   | { type: "set_live_text"; liveText: string }
   | { type: "set_execution_plan"; executionPlan: BridgeExecutionPlan | null }
   | { type: "append_items"; items: BridgeItem[] }
@@ -296,6 +304,10 @@ type ActiveStreamingTurn = {
   startedAt: string;
   assistantBufferRef: { current: string };
   assistantStreamRef: { committedVisibleText: string };
+};
+
+type RequestTimingState = BridgeRequestTiming & {
+  startedAtMs: number;
 };
 
 const DEFAULT_EMPTY_STATE: BridgeItem = {
@@ -542,6 +554,12 @@ export class BubbleTeaBridge {
   private shutdownPromise: Promise<void> | null = null;
   private isShuttingDown = false;
   private activeStreamingTurn: ActiveStreamingTurn | null = null;
+  private requestTiming: RequestTimingState = {
+    active: false,
+    startedAt: "",
+    startedAtMs: 0,
+    elapsedMs: 0,
+  };
 
   enqueue(command: BridgeCommand) {
     if (command.type === "shutdown") {
@@ -943,6 +961,7 @@ export class BubbleTeaBridge {
       activeSessionId: this.activeSessionId,
       items: this.items,
       liveText: this.liveText,
+      requestTiming: this.serializeRequestTiming(),
       executionPlan: this.executionPlan,
       pendingReviews: this.pendingReviews,
       sessions: this.sessions,
@@ -1020,6 +1039,13 @@ export class BubbleTeaBridge {
     });
   }
 
+  private emitRequestTiming() {
+    this.emit({
+      type: "set_request_timing",
+      requestTiming: this.serializeRequestTiming(),
+    });
+  }
+
   private emitLiveText() {
     this.emit({
       type: "set_live_text",
@@ -1082,6 +1108,44 @@ export class BubbleTeaBridge {
       type: "set_usage_summary",
       usageSummary: this.currentUsageSummary(),
     });
+  }
+
+  private currentRequestElapsedMs(nowMs = Date.now()) {
+    if (!this.requestTiming.active || this.requestTiming.startedAtMs <= 0) {
+      return Math.max(0, this.requestTiming.elapsedMs);
+    }
+    return Math.max(0, nowMs - this.requestTiming.startedAtMs, this.requestTiming.elapsedMs);
+  }
+
+  private serializeRequestTiming(): BridgeRequestTiming {
+    return {
+      active: this.requestTiming.active,
+      startedAt: this.requestTiming.startedAt,
+      elapsedMs: this.currentRequestElapsedMs(),
+    };
+  }
+
+  private startRequestTiming(startedAt = new Date().toISOString()) {
+    const startedAtMs = Date.parse(startedAt);
+    this.requestTiming = {
+      active: true,
+      startedAt,
+      startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : Date.now(),
+      elapsedMs: 0,
+    };
+    this.emitRequestTiming();
+  }
+
+  private finishRequestTiming() {
+    if (!this.requestTiming.active) {
+      return;
+    }
+    this.requestTiming = {
+      ...this.requestTiming,
+      active: false,
+      elapsedMs: this.currentRequestElapsedMs(),
+    };
+    this.emitRequestTiming();
   }
 
   private currentUsageSummary(): BridgeUsageSummary {
@@ -2713,6 +2777,7 @@ export class BubbleTeaBridge {
     );
 
     const startedAt = new Date().toISOString();
+    this.startRequestTiming(startedAt);
     await this.appendUserMessage(
       session.id,
       {
@@ -2916,6 +2981,7 @@ export class BubbleTeaBridge {
             assistantStreamRef,
           });
           void this.flushInFlightSnapshot(session.id).catch(() => undefined);
+          this.finishRequestTiming();
           this.status = "error";
           void this.pushPersistentSessionItem(session.id, {
             role: "system",
@@ -2936,6 +3002,7 @@ export class BubbleTeaBridge {
         result,
       });
     } catch (error) {
+      this.finishRequestTiming();
       this.discardInFlightSnapshot(session.id);
       await this.waitForSessionMutations(session.id);
       await this.updateInFlightTurn(session.id, null);
@@ -2963,6 +3030,7 @@ export class BubbleTeaBridge {
     result: RunQuerySessionResult | void;
   }) {
     if (!input.result || input.result.status === "completed") {
+      this.finishRequestTiming();
       await this.finalizeAssistant(
         input.sessionId,
         input.assistantBufferRef.current,
@@ -2971,6 +3039,7 @@ export class BubbleTeaBridge {
       return;
     }
 
+    this.finishRequestTiming();
     this.suspended = {
       sessionId: input.sessionId,
       userText: input.userText,
@@ -3216,7 +3285,6 @@ export class BubbleTeaBridge {
         pendingDigest: nextPendingDigest,
         lastStateUpdate: diagnostic,
       });
-      await this.maybeSuggestSkillCreation(sessionId, nextSummary);
     }
 
     await this.updateSessionPendingChoice(sessionId, nextPendingChoice);
@@ -3227,6 +3295,7 @@ export class BubbleTeaBridge {
     assistantText: string,
     committedVisibleText = ""
   ) {
+    this.finishRequestTiming();
     this.liveText = "";
     this.suspended = null;
     await this.applyAssistantStateUpdate(sessionId, assistantText, committedVisibleText);
@@ -3248,6 +3317,7 @@ export class BubbleTeaBridge {
       return;
     }
 
+    this.finishRequestTiming();
     await this.applyAssistantStateUpdate(
       suspended.sessionId,
       suspended.assistantBufferRef.current,
@@ -3304,6 +3374,7 @@ export class BubbleTeaBridge {
     }
 
     this.suspended = null;
+    this.startRequestTiming();
     const nextResult = await suspended.resume({
       message: result.message,
       metadata: result.metadata,

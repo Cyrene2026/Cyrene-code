@@ -108,3 +108,15 @@ func SetClipboardReaderForTest(reader func() (string, error)) func() {
 		readClipboardText = previous
 	}
 }
+
+func SetClipboardImageReaderForTest(reader func() (*ClipboardImage, error)) func() {
+	previous := readClipboardImage
+	if reader == nil {
+		readClipboardImage = defaultClipboardImageReader
+	} else {
+		readClipboardImage = reader
+	}
+	return func() {
+		readClipboardImage = previous
+	}
+}

@@ -109,12 +109,19 @@ type BridgeExecutionPlan struct {
 	Steps           []BridgePlanStep `json:"steps"`
 }
 
+type BridgeRequestTiming struct {
+	Active    bool   `json:"active"`
+	StartedAt string `json:"startedAt"`
+	ElapsedMs int64  `json:"elapsedMs"`
+}
+
 type bridgeSnapshot struct {
 	AppRoot                  string                       `json:"appRoot"`
 	Status                   string                       `json:"status"`
 	ActiveSessionID          string                       `json:"activeSessionId"`
 	Items                    []Message                    `json:"items"`
 	LiveText                 string                       `json:"liveText"`
+	RequestTiming            BridgeRequestTiming          `json:"requestTiming"`
 	ExecutionPlan            *BridgeExecutionPlan         `json:"executionPlan"`
 	PendingReviews           []BridgeReview               `json:"pendingReviews"`
 	Sessions                 []BridgeSession              `json:"sessions"`
@@ -141,6 +148,7 @@ type bridgeEvent struct {
 	Message                  string                       `json:"message,omitempty"`
 	Status                   string                       `json:"status,omitempty"`
 	LiveText                 string                       `json:"liveText,omitempty"`
+	RequestTiming            BridgeRequestTiming          `json:"requestTiming,omitempty"`
 	ExecutionPlan            *BridgeExecutionPlan         `json:"executionPlan,omitempty"`
 	Items                    []Message                    `json:"items,omitempty"`
 	Sessions                 []BridgeSession              `json:"sessions,omitempty"`

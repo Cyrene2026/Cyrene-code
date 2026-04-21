@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
@@ -15,8 +16,6 @@ import (
 
 var (
 	rootStyle = lipgloss.NewStyle()
-
-	statusBarColor = lipgloss.Color("#FFF")
 
 	startupLogoTrueColorStart = rgbColor{R: 0x2F, G: 0x81, B: 0xFF}
 	startupLogoTrueColorEnd   = rgbColor{R: 0xA8, G: 0x55, B: 0xF7}
@@ -37,6 +36,8 @@ var (
 			Padding(0, 1)
 
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+	subtitleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#C9D1D9"))
+	minorTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#8B949E"))
 	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	userStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
@@ -52,7 +53,17 @@ var (
 	sectionStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
 	codeBlockStyle  = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E6EDF3")).
-			Padding(0, 0)
+			Background(lipgloss.Color("#0D1117")).
+			ColorWhitespace(true)
+	codeBlockHeaderStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#D1E9FF")).
+				Background(lipgloss.Color("#172235")).
+				Bold(true)
+	codeBlockBorderStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#3B82F6"))
+	codeBlockLineNoStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#6E7681")).
+				Background(lipgloss.Color("#0D1117"))
 	inlineCodeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Bold(true)
@@ -64,6 +75,10 @@ var (
 	codeTypeStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
 	codeBuiltinStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657"))
 	codePlainStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
+	linkStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF")).Underline(true)
+	ruleStyle           = dimStyle.Copy()
+	taskDoneStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
+	taskTodoStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF")).Bold(true)
 	diffGutterBaseStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#24292F")).
 				Background(lipgloss.Color("#FFFFFF")).
@@ -87,16 +102,41 @@ var (
 			Bold(true)
 
 	inputBoxStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E6EDF3")).
+			Background(lipgloss.Color("#161B22")).
+			ColorWhitespace(true).
 			Padding(0, 1)
+	composerPlaceholderStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#7D8590")).
+					Background(lipgloss.Color("#161B22")).
+					Italic(true)
+	composerContinuationStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#8B949E")).
+					Background(lipgloss.Color("#161B22"))
+	composerDividerStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#30363D"))
 	compositionStyle = lipgloss.NewStyle().
 				Underline(true).
-				Foreground(lipgloss.Color("#E6EDF3"))
+				Foreground(lipgloss.Color("#D2A8FF")).
+				Background(lipgloss.Color("#161B22"))
 	attachmentChipStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#E6EDF3")).
 				Background(lipgloss.Color("#1F2A37")).
 				ColorWhitespace(true)
 	attachmentAddStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("14")).
+				Bold(true)
+	collapsedPasteStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#58A6FF")).
+				Background(lipgloss.Color("#17324D")).
+				Bold(true)
+	toolPrefixStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B949E")).
+			Bold(true)
+	toolDetailStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#AAB6C3"))
+	toolErrorPrefixStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFA198")).
 				Bold(true)
 
 	focusedInputBoxStyle = inputBoxStyle.Copy()
@@ -115,6 +155,27 @@ var (
 				Bold(true).
 				Foreground(lipgloss.Color("0")).
 				Background(lipgloss.Color("#FFF"))
+	footerStatusLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#8B949E")).
+				Bold(true)
+	footerTokenValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
+	footerBranchValueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#F2CC60"))
+	footerProjectValueStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF"))
+	footerModelValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
+	footerProviderValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#56D4DD"))
+	footerDurationValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657")).Bold(true)
+	footerStatusValueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
+	footerTimeStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAB6C3"))
+	pageHeroStyle            = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#D1E9FF")).
+					Background(lipgloss.Color("#172235")).
+					Bold(true)
+	pageHintStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B949E"))
+	pageSelectedBannerStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#0D1117")).
+				Background(lipgloss.Color("#7EE787")).
+				Bold(true)
 
 	cursorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	statusKeyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -130,6 +191,15 @@ var (
 				Background(lipgloss.Color("15")).
 				Foreground(lipgloss.Color("0")).
 				Bold(true)
+	approvalMetaKeyStyle      = dimStyle.Copy().Bold(true)
+	approvalMetaValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
+	approvalPathStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF")).Bold(true)
+	approvalDetailBannerStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#0D1117")).
+					Background(lipgloss.Color("#E6EDF3")).
+					Bold(true).
+					Padding(0, 1)
+	approvalSectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A5D6FF")).Bold(true)
 )
 
 var startupShadowLogoLines = []string{
@@ -154,21 +224,91 @@ var (
 	confirmedMutationLinePattern = regexp.MustCompile(`^\[confirmed file mutation\]\s+(create_file|write_file|edit_file|apply_patch)\s+(.+)$`)
 	leakedToolActionJSONPattern  = regexp.MustCompile(`"action"\s*:\s*"(read_file|read_files|read_range|read_json|read_yaml|list_dir|create_dir|create_file|write_file|edit_file|apply_patch|applypatch|delete_file|stat_path|stat_paths|outline_file|find_files|find_symbol|find_references|search_text|search_text_context|copy_path|move_path|git_status|git_diff|git_log|git_show|git_blame|ts_hover|ts_definition|ts_references|ts_diagnostics|ts_prepare_rename|lsp_hover|lsp_definition|lsp_implementation|lsp_type_definition|lsp_references|lsp_workspace_symbols|lsp_document_symbols|lsp_diagnostics|lsp_prepare_rename|lsp_rename|lsp_code_actions|lsp_format_document|run_command|run_shell|open_shell|write_shell|read_shell|shell_status|interrupt_shell|close_shell)"`)
 	leakedFunctionCallPattern    = regexp.MustCompile(`(?:to=functions\.[a-z_]+|recipient_name"\s*:\s*"functions\.[a-z_]+")`)
-	orderedListPattern           = regexp.MustCompile(`^(\d+)[.)]\s+(.*)$`)
+	orderedListPattern           = regexp.MustCompile(`^([ \t]*)(\d+)[.)]\s+(.*)$`)
+	unorderedListPattern         = regexp.MustCompile(`^([ \t]*)([-*+])\s+(.*)$`)
+	taskListPattern              = regexp.MustCompile(`^\[( |x|X)\]\s+(.*)$`)
+	markdownRulePattern          = regexp.MustCompile(`^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$`)
+	setextHeadingPattern         = regexp.MustCompile(`^\s{0,3}(=+|-+)\s*$`)
 	kvPattern                    = regexp.MustCompile(`^([a-z][a-z0-9_ ]*):\s*(.*)$`)
 	headerKVPattern              = regexp.MustCompile(`^[a-z_]+=.*$`)
+	composerPasteSummaryPattern  = regexp.MustCompile(`\[chars \d+ \| \d+ bytes\]`)
 )
 
 const (
-	toolStatusANSIStart     = "\x1b[38;2;139;148;158m"
-	toolStatusANSIEnd       = "\x1b[0m"
-	diffAddSignANSI         = "\x1b[38;2;126;231;135m"
-	diffRemoveSignANSI      = "\x1b[38;2;255;161;152m"
-	diffAddANSIStart        = "\x1b[38;2;126;231;135;48;2;16;63;43m"
-	diffRemoveANSIStart     = "\x1b[38;2;255;161;152;48;2;93;30;39m"
-	diffANSIEnd             = "\x1b[0m"
-	composerVisibleRowLimit = 6
+	toolStatusANSIStart                     = "\x1b[38;2;139;148;158m"
+	toolStatusExploreANSIStart              = "\x1b[38;2;227;179;65m"
+	toolStatusReadANSIStart                 = "\x1b[38;2;88;166;255m"
+	toolStatusSemanticANSIStart             = "\x1b[38;2;94;215;200m"
+	toolStatusMutationANSIStart             = "\x1b[38;2;126;231;135m"
+	toolStatusGitANSIStart                  = "\x1b[38;2;255;166;87m"
+	toolStatusShellANSIStart                = "\x1b[38;2;238;196;91m"
+	toolStatusANSIEnd                       = "\x1b[0m"
+	diffAddSignANSI                         = "\x1b[38;2;126;231;135m"
+	diffRemoveSignANSI                      = "\x1b[38;2;255;161;152m"
+	diffAddANSIStart                        = "\x1b[38;2;126;231;135;48;2;16;63;43m"
+	diffRemoveANSIStart                     = "\x1b[38;2;255;161;152;48;2;93;30;39m"
+	diffANSIEnd                             = "\x1b[0m"
+	composerVisibleRowLimit                 = 6
+	composerCollapsedPasteCharThreshold     = 280
+	composerCollapsedPasteTailChars         = 96
+	composerCollapsedPasteMinCollapsedChars = 120
+	modelCustomHint                         = "custom: press c or type /model custom <id>"
 )
+
+var canonicalToolStatusActionLookup = buildCanonicalToolStatusActionLookup([]string{
+	"list_dir",
+	"create_dir",
+	"stat_path",
+	"stat_paths",
+	"find_files",
+	"copy_path",
+	"move_path",
+	"read_file",
+	"read_files",
+	"read_range",
+	"read_json",
+	"read_yaml",
+	"outline_file",
+	"find_symbol",
+	"find_references",
+	"search_text",
+	"search_text_context",
+	"create_file",
+	"write_file",
+	"edit_file",
+	"apply_patch",
+	"delete_file",
+	"git_status",
+	"git_diff",
+	"git_log",
+	"git_show",
+	"git_blame",
+	"ts_hover",
+	"ts_definition",
+	"ts_references",
+	"ts_diagnostics",
+	"ts_prepare_rename",
+	"lsp_hover",
+	"lsp_definition",
+	"lsp_implementation",
+	"lsp_type_definition",
+	"lsp_references",
+	"lsp_workspace_symbols",
+	"lsp_document_symbols",
+	"lsp_diagnostics",
+	"lsp_prepare_rename",
+	"lsp_rename",
+	"lsp_code_actions",
+	"lsp_format_document",
+	"run_command",
+	"run_shell",
+	"open_shell",
+	"write_shell",
+	"read_shell",
+	"shell_status",
+	"interrupt_shell",
+	"close_shell",
+})
 
 func (m *Model) View() string {
 	width := maxInt(50, m.Width)
@@ -178,8 +318,8 @@ func (m *Model) View() string {
 
 	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
-	topComposerDivider := renderComposerDivider(contentWidth)
-	bottomComposerDivider := renderComposerDivider(contentWidth)
+	topComposerDivider := renderComposerTopDivider(contentWidth)
+	bottomComposerDivider := renderComposerBottomDivider(contentWidth)
 	footer := m.renderBottomStatusBar(contentWidth)
 	fixedHeight := lipgloss.Height(header) +
 		lipgloss.Height(composer) +
@@ -198,7 +338,7 @@ func (m *Model) View() string {
 		bottomComposerDivider,
 		footer,
 	}
-	content := strings.Join(parts, "\n")
+	content := joinNonEmptyLines(parts...)
 	return rootStyle.Width(width).Height(height).Render(
 		appShellStyle.Width(contentWidth).Render(content),
 	)
@@ -209,6 +349,10 @@ func (m *Model) renderMainArea(width, height int) string {
 
 	if m.ActivePanel == PanelNone {
 		return m.renderSessionPane(width, contentHeight, true)
+	}
+
+	if usesPagePanelLayout(m.ActivePanel) {
+		return m.renderActivePanel(width, contentHeight)
 	}
 
 	if width >= 96 {
@@ -246,6 +390,9 @@ func (m *Model) widePanelWidth(totalWidth int) int {
 	} else if m.ActivePanel == PanelPlans {
 		minPanelWidth = 46
 		desiredWidth = totalWidth * 2 / 5
+	} else if m.ActivePanel == PanelProviders {
+		minPanelWidth = 50
+		desiredWidth = totalWidth / 2
 	}
 
 	maxPanelWidth := totalWidth - minSessionWidth - 1
@@ -263,22 +410,36 @@ func (m *Model) widePanelWidth(totalWidth int) int {
 }
 
 func (m *Model) renderTopStatusBar(width int) string {
-	return renderStatusColumns(width,
-		statusColumn{Label: "STATUS", Value: m.renderAnimatedStatusLabel(), Color: statusBarColor},
-		statusColumn{Label: "PANEL", Value: emptyFallback(string(m.ActivePanel), "none"), Color: statusBarColor},
-		statusColumn{Label: "PENDING", Value: fmt.Sprintf("%d", len(m.PendingReviews)), Color: statusBarColor},
-		statusColumn{Label: "PROJECT", Value: formatProjectPathLabel(m.AppRoot, statusValueWidth(width, 4, "PROJECT")), Color: statusBarColor},
-	)
+	return ""
 }
 
 func (m *Model) renderBottomStatusBar(width int) string {
-	return renderStatusColumns(width,
-		statusColumn{Label: "SESSION", Value: emptyFallback(m.ActiveSessionID, "none"), Color: statusBarColor},
-		statusColumn{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), Color: statusBarColor},
-		statusColumn{Label: "FORMAT", Value: formatTransportFormatLabel(m.currentProviderFormat()), Color: statusBarColor},
-		statusColumn{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), Color: statusBarColor},
-		statusColumn{Label: "KEY", Value: formatKeySourceLabel(m.CurrentProviderKeySource), Color: statusBarColor},
-	)
+	now := time.Now()
+	items := []footerStatusItem{
+		{Label: "TOKENS", Value: formatUsageCompact(m.UsageSummary), ValueStyle: footerTokenValueStyle},
+		{Label: "TIME", Value: m.renderRequestElapsedLabel(now), ValueStyle: footerDurationValueStyle},
+		{Label: "BRANCH", Value: emptyFallback(m.GitBranch, "none"), ValueStyle: footerBranchValueStyle},
+		{Label: "PROJECT", Value: formatProjectPathLabel(m.AppRoot, maxInt(12, width/8)), ValueStyle: footerProjectValueStyle},
+		{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), ValueStyle: footerModelValueStyle},
+		{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), ValueStyle: footerProviderValueStyle},
+		{Label: "STATUS", Value: m.renderAnimatedStatusLabel(), ValueStyle: footerStatusValueStyle},
+	}
+	return renderSegmentedStatusBar(width, items, now.Format("2006-01-02 15:04:05"))
+}
+
+func (m *Model) renderRequestElapsedLabel(now time.Time) string {
+	hasTiming := m.RequestTimingActive || !m.RequestTimingStartedAt.IsZero() || m.RequestTimingElapsedMs > 0
+	if !hasTiming {
+		return "-"
+	}
+	elapsedMs := m.RequestTimingElapsedMs
+	if m.RequestTimingActive && !m.RequestTimingStartedAt.IsZero() {
+		activeElapsedMs := now.Sub(m.RequestTimingStartedAt).Milliseconds()
+		if activeElapsedMs > elapsedMs {
+			elapsedMs = activeElapsedMs
+		}
+	}
+	return formatRequestElapsed(elapsedMs)
 }
 
 func (m *Model) renderAnimatedStatusLabel() string {
@@ -293,6 +454,12 @@ type statusColumn struct {
 	Label string
 	Value string
 	Color lipgloss.Color
+}
+
+type footerStatusItem struct {
+	Label      string
+	Value      string
+	ValueStyle lipgloss.Style
 }
 
 type rgbColor struct {
@@ -412,6 +579,161 @@ func renderStatusColumns(width int, columns ...statusColumn) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
 }
 
+func renderCompactStatusBar(width int, left, right string, color lipgloss.Color) string {
+	if width <= 0 {
+		return ""
+	}
+	right = strings.TrimSpace(right)
+	if right == "" {
+		return lipgloss.NewStyle().
+			Width(width).
+			MaxWidth(width).
+			Align(lipgloss.Left).
+			Background(color).
+			Foreground(lipgloss.Color("0")).
+			Bold(true).
+			Render(truncatePlain(strings.TrimSpace(left), width))
+	}
+	rightWidth := lipgloss.Width(right)
+	if rightWidth >= width {
+		return lipgloss.NewStyle().
+			Width(width).
+			MaxWidth(width).
+			Align(lipgloss.Left).
+			Background(color).
+			Foreground(lipgloss.Color("0")).
+			Bold(true).
+			Render(truncatePlain(right, width))
+	}
+
+	leftWidth := maxInt(1, width-rightWidth-1)
+	leftText := truncatePlain(strings.TrimSpace(left), leftWidth)
+	leftCell := lipgloss.NewStyle().
+		Width(leftWidth).
+		MaxWidth(leftWidth).
+		Align(lipgloss.Left).
+		Background(color).
+		Foreground(lipgloss.Color("0")).
+		Bold(true).
+		Render(leftText)
+	rightCell := lipgloss.NewStyle().
+		Width(width - leftWidth).
+		MaxWidth(width - leftWidth).
+		Align(lipgloss.Right).
+		Background(color).
+		Foreground(lipgloss.Color("0")).
+		Bold(true).
+		Render(right)
+	return leftCell + rightCell
+}
+
+func renderSegmentedStatusBar(width int, items []footerStatusItem, right string) string {
+	if width <= 0 {
+		return ""
+	}
+
+	left := renderFooterStatusItems(items, footerStatusGap(width))
+	right = footerTimeStyle.Render(strings.TrimSpace(right))
+	rightWidth := ansi.StringWidth(right)
+	if rightWidth >= width {
+		return ansi.Truncate(right, width, "")
+	}
+
+	gapWidth := footerRightGap(width)
+	leftWidth := maxInt(1, width-rightWidth-gapWidth)
+	left = ansi.Truncate(left, leftWidth, "~")
+	padding := strings.Repeat(" ", maxInt(gapWidth, width-ansi.StringWidth(left)-rightWidth))
+	return left + padding + right
+}
+
+func renderFooterStatusItems(items []footerStatusItem, gap string) string {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		label := strings.ToUpper(strings.TrimSpace(item.Label))
+		value := strings.TrimSpace(item.Value)
+		if label == "" || value == "" {
+			continue
+		}
+		valueStyle := item.ValueStyle
+		parts = append(parts, footerStatusLabelStyle.Render(label)+" "+valueStyle.Render(value))
+	}
+	return strings.Join(parts, gap)
+}
+
+func footerStatusGap(width int) string {
+	switch {
+	case width >= 180:
+		return "    "
+	case width >= 140:
+		return "   "
+	default:
+		return "  "
+	}
+}
+
+func footerRightGap(width int) int {
+	if width >= 140 {
+		return 4
+	}
+	return 2
+}
+
+func formatUsageCompact(summary BridgeUsageSummary) string {
+	total := maxInt(0, summary.TotalTokens)
+	switch {
+	case total >= 1_000_000:
+		return fmt.Sprintf("%.1fm", float64(total)/1_000_000)
+	case total >= 1_000:
+		value := float64(total) / 1_000
+		if total%1_000 == 0 {
+			return fmt.Sprintf("%.0fk", value)
+		}
+		return fmt.Sprintf("%.1fk", value)
+	default:
+		return fmt.Sprintf("%d", total)
+	}
+}
+
+func formatRequestElapsed(elapsedMs int64) string {
+	if elapsedMs < 0 {
+		elapsedMs = 0
+	}
+	if elapsedMs < 1_000 {
+		return fmt.Sprintf("%dms", elapsedMs)
+	}
+	if elapsedMs < 10_000 {
+		return fmt.Sprintf("%.1fs", float64(elapsedMs)/1_000)
+	}
+	totalSeconds := elapsedMs / 1_000
+	if totalSeconds < 60 {
+		return fmt.Sprintf("%ds", totalSeconds)
+	}
+	if totalSeconds < 3_600 {
+		return fmt.Sprintf("%dm%02ds", totalSeconds/60, totalSeconds%60)
+	}
+	return fmt.Sprintf("%dh%02dm", totalSeconds/3_600, (totalSeconds%3_600)/60)
+}
+
+func usesPagePanelLayout(panel Panel) bool {
+	switch panel {
+	case PanelSessions, PanelModels, PanelProviders, PanelAuth:
+		return true
+	default:
+		return false
+	}
+}
+
+func joinNonEmptyLines(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return strings.Join(filtered, "\n")
+}
+
 func renderPanelHeaderColumns(width int, values ...string) string {
 	if len(values) == 0 || width <= 0 {
 		return ""
@@ -460,6 +782,26 @@ func renderPanelSummaryColumns(width int, values ...string) string {
 			Render(fitDisplayWidth(text, cellWidth)))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+}
+
+func renderPageHeroLine(width int, title, summary string) string {
+	text := strings.ToUpper(strings.TrimSpace(title))
+	if summary = strings.TrimSpace(summary); summary != "" {
+		text += "  |  " + summary
+	}
+	return pageHeroStyle.Render(truncatePlain(text, maxInt(1, width)))
+}
+
+func renderPageHintLines(width int, text string) []string {
+	if width <= 0 || strings.TrimSpace(text) == "" {
+		return nil
+	}
+	rows := wrapPlainText(text, width)
+	lines := make([]string, 0, len(rows))
+	for _, row := range rows {
+		lines = append(lines, pageHintStyle.Render(row))
+	}
+	return lines
 }
 
 func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScrollState) {
@@ -542,9 +884,6 @@ func (m *Model) renderTranscriptLines(width int) []string {
 			lines = append(lines, "")
 		}
 		lines = append(lines, liveLines...)
-	}
-	if len(lines) == 0 {
-		lines = append(lines, dimStyle.Render("No transcript yet."))
 	}
 
 	if !m.hasAnimatedToolStatus() {
@@ -675,58 +1014,11 @@ func (m *Model) shouldShowStartupView() bool {
 }
 
 func (m *Model) renderStartupLines(width int) []string {
-	lines := make([]string, 0, len(startupShadowLogoLines)+20)
-	lines = append(lines, "")
-	logoLines, logoWidth := startupLogoLinesForWidth(width)
-	for index, line := range logoLines {
-		lines = append(lines, renderGradientLogoLine(line, index, len(logoLines), logoWidth))
-	}
-
-	lines = append(lines,
-		"",
-		titleStyle.Bold(true).Render("terminal workspace"),
-		dimStyle.Render("Bubble Tea terminal workspace for the current project."),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("mode %s  |  model %s  |  provider %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.CurrentModel, "none"), emptyFallback(m.CurrentProvider, "none")), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("session %s  |  pending %d", emptyFallback(m.ActiveSessionID, "none"), len(m.PendingReviews)), width)),
-		"",
-		reviewStyle.Bold(true).Render("fast paths"),
-		"• Explain this repo  - summarize structure, stack, or one file.",
-		"• Fix a bug  - describe the failure and let Cyrene patch it.",
-		"• Connect HTTP  - use /login to save credentials.",
-		"• Continue work  - use /sessions, /review, /model, or /provider.",
-		"",
-		sectionStyle.Render("terminal advantages"),
-		"• Keyboard-first flow with mouse-aware panels and safe picker clicks.",
-		"• Dense transcript + inspector layout when a panel is open.",
-		"• One-screen workflow without leaving the terminal.",
-		"",
-		"Use /help for full command reference.",
-		"",
-	)
-	return wrapLinesToWidth(lines, width)
+	return nil
 }
 
 func (m *Model) renderCompactStartupLines(width int) []string {
-	lines := []string{
-		"",
-		titleStyle.Bold(true).Render("terminal workspace"),
-		dimStyle.Render("Startup splash is compressed while the inspector is open."),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("active panel  %s", emptyFallback(string(m.ActivePanel), "none")), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("project       %s", formatProjectPathLabel(m.AppRoot, maxInt(12, width-14))), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("session       %s", emptyFallback(m.ActiveSessionID, "none")), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("model         %s", emptyFallback(m.CurrentModel, "none")), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("format        %s", formatTransportFormatLabel(m.currentProviderFormat())), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("provider      %s", m.providerDisplayName(m.CurrentProvider)), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("key source    %s", formatKeySourceLabel(m.CurrentProviderKeySource)), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("pending       %d", len(m.PendingReviews)), width)),
-		"",
-		sectionStyle.Render("next"),
-		"/help  command reference and shortcuts",
-		"/sessions  /review  /model  /provider",
-		"Esc closes the panel and restores the full startup view.",
-		"",
-	}
-	return wrapLinesToWidth(lines, width)
+	return nil
 }
 
 func renderMessageLines(message Message, width int) []string {
@@ -735,8 +1027,8 @@ func renderMessageLines(message Message, width int) []string {
 	}
 
 	if message.Kind == "tool_status" {
-		lines := renderPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, lipgloss.NewStyle())
-		return wrapTranscriptLinesWithANSI(lines, toolStatusANSIStart, toolStatusANSIEnd)
+		style := toolStatusStyleForText(message.Text)
+		return renderStyledPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, style, style)
 	}
 
 	if shouldRenderCompactTranscript(message) {
@@ -781,8 +1073,141 @@ func (m *Model) renderAnimatedToolStatusLines(message Message, width int) []stri
 	if len(statusSpinnerFrames) > 0 {
 		frame = statusSpinnerFrames[m.SpinnerFrame%len(statusSpinnerFrames)]
 	}
-	lines := renderPrefixedTranscriptLines(frame+" ", text, width, lipgloss.NewStyle())
-	return wrapTranscriptLinesWithANSI(lines, toolStatusANSIStart, toolStatusANSIEnd)
+	style := toolStatusStyleForText(message.Text)
+	return renderStyledPrefixedTranscriptLines(frame+" ", text, width, style, style)
+}
+
+func toolStatusANSIStartForText(text string) string {
+	switch toolStatusFamilyForAction(extractToolStatusAction(text)) {
+	case "explore":
+		return toolStatusExploreANSIStart
+	case "read":
+		return toolStatusReadANSIStart
+	case "semantic":
+		return toolStatusSemanticANSIStart
+	case "mutation":
+		return toolStatusMutationANSIStart
+	case "git":
+		return toolStatusGitANSIStart
+	case "shell":
+		return toolStatusShellANSIStart
+	default:
+		return toolStatusANSIStart
+	}
+}
+
+func toolStatusStyleForText(text string) lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(toolStatusANSIColorForText(text)))
+}
+
+func toolStatusANSIColorForText(text string) string {
+	switch toolStatusFamilyForAction(extractToolStatusAction(text)) {
+	case "explore":
+		return "#E3B341"
+	case "read":
+		return "#58A6FF"
+	case "semantic":
+		return "#5ED7C8"
+	case "mutation":
+		return "#7EE787"
+	case "git":
+		return "#FFA657"
+	case "shell":
+		return "#EEC45B"
+	default:
+		return "#8B949E"
+	}
+}
+
+func extractToolStatusAction(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "Running ") {
+		detail := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "Running "), "..."))
+		return canonicalizeToolStatusAction(firstToolStatusField(detail))
+	}
+	for _, prefix := range []string{"Calling tool: ", "Tool: ", "Tool error: ", "Tool result: "} {
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		detail := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		return canonicalizeToolStatusAction(firstToolStatusField(detail))
+	}
+	return ""
+}
+
+func firstToolStatusField(detail string) string {
+	head := detail
+	if idx := strings.Index(head, " | "); idx >= 0 {
+		head = head[:idx]
+	}
+	fields := strings.Fields(head)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func canonicalizeToolStatusAction(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return ""
+	}
+	compact := compactToolStatusAction(trimmed)
+	if compact == "" {
+		return trimmed
+	}
+	if canonical, ok := canonicalToolStatusActionLookup[compact]; ok {
+		return canonical
+	}
+	return trimmed
+}
+
+func compactToolStatusAction(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, r := range value {
+		switch r {
+		case '_', '-', ' ', '\t':
+			continue
+		default:
+			builder.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return builder.String()
+}
+
+func buildCanonicalToolStatusActionLookup(actions []string) map[string]string {
+	lookup := make(map[string]string, len(actions))
+	for _, action := range actions {
+		lookup[compactToolStatusAction(action)] = action
+	}
+	return lookup
+}
+
+func toolStatusFamilyForAction(action string) string {
+	switch action {
+	case "list_dir", "create_dir", "stat_path", "stat_paths", "find_files", "copy_path", "move_path":
+		return "explore"
+	case "read_file", "read_files", "read_range", "read_json", "read_yaml", "search_text", "search_text_context":
+		return "read"
+	case "outline_file", "find_symbol", "find_references",
+		"ts_hover", "ts_definition", "ts_references", "ts_diagnostics", "ts_prepare_rename",
+		"lsp_hover", "lsp_definition", "lsp_implementation", "lsp_type_definition", "lsp_references",
+		"lsp_workspace_symbols", "lsp_document_symbols", "lsp_diagnostics", "lsp_prepare_rename",
+		"lsp_rename", "lsp_code_actions", "lsp_format_document":
+		return "semantic"
+	case "create_file", "write_file", "edit_file", "apply_patch", "delete_file":
+		return "mutation"
+	case "git_status", "git_diff", "git_log", "git_show", "git_blame":
+		return "git"
+	case "run_command", "run_shell", "open_shell", "write_shell", "read_shell", "shell_status", "interrupt_shell", "close_shell":
+		return "shell"
+	default:
+		return ""
+	}
 }
 
 func wrapTranscriptLinesWithANSI(lines []string, start, end string) []string {
@@ -854,14 +1279,256 @@ func renderPrefixedTranscriptLines(prefix string, value string, width int, baseS
 	return lines
 }
 
+func renderStyledPrefixedTranscriptLines(prefix string, value string, width int, prefixStyle lipgloss.Style, baseStyle lipgloss.Style) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	bodyWidth := maxInt(1, width-lipgloss.Width(prefix))
+	bodyLines := renderToolStatusBodyLines(value, bodyWidth, baseStyle)
+	if len(bodyLines) == 0 {
+		return []string{""}
+	}
+
+	lines := make([]string, 0, len(bodyLines))
+	styledPrefix := prefixStyle.Render(prefix)
+	prefixPadding := strings.Repeat(" ", lipgloss.Width(prefix))
+	for index, row := range bodyLines {
+		if index == 0 {
+			lines = append(lines, styledPrefix+row)
+			continue
+		}
+		lines = append(lines, prefixPadding+row)
+	}
+	return lines
+}
+
+func renderToolStatusBodyLines(value string, width int, baseStyle lipgloss.Style) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	rawLines := strings.Split(value, "\n")
+	lines := make([]string, 0, len(rawLines))
+	for _, raw := range rawLines {
+		trimmed := strings.TrimSpace(raw)
+		switch {
+		case diffStatsPattern.MatchString(raw):
+			lines = append(lines, renderDiffStatsLine(raw, width, baseStyle)...)
+		case isRecognizedDiffPreviewLine(raw):
+			sign, lineNumber, content, _ := parseRenderedDiffLine(raw)
+			lines = append(lines, renderDiffRows(sign, lineNumber, content, width)...)
+		case strings.HasPrefix(trimmed, "@@"):
+			for _, row := range wrapPlainText(raw, width) {
+				lines = append(lines, diffHunkStyle.Render(row))
+			}
+		case strings.HasPrefix(trimmed, "[diff preview]"):
+			for _, row := range wrapPlainText(raw, width) {
+				lines = append(lines, sectionStyle.Render(row))
+			}
+		case trimmed == "":
+			lines = append(lines, "")
+		default:
+			lines = append(lines, renderToolStatusLineRows(raw, width, baseStyle)...)
+		}
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func renderToolStatusLineRows(raw string, width int, baseStyle lipgloss.Style) []string {
+	prefix, detail, ok := splitToolStatusDisplayLine(raw)
+	if !ok {
+		rows := wrapPlainText(raw, width)
+		if len(rows) == 0 {
+			return []string{""}
+		}
+		rendered := make([]string, 0, len(rows))
+		for _, row := range rows {
+			rendered = append(rendered, baseStyle.Render(row))
+		}
+		return rendered
+	}
+
+	plain := prefix + " " + detail
+	rows := wrapPlainText(plain, width)
+	if len(rows) == 0 {
+		return []string{""}
+	}
+	rendered := make([]string, 0, len(rows))
+	rendered = append(rendered, renderToolStatusStructuredRow(prefix, detail, rows[0]))
+	for _, row := range rows[1:] {
+		rendered = append(rendered, toolDetailStyle.Render(row))
+	}
+	return rendered
+}
+
+func splitToolStatusDisplayLine(raw string) (string, string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	prefixes := []string{"Calling tool:", "Tool error:", "Tool result:", "Tool:", "Running"}
+	for _, prefix := range prefixes {
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		detail := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		if detail == "" {
+			return prefix, "", true
+		}
+		return prefix, detail, true
+	}
+	return "", "", false
+}
+
+func renderToolStatusStructuredRow(prefix, detail, row string) string {
+	prefixText := prefix + " "
+	prefixStyle := toolPrefixStyle
+	if strings.Contains(strings.ToLower(prefix), "error") {
+		prefixStyle = toolErrorPrefixStyle
+	}
+	if !strings.HasPrefix(row, prefixText) {
+		return toolDetailStyle.Render(row)
+	}
+
+	rowDetail := strings.TrimPrefix(row, prefixText)
+	action, rest := splitToolStatusActionDetail(rowDetail)
+	actionStyle := toolStatusStyleForText(prefixText + detail).Bold(true)
+	rendered := prefixStyle.Render(prefixText)
+	if action != "" {
+		rendered += actionStyle.Render(action)
+	}
+	if rest != "" {
+		rendered += toolDetailStyle.Render(rest)
+	}
+	return rendered
+}
+
+func splitToolStatusActionDetail(detail string) (string, string) {
+	fields := strings.Fields(detail)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	action := fields[0]
+	rest := strings.TrimPrefix(detail, action)
+	return action, rest
+}
+
 func sanitizeTranscriptDisplayText(message Message) string {
-	if message.Role == "system" || message.Kind == "tool_status" || message.Kind == "review_status" || message.Kind == "system_hint" {
-		return compactToolStatusDisplayText(stripLeakedToolProtocolText(message.Text))
+	if message.Kind == "tool_status" {
+		return normalizeToolStatusDisplayText(compactToolStatusDisplayText(stripLeakedToolProtocolText(message.Text)))
+	}
+	if message.Role == "system" || message.Kind == "review_status" || message.Kind == "system_hint" {
+		return normalizeToolStatusDisplayText(compactToolStatusDisplayText(stripLeakedToolProtocolText(message.Text)))
 	}
 	if message.Role != "assistant" || message.Kind != "transcript" {
-		return message.Text
+		return normalizeToolStatusDisplayText(message.Text)
 	}
-	return stripLeakedToolProtocolText(message.Text)
+	return normalizeToolStatusDisplayText(stripLeakedToolProtocolText(message.Text))
+}
+
+func normalizeToolStatusDisplayText(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return text
+	}
+	for index, line := range lines {
+		lines[index] = normalizeToolStatusDisplayLine(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func normalizeToolStatusDisplayLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return line
+	}
+
+	for _, prefix := range []string{"Calling tool:", "Tool error:", "Tool result:", "Tool:", "Running"} {
+		index := findToolStatusPrefixIndex(line, prefix)
+		if index < 0 {
+			continue
+		}
+		detailStart := index + len(prefix)
+		if prefix == "Running" {
+			if detailStart >= len(line) || !isToolStatusSeparatorRune(rune(line[detailStart])) {
+				continue
+			}
+		}
+		detail := line[detailStart:]
+		separator := " "
+		if strings.HasSuffix(prefix, ":") {
+			separator = ": "
+			prefix = strings.TrimSuffix(prefix, ":")
+		}
+		return line[:index] + prefix + separator + normalizeToolStatusDetail(detail)
+	}
+	return line
+}
+
+func findToolStatusPrefixIndex(line, prefix string) int {
+	searchStart := 0
+	for {
+		index := strings.Index(line[searchStart:], prefix)
+		if index < 0 {
+			return -1
+		}
+		index += searchStart
+		if index == 0 || isToolStatusPrefixBoundary(line[:index]) {
+			return index
+		}
+		searchStart = index + len(prefix)
+		if searchStart >= len(line) {
+			return -1
+		}
+	}
+}
+
+func isToolStatusPrefixBoundary(before string) bool {
+	trimmed := strings.TrimSpace(before)
+	if trimmed == "" {
+		return true
+	}
+	for _, r := range trimmed {
+		switch r {
+		case '❯', '›', '>', '•', '-', '|', '│':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isToolStatusSeparatorRune(r rune) bool {
+	return r == ' ' || r == '\t' || r == '|'
+}
+
+func normalizeToolStatusDetail(detail string) string {
+	trailingDots := ""
+	trimmed := strings.TrimSpace(detail)
+	if strings.HasSuffix(trimmed, "...") {
+		trailingDots = "..."
+		trimmed = strings.TrimSuffix(trimmed, "...")
+	}
+
+	head := trimmed
+	rest := ""
+	if idx := strings.Index(trimmed, " | "); idx >= 0 {
+		head = trimmed[:idx]
+		rest = trimmed[idx:]
+	}
+	fields := strings.Fields(head)
+	if len(fields) == 0 {
+		return detail
+	}
+	canonical := canonicalizeToolStatusAction(fields[0])
+	if canonical == fields[0] {
+		return strings.TrimSpace(detail)
+	}
+	fields[0] = canonical
+	return strings.Join(fields, " ") + rest + trailingDots
 }
 
 func compactToolStatusDisplayText(text string) string {
@@ -1028,29 +1695,14 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 
 	rawLines := strings.Split(value, "\n")
 	lines := make([]string, 0, len(rawLines))
-	inCodeBlock := false
 
 	for index := 0; index < len(rawLines); index++ {
 		raw := rawLines[index]
 		trimmed := strings.TrimSpace(raw)
-		if strings.HasPrefix(trimmed, "```") {
-			inCodeBlock = !inCodeBlock
-			lang := strings.TrimSpace(strings.TrimPrefix(trimmed, "```"))
-			if lang != "" {
-				lines = append(lines, codeFenceStyle.Render("code "+lang))
-			}
-			continue
-		}
-
-		if inCodeBlock {
-			wrapped := wrapPlainText(raw, maxInt(1, width-2))
-			if len(wrapped) == 0 {
-				lines = append(lines, "│ "+codeBlockStyle.Render(""))
-				continue
-			}
-			for _, row := range wrapped {
-				lines = append(lines, "│ "+codeBlockStyle.Render(renderCodeLine(row)))
-			}
+		if marker, lang, ok := parseMarkdownFenceLine(trimmed); ok {
+			rendered, consumed := renderMarkdownCodeBlock(rawLines[index+1:], marker, lang, width)
+			lines = append(lines, rendered...)
+			index += consumed
 			continue
 		}
 
@@ -1058,6 +1710,30 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			lines = append(lines, renderMarkdownTable(table, width, baseStyle)...)
 			index += consumed - 1
 			continue
+		}
+
+		if trimmed != "" && index+1 < len(rawLines) {
+			if level, ok := parseSetextHeadingLevel(strings.TrimSpace(rawLines[index+1])); ok {
+				heading := strings.TrimSpace(raw)
+				for _, row := range wrapPlainText(heading, width) {
+					lines = append(lines, markdownHeadingStyle(level).Render(row))
+				}
+				index++
+				continue
+			}
+		}
+
+		if markdownRulePattern.MatchString(trimmed) {
+			lines = append(lines, ruleStyle.Render(strings.Repeat("─", maxInt(3, width))))
+			continue
+		}
+
+		quoteDepth, quoteContent, hasQuote := parseMarkdownQuote(raw)
+		quotePrefix := ""
+		if hasQuote {
+			quotePrefix = renderMarkdownQuotePrefix(quoteDepth)
+			raw = quoteContent
+			trimmed = strings.TrimSpace(quoteContent)
 		}
 
 		switch {
@@ -1081,49 +1757,30 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 				lines = append(lines, sectionStyle.Render(row))
 			}
 		case strings.HasPrefix(trimmed, "#"):
-			heading := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
+			level, heading := parseATXHeading(trimmed)
 			for _, row := range wrapPlainText(heading, width) {
-				lines = append(lines, titleStyle.Bold(true).Render(row))
+				lines = append(lines, markdownHeadingStyle(level).Render(row))
 			}
-		case orderedListPattern.MatchString(trimmed):
-			matches := orderedListPattern.FindStringSubmatch(trimmed)
-			prefix := ""
-			content := trimmed
-			if len(matches) >= 3 {
-				prefix = strings.TrimSpace(matches[1]) + ". "
-				content = matches[2]
-			}
-			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
-				if index == 0 {
-					lines = append(lines, dimStyle.Render(prefix)+renderInlineMarkdown(row, baseStyle))
-					continue
-				}
-				lines = append(lines, strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, baseStyle))
-			}
-		case strings.HasPrefix(trimmed, "- "),
-			strings.HasPrefix(trimmed, "* "),
-			strings.HasPrefix(trimmed, "> "):
-			prefix := ""
-			content := raw
-			style := baseStyle
-			switch {
-			case strings.HasPrefix(trimmed, "- "), strings.HasPrefix(trimmed, "* "):
-				prefix = "• "
-				content = strings.TrimSpace(trimmed[2:])
-			case strings.HasPrefix(trimmed, "> "):
-				prefix = "│ "
-				content = strings.TrimSpace(trimmed[2:])
-				style = dimStyle.Copy()
-			}
-			for index, row := range wrapPlainText(content, maxInt(1, width-lipgloss.Width(prefix))) {
-				if index == 0 {
-					lines = append(lines, dimStyle.Render(prefix)+renderInlineMarkdown(row, style))
-					continue
-				}
-				lines = append(lines, strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, style))
-			}
+		case orderedListPattern.MatchString(raw):
+			prefix, content := renderMarkdownListPrefix(orderedListPattern.FindStringSubmatch(raw), true)
+			rendered, consumed := renderMarkdownListBlock(rawLines, index, width, quotePrefix+prefix, content, markdownIndentWidth(raw), baseStyle)
+			lines = append(lines, rendered...)
+			index += consumed
+		case unorderedListPattern.MatchString(raw):
+			prefix, content := renderMarkdownListPrefix(unorderedListPattern.FindStringSubmatch(raw), false)
+			rendered, consumed := renderMarkdownListBlock(rawLines, index, width, quotePrefix+prefix, content, markdownIndentWidth(raw), baseStyle)
+			lines = append(lines, rendered...)
+			index += consumed
 		case trimmed == "":
 			lines = append(lines, "")
+		case hasQuote:
+			for index, row := range wrapPlainText(raw, maxInt(1, width-lipgloss.Width(quotePrefix))) {
+				linePrefix := quotePrefix
+				if index > 0 {
+					linePrefix = strings.Repeat(" ", lipgloss.Width(quotePrefix))
+				}
+				lines = append(lines, linePrefix+renderInlineMarkdown(row, dimStyle.Copy()))
+			}
 		default:
 			for _, row := range wrapPlainText(raw, width) {
 				lines = append(lines, renderInlineMarkdown(row, baseStyle))
@@ -1135,6 +1792,332 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 		return []string{""}
 	}
 	return lines
+}
+
+func parseMarkdownFenceLine(trimmed string) (marker string, lang string, ok bool) {
+	switch {
+	case strings.HasPrefix(trimmed, "```"):
+		return "```", strings.TrimSpace(strings.TrimPrefix(trimmed, "```")), true
+	case strings.HasPrefix(trimmed, "~~~"):
+		return "~~~", strings.TrimSpace(strings.TrimPrefix(trimmed, "~~~")), true
+	default:
+		return "", "", false
+	}
+}
+
+func renderMarkdownCodeBlock(rawLines []string, marker, lang string, width int) ([]string, int) {
+	codeLines := make([]string, 0, len(rawLines))
+	consumed := 0
+	for consumed < len(rawLines) {
+		trimmed := strings.TrimSpace(rawLines[consumed])
+		if nextMarker, _, ok := parseMarkdownFenceLine(trimmed); ok && sameMarkdownFenceFamily(marker, nextMarker) {
+			break
+		}
+		codeLines = append(codeLines, rawLines[consumed])
+		consumed++
+	}
+	if consumed < len(rawLines) {
+		consumed++
+	}
+	return renderMarkdownCodeBlockLines(codeLines, lang, width), consumed
+}
+
+func renderMarkdownCodeBlockLines(codeLines []string, lang string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+
+	label := " code "
+	if trimmedLang := strings.TrimSpace(lang); trimmedLang != "" {
+		label = " code " + trimmedLang + " "
+	}
+
+	lineCount := maxInt(1, len(codeLines))
+	gutterWidth := maxInt(4, len(strconv.Itoa(lineCount))+2)
+	innerWidth := maxInt(lipgloss.Width(label)+2, width-2)
+	contentWidth := maxInt(8, innerWidth-gutterWidth-1)
+	innerWidth = gutterWidth + 1 + contentWidth
+
+	topFillWidth := maxInt(0, innerWidth-lipgloss.Width(label))
+	topLine := codeBlockBorderStyle.Render("╭") +
+		codeBlockHeaderStyle.Render(label) +
+		codeBlockBorderStyle.Render(strings.Repeat("─", topFillWidth)+"╮")
+
+	rendered := []string{fitDisplayWidth(topLine, width)}
+	if len(codeLines) == 0 {
+		codeLines = []string{""}
+	}
+
+	for index, raw := range codeLines {
+		wrapped := wrapPlainText(raw, contentWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{""}
+		}
+		for wrapIndex, row := range wrapped {
+			lineNo := ""
+			if wrapIndex == 0 {
+				lineNo = strconv.Itoa(index + 1)
+			}
+			rendered = append(rendered, renderMarkdownCodeBlockRow(lineNo, row, gutterWidth, contentWidth, width))
+		}
+	}
+
+	bottomLine := codeBlockBorderStyle.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
+	rendered = append(rendered, fitDisplayWidth(bottomLine, width))
+	return rendered
+}
+
+func renderMarkdownCodeBlockRow(lineNo, content string, gutterWidth, contentWidth, width int) string {
+	gutterText := lineNo
+	if gutterText != "" {
+		gutterText = strings.Repeat(" ", maxInt(0, gutterWidth-lipgloss.Width(gutterText))) + gutterText
+	} else {
+		gutterText = strings.Repeat(" ", gutterWidth)
+	}
+	leftBorder := codeBlockBorderStyle.Render("│")
+	gutter := codeBlockLineNoStyle.Render(gutterText)
+	separator := codeBlockBorderStyle.Render("│")
+	code := codeBlockStyle.Render(fitDisplayWidth(renderCodeLine(content), contentWidth))
+	rightBorder := codeBlockBorderStyle.Render("│")
+	return fitDisplayWidth(leftBorder+gutter+separator+code+rightBorder, width)
+}
+
+func sameMarkdownFenceFamily(left, right string) bool {
+	if left == "" || right == "" {
+		return false
+	}
+	return left[0] == right[0]
+}
+
+func parseSetextHeadingLevel(trimmed string) (int, bool) {
+	matches := setextHeadingPattern.FindStringSubmatch(trimmed)
+	if len(matches) != 2 {
+		return 0, false
+	}
+	if strings.HasPrefix(matches[1], "=") {
+		return 1, true
+	}
+	return 2, true
+}
+
+func parseATXHeading(trimmed string) (int, string) {
+	level := 0
+	for level < len(trimmed) && level < 6 && trimmed[level] == '#' {
+		level++
+	}
+	heading := strings.TrimSpace(trimmed[level:])
+	heading = strings.TrimSpace(strings.TrimRight(heading, "#"))
+	return maxInt(1, level), heading
+}
+
+func markdownHeadingStyle(level int) lipgloss.Style {
+	switch {
+	case level <= 1:
+		return titleStyle.Copy()
+	case level == 2:
+		return subtitleStyle.Copy()
+	default:
+		return minorTitleStyle.Copy()
+	}
+}
+
+func parseMarkdownQuote(raw string) (depth int, content string, ok bool) {
+	remaining := strings.TrimLeft(raw, " \t")
+	for strings.HasPrefix(remaining, ">") {
+		depth++
+		remaining = strings.TrimLeft(strings.TrimPrefix(remaining, ">"), " ")
+	}
+	if depth == 0 {
+		return 0, raw, false
+	}
+	return depth, remaining, true
+}
+
+func renderMarkdownQuotePrefix(depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	return dimStyle.Render(strings.Repeat("│ ", depth))
+}
+
+func renderMarkdownListPrefix(matches []string, ordered bool) (string, string) {
+	if ordered {
+		if len(matches) < 4 {
+			return "", ""
+		}
+		indent := markdownIndentPrefix(matches[1])
+		prefix := indent + dimStyle.Render(strings.TrimSpace(matches[2])+". ")
+		content := matches[3]
+		return applyTaskListMarker(prefix, content)
+	}
+	if len(matches) < 4 {
+		return "", ""
+	}
+	indent := markdownIndentPrefix(matches[1])
+	level := markdownIndentLevel(matches[1])
+	prefix := indent + dimStyle.Render(markdownBulletForLevel(level)+" ")
+	content := matches[3]
+	return applyTaskListMarker(prefix, content)
+}
+
+func renderMarkdownListBlock(rawLines []string, start, width int, prefix, content string, baseIndent int, baseStyle lipgloss.Style) ([]string, int) {
+	lines := make([]string, 0, 4)
+	contentWidth := maxInt(1, width-lipgloss.Width(prefix))
+	for index, row := range wrapPlainText(content, contentWidth) {
+		if index == 0 {
+			lines = append(lines, prefix+renderInlineMarkdown(row, baseStyle))
+			continue
+		}
+		lines = append(lines, strings.Repeat(" ", lipgloss.Width(prefix))+renderInlineMarkdown(row, baseStyle))
+	}
+
+	continuations, consumed := collectMarkdownListContinuations(rawLines, start+1, baseIndent)
+	continuationPrefix := strings.Repeat(" ", lipgloss.Width(prefix))
+	continuationWidth := maxInt(1, width-lipgloss.Width(continuationPrefix))
+	for _, paragraph := range continuations {
+		if paragraph == "" {
+			lines = append(lines, "")
+			continue
+		}
+		for _, row := range wrapPlainText(paragraph, continuationWidth) {
+			lines = append(lines, continuationPrefix+renderInlineMarkdown(row, baseStyle))
+		}
+	}
+
+	return lines, consumed
+}
+
+func collectMarkdownListContinuations(rawLines []string, start, baseIndent int) ([]string, int) {
+	paragraphs := make([]string, 0, 2)
+	consumed := 0
+	current := make([]string, 0, 2)
+
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		paragraphs = append(paragraphs, strings.Join(current, " "))
+		current = current[:0]
+	}
+
+	for start+consumed < len(rawLines) {
+		raw := rawLines[start+consumed]
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			if hasMarkdownListContinuation(rawLines, start+consumed+1, baseIndent) {
+				flush()
+				paragraphs = append(paragraphs, "")
+				consumed++
+				continue
+			}
+			break
+		}
+
+		if markdownIndentWidth(raw) <= baseIndent || isMarkdownListBoundary(raw) {
+			break
+		}
+
+		current = append(current, strings.TrimSpace(raw))
+		consumed++
+	}
+
+	flush()
+	return paragraphs, consumed
+}
+
+func hasMarkdownListContinuation(rawLines []string, start, baseIndent int) bool {
+	for start < len(rawLines) {
+		raw := rawLines[start]
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			start++
+			continue
+		}
+		return markdownIndentWidth(raw) > baseIndent && !isMarkdownListBoundary(raw)
+	}
+	return false
+}
+
+func isMarkdownListBoundary(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	if _, _, ok := parseMarkdownFenceLine(trimmed); ok {
+		return true
+	}
+	if orderedListPattern.MatchString(raw) || unorderedListPattern.MatchString(raw) {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "#") ||
+		markdownRulePattern.MatchString(trimmed) ||
+		setextHeadingPattern.MatchString(trimmed) ||
+		strings.HasPrefix(trimmed, ">") ||
+		diffStatsPattern.MatchString(trimmed) ||
+		isRecognizedDiffPreviewLine(trimmed) ||
+		strings.HasPrefix(trimmed, "@@") ||
+		strings.HasPrefix(trimmed, "[diff preview]") ||
+		strings.HasPrefix(trimmed, "[create preview") ||
+		strings.HasPrefix(trimmed, "[write preview") ||
+		strings.HasPrefix(trimmed, "[edit preview") ||
+		strings.HasPrefix(trimmed, "[patch preview") ||
+		strings.HasPrefix(trimmed, "[old -") ||
+		strings.HasPrefix(trimmed, "[new +")
+}
+
+func applyTaskListMarker(prefix, content string) (string, string) {
+	matches := taskListPattern.FindStringSubmatch(strings.TrimSpace(content))
+	if len(matches) != 3 {
+		return prefix, content
+	}
+	marker := taskTodoStyle.Render("☐")
+	if strings.EqualFold(matches[1], "x") {
+		marker = taskDoneStyle.Render("☑")
+	}
+	return prefix + marker + " ", matches[2]
+}
+
+func markdownIndentLevel(rawIndent string) int {
+	width := 0
+	for _, r := range rawIndent {
+		if r == '\t' {
+			width += 4
+			continue
+		}
+		width++
+	}
+	return maxInt(0, width/2)
+}
+
+func markdownIndentWidth(raw string) int {
+	width := 0
+	for _, r := range raw {
+		if r == ' ' {
+			width++
+			continue
+		}
+		if r == '\t' {
+			width += 4
+			continue
+		}
+		break
+	}
+	return width
+}
+
+func markdownIndentPrefix(rawIndent string) string {
+	return strings.Repeat("  ", markdownIndentLevel(rawIndent))
+}
+
+func markdownBulletForLevel(level int) string {
+	switch level % 3 {
+	case 1:
+		return "◦"
+	case 2:
+		return "▪"
+	default:
+		return "•"
+	}
 }
 
 func renderDiffStatsLine(raw string, width int, baseStyle lipgloss.Style) []string {
@@ -1362,7 +2345,7 @@ func renderMarkdownTableRow(row []string, widths []int, style lipgloss.Style) st
 }
 
 func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {
-	if !strings.ContainsAny(value, "`*_~") {
+	if !strings.ContainsAny(value, "`*_~[<!") && !strings.Contains(value, "](") {
 		return baseStyle.Render(value)
 	}
 
@@ -1373,12 +2356,12 @@ func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {
 			builder.WriteString(inlineCodeStyle.Render(part))
 			continue
 		}
-		builder.WriteString(renderInlineEmphasis(part, baseStyle))
+		builder.WriteString(renderInlineRichText(part, baseStyle))
 	}
 	return builder.String()
 }
 
-func renderInlineEmphasis(value string, baseStyle lipgloss.Style) string {
+func renderInlineRichText(value string, baseStyle lipgloss.Style) string {
 	if value == "" {
 		return ""
 	}
@@ -1386,50 +2369,53 @@ func renderInlineEmphasis(value string, baseStyle lipgloss.Style) string {
 	runes := []rune(value)
 	var builder strings.Builder
 	for index := 0; index < len(runes); {
-		if index+1 < len(runes) {
-			switch {
-			case runes[index] == '*' && runes[index+1] == '*':
-				if end := findInlineMarkerEndString(runes, index+2, "**"); end >= 0 {
-					builder.WriteString(baseStyle.Copy().Bold(true).Render(string(runes[index+2 : end])))
-					index = end + 2
-					continue
+		switch {
+		case runes[index] == '!' && index+1 < len(runes) && runes[index+1] == '[':
+			if alt, target, nextIndex, ok := parseMarkdownLinkRunes(runes, index+1); ok {
+				builder.WriteString(dimStyle.Render("[image] "))
+				builder.WriteString(renderInlineEmphasis(alt, linkStyle.Copy()))
+				if target != "" {
+					builder.WriteString(dimStyle.Render(" <" + target + ">"))
 				}
-			case runes[index] == '_' && runes[index+1] == '_':
-				if end := findInlineMarkerEndString(runes, index+2, "__"); end >= 0 {
-					builder.WriteString(baseStyle.Copy().Bold(true).Render(string(runes[index+2 : end])))
-					index = end + 2
-					continue
+				index = nextIndex
+				continue
+			}
+		case runes[index] == '[':
+			if label, target, nextIndex, ok := parseMarkdownLinkRunes(runes, index); ok {
+				builder.WriteString(renderInlineEmphasis(label, linkStyle.Copy()))
+				if target != "" {
+					builder.WriteString(dimStyle.Render(" <" + target + ">"))
 				}
+				index = nextIndex
+				continue
+			}
+		case runes[index] == '<':
+			if target, nextIndex, ok := parseAutoLinkRunes(runes, index); ok {
+				builder.WriteString(linkStyle.Render(target))
+				index = nextIndex
+				continue
+			}
+			if nextIndex, ok := parseInlineHTMLTagRunes(runes, index); ok {
+				index = nextIndex
+				continue
 			}
 		}
 
-		switch runes[index] {
-		case '*':
-			if end := findInlineMarkerEndRune(runes, index+1, '*'); end >= 0 {
-				builder.WriteString(baseStyle.Copy().Italic(true).Render(string(runes[index+1 : end])))
-				index = end + 1
-				continue
-			}
-		case '_':
-			if end := findInlineMarkerEndRune(runes, index+1, '_'); end >= 0 {
-				builder.WriteString(baseStyle.Copy().Italic(true).Render(string(runes[index+1 : end])))
-				index = end + 1
-				continue
-			}
-		case '~':
-			if index+1 < len(runes) && runes[index+1] == '~' {
-				if end := findInlineMarkerEndString(runes, index+2, "~~"); end >= 0 {
-					builder.WriteString(baseStyle.Copy().Strikethrough(true).Render(string(runes[index+2 : end])))
-					index = end + 2
-					continue
-				}
-			}
+		nextIndex := index + 1
+		for nextIndex < len(runes) &&
+			runes[nextIndex] != '[' &&
+			runes[nextIndex] != '<' &&
+			!(runes[nextIndex] == '!' && nextIndex+1 < len(runes) && runes[nextIndex+1] == '[') {
+			nextIndex++
 		}
-
-		builder.WriteString(baseStyle.Render(string(runes[index])))
-		index++
+		builder.WriteString(renderInlineEmphasis(string(runes[index:nextIndex]), baseStyle))
+		index = nextIndex
 	}
 	return builder.String()
+}
+
+func renderInlineEmphasis(value string, baseStyle lipgloss.Style) string {
+	return renderInlineStyled(value, baseStyle)
 }
 
 func findInlineMarkerEndRune(runes []rune, start int, marker rune) int {
@@ -1456,6 +2442,189 @@ func findInlineMarkerEndString(runes []rune, start int, marker string) int {
 		}
 	}
 	return -1
+}
+
+func parseMarkdownLinkRunes(runes []rune, start int) (label string, target string, nextIndex int, ok bool) {
+	if start < 0 || start >= len(runes) || runes[start] != '[' {
+		return "", "", start, false
+	}
+	labelEnd := findInlineMarkerEndRune(runes, start+1, ']')
+	if labelEnd < 0 || labelEnd+1 >= len(runes) || runes[labelEnd+1] != '(' {
+		return "", "", start, false
+	}
+	targetEnd := findInlineMarkerEndRune(runes, labelEnd+2, ')')
+	if targetEnd < 0 {
+		return "", "", start, false
+	}
+	label = string(runes[start+1 : labelEnd])
+	target = strings.TrimSpace(string(runes[labelEnd+2 : targetEnd]))
+	return label, target, targetEnd + 1, true
+}
+
+func parseAutoLinkRunes(runes []rune, start int) (target string, nextIndex int, ok bool) {
+	if start < 0 || start >= len(runes) || runes[start] != '<' {
+		return "", start, false
+	}
+	end := findInlineMarkerEndRune(runes, start+1, '>')
+	if end < 0 {
+		return "", start, false
+	}
+	candidate := strings.TrimSpace(string(runes[start+1 : end]))
+	parsed, err := url.Parse(candidate)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", start, false
+	}
+	return candidate, end + 1, true
+}
+
+func parseInlineHTMLTagRunes(runes []rune, start int) (nextIndex int, ok bool) {
+	if start < 0 || start >= len(runes) || runes[start] != '<' {
+		return start, false
+	}
+	end := findInlineMarkerEndRune(runes, start+1, '>')
+	if end < 0 {
+		return start, false
+	}
+	tag := strings.TrimSpace(string(runes[start+1 : end]))
+	if tag == "" {
+		return start, false
+	}
+	tag = strings.TrimPrefix(tag, "/")
+	tag = strings.TrimPrefix(tag, "!")
+	tag = strings.TrimPrefix(tag, "?")
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return start, false
+	}
+	name := tag
+	for index, r := range tag {
+		if unicode.IsSpace(r) || r == '/' {
+			name = tag[:index]
+			break
+		}
+	}
+	if name == "" {
+		return start, false
+	}
+	for index, r := range name {
+		if index == 0 {
+			if !unicode.IsLetter(r) {
+				return start, false
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != ':' {
+			return start, false
+		}
+	}
+	return end + 1, true
+}
+
+func renderInlineStyled(value string, baseStyle lipgloss.Style) string {
+	if value == "" {
+		return ""
+	}
+
+	runes := []rune(value)
+	var builder strings.Builder
+	for index := 0; index < len(runes); {
+		if runes[index] == '\\' && index+1 < len(runes) && isMarkdownEscapableRune(runes[index+1]) {
+			builder.WriteString(baseStyle.Render(string(runes[index+1])))
+			index += 2
+			continue
+		}
+
+		if marker, end, ok := findInlineStyledMarker(runes, index); ok {
+			inner := string(runes[index+len([]rune(marker)) : end])
+			builder.WriteString(renderInlineStyled(inner, applyInlineMarkerStyle(baseStyle, marker)))
+			index = end + len([]rune(marker))
+			continue
+		}
+
+		builder.WriteString(baseStyle.Render(string(runes[index])))
+		index++
+	}
+	return builder.String()
+}
+
+func findInlineStyledMarker(runes []rune, start int) (marker string, end int, ok bool) {
+	markers := []string{"***", "___", "**", "__", "~~", "*", "_"}
+	for _, marker := range markers {
+		if hasRunePrefixAt(runes, start, marker) {
+			if !isValidInlineStyleDelimiter(runes, start, marker) {
+				continue
+			}
+			end := findInlineClosingMarker(runes, start+len([]rune(marker)), marker)
+			if end >= 0 {
+				return marker, end, true
+			}
+		}
+	}
+	return "", -1, false
+}
+
+func hasRunePrefixAt(runes []rune, start int, marker string) bool {
+	markerRunes := []rune(marker)
+	if start < 0 || start+len(markerRunes) > len(runes) {
+		return false
+	}
+	for offset, r := range markerRunes {
+		if runes[start+offset] != r {
+			return false
+		}
+	}
+	return true
+}
+
+func findInlineClosingMarker(runes []rune, start int, marker string) int {
+	markerRunes := []rune(marker)
+	for index := start; index+len(markerRunes) <= len(runes); index++ {
+		if index > 0 && runes[index-1] == '\\' {
+			continue
+		}
+		if hasRunePrefixAt(runes, index, marker) {
+			if !isValidInlineStyleDelimiter(runes, index, marker) {
+				continue
+			}
+			return index
+		}
+	}
+	return -1
+}
+
+func isValidInlineStyleDelimiter(runes []rune, start int, marker string) bool {
+	if marker == "" || marker[0] != '_' {
+		return true
+	}
+	markerWidth := len([]rune(marker))
+	beforeIsWord := start > 0 && isMarkdownWordRune(runes[start-1])
+	afterIndex := start + markerWidth
+	afterIsWord := afterIndex < len(runes) && isMarkdownWordRune(runes[afterIndex])
+	return !(beforeIsWord && afterIsWord)
+}
+
+func isMarkdownWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+func applyInlineMarkerStyle(baseStyle lipgloss.Style, marker string) lipgloss.Style {
+	style := baseStyle.Copy()
+	switch marker {
+	case "***", "___":
+		return style.Bold(true).Italic(true)
+	case "**", "__":
+		return style.Bold(true)
+	case "*", "_":
+		return style.Italic(true)
+	case "~~":
+		return style.Strikethrough(true)
+	default:
+		return style
+	}
+}
+
+func isMarkdownEscapableRune(r rune) bool {
+	return strings.ContainsRune(`\`+"`*_{}[]()#+-.!~<>", r)
 }
 
 func renderDiffRows(sign, lineNumber, content string, width int) []string {
@@ -1576,13 +2745,9 @@ func tokenizeCode(value string) []string {
 			tokens = append(tokens, string(runes[index:end]))
 			index = end
 		case current >= '0' && current <= '9':
-			end := index + 1
-			for end < len(runes) {
-				next := runes[end]
-				if !((next >= '0' && next <= '9') || next == '.') {
-					break
-				}
-				end++
+			end := scanCodeNumericToken(runes, index)
+			if end <= index {
+				end = index + 1
 			}
 			tokens = append(tokens, string(runes[index:end]))
 			index = end
@@ -1777,12 +2942,92 @@ func isNumericToken(token string) bool {
 	if token == "" {
 		return false
 	}
-	for _, r := range token {
-		if (r < '0' || r > '9') && r != '.' {
-			return false
+	return scanCodeNumericToken([]rune(token), 0) == len([]rune(token))
+}
+
+func scanCodeNumericToken(runes []rune, start int) int {
+	if start < 0 || start >= len(runes) || runes[start] < '0' || runes[start] > '9' {
+		return start
+	}
+
+	if start+1 < len(runes) && runes[start] == '0' {
+		switch runes[start+1] {
+		case 'x', 'X':
+			return scanCodeRadixNumericToken(runes, start, 2, isHexDigit)
+		case 'b', 'B':
+			return scanCodeRadixNumericToken(runes, start, 2, func(r rune) bool { return r == '0' || r == '1' })
+		case 'o', 'O':
+			return scanCodeRadixNumericToken(runes, start, 2, func(r rune) bool { return r >= '0' && r <= '7' })
 		}
 	}
-	return true
+
+	index := start
+	index = scanCodeDigitsWithSeparators(runes, index, func(r rune) bool { return r >= '0' && r <= '9' })
+
+	if index < len(runes) && runes[index] == '.' {
+		next := index + 1
+		if next < len(runes) && ((runes[next] >= '0' && runes[next] <= '9') || runes[next] == '_') {
+			index = next
+			index = scanCodeDigitsWithSeparators(runes, index, func(r rune) bool { return r >= '0' && r <= '9' })
+		}
+	}
+
+	if index < len(runes) && (runes[index] == 'e' || runes[index] == 'E') {
+		expStart := index
+		next := index + 1
+		if next < len(runes) && (runes[next] == '+' || runes[next] == '-') {
+			next++
+		}
+		expEnd := scanCodeDigitsWithSeparators(runes, next, func(r rune) bool { return r >= '0' && r <= '9' })
+		if expEnd > next {
+			index = expEnd
+		} else {
+			index = expStart
+		}
+	}
+
+	return index
+}
+
+func scanCodeRadixNumericToken(runes []rune, start, prefixLen int, isDigit func(rune) bool) int {
+	index := start + prefixLen
+	end := scanCodeDigitsWithSeparators(runes, index, isDigit)
+	if end == index {
+		return start + 1
+	}
+	return end
+}
+
+func scanCodeDigitsWithSeparators(runes []rune, start int, isDigit func(rune) bool) int {
+	index := start
+	seenDigit := false
+	lastWasSeparator := false
+	for index < len(runes) {
+		switch r := runes[index]; {
+		case isDigit(r):
+			seenDigit = true
+			lastWasSeparator = false
+			index++
+		case r == '_' && seenDigit && !lastWasSeparator && index+1 < len(runes) && isDigit(runes[index+1]):
+			lastWasSeparator = true
+			index++
+		default:
+			if lastWasSeparator {
+				return index - 1
+			}
+			return index
+		}
+	}
+	if lastWasSeparator {
+		return index - 1
+	}
+	return index
+}
+
+func isHexDigit(r rune) bool {
+	return (r >= '0' && r <= '9') ||
+		(r >= 'a' && r <= 'f') ||
+		(r >= 'A' && r <= 'F')
 }
 
 func (m *Model) renderActivePanel(width, height int) string {
@@ -1829,7 +3074,7 @@ type attachmentBarLine struct {
 }
 
 func (m *Model) composerAttachmentBarLine(width int) attachmentBarLine {
-	segments := make([]attachmentBarSegment, 0, len(m.Attachments)+1)
+	segments := make([]attachmentBarSegment, 0, len(m.Attachments))
 	column := 0
 	appendSegment := func(kind string, index int, text string) {
 		if len(segments) > 0 {
@@ -1854,7 +3099,6 @@ func (m *Model) composerAttachmentBarLine(width int) attachmentBarLine {
 		chip := fmt.Sprintf("[img %s x]", truncatePlain(name, maxInt(8, minInt(18, maxInt(8, width/5)))))
 		appendSegment("attachment", index, chip)
 	}
-	appendSegment("add", -1, "[+ image]")
 
 	plain := make([]string, 0, len(segments))
 	for _, segment := range segments {
@@ -1868,13 +3112,14 @@ func (m *Model) composerAttachmentBarLine(width int) attachmentBarLine {
 
 func (m *Model) renderComposerAttachmentBar(width int) []string {
 	line := m.composerAttachmentBarLine(width)
+	if len(line.Segments) == 0 {
+		return nil
+	}
 	rendered := make([]string, 0, len(line.Segments))
 	for _, segment := range line.Segments {
 		switch segment.Kind {
 		case "attachment":
 			rendered = append(rendered, attachmentChipStyle.Render(segment.Text))
-		default:
-			rendered = append(rendered, attachmentAddStyle.Render(segment.Text))
 		}
 	}
 	return []string{strings.Join(rendered, " ")}
@@ -1939,10 +3184,14 @@ func (m *Model) renderComposer(width int) string {
 		}
 
 		if row.Placeholder {
-			lines = append(lines, promptStyle.Render(prefix)+dimStyle.Render(row.Text))
+			lines = append(lines, promptStyle.Render(prefix)+composerPlaceholderStyle.Render(row.Text))
 			continue
 		}
-		lines = append(lines, promptStyle.Render(prefix)+row.Text)
+		prefixStyle := promptStyle
+		if row.Continued {
+			prefixStyle = composerContinuationStyle
+		}
+		lines = append(lines, prefixStyle.Render(prefix)+row.Text)
 	}
 
 	return style.
@@ -2056,11 +3305,19 @@ func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
 	return visibleCursorRow, cursorCol, true
 }
 
-func renderComposerDivider(width int) string {
+func renderComposerTopDivider(width int) string {
+	return renderComposerDividerLine(width)
+}
+
+func renderComposerBottomDivider(width int) string {
+	return renderComposerDividerLine(width)
+}
+
+func renderComposerDividerLine(width int) string {
 	if width <= 0 {
 		return ""
 	}
-	return strings.Repeat("─", width)
+	return composerDividerStyle.Render(strings.Repeat("─", width))
 }
 
 func slashAlternateSummary(item slashCommandSpec) string {
@@ -2115,23 +3372,56 @@ type composerSegment struct {
 func (m *Model) composerDisplaySegments() []composerSegment {
 	cursor := clampInt(m.Cursor, 0, len(m.Input))
 	compositionCursor := clampInt(m.CompositionCursor, 0, len(m.Composition))
-	segments := make([]composerSegment, 0, 6)
+	segments := make([]composerSegment, 0, 8)
 	if cursor > 0 {
-		segments = append(segments, composerSegment{Text: string(m.Input[:cursor]), Kind: "plain"})
+		segments = append(segments, collapseComposerDisplayText(string(m.Input[:cursor]), "plain")...)
 	}
 	if len(m.Composition) > 0 {
 		if compositionCursor > 0 {
-			segments = append(segments, composerSegment{Text: string(m.Composition[:compositionCursor]), Kind: "composition"})
+			segments = append(segments, collapseComposerDisplayText(string(m.Composition[:compositionCursor]), "composition")...)
 		}
 		segments = append(segments, composerSegment{Text: composerCursorGlyph, Kind: "cursor"})
 		if compositionCursor < len(m.Composition) {
-			segments = append(segments, composerSegment{Text: string(m.Composition[compositionCursor:]), Kind: "composition"})
+			segments = append(segments, collapseComposerDisplayText(string(m.Composition[compositionCursor:]), "composition")...)
 		}
 	} else {
 		segments = append(segments, composerSegment{Text: composerCursorGlyph, Kind: "cursor"})
 	}
 	if cursor < len(m.Input) {
-		segments = append(segments, composerSegment{Text: string(m.Input[cursor:]), Kind: "plain"})
+		segments = append(segments, collapseComposerDisplayText(string(m.Input[cursor:]), "plain")...)
+	}
+	return segments
+}
+
+func collapseComposerDisplayText(text string, kind string) []composerSegment {
+	if text == "" {
+		return nil
+	}
+	if kind != "collapsed" {
+		if segments := splitComposerPasteSummarySegments(text, kind); len(segments) > 0 {
+			return segments
+		}
+	}
+	return []composerSegment{{Text: text, Kind: kind}}
+}
+
+func splitComposerPasteSummarySegments(text string, kind string) []composerSegment {
+	indices := composerPasteSummaryPattern.FindAllStringIndex(text, -1)
+	if len(indices) == 0 {
+		return nil
+	}
+
+	segments := make([]composerSegment, 0, len(indices)*2+1)
+	start := 0
+	for _, index := range indices {
+		if index[0] > start {
+			segments = append(segments, composerSegment{Text: text[start:index[0]], Kind: kind})
+		}
+		segments = append(segments, composerSegment{Text: text[index[0]:index[1]], Kind: "collapsed"})
+		start = index[1]
+	}
+	if start < len(text) {
+		segments = append(segments, composerSegment{Text: text[start:], Kind: kind})
 	}
 	return segments
 }
@@ -2168,6 +3458,8 @@ func renderComposerSegments(segments []composerSegment, width int) []composerRow
 				current.WriteString(cursorStyle.Render(string(r)))
 			case "composition":
 				current.WriteString(compositionStyle.Render(string(r)))
+			case "collapsed":
+				current.WriteString(collapsedPasteStyle.Render(string(r)))
 			default:
 				current.WriteRune(r)
 			}
@@ -2272,8 +3564,11 @@ func (m *Model) renderApprovals(width, height int) string {
 	}
 
 	bodyLines = append(bodyLines, sectionStyle.Render("detail"))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("%s  |  %s", selected.Action, truncatePlain(selected.Path, maxInt(8, bodyWidth-16)))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s  |  %s", truncatePlain(selected.ID, 14), emptyFallback(selected.CreatedAt, "unknown"))))
+	bodyLines = append(bodyLines, approvalDetailBannerStyle.Render(truncatePlain(fmt.Sprintf("%s  %s", actionBadge(selected.Action), selected.Path), bodyWidth)))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("kind", describeApprovalAction(selected.Action), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("path", selected.Path, bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("id", truncatePlain(selected.ID, maxInt(12, bodyWidth-8)), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("created", emptyFallback(selected.CreatedAt, "unknown"), bodyWidth))
 	previewSource := selected.PreviewSummary
 	if m.ApprovalPreview == ApprovalFull && strings.TrimSpace(selected.PreviewFull) != "" {
 		previewSource = selected.PreviewFull
@@ -2283,7 +3578,7 @@ func (m *Model) renderApprovals(width, height int) string {
 	addCount, delCount := approvalDiffStats(previewLines)
 	bodyLines = append(bodyLines,
 		sectionStyle.Render("preview"),
-		dimStyle.Render(fmt.Sprintf("%s  %d-%d/%d  |  +%d -%d", m.ApprovalPreview, previewWindow.Start+1, previewWindow.End, previewWindow.Total, addCount, delCount)),
+		renderApprovalPreviewSummary(m.ApprovalPreview, previewWindow, addCount, delCount, bodyWidth),
 	)
 	previewRendered := make([]string, 0, len(previewWindow.Lines))
 	for _, line := range previewWindow.Lines {
@@ -2427,7 +3722,7 @@ func (m *Model) renderSessions(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	page := pageForSelection(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(width, height))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "load ↵", "new n", "refresh r", "esc"),
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page", "load ↵", "refresh", "esc"),
 	}
 	footerLines := []string{
 		renderPanelSummaryColumns(bodyWidth, "sessions", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total)),
@@ -2435,9 +3730,16 @@ func (m *Model) renderSessions(width, height int) string {
 	}
 	bodyLines := []string{}
 	if len(m.Sessions) == 0 {
-		bodyLines = append(bodyLines, dimStyle.Render("No saved sessions."))
+		bodyLines = append(bodyLines,
+			renderPageHeroLine(bodyWidth, "sessions", "0 saved"),
+		)
+		bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "No saved sessions yet. Use /resume <id> to load one, or keep working to create a new session.")...)
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
+	selected := m.Sessions[clampInt(m.SessionIndex, 0, len(m.Sessions)-1)]
+	heroSummary := fmt.Sprintf("%d saved  |  current %s", len(m.Sessions), emptyFallback(m.ActiveSessionID, "none"))
+	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "sessions", heroSummary))
+	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "Enter load | arrows navigate | Esc back")...)
 	bodyLines = append(bodyLines, sectionStyle.Render("list"))
 	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
 	for index := page.Start; index < page.End; index++ {
@@ -2464,19 +3766,19 @@ func (m *Model) renderSessions(width, height int) string {
 		Visible: 1,
 		Total:   maxInt(1, page.TotalPages),
 	})...)
-	selected := m.Sessions[clampInt(m.SessionIndex, 0, len(m.Sessions)-1)]
 	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s", selected.ID)))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("updated %s", selected.UpdatedAt)))
+	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", selected.Title), bodyWidth)))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("id", selected.ID, bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("updated", selected.UpdatedAt, bodyWidth))
 	if strings.TrimSpace(selected.ProjectRoot) != "" {
-		bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("project %s", truncatePlain(selected.ProjectRoot, bodyWidth-8))))
+		bodyLines = append(bodyLines, renderApprovalMetaRow("project", selected.ProjectRoot, bodyWidth))
 	} else {
-		bodyLines = append(bodyLines, dimStyle.Render("project none"))
+		bodyLines = append(bodyLines, renderApprovalMetaRow("project", "none", bodyWidth))
 	}
 	if len(selected.Tags) > 0 {
-		bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("tags %s", strings.Join(selected.Tags, ", "))))
+		bodyLines = append(bodyLines, renderApprovalMetaRow("tags", strings.Join(selected.Tags, ", "), bodyWidth))
 	} else {
-		bodyLines = append(bodyLines, dimStyle.Render("tags none"))
+		bodyLines = append(bodyLines, renderApprovalMetaRow("tags", "none", bodyWidth))
 	}
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
@@ -2491,9 +3793,8 @@ func (m *Model) renderModels(width, height int) string {
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "models", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
 	bodyLines := []string{}
-	for _, row := range wrapPlainText("custom model id: press c to prefill /model custom <id> in the composer", bodyWidth) {
-		bodyLines = append(bodyLines, dimStyle.Render(row))
-	}
+	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "models", fmt.Sprintf("current %s", emptyFallback(m.CurrentModel, "none"))))
+	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, modelCustomHint)...)
 	if len(m.AvailableModels) == 0 {
 		bodyLines = append(bodyLines, dimStyle.Render("No models available."))
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
@@ -2527,9 +3828,9 @@ func (m *Model) renderModels(width, height int) string {
 	})...)
 	selected := m.AvailableModels[clampInt(m.ModelIndex, 0, len(m.AvailableModels)-1)]
 	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("selected %s", selected)))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("family %s", modelFamily(selected))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("provider %s", truncatePlain(emptyFallback(m.CurrentProvider, "none"), bodyWidth))))
+	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", selected), bodyWidth)))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("family", modelFamily(selected), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("provider", emptyFallback(m.CurrentProvider, "none"), bodyWidth))
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
@@ -2539,14 +3840,19 @@ func (m *Model) renderProviders(width, height int) string {
 	listWidth := maxInt(1, bodyWidth-2)
 	page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(width, height))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh r", "esc"),
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "switch ↵", "refresh", "esc"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "providers", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
 	bodyLines := []string{}
 	if len(m.AvailableProviders) == 0 {
-		bodyLines = append(bodyLines, dimStyle.Render("No providers available."))
+		bodyLines = append(bodyLines,
+			renderPageHeroLine(bodyWidth, "providers", "0 configured"),
+		)
+		bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "No providers available. Use /login or /provider <url> to configure one.")...)
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
+	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "providers", fmt.Sprintf("current %s", m.providerDisplayName(m.CurrentProvider))))
+	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "Enter switch | refresh reloads providers and models | Esc back")...)
 	bodyLines = append(bodyLines, sectionStyle.Render("list"))
 	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*3))
 	for index := page.Start; index < page.End; index++ {
@@ -2564,7 +3870,7 @@ func (m *Model) renderProviders(width, height int) string {
 		format := formatTransportFormatLabel(m.providerFormat(provider))
 		source := formatProviderProfileSourceLabel(m.providerProfileSource(provider))
 		nameLine := fmt.Sprintf("%s%s%s", prefix, truncatePlain(name, bodyWidth-20), marker)
-		endpointLine := fmt.Sprintf("   endpoint %s  |  source %s", truncatePlain(formatProviderLabel(provider, maxInt(8, bodyWidth-30)), maxInt(8, bodyWidth-4)), source)
+		endpointLine := fmt.Sprintf("   endpoint %s  |  source %s", formatProviderLabel(provider, maxInt(8, bodyWidth)), source)
 		profileLine := fmt.Sprintf("   profile %s  |  format %s", profile, format)
 		if index == m.ProviderIndex {
 			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, nameLine, listWidth))
@@ -2583,14 +3889,16 @@ func (m *Model) renderProviders(width, height int) string {
 	})...)
 	selected := m.AvailableProviders[clampInt(m.ProviderIndex, 0, len(m.AvailableProviders)-1)]
 	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("selected %s", m.providerDisplayName(selected))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("url %s", truncatePlain(selected, bodyWidth-4))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("profile %s  |  source %s", formatProviderProfileLabel(m.providerProfile(selected)), formatProviderProfileSourceLabel(m.providerProfileSource(selected)))))
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("format %s  |  host %s", formatTransportFormatLabel(m.providerFormat(selected)), providerEndpointKind(selected, m.providerProfile(selected)))))
+	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", m.providerDisplayName(selected)), bodyWidth)))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("url", selected, bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("profile", formatProviderProfileLabel(m.providerProfile(selected)), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("source", formatProviderProfileSourceLabel(m.providerProfileSource(selected)), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("format", formatTransportFormatLabel(m.providerFormat(selected)), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("host", providerEndpointKind(selected, m.providerProfile(selected)), bodyWidth))
 	for _, line := range m.providerEndpointDetailLines(selected, bodyWidth) {
 		bodyLines = append(bodyLines, dimStyle.Render(line))
 	}
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("key %s", formatKeySourceLabel(m.CurrentProviderKeySource))))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("key", formatKeySourceLabel(m.CurrentProviderKeySource), bodyWidth))
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
@@ -2599,10 +3907,12 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	stepLabel := strings.ToUpper(strings.ReplaceAll(string(m.AuthStep), "_", " "))
 	headerLines := []string{
-		renderPanelHeaderColumns(bodyWidth, "Alt+1/2/3/4 jump", "tab/↑/↓ step", "enter next/connect", "esc close"),
+		renderPanelHeaderColumns(bodyWidth, "Alt+1-4", "tab/↑/↓", "enter", "esc"),
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
 	bodyLines := []string{}
+	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "login", "step "+stepLabel))
+	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, fmt.Sprintf("mode %s  |  persistence %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable")))...)
 
 	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider, bodyWidth)
 	typeLine := formatAuthFieldLine(2, "Provider Type", string(m.AuthProviderType), m.AuthStep == AuthStepProviderType, bodyWidth)
@@ -2613,13 +3923,12 @@ func (m *Model) renderAuthPanel(width, height int) string {
 		confirmLine = renderFullWidthStyledLine(selectedPanelItemStyle, confirmLine, bodyWidth)
 	}
 	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, typeLine, apiLine, modelLine, confirmLine)
-	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("Current mode: %s  |  persistence: %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable"))))
 	if strings.TrimSpace(m.Auth.PersistencePath) != "" {
-		bodyLines = append(bodyLines, dimStyle.Render(truncatePlain(m.Auth.PersistencePath, bodyWidth)))
+		bodyLines = append(bodyLines, renderApprovalMetaRow("path", m.Auth.PersistencePath, bodyWidth))
 	}
 
 	if m.AuthStep == AuthStepConfirm {
-		bodyLines = append(bodyLines, "", sectionStyle.Render("detail"), dimStyle.Render("Press Enter to save login and rebuild the transport."))
+		bodyLines = append(bodyLines, "", sectionStyle.Render("detail"), pageSelectedBannerStyle.Render(truncatePlain("Press Enter to save login and rebuild the transport.", bodyWidth)))
 	} else {
 		bodyLines = append(bodyLines, "", sectionStyle.Render("editor"))
 		for _, row := range m.authEditorLines(bodyWidth) {
@@ -2756,7 +4065,7 @@ func (m *Model) providerEndpointDetailLines(provider string, bodyWidth int) []st
 	lines := make([]string, 0, len(rows))
 	for _, row := range rows {
 		label := fmt.Sprintf("%-10s %s", row.label, formatProviderEndpointLabel(m.providerEndpoint(provider, row.kind)))
-		lines = append(lines, truncatePlain(label, maxInt(8, bodyWidth-4)))
+		lines = append(lines, label)
 	}
 	return lines
 }
@@ -2961,11 +4270,30 @@ func approvalDiffStats(lines []approvalPreviewLine) (int, int) {
 	return add, del
 }
 
+func renderApprovalMetaRow(key, value string, width int) string {
+	keyText := approvalMetaKeyStyle.Render(strings.ToUpper(strings.TrimSpace(key)))
+	plainPrefix := strings.ToUpper(strings.TrimSpace(key)) + "  "
+	valueWidth := maxInt(1, width-lipgloss.Width(plainPrefix))
+	valueText := strings.TrimSpace(value)
+	valueStyle := approvalMetaValueStyle
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "path", "destination", "cwd":
+		valueStyle = approvalPathStyle
+	}
+	renderedValue := truncatePlain(valueStyle.Render(valueText), valueWidth)
+	return keyText + "  " + renderedValue
+}
+
+func renderApprovalPreviewSummary(mode ApprovalPreviewMode, page previewPage, addCount, delCount, width int) string {
+	text := fmt.Sprintf("%s  %d-%d/%d  |  +%d -%d", mode, page.Start+1, page.End, page.Total, addCount, delCount)
+	return dimStyle.Render(truncatePlain(text, width))
+}
+
 func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 	maxWidth := maxInt(1, width)
 	switch line.Kind {
 	case "section":
-		return []string{dimStyle.Bold(true).Render(truncatePlain("== "+emptyFallback(line.Section, "preview")+" ==", maxWidth))}
+		return []string{approvalSectionStyle.Render(truncatePlain("▌ "+emptyFallback(line.Section, "preview"), maxWidth))}
 	case "hunk":
 		return []string{diffHunkStyle.Render(truncatePlain(line.Text, maxWidth))}
 	case "add":
@@ -2973,19 +4301,25 @@ func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 	case "remove":
 		return renderTerminalDiffRows("-", line.LineNumber, emptyFallback(line.Content, line.Text), maxWidth, diffRemoveGutterStyle, diffRemoveLineStyle)
 	case "kv":
-		keyPrefix := dimStyle.Render(line.Key + ": ")
-		valueWidth := maxInt(1, maxWidth-lipgloss.Width(line.Key)-2)
+		keyPlain := strings.TrimSpace(line.Key)
+		keyPrefix := approvalMetaKeyStyle.Render(strings.ToUpper(keyPlain) + "  ")
+		valueWidth := maxInt(1, maxWidth-lipgloss.Width(strings.ToUpper(keyPlain))-2)
 		wrapped := wrapPlainText(line.Val, valueWidth)
 		if len(wrapped) == 0 {
 			return []string{truncatePlain(keyPrefix, maxWidth)}
 		}
 		lines := make([]string, 0, len(wrapped))
+		valueStyle := approvalMetaValueStyle
+		switch strings.ToLower(keyPlain) {
+		case "path", "destination", "cwd":
+			valueStyle = approvalPathStyle
+		}
 		for index, row := range wrapped {
 			if index == 0 {
-				lines = append(lines, truncatePlain(keyPrefix+asstStyle.Render(row), maxWidth))
+				lines = append(lines, truncatePlain(keyPrefix+valueStyle.Render(row), maxWidth))
 				continue
 			}
-			lines = append(lines, truncatePlain(strings.Repeat(" ", lipgloss.Width(line.Key)+2)+asstStyle.Render(row), maxWidth))
+			lines = append(lines, truncatePlain(strings.Repeat(" ", lipgloss.Width(strings.ToUpper(keyPlain))+2)+valueStyle.Render(row), maxWidth))
 		}
 		return lines
 	case "blank":

@@ -156,8 +156,8 @@ func (m *Model) mouseLayout() mouseLayout {
 
 	header := m.renderTopStatusBar(contentWidth)
 	composer := m.renderComposer(contentWidth)
-	topComposerDivider := renderComposerDivider(contentWidth)
-	bottomComposerDivider := renderComposerDivider(contentWidth)
+	topComposerDivider := renderComposerTopDivider(contentWidth)
+	bottomComposerDivider := renderComposerBottomDivider(contentWidth)
 	footer := m.renderBottomStatusBar(contentWidth)
 	headerHeight := lipgloss.Height(header)
 	composerHeight := lipgloss.Height(composer)
@@ -174,7 +174,7 @@ func (m *Model) mouseLayout() mouseLayout {
 			Left:   0,
 			Top:    0,
 			Width:  contentWidth,
-			Height: maxInt(1, headerHeight),
+			Height: headerHeight,
 		},
 		Session: mouseRect{
 			Left:   0,
@@ -198,6 +198,17 @@ func (m *Model) mouseLayout() mouseLayout {
 	}
 
 	if !layout.HasPanel {
+		return layout
+	}
+
+	if usesPagePanelLayout(m.ActivePanel) {
+		layout.Session = mouseRect{}
+		layout.Panel = mouseRect{
+			Left:   0,
+			Top:    bodyTop,
+			Width:  contentWidth,
+			Height: bodyHeight,
+		}
 		return layout
 	}
 
@@ -276,9 +287,6 @@ func (m *Model) composerMouseHit(composerRect mouseRect, mouseX, mouseY int) (mo
 		}
 		if segment.Kind == "attachment" {
 			return mouseHit{Region: mouseRegionComposerAttachmentRemove, Index: segment.Index}, true
-		}
-		if segment.Kind == "add" {
-			return mouseHit{Region: mouseRegionComposerAttachmentAdd, Index: -1}, true
 		}
 	}
 	return mouseHit{}, false
@@ -408,10 +416,11 @@ func (m *Model) panelScrollbarGeometry(panelRect mouseRect) (scrollbarGeometry, 
 		}
 		page := pageForSelection(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
 		listRows := maxInt(1, (page.End-page.Start)*2)
+		startLine := 2 + sessionPanelLeadRows(bodyWidth)
 		return scrollbarGeometryForBlock(
 			mouseRegionSessionListScrollbar,
 			x,
-			inner.Top+2,
+			inner.Top+startLine,
 			listRows,
 			listRows,
 			panelScrollState{
@@ -426,7 +435,7 @@ func (m *Model) panelScrollbarGeometry(panelRect mouseRect) (scrollbarGeometry, 
 		}
 		page := pageForSelection(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
 		listRows := maxInt(1, (page.End-page.Start)*2)
-		startLine := 2 + len(wrapPlainText("custom model id: press c to prefill /model custom <id> in the composer", bodyWidth))
+		startLine := 2 + modelPanelLeadRows(bodyWidth)
 		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
 		return scrollbarGeometryForBlock(
 			mouseRegionModelListScrollbar,
@@ -446,7 +455,7 @@ func (m *Model) panelScrollbarGeometry(panelRect mouseRect) (scrollbarGeometry, 
 		}
 		page := pageForSelection(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
 		listRows := maxInt(1, (page.End-page.Start)*3)
-		startLine := 2 + providerPanelCommandRows(bodyWidth)
+		startLine := 2 + providerPanelLeadRows(bodyWidth)
 		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
 		return scrollbarGeometryForBlock(
 			mouseRegionProviderListScrollbar,
@@ -491,15 +500,17 @@ func (m *Model) panelMouseHit(panelRect mouseRect, mouseX, mouseY int) mouseHit 
 			return mouseHit{Region: mouseRegionPlanList, Index: index}
 		}
 	case PanelSessions:
-		if index, ok := listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 2, innerY, 2); ok {
+		startLine := 2 + sessionPanelLeadRows(bodyWidth)
+		if index, ok := listIndexAtPanelLine(len(m.Sessions), m.SessionIndex, m.sessionPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 2, innerY, startLine); ok {
 			return mouseHit{Region: mouseRegionSessionList, Index: index}
 		}
 	case PanelModels:
-		if index, ok := listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 2, innerY, 2); ok {
+		startLine := 2 + modelPanelLeadRows(bodyWidth)
+		if index, ok := listIndexAtPanelLine(len(m.AvailableModels), m.ModelIndex, m.modelPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 2, innerY, startLine); ok {
 			return mouseHit{Region: mouseRegionModelList, Index: index}
 		}
 	case PanelProviders:
-		startLine := 2 + providerPanelCommandRows(bodyWidth)
+		startLine := 2 + providerPanelLeadRows(bodyWidth)
 		if index, ok := listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 3, innerY, startLine); ok {
 			return mouseHit{Region: mouseRegionProviderList, Index: index}
 		}

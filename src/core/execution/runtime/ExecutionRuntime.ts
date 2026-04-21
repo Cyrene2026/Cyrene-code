@@ -40,7 +40,6 @@ const SILENT_REVIEW_RESUME_RECOVERY_NOTE = [
 
 const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
 const MAX_NON_PROGRESS_CHATTER_CHARS = 240;
-const MAX_NON_PROGRESS_ROUNDS = 3;
 const BROAD_DISCOVERY_SCOPE_BUDGET = 3;
 const ROUND_PROMPT_TASK_CHAR_LIMIT = 12000;
 const ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT = 16000;
@@ -71,6 +70,7 @@ const PROJECT_ANALYSIS_BROAD_DISCOVERY_ACTIONS = new Set([
 
 const TARGETED_SOURCE_READ_ACTIONS = new Set([
   "read_file",
+  "read_files",
   "read_range",
   "read_json",
   "read_yaml",
@@ -412,6 +412,12 @@ const isSemanticNavigationAction = (toolName: string, input: unknown) =>
 const taskSuggestsProjectAnalysis = (task: string) =>
   !taskSuggestsWriting(task) && PROJECT_ANALYSIS_TASK_PATTERN.test(task);
 
+const WRITE_FOCUS_TASK_PATTERN =
+  /(\bcreate\b|\bwrite\b|\badd\b|\bappend\b|\bfill\b|\bimplement\b|\bfix\b|\bupdate\b|\bmodify\b|\bpatch\b|\bsave\b|\bgenerate\b|\bsplit\b|\bmodulari(?:s|z)e\b|\breorganize\b|\bclassify\b|\bmigrate\b|补|写|创建|修复|更新|修改|实现|填充|补充|写入|拆分|模块化|整理|分类|迁移)/i;
+
+const taskShouldUseWriteFocus = (task: string) =>
+  WRITE_FOCUS_TASK_PATTERN.test(task) && !taskSuggestsProjectAnalysis(task);
+
 const taskSuggestsSimpleMultiFile = (
   task: string,
   ledger: MultiFileProgressLedger
@@ -433,11 +439,14 @@ const createUncertaintyState = (
   return {
     mode,
     phase: "discover",
+    writeFocus: taskShouldUseWriteFocus(task),
+    mutationStarted: false,
     discoverBudgetUsed: 0,
     discoverBudgetMax: mode === "project_analysis" ? 3 : 4,
     analysisSignalCount: 0,
     semanticNavigationCount: 0,
     nonProgressAutoContinueUsed: false,
+    nonProgressAutoContinueCount: 0,
     explicitSourceReads: new Set<string>(),
     explicitTaskPaths: new Set(extractExplicitTaskPaths(task)),
     verifyRequested: taskSuggestsPostWriteVerification(task),
@@ -449,7 +458,7 @@ const formatExecutionState = (
   uncertainty: UncertaintyState,
   ledger: MultiFileProgressLedger
 ) => {
-  if (uncertainty.mode === "normal") {
+  if (uncertainty.mode === "normal" && !uncertainty.writeFocus) {
     return "";
   }
 
@@ -457,12 +466,26 @@ const formatExecutionState = (
   const completedCount = ledger.completedPaths.length;
   const remainingPaths = ProgressTracker.getLedgerRemainingPaths(ledger);
   const remainingCount = ProgressTracker.getLedgerRemainingCount(ledger);
+  const explicitPaths = Array.from(uncertainty.explicitTaskPaths).sort();
   const lines = [
     "Execution state:",
-    `mode: ${uncertainty.mode}`,
+    `mode: ${
+      uncertainty.mode === "normal" && uncertainty.writeFocus
+        ? "write_focus"
+        : uncertainty.mode
+    }`,
     `phase: ${uncertainty.phase}`,
     `broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
   ];
+
+  if (uncertainty.writeFocus) {
+    lines.push(
+      `write focus: ${uncertainty.mutationStarted ? "mutation_started" : "pre_mutation"}`
+    );
+    if (explicitPaths.length > 0) {
+      lines.push(`explicit task paths: ${formatPathList(explicitPaths, 4)}`);
+    }
+  }
 
   if (uncertainty.mode === "project_analysis") {
     lines.push(`architecture evidence: ${uncertainty.analysisSignalCount}`);
@@ -508,6 +531,24 @@ const formatExecutionState = (
     lines.push(`blocked: ${uncertainty.blockedReason}`);
   }
 
+  if (
+    uncertainty.writeFocus &&
+    !uncertainty.mutationStarted &&
+    uncertainty.phase !== "blocked"
+  ) {
+    lines.push(
+      "directive: use at most one targeted source read, then move directly to the next write/edit step"
+    );
+  } else if (
+    uncertainty.writeFocus &&
+    uncertainty.mutationStarted &&
+    uncertainty.phase !== "blocked"
+  ) {
+    lines.push(
+      "directive: continue remaining writes, explicit verification, or finalize; do not drift back into broad discovery"
+    );
+  }
+
   return lines.join("\n");
 };
 
@@ -542,23 +583,45 @@ const buildInitialExecutionMemo = (
     ].join("\n");
   }
 
-  if (uncertainty.mode !== "simple_multi_file") {
+  if (!uncertainty.writeFocus) {
+    if (uncertainty.mode !== "simple_multi_file") {
+      return clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT);
+    }
+  }
+
+  if (!uncertainty.writeFocus && uncertainty.mode !== "simple_multi_file") {
     return clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT);
   }
 
   const expected = ProgressTracker.getLedgerExpectedFileCount(ledger);
+  const explicitPaths = Array.from(uncertainty.explicitTaskPaths).sort();
   const memo = [
     clipRoundPromptText(query, ROUND_PROMPT_TASK_CHAR_LIMIT),
     "",
     "Execution memo:",
-    "- This is a simple multi-file task.",
+    uncertainty.writeFocus ? "- This is an explicit code-change task." : "",
+    uncertainty.mode === "simple_multi_file" ? "- This is a simple multi-file task." : "",
+    uncertainty.writeFocus && uncertainty.mode !== "simple_multi_file"
+      ? "- This is a focused write/edit task."
+      : "",
     `- phase: ${uncertainty.phase}`,
     `- broad discovery budget: ${uncertainty.discoverBudgetUsed}/${uncertainty.discoverBudgetMax}`,
     expected > 0 ? `- expected files: ${expected}` : "",
+    uncertainty.writeFocus && explicitPaths.length > 0
+      ? `- explicit task paths: ${formatPathList(explicitPaths, 4)}`
+      : "",
     ledger.targetPaths.length > 1
       ? `- known target paths: ${formatPathList(ledger.targetPaths, 4)}`
       : "",
-    "- If enough context is already clear, move straight to the remaining writes/edits.",
+    uncertainty.writeFocus
+      ? "- If target paths are already known, use at most one targeted source read before the first write/edit."
+      : "- If enough context is already clear, move straight to the remaining writes/edits.",
+    uncertainty.writeFocus
+      ? "- Once enough context is clear, move directly to create_file/write_file/edit_file/apply_patch."
+      : "- If several similar writes are needed, emit multiple tool_call actions in the same round before the final answer.",
+    uncertainty.writeFocus
+      ? "- Do not spend extra turns re-checking the same path or directory before writing."
+      : "",
     "- If several similar writes are needed, emit multiple tool_call actions in the same round before the final answer.",
     "- Keep narration minimal and do not stop after partial progress.",
     "- Later rounds may include runtime fact sections derived from structured tool metadata. Treat those sections as authoritative current state; do not rerun reads/searches just because the visible tool text is short.",
@@ -638,6 +701,21 @@ const shouldAllowTargetedSourceRead = (
     return false;
   }
 
+  const normalizedPath = normalizeComparedPath(path);
+  const recentlyDiscovered = new Set(
+    getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
+  );
+
+  if (uncertainty.writeFocus && !uncertainty.mutationStarted && !uncertainty.verifyRequested) {
+    const pathIsConcreteTarget =
+      uncertainty.explicitTaskPaths.has(normalizedPath) ||
+      recentlyDiscovered.has(normalizedPath) ||
+      searchMemory.discoveredPaths.has(normalizedPath);
+    if (pathIsConcreteTarget) {
+      return !uncertainty.explicitSourceReads.has(normalizedPath);
+    }
+  }
+
   if (uncertainty.mode !== "simple_multi_file") {
     return true;
   }
@@ -646,10 +724,6 @@ const shouldAllowTargetedSourceRead = (
     return true;
   }
 
-  const normalizedPath = normalizeComparedPath(path);
-  const recentlyDiscovered = new Set(
-    getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
-  );
   if (recentlyDiscovered.has(normalizedPath)) {
     return true;
   }
@@ -792,15 +866,18 @@ const shouldAutoContinueNonProgress = (
   ledger: MultiFileProgressLedger
 ) => {
   const visibleChars = assistantText.replace(/\s+/g, "").length;
+  const autoContinueLimit =
+    uncertainty.writeFocus && !uncertainty.mutationStarted ? 2 : 1;
   return (
-    uncertainty.mode === "simple_multi_file" &&
-    uncertainty.phase === "execute" &&
-    ProgressTracker.getLedgerRemainingCount(ledger) > 0 &&
+    ((uncertainty.mode === "simple_multi_file" &&
+      uncertainty.phase === "execute" &&
+      ProgressTracker.getLedgerRemainingCount(ledger) > 0) ||
+      (uncertainty.writeFocus && !uncertainty.mutationStarted)) &&
     !uncertainty.blockedReason &&
     visibleChars > 0 &&
     visibleChars < MAX_NON_PROGRESS_CHATTER_CHARS &&
     NON_PROGRESS_CHATTER_PATTERN.test(assistantText) &&
-    !uncertainty.nonProgressAutoContinueUsed
+    uncertainty.nonProgressAutoContinueCount < autoContinueLimit
   );
 };
 
@@ -949,6 +1026,16 @@ const buildRoundPrompt = (
           "- Organize the final answer around overall architecture, main chain, key modules, and open questions.",
         ].join("\n")
       : "";
+  const writeFocusRules =
+    uncertainty.writeFocus
+      ? [
+          "Write-focus rules:",
+          "- This is an explicit code-change task. Bias toward concrete writes/edits once the target path is known.",
+          "- If a target path is already explicit or just discovered, use at most one targeted source read before the first write/edit on that path.",
+          "- After the first confirmed mutation, spend later rounds on remaining writes, explicit verification, or the final answer.",
+          "- Do not reopen broad discovery once a concrete target path or confirmed mutation already gives enough context.",
+        ].join("\n")
+      : "";
   return [
     "Original user task:",
     clipRoundPromptText(originalTask, ROUND_PROMPT_TASK_CHAR_LIMIT),
@@ -968,6 +1055,7 @@ const buildRoundPrompt = (
     "- Keep progress narration minimal and non-repetitive. Avoid repeated lines like 'I will now...'.",
     "- For multi-file create/edit tasks, batch similar writes naturally and move forward without repeated preambles.",
     "- Keep assistant wording in the same language as the user request unless the user asks to switch.",
+    writeFocusRules,
     analysisRules,
     recentMutationFacts
       ? `Recent confirmed file mutations:\n${recentMutationFacts}`
@@ -1016,7 +1104,6 @@ const runExecutionRuntime = async ({
   const readLedger = new Map<string, FileReadLedgerEntry>();
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
   let repeatedImmediatePostWriteReadCount = 0;
-  let nonProgressRounds = 0;
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
       ? Math.floor(queryMaxToolSteps)
@@ -1044,9 +1131,10 @@ const runExecutionRuntime = async ({
       metadata
     );
     if (confirmedFileMutation) {
+      uncertainty.mutationStarted = true;
       recentConfirmedFileMutations =
         ToolObservationStore.pushRecentConfirmedFileMutation(
-        recentConfirmedFileMutations,
+          recentConfirmedFileMutations,
         confirmedFileMutation
       );
       ToolObservationStore.clearReadLedgerForMutation(
@@ -1072,6 +1160,14 @@ const runExecutionRuntime = async ({
         message,
         progressLedger
       );
+      if (
+        uncertainty.writeFocus &&
+        !uncertainty.mutationStarted &&
+        uncertainty.phase === "discover" &&
+        uncertainty.explicitSourceReads.size > 0
+      ) {
+        uncertainty.phase = "collapse";
+      }
     }
     const blockedReason = getBlockedReason(
       task,
@@ -1109,17 +1205,10 @@ const runExecutionRuntime = async ({
     const toolResults: string[] = [];
     let latestUsage: TokenUsage | null = null;
     let usageReported = false;
-    const roundProgressBefore = ProgressTracker.captureProgressSnapshot(
-      uncertainty,
-      progressLedger,
-      searchMemory,
-      readLedger,
-      filesystemMutationRevision
-    );
-    let roundUsedProgressSensitiveTool = false;
     const shouldDeferRoundText =
-      uncertainty.mode === "simple_multi_file" &&
-      uncertainty.phase === "execute";
+      uncertainty.writeFocus ||
+      (uncertainty.mode === "simple_multi_file" &&
+        uncertainty.phase === "execute");
     let deferredRoundText = "";
 
     const flushUsage = () => {
@@ -1142,41 +1231,6 @@ const runExecutionRuntime = async ({
       }
       dispatch({ type: "text_delta", text });
       onTextDelta(text);
-    };
-
-    const finalizeRoundProgress = () => {
-      const roundProgressAfter = ProgressTracker.captureProgressSnapshot(
-        uncertainty,
-        progressLedger,
-        searchMemory,
-        readLedger,
-        filesystemMutationRevision
-      );
-      if (
-        ProgressTracker.didMakeExecutionProgress(
-          roundProgressBefore,
-          roundProgressAfter
-        )
-      ) {
-        nonProgressRounds = 0;
-        return false;
-      }
-      if (!roundUsedProgressSensitiveTool) {
-        nonProgressRounds = 0;
-        return false;
-      }
-      nonProgressRounds += 1;
-      if (nonProgressRounds < MAX_NON_PROGRESS_ROUNDS) {
-        return false;
-      }
-      emitRoundText(
-        [
-          "[execution paused]",
-          `No new file mutation, high-value evidence, or phase progression was recorded across ${nonProgressRounds} consecutive search/read rounds.`,
-          "Stop broad searching and continue from known paths, or ask for a narrower target.",
-        ].join("\n")
-      );
-      return true;
     };
 
     const createOneShotResume = (
@@ -1235,13 +1289,32 @@ const runExecutionRuntime = async ({
           const toolPath = getToolPath(event.input);
           const displayName = getLoopDisplayName(event.toolName, event.input);
           if (
-            ToolLoopGuard.shouldTrackRoundForNoProgress(
-              uncertainty,
-              event.toolName,
-              event.input
-            )
+            uncertainty.writeFocus &&
+            !uncertainty.verifyRequested &&
+            isBroadDiscoveryAction(event.toolName, event.input) &&
+            (uncertainty.mutationStarted ||
+              searchMemory.discoveredPaths.size > 0 ||
+              (uncertainty.explicitTaskPaths.size > 0 &&
+                uncertainty.explicitSourceReads.size > 0))
           ) {
-            roundUsedProgressSensitiveTool = true;
+            const skipReason = uncertainty.mutationStarted
+              ? "a confirmed code mutation already exists"
+              : searchMemory.discoveredPaths.size > 0
+                ? "concrete target paths are already known"
+                : "the explicit target path was already read once";
+            loopCorrection = [
+              "Write-focused discovery blocked:",
+              `Skipped ${action} ${toolPath ?? "."} because ${skipReason}.`,
+              "Use the known path directly for the next read/edit/write step instead of reopening broad discovery.",
+            ].join("\n");
+            toolResults.push(
+              [
+                `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
+                `Skipped ${action} because ${skipReason}.`,
+                "Continue with the concrete read/edit/write step instead of broad rediscovery.",
+              ].join("\n")
+            );
+            continue;
           }
 
           if (
@@ -1690,6 +1763,14 @@ const runExecutionRuntime = async ({
             event.input,
             toolResult.message
           );
+          if (
+            uncertainty.writeFocus &&
+            !uncertainty.mutationStarted &&
+            uncertainty.phase === "discover" &&
+            searchMemory.discoveredPaths.size > 0
+          ) {
+            uncertainty.phase = "collapse";
+          }
           if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
             emitRoundText(`${uncertainty.blockedReason}\n`);
             return completeRound();
@@ -1730,11 +1811,16 @@ const runExecutionRuntime = async ({
                 event.input,
                 resumedToolResult.message
               );
+              if (
+                uncertainty.writeFocus &&
+                !uncertainty.mutationStarted &&
+                uncertainty.phase === "discover" &&
+                searchMemory.discoveredPaths.size > 0
+              ) {
+                uncertainty.phase = "collapse";
+              }
               if (uncertainty.phase === "blocked" && uncertainty.blockedReason) {
                 emitRoundText(`${uncertainty.blockedReason}\n`);
-                return completeRound();
-              }
-              if (finalizeRoundProgress()) {
                 return completeRound();
               }
               const nextToolResults = [
@@ -1812,13 +1898,19 @@ const runExecutionRuntime = async ({
         ) {
           flushUsage();
           uncertainty.nonProgressAutoContinueUsed = true;
+          uncertainty.nonProgressAutoContinueCount += 1;
           const nextPrompt = buildRoundPrompt(
             task,
             accumulatedToolResults,
-            [
-              "The previous reply narrated progress without completing the remaining files.",
-              "Do not narrate. Execute the remaining files directly.",
-            ].join("\n"),
+            uncertainty.writeFocus && !uncertainty.mutationStarted
+              ? [
+                  "The previous reply narrated progress before taking a concrete code step.",
+                  "Do not narrate. Use the next concrete read/edit/write action now.",
+                ].join("\n")
+              : [
+                  "The previous reply narrated progress without completing the remaining files.",
+                  "Do not narrate. Execute the remaining files directly.",
+                ].join("\n"),
             recentConfirmedFileMutations,
             progressLedger,
             uncertainty,
@@ -1874,9 +1966,6 @@ const runExecutionRuntime = async ({
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
     flushUsage();
-    if (finalizeRoundProgress()) {
-      return completeRound();
-    }
     const nextPrompt = buildRoundPrompt(
       task,
       accumulatedToolResults,

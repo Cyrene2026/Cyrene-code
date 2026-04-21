@@ -553,6 +553,7 @@ export const TOOL_USAGE_SYSTEM_PROMPT = [
   "- For search_text_context across the whole workspace, also set `path` to `\".\"`.",
   "- Omit every optional field you do not need. Do not send empty strings, empty arrays, or placeholder values.",
   "- Use read_file only when you actually need the file contents.",
+  "- When the task explicitly asks for code changes and the target path is already known, prefer one targeted read or direct write/edit instead of extra confirmation-style exploration.",
   "- For read_files, set `path` to the first file and `paths` to any additional files.",
   "- For read_file, provide `path` only. Do not send `paths`.",
   "- For stat_paths, set `path` to the first target and `paths` to any additional targets.",
@@ -1625,6 +1626,161 @@ const resolveGeminiGenerateContentUrl = (
   return `${normalized}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 };
 const DONE_EVENT = JSON.stringify({ type: "done" });
+const buildStreamInterruptionEvent = (detail: string) =>
+  JSON.stringify({
+    type: "text_delta",
+    text: `\n[model stream interrupted] ${detail}\n`,
+  });
+
+const buildUnexpectedSocketCloseEvent = () =>
+  buildStreamInterruptionEvent(
+    "The stream closed before the provider sent an explicit completion signal."
+  );
+
+const buildOpenAiFinishReasonInterruptionEvent = (finishReason: string) => {
+  switch (finishReason) {
+    case "length":
+      return buildStreamInterruptionEvent(
+        "The model hit the output limit before finishing the task."
+      );
+    case "content_filter":
+      return buildStreamInterruptionEvent(
+        "The provider stopped the response due to content filtering."
+      );
+    default:
+      return buildStreamInterruptionEvent(
+        `The provider ended the response with finish_reason=${finishReason}.`
+      );
+  }
+};
+
+const extractResponseCompletionDetail = (response: unknown) => {
+  if (!response || typeof response !== "object") {
+    return null;
+  }
+
+  const record = response as {
+    error?: unknown;
+    incomplete_details?: unknown;
+  };
+  return (
+    extractHttpFailureDetail(record.error) ??
+    extractHttpFailureDetail(record.incomplete_details)
+  );
+};
+
+const buildResponsesStatusInterruptionEvent = (
+  status: string,
+  response: unknown
+) => {
+  const detail = extractResponseCompletionDetail(response);
+  if (status === "incomplete") {
+    return buildStreamInterruptionEvent(
+      detail
+        ? `The provider marked the response incomplete: ${detail}`
+        : "The provider marked the response incomplete before finishing the task."
+    );
+  }
+  if (status === "failed") {
+    return buildStreamInterruptionEvent(
+      detail
+        ? `The provider reported response failure: ${detail}`
+        : "The provider reported response.status=failed."
+    );
+  }
+  if (status === "cancelled" || status === "canceled") {
+    return buildStreamInterruptionEvent(
+      detail
+        ? `The provider cancelled the response: ${detail}`
+        : "The provider cancelled the response before completion."
+    );
+  }
+  return buildStreamInterruptionEvent(
+    detail
+      ? `The provider ended the response with status=${status}: ${detail}`
+      : `The provider ended the response with status=${status}.`
+  );
+};
+
+const isAnthropicExpectedStopReason = (stopReason: string) =>
+  stopReason === "end_turn" ||
+  stopReason === "tool_use" ||
+  stopReason === "stop_sequence";
+
+const buildAnthropicStopReasonInterruptionEvent = (stopReason: string) => {
+  switch (stopReason) {
+    case "max_tokens":
+      return buildStreamInterruptionEvent(
+        "The model hit the output limit before finishing the task."
+      );
+    case "refusal":
+      return buildStreamInterruptionEvent(
+        "The provider refused to continue the response."
+      );
+    default:
+      return buildStreamInterruptionEvent(
+        `The provider ended the response with stop_reason=${stopReason}.`
+      );
+  }
+};
+
+const buildGeminiFinishReasonInterruptionEvent = (finishReason: string) => {
+  switch (finishReason) {
+    case "MAX_TOKENS":
+      return buildStreamInterruptionEvent(
+        "The model hit the output limit before finishing the task."
+      );
+    case "SAFETY":
+      return buildStreamInterruptionEvent(
+        "The provider stopped the response due to safety filtering."
+      );
+    case "RECITATION":
+      return buildStreamInterruptionEvent(
+        "The provider stopped the response due to recitation safeguards."
+      );
+    default:
+      return buildStreamInterruptionEvent(
+        `The provider ended the response with finishReason=${finishReason}.`
+      );
+  }
+};
+
+const extractGeminiInterruptionEvent = (payload: unknown) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    candidates?: unknown;
+    promptFeedback?: unknown;
+  };
+  if (Array.isArray(record.candidates)) {
+    for (const candidate of record.candidates) {
+      if (!candidate || typeof candidate !== "object") {
+        continue;
+      }
+      const finishReason = (candidate as { finishReason?: unknown }).finishReason;
+      if (typeof finishReason === "string" && finishReason && finishReason !== "STOP") {
+        return buildGeminiFinishReasonInterruptionEvent(finishReason);
+      }
+    }
+  }
+
+  const blockReason =
+    record.promptFeedback &&
+    typeof record.promptFeedback === "object" &&
+    typeof (record.promptFeedback as { blockReason?: unknown }).blockReason === "string"
+      ? String((record.promptFeedback as { blockReason?: unknown }).blockReason)
+      : "";
+  if (blockReason) {
+    return buildStreamInterruptionEvent(
+      `The provider blocked the prompt with blockReason=${blockReason}.`
+    );
+  }
+
+  return null;
+};
+
 const resolveProviderBaseUrl = (baseUrl: string | undefined) => {
   if (!baseUrl) {
     return undefined;
@@ -1917,6 +2073,7 @@ async function* streamSseOpenAI(
   let buffer = "";
   const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
   let lastUsageSignature = "";
+  let sawExplicitCompletion = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -1934,6 +2091,7 @@ async function* streamSseOpenAI(
       const dataLines = parseSseEventData(rawEvent);
       for (const line of dataLines) {
         if (line === "[DONE]") {
+          sawExplicitCompletion = true;
           yield DONE_EVENT;
           return;
         }
@@ -2038,6 +2196,18 @@ async function* streamSseOpenAI(
           }
 
           if (choice?.finish_reason === "stop") {
+            sawExplicitCompletion = true;
+            yield DONE_EVENT;
+            return;
+          }
+
+          if (
+            typeof choice?.finish_reason === "string" &&
+            choice.finish_reason &&
+            choice.finish_reason !== "tool_calls"
+          ) {
+            sawExplicitCompletion = true;
+            yield buildOpenAiFinishReasonInterruptionEvent(choice.finish_reason);
             yield DONE_EVENT;
             return;
           }
@@ -2054,12 +2224,16 @@ async function* streamSseOpenAI(
     const dataLines = parseSseEventData(buffer);
     for (const line of dataLines) {
       if (line === "[DONE]") {
+        sawExplicitCompletion = true;
         yield DONE_EVENT;
         return;
       }
     }
   }
 
+  if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseEvent();
+  }
   yield DONE_EVENT;
 }
 
@@ -2310,6 +2484,7 @@ async function* streamSseOpenAIResponses(
       emitted: boolean;
     }
   >();
+  let sawExplicitCompletion = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -2327,6 +2502,7 @@ async function* streamSseOpenAIResponses(
       const dataLines = parseSseEventData(rawEvent);
       for (const line of dataLines) {
         if (line === "[DONE]") {
+          sawExplicitCompletion = true;
           yield DONE_EVENT;
           return;
         }
@@ -2343,7 +2519,13 @@ async function* streamSseOpenAIResponses(
               arguments?: unknown;
               call_id?: unknown;
             };
-            response?: { output?: Array<unknown>; usage?: unknown };
+            response?: {
+              output?: Array<unknown>;
+              usage?: unknown;
+              status?: unknown;
+              incomplete_details?: unknown;
+              error?: unknown;
+            };
           };
           const usageEvent = extractResponsesUsageEvent(parsed, usageState);
           if (usageEvent) {
@@ -2412,6 +2594,7 @@ async function* streamSseOpenAIResponses(
           }
 
           if (eventType === "response.completed") {
+            sawExplicitCompletion = true;
             if (parsed.response?.output) {
               for (const item of parsed.response.output) {
                 if (!item || typeof item !== "object") {
@@ -2446,6 +2629,13 @@ async function* streamSseOpenAIResponses(
                 }
               }
             }
+            const status =
+              typeof parsed.response?.status === "string"
+                ? parsed.response.status
+                : "completed";
+            if (status !== "completed") {
+              yield buildResponsesStatusInterruptionEvent(status, parsed.response);
+            }
             yield DONE_EVENT;
             return;
           }
@@ -2462,6 +2652,7 @@ async function* streamSseOpenAIResponses(
     const dataLines = parseSseEventData(buffer);
     for (const line of dataLines) {
       if (line === "[DONE]") {
+        sawExplicitCompletion = true;
         yield DONE_EVENT;
         return;
       }
@@ -2478,7 +2669,13 @@ async function* streamSseOpenAIResponses(
             arguments?: unknown;
             call_id?: unknown;
           };
-          response?: { output?: Array<unknown>; usage?: unknown };
+          response?: {
+            output?: Array<unknown>;
+            usage?: unknown;
+            status?: unknown;
+            incomplete_details?: unknown;
+            error?: unknown;
+          };
         };
         const usageEvent = extractResponsesUsageEvent(parsed, usageState);
         if (usageEvent) {
@@ -2547,6 +2744,7 @@ async function* streamSseOpenAIResponses(
         }
 
         if (eventType === "response.completed") {
+          sawExplicitCompletion = true;
           if (parsed.response?.output) {
             for (const item of parsed.response.output) {
               if (!item || typeof item !== "object") {
@@ -2580,6 +2778,13 @@ async function* streamSseOpenAIResponses(
                 yield toolEvent;
               }
             }
+          }
+          const status =
+            typeof parsed.response?.status === "string"
+              ? parsed.response.status
+              : "completed";
+          if (status !== "completed") {
+            yield buildResponsesStatusInterruptionEvent(status, parsed.response);
           }
           yield DONE_EVENT;
           return;
@@ -2808,6 +3013,7 @@ async function* streamSseGeminiGenerateContent(
   let buffer = "";
   const usageState: GeminiUsageState = {};
   const emittedToolCalls = new Set<string>();
+  let sawExplicitCompletion = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -2825,6 +3031,7 @@ async function* streamSseGeminiGenerateContent(
       const dataLines = parseSseEventData(rawEvent);
       for (const line of dataLines) {
         if (line === "[DONE]") {
+          sawExplicitCompletion = true;
           yield DONE_EVENT;
           return;
         }
@@ -2841,6 +3048,13 @@ async function* streamSseGeminiGenerateContent(
           for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
             yield event;
           }
+          const interruptionEvent = extractGeminiInterruptionEvent(parsed);
+          if (interruptionEvent) {
+            sawExplicitCompletion = true;
+            yield interruptionEvent;
+            yield DONE_EVENT;
+            return;
+          }
         } catch {
           // ignore malformed SSE data line
         }
@@ -2854,6 +3068,7 @@ async function* streamSseGeminiGenerateContent(
     const dataLines = parseSseEventData(buffer);
     for (const line of dataLines) {
       if (line === "[DONE]") {
+        sawExplicitCompletion = true;
         yield DONE_EVENT;
         return;
       }
@@ -2869,6 +3084,13 @@ async function* streamSseGeminiGenerateContent(
         }
         for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
           yield event;
+        }
+        const interruptionEvent = extractGeminiInterruptionEvent(parsed);
+        if (interruptionEvent) {
+          sawExplicitCompletion = true;
+          yield interruptionEvent;
+          yield DONE_EVENT;
+          return;
         }
       } catch {
         // ignore malformed SSE data line
@@ -3089,6 +3311,8 @@ async function* streamSseAnthropic(
   const usageState: AnthropicUsageState = {};
   const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
   const usageEvents: Array<{ eventType: string; usage: unknown }> = [];
+  let sawExplicitCompletion = false;
+  let stopReason = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -3105,6 +3329,7 @@ async function* streamSseAnthropic(
       const dataLines = parseSseEventData(rawEvent);
       for (const line of dataLines) {
         if (line === "[DONE]") {
+          sawExplicitCompletion = true;
           yield DONE_EVENT;
           return;
         }
@@ -3123,6 +3348,7 @@ async function* streamSseAnthropic(
               type?: unknown;
               text?: unknown;
               partial_json?: unknown;
+              stop_reason?: unknown;
             };
           };
           const usageEvent = extractAnthropicUsageEvent(parsed, usageState);
@@ -3154,7 +3380,15 @@ async function* streamSseAnthropic(
             typeof parsed.type === "string" ? parsed.type : "";
           const index = typeof parsed.index === "number" ? parsed.index : 0;
 
+          if (
+            eventType === "message_delta" &&
+            typeof parsed.delta?.stop_reason === "string"
+          ) {
+            stopReason = parsed.delta.stop_reason;
+          }
+
           if (eventType === "message_stop") {
+            sawExplicitCompletion = true;
             if (snapshotPath && usageEvents.length > 0) {
               try {
                 await updateAnthropicRequestSnapshot(snapshotPath, {
@@ -3163,6 +3397,9 @@ async function* streamSseAnthropic(
               } catch {
                 // ignore debug write errors
               }
+            }
+            if (stopReason && !isAnthropicExpectedStopReason(stopReason)) {
+              yield buildAnthropicStopReasonInterruptionEvent(stopReason);
             }
             yield DONE_EVENT;
             return;
@@ -3252,11 +3489,6 @@ async function* streamSseAnthropic(
               }
             }
           }
-
-          if (eventType === "message_stop") {
-            yield DONE_EVENT;
-            return;
-          }
         } catch {
           // ignore malformed SSE data line
         }
@@ -3270,8 +3502,154 @@ async function* streamSseAnthropic(
     const dataLines = parseSseEventData(buffer);
     for (const line of dataLines) {
       if (line === "[DONE]") {
+        sawExplicitCompletion = true;
         yield DONE_EVENT;
         return;
+      }
+
+      try {
+        const parsed = JSON.parse(line) as {
+          type?: unknown;
+          index?: unknown;
+          content_block?: {
+            type?: unknown;
+            text?: unknown;
+            name?: unknown;
+            input?: unknown;
+          };
+          delta?: {
+            type?: unknown;
+            text?: unknown;
+            partial_json?: unknown;
+            stop_reason?: unknown;
+          };
+        };
+        const usageEvent = extractAnthropicUsageEvent(parsed, usageState);
+        const usageCandidate =
+          parsed && typeof parsed === "object" && "usage" in parsed
+            ? (parsed as { usage?: unknown }).usage
+            : parsed &&
+                typeof parsed === "object" &&
+                "message" in parsed &&
+                (parsed as { message?: { usage?: unknown } }).message?.usage
+              ? (parsed as { message?: { usage?: unknown } }).message?.usage
+              : null;
+        if (snapshotPath && usageCandidate && usageEvents.length < 16) {
+          usageEvents.push({
+            eventType:
+              typeof parsed.type === "string" ? parsed.type : "unknown",
+            usage: usageCandidate,
+          });
+        }
+        if (usageEvent) {
+          yield usageEvent;
+        }
+
+        const eventType = typeof parsed.type === "string" ? parsed.type : "";
+        const index = typeof parsed.index === "number" ? parsed.index : 0;
+
+        if (
+          eventType === "message_delta" &&
+          typeof parsed.delta?.stop_reason === "string"
+        ) {
+          stopReason = parsed.delta.stop_reason;
+        }
+
+        if (eventType === "content_block_start") {
+          const contentBlock = parsed.content_block;
+          const blockType =
+            contentBlock && typeof contentBlock.type === "string"
+              ? contentBlock.type
+              : "";
+          if (blockType === "text" && typeof contentBlock?.text === "string") {
+            if (contentBlock.text) {
+              yield JSON.stringify({
+                type: "text_delta",
+                text: contentBlock.text,
+              });
+            }
+          }
+          if (blockType === "tool_use") {
+            const current = toolState.get(index) ?? {
+              args: "",
+              emitted: false,
+            };
+            if (typeof contentBlock?.name === "string") {
+              current.name = contentBlock.name;
+            }
+            if (typeof contentBlock?.input === "string") {
+              current.args += contentBlock.input;
+            } else if (
+              contentBlock?.input &&
+              typeof contentBlock.input === "object"
+            ) {
+              const serializedInput = JSON.stringify(contentBlock.input);
+              if (serializedInput !== "{}") {
+                current.args = serializedInput;
+              }
+            }
+            toolState.set(index, current);
+          }
+        }
+
+        if (eventType === "content_block_delta") {
+          const deltaType =
+            parsed.delta && typeof parsed.delta.type === "string"
+              ? parsed.delta.type
+              : "";
+          if (
+            deltaType === "text_delta" &&
+            typeof parsed.delta?.text === "string" &&
+            parsed.delta.text
+          ) {
+            yield JSON.stringify({
+              type: "text_delta",
+              text: parsed.delta.text,
+            });
+          }
+          if (
+            deltaType === "input_json_delta" &&
+            typeof parsed.delta?.partial_json === "string"
+          ) {
+            const current = toolState.get(index) ?? {
+              args: "",
+              emitted: false,
+            };
+            current.args += parsed.delta.partial_json;
+            toolState.set(index, current);
+          }
+        }
+
+        if (eventType === "content_block_stop") {
+          const current = toolState.get(index);
+          if (current?.name && !current.emitted) {
+            const parsedArgs = parseAnthropicToolArgs(current.args);
+            if (
+              parsedArgs &&
+              typeof parsedArgs === "object" &&
+              Object.keys(parsedArgs as Record<string, unknown>).length > 0
+            ) {
+              yield JSON.stringify({
+                type: "tool_call",
+                toolName: current.name,
+                input: parsedArgs,
+              });
+              current.emitted = true;
+              toolState.set(index, current);
+            }
+          }
+        }
+
+        if (eventType === "message_stop") {
+          sawExplicitCompletion = true;
+          if (stopReason && !isAnthropicExpectedStopReason(stopReason)) {
+            yield buildAnthropicStopReasonInterruptionEvent(stopReason);
+          }
+          yield DONE_EVENT;
+          return;
+        }
+      } catch {
+        // ignore malformed SSE data line
       }
     }
   }
@@ -3286,6 +3664,9 @@ async function* streamSseAnthropic(
     }
   }
 
+  if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseEvent();
+  }
   yield DONE_EVENT;
 }
 

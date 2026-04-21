@@ -201,6 +201,7 @@ func TestClampTranscriptOffsetPreventsOverscrollAccumulation(t *testing.T) {
 func TestRenderMarkdownBodyLinesHandlesInlineCodeAndFences(t *testing.T) {
 	lines := app.RenderMarkdownBodyLinesForTest("Use `python demo.py`\n```bash\npython demo.py\n```", 80, lipgloss.NewStyle())
 	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
 
 	if strings.Contains(rendered, "`python demo.py`") {
 		t.Fatalf("expected inline code markers to be rendered without raw backticks, got %q", rendered)
@@ -208,8 +209,14 @@ func TestRenderMarkdownBodyLinesHandlesInlineCodeAndFences(t *testing.T) {
 	if strings.Contains(rendered, "```") {
 		t.Fatalf("expected code fences to be rendered without raw triple backticks, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "python demo.py") {
+	if !strings.Contains(plain, "python demo.py") {
 		t.Fatalf("expected code content to remain visible, got %q", rendered)
+	}
+	if !strings.Contains(plain, "╭ code bash ") || !strings.Contains(plain, "╰") {
+		t.Fatalf("expected styled code block frame rendered, got %q", plain)
+	}
+	if !strings.Contains(plain, " 1│") {
+		t.Fatalf("expected code block line number gutter rendered, got %q", plain)
 	}
 }
 
@@ -228,6 +235,143 @@ func TestRenderMarkdownBodyLinesHandlesListsQuotesAndEmphasis(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "1. ") || !strings.Contains(rendered, "• ") || !strings.Contains(rendered, "│ ") {
 		t.Fatalf("expected list and quote prefixes rendered, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownBodyLinesHandlesNestedListsAndTaskLists(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("- [x] done\n  - [ ] todo\n    1. child", 80, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "[x]") || strings.Contains(plain, "[ ]") {
+		t.Fatalf("expected task list markers normalized, got %q", plain)
+	}
+	if !strings.Contains(plain, "☑") || !strings.Contains(plain, "☐") {
+		t.Fatalf("expected rendered task list checkboxes, got %q", plain)
+	}
+	if !strings.Contains(plain, "◦") || !strings.Contains(plain, "1. ") {
+		t.Fatalf("expected nested list prefixes preserved, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesDoesNotTreatIdentifierUnderscoresAsEmphasis(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("Tool: outline_file agent/prompt_builder.py | Outline for agent/prompt_builder.py", 120, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "outlinefile") || strings.Contains(plain, "promptbuilder") {
+		t.Fatalf("expected identifier underscores preserved, got %q", plain)
+	}
+	if !strings.Contains(plain, "outline_file") || !strings.Contains(plain, "prompt_builder.py") {
+		t.Fatalf("expected identifier underscores visible, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesHandlesSetextRulesAndTildeFences(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("Main title\n---\n\n***\n~~~ts\nconst x = 1\n~~~", 80, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "~~~") || strings.Contains(plain, "***") {
+		t.Fatalf("expected fence and rule markers removed, got %q", plain)
+	}
+	if !strings.Contains(plain, "Main title") || !strings.Contains(plain, "const x = 1") {
+		t.Fatalf("expected heading and code content preserved, got %q", plain)
+	}
+	if !strings.Contains(plain, "───") {
+		t.Fatalf("expected horizontal rule rendered, got %q", plain)
+	}
+	if !strings.Contains(plain, "╭ code ts ") || !strings.Contains(plain, "const x = 1") {
+		t.Fatalf("expected fenced code block promoted to framed renderer, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesKeepsCodeBlockFrameAcrossWrappedAndBlankLines(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("```py\n\nprint('a very long line that should wrap inside the code block without breaking the frame')\n```", 54, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "╭ code py ") || !strings.Contains(plain, "╰") {
+		t.Fatalf("expected code block frame preserved, got %q", plain)
+	}
+	if !strings.Contains(plain, " 1│") || !strings.Contains(plain, " 2│") {
+		t.Fatalf("expected line number gutter for blank and content lines, got %q", plain)
+	}
+	if strings.Contains(plain, "```") {
+		t.Fatalf("expected raw fence markers removed, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesKeepsNumericSeparatorsInSingleToken(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	lines := app.RenderMarkdownBodyLinesForTest("```py\nCONTEXT_FILE_MAX_CHARS = 20_000\n```", 80, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "CONTEXT_FILE_MAX_CHARS = 20_000") {
+		t.Fatalf("expected numeric literal with separators preserved, got %q", plain)
+	}
+	if !strings.Contains(rendered, "38;2;121;192;255m20_000") {
+		t.Fatalf("expected numeric literal rendered as a single highlighted token, got %q", rendered)
+	}
+}
+
+func TestRenderMarkdownBodyLinesHandlesLinksImagesAndNestedQuotes(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("> > See [docs](https://example.com/docs) and <https://example.com/raw>\n![diagram](https://example.com/img.png)", 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "[docs](") || strings.Contains(plain, "![diagram](") || strings.Contains(plain, "> >") {
+		t.Fatalf("expected markdown markers normalized, got %q", plain)
+	}
+	if !strings.Contains(plain, "│ │ ") {
+		t.Fatalf("expected nested quote prefix rendered, got %q", plain)
+	}
+	if !strings.Contains(plain, "docs <https://example.com/docs>") || !strings.Contains(plain, "https://example.com/raw") {
+		t.Fatalf("expected links preserved in readable form, got %q", plain)
+	}
+	if !strings.Contains(plain, "[image] diagram <https://example.com/img.png>") {
+		t.Fatalf("expected image markdown summarized, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesHandlesListContinuationParagraphs(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest("- first line\n  continuation paragraph with more detail\n  another continuation line\n- second item", 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "continuation paragraph with more detail") || !strings.Contains(plain, "another continuation line") {
+		t.Fatalf("expected list continuation text preserved, got %q", plain)
+	}
+	if strings.Count(plain, "• ") != 2 {
+		t.Fatalf("expected exactly two rendered bullets, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesHandlesEscapesAndNestedEmphasis(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest(`***bold italic*** and **bold _nested italic_** and \*escaped\* and ~~gone~~`, 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "***") || strings.Contains(plain, "**bold") || strings.Contains(plain, "_nested italic_") || strings.Contains(plain, "~~gone~~") {
+		t.Fatalf("expected emphasis markers removed, got %q", plain)
+	}
+	if !strings.Contains(plain, "bold italic") || !strings.Contains(plain, "bold nested italic") || !strings.Contains(plain, "*escaped*") || !strings.Contains(plain, "gone") {
+		t.Fatalf("expected nested emphasis and escapes preserved semantically, got %q", plain)
+	}
+}
+
+func TestRenderMarkdownBodyLinesIgnoresInlineHTMLTags(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest(`Use <kbd>Ctrl+C</kbd> and <span class="hint">hint</span><br/>done`, 96, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if strings.Contains(plain, "<kbd>") || strings.Contains(plain, "</span>") || strings.Contains(plain, "<br/>") {
+		t.Fatalf("expected inline html tags ignored, got %q", plain)
+	}
+	if !strings.Contains(plain, "Ctrl+C") || !strings.Contains(plain, "hint") || !strings.Contains(plain, "done") {
+		t.Fatalf("expected inline html content preserved, got %q", plain)
 	}
 }
 
@@ -331,6 +475,28 @@ func TestRenderTranscriptClampsStyledLinesToWidth(t *testing.T) {
 		if lipgloss.Width(plain) > 24 {
 			t.Fatalf("expected transcript line width <= 24, got %d for %q", lipgloss.Width(plain), plain)
 		}
+	}
+}
+
+func TestComposerPreservesLargePastedTextDisplay(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	model := app.NewModel()
+	largePaste := strings.Repeat("bulk pasted block\n", 48) + "tail marker"
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(largePaste)})
+
+	rendered := model.RenderComposerForTest(80)
+	plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "bulk pasted block") {
+		t.Fatalf("expected large pasted content preserved in composer, got %q", plain)
+	}
+	if !strings.Contains(plain, "tail marker") {
+		t.Fatalf("expected pasted tail preserved in composer, got %q", plain)
 	}
 }
 

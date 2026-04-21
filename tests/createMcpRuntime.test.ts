@@ -199,6 +199,28 @@ const createFakeDiagnosticLspSpawn = () => {
   };
 };
 
+const createMissingExecutableLspSpawn = (detail: string) => {
+  const spawnProcess = () => {
+    const child = new EventEmitter() as FakeLspChildProcess;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = {
+      write: () => true,
+    };
+    child.kill = () => true;
+
+    queueMicrotask(() => {
+      child.emit("error", new Error(detail));
+    });
+
+    return child as any;
+  };
+
+  return {
+    spawnProcess,
+  };
+};
+
 const createUnresponsiveStdioSpawn = () => {
   const spawnCalls: Array<{ command: string; args: string[] }> = [];
 
@@ -947,6 +969,49 @@ describe("createMcpRuntime", () => {
     expect(result?.message).toContain("status: startup_error");
     expect(result?.message).toContain("reason: command_not_found");
     expect(result?.message).toContain("definitely-not-a-real-lsp-binary");
+
+    runtime.dispose();
+  });
+
+  test("doctorLsp surfaces preset install hints for missing LSP executables", async () => {
+    const { root, cyreneHome } = await createWorkspace();
+    const fake = createMissingExecutableLspSpawn(
+      'Executable not found in $PATH: "pyright-langserver"'
+    );
+    await mkdir(join(root, "app"), { recursive: true });
+    await writeFile(join(root, "app", "main.py"), "print('hi')\n", "utf8");
+    await writeFile(
+      join(root, ".cyrene", "mcp.yaml"),
+      [
+        "servers:",
+        "  - id: repo",
+        "    transport: filesystem",
+        "    workspace_root: .",
+        "    lsp_servers:",
+        "      - id: python",
+        "        command: pyright-langserver",
+        "        args: [\"--stdio\"]",
+        "        file_patterns: [\"**/*.py\"]",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtime = await createTestMcpRuntime(root, {
+      env: {
+        ...process.env,
+        CYRENE_HOME: cyreneHome,
+      },
+      spawnProcess: fake.spawnProcess as any,
+    });
+
+    const result = await runtime.doctorLsp?.("repo", "app/main.py");
+
+    expect(result?.ok).toBe(false);
+    expect(result?.status).toBe("startup_error");
+    expect(result?.reason).toBe("command_not_found");
+    expect(result?.message).toContain("error: LSP startup error: python (pyright-langserver)");
+    expect(result?.message).toContain("install hint: npm install -g pyright");
+    expect(result?.message).toContain("hint: npm install -g pyright");
 
     runtime.dispose();
   });

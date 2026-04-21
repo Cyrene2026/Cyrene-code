@@ -720,6 +720,8 @@ const classifyLspDoctorFailure = (
   hint: string;
 } => {
   const normalized = message.toLowerCase();
+  const installHintMatch = message.match(/(?:^|\n)install hint:\s*(.+)$/im);
+  const installHint = installHintMatch?.[1]?.trim() || null;
 
   if (normalized.includes("method not found")) {
     return {
@@ -756,13 +758,17 @@ const classifyLspDoctorFailure = (
   ) {
     return {
       reason: "command_not_found",
-      hint: "the configured command was not found in PATH; install the language server or set --command to an executable path",
+      hint:
+        installHint ??
+        "the configured command was not found in PATH; install the language server or set --command to an executable path",
     };
   }
   if (startupFailed) {
     return {
       reason: "startup_failed",
-      hint: "install the language server binary or fix the configured command/args/env",
+      hint:
+        installHint ??
+        "install the language server binary or fix the configured command/args/env",
     };
   }
   if (requestFailed) {

@@ -279,6 +279,46 @@ export const findLspPresetByInput = (input: McpRuntimeLspServerInput) =>
       arraysEqual(preset.rootMarkers, input.rootMarkers)
   ) ?? null;
 
+type LspPresetConfigLike = {
+  id?: string;
+  command: string;
+  args?: string[];
+  filePatterns?: string[];
+  rootMarkers?: string[];
+};
+
+export const resolveLspPresetForConfig = (config: LspPresetConfigLike) => {
+  const exactMatch = LSP_PRESETS.find(
+    preset =>
+      preset.command === config.command &&
+      arraysEqual(preset.args, config.args) &&
+      arraysEqual(preset.filePatterns, config.filePatterns) &&
+      arraysEqual(preset.rootMarkers, config.rootMarkers)
+  );
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const idMatch = config.id ? resolveLspPreset(config.id) : null;
+  if (idMatch) {
+    return idMatch;
+  }
+
+  const commandAndArgsMatch = LSP_PRESETS.find(
+    preset =>
+      preset.command === config.command &&
+      arraysEqual(preset.args, config.args)
+  );
+  if (commandAndArgsMatch) {
+    return commandAndArgsMatch;
+  }
+
+  return LSP_PRESETS.find(preset => preset.command === config.command) ?? null;
+};
+
+export const getLspInstallHintForConfig = (config: LspPresetConfigLike) =>
+  resolveLspPresetForConfig(config)?.installHint ?? null;
+
 export const matchesLspPresetPath = (preset: LspPreset, workspacePath: string) => {
   const normalized = normalizeGlob(workspacePath);
   return preset.filePatterns.some(pattern => globToRegExp(pattern).test(normalized));

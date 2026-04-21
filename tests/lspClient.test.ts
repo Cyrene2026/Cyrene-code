@@ -120,6 +120,28 @@ const createFakeLspSpawn = () => {
   };
 };
 
+const createMissingExecutableLspSpawn = (detail: string) => {
+  const spawnProcess = () => {
+    const child = new EventEmitter() as FakeLspChildProcess;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = {
+      write: () => true,
+    };
+    child.kill = () => true;
+
+    queueMicrotask(() => {
+      child.emit("error", new Error(detail));
+    });
+
+    return child as any;
+  };
+
+  return {
+    spawnProcess,
+  };
+};
+
 const getPathEnvValue = (env?: NodeJS.ProcessEnv) =>
   env?.PATH ?? env?.Path;
 
@@ -198,6 +220,41 @@ describe("LspClient environment", () => {
       } else {
         restorePathEnvValue(previousPath);
       }
+    }
+  });
+
+  test("surfaces preset install hints when an LSP executable is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cyrene-lsp-test-"));
+    tempRoots.push(root);
+    const filePath = join(root, "main.py");
+    await writeFile(filePath, "print('hi')\n", "utf8");
+
+    const fake = createMissingExecutableLspSpawn(
+      'Executable not found in $PATH: "pyright-langserver"'
+    );
+    const manager = new LspManager(
+      root,
+      [
+        {
+          id: "python",
+          command: "pyright-langserver",
+          args: ["--stdio"],
+          filePatterns: ["**/*.py"],
+          rootMarkers: ["pyproject.toml", ".git"],
+        },
+      ],
+      {
+        spawnProcess: fake.spawnProcess as any,
+      }
+    );
+
+    try {
+      const session = await manager.getSession(filePath, { serverId: "python" });
+      await expect(session.hover(filePath, 1, 1)).rejects.toThrow(
+        "install hint: npm install -g pyright"
+      );
+    } finally {
+      await manager.dispose();
     }
   });
 });

@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { access, readFile, stat } from "node:fs/promises";
 import { basename, dirname, extname, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { getLspInstallHintForConfig } from "../../lspPresets";
 import type { LspServerConfig } from "../../toolTypes";
 import { buildRestrictedSubprocessEnv } from "./subprocessEnv";
 
@@ -800,8 +801,26 @@ class LspClient {
     this.workspaceFolder.name = basename(options.rootPath) || options.config.id;
   }
 
+  private getStartupInstallHint(reason: string) {
+    const normalized = reason.toLowerCase();
+    if (
+      !(
+        normalized.includes("failed to launch") &&
+        (normalized.includes("enoent") ||
+          normalized.includes("not found") ||
+          normalized.includes("command not found"))
+      )
+    ) {
+      return null;
+    }
+
+    return getLspInstallHintForConfig(this.options.config);
+  }
+
   private formatStartupError(reason: string) {
-    return `LSP startup error: ${this.options.config.id} (${this.options.config.command}) ${reason}`;
+    const base = `LSP startup error: ${this.options.config.id} (${this.options.config.command}) ${reason}`;
+    const installHint = this.getStartupInstallHint(reason);
+    return installHint ? `${base}\ninstall hint: ${installHint}` : base;
   }
 
   private rememberDiagnostics(uri: string, diagnostics: LspDiagnostic[]) {

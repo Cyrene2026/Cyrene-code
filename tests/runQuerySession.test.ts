@@ -1894,6 +1894,73 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     );
   });
 
+  test("targeted read_range continuation does not trip the no-progress breaker", async () => {
+    const transport = createRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/main.ts", startLine: 1, endLine: 40 },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/main.ts", startLine: 41, endLine: 80 },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/main.ts", startLine: 81, endLine: 120 },
+      },
+      null,
+    ]);
+    const textDeltas: string[] = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "inspect src/main.ts in detail and continue reading as needed",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async (_toolName, input) => {
+        toolCallCount += 1;
+        const record =
+          input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+        const startLine = Number(record.startLine ?? 1);
+        const endLine = Number(record.endLine ?? startLine);
+        return {
+          message: `[tool result] read_range src/main.ts\nlines: ${startLine}-${endLine}`,
+          metadata: {
+            kind: "file",
+            action: "read_range",
+            workspacePath: "src/main.ts",
+            resolvedPath: "/workspace/src/main.ts",
+            pathKind: "file",
+            fileRevision: {
+              sizeBytes: 4096,
+              mtimeMs: 1,
+              revisionKey: "4096:1",
+            },
+            read: {
+              mode: "range",
+              startLine,
+              endLine,
+              fullyRead: false,
+              truncated: true,
+              nextSuggestedStartLine: endLine + 1,
+              empty: false,
+              lineCount: endLine - startLine + 1,
+            },
+          },
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCallCount).toBe(3);
+    expect(textDeltas.join("")).not.toContain("[execution paused]");
+  });
+
   test("injects a simple multi-file execution memo into the first round only for matching tasks", async () => {
     const { transport, prompts } = createPromptCaptureTransport({
       toolName: "file",

@@ -2996,6 +2996,54 @@ describe("FileMcpService", () => {
     expect(result.message).not.toContain("node_modules/demo-pkg/index.ts");
   });
 
+  test("search_text skips discovered directory symlinks during workspace-wide search", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "app.ts"), "const marker = 'needle';\n", "utf8");
+    await symlink(
+      join(root, "src"),
+      join(root, "linked-src"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: ".",
+      query: "needle",
+      maxResults: 10,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("src/app.ts:1 | const marker = 'needle';");
+    expect(result.message).not.toContain("linked-src/app.ts");
+  });
+
+  test("search_text ignores symlinked files that resolve outside the workspace", async () => {
+    const { root, service } = await createService();
+    const outsideRoot = await mkdtemp(join(tmpdir(), "cyrene-mcp-outside-file-"));
+    tempRoots.push(outsideRoot);
+    await writeFile(join(outsideRoot, "outside.txt"), "secret-from-outside-workspace\n", "utf8");
+    await symlink(
+      join(outsideRoot, "outside.txt"),
+      join(root, "outside-link.txt"),
+      "file"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      path: ".",
+      query: "secret-from-outside-workspace",
+      maxResults: 10,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pending).toBeUndefined();
+    expect(result.message).toContain("(no text matches for query: secret-from-outside-workspace)");
+    expect(result.message).not.toContain("outside-link.txt");
+  });
+
   test("search_text still searches inside node_modules when path explicitly targets it", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "node_modules", "demo-pkg"), { recursive: true });

@@ -862,6 +862,10 @@ type AnthropicImageBlock = {
   };
 };
 
+const isAnthropicTextBlock = (
+  block: AnthropicTextBlock | AnthropicImageBlock
+): block is AnthropicTextBlock => block.type === "text";
+
 type AnthropicSystemBlock = AnthropicTextBlock;
 
 const buildAnthropicSystemBlocks = (
@@ -978,7 +982,7 @@ const collectAnthropicCacheBreakpointPaths = (
   });
   requestBody.messages.forEach((message, messageIndex) => {
     message.content.forEach((block, blockIndex) => {
-      if (block.cache_control) {
+      if (isAnthropicTextBlock(block) && block.cache_control) {
         paths.push(`messages[${messageIndex}].content[${blockIndex}]`);
       }
     });
@@ -1311,11 +1315,18 @@ const buildAnthropicUserBlocks = (
     }
 
     if (blocks.length > 0) {
-      if (!blocks.some(block => block.cache_control)) {
-        blocks[0] = {
-          ...blocks[0]!,
-          cache_control: cacheControl,
-        };
+      const firstCacheableBlockIndex = blocks.findIndex(isAnthropicTextBlock);
+      if (
+        firstCacheableBlockIndex >= 0 &&
+        !blocks.some(block => isAnthropicTextBlock(block) && block.cache_control)
+      ) {
+        const firstCacheableBlock = blocks[firstCacheableBlockIndex];
+        if (firstCacheableBlock && isAnthropicTextBlock(firstCacheableBlock)) {
+          blocks[firstCacheableBlockIndex] = {
+            ...firstCacheableBlock,
+            cache_control: cacheControl,
+          };
+        }
       }
       return blocks;
     }

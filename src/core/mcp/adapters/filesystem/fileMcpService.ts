@@ -6239,15 +6239,34 @@ export class FileMcpService {
       const entries = await readdir(current.absolutePath, { withFileTypes: true });
       for (const entry of entries) {
         const absolutePath = resolve(current.absolutePath, entry.name);
+        if (!this.canAccessAbsolutePathInsideWorkspaceRoot(absolutePath)) {
+          continue;
+        }
+        let entryInfo;
+        try {
+          entryInfo = await stat(absolutePath);
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code === "ENOENT") {
+            continue;
+          }
+          throw error;
+        }
         const workspacePath = relative(resolve(this.rules.workspaceRoot), absolutePath)
           .replace(/\\/g, "/")
           .replace(/^\.\/+/, "") || ".";
-        if (entry.isDirectory()) {
+        if (entryInfo.isDirectory()) {
+          if (!entry.isDirectory()) {
+            continue;
+          }
           if (this.shouldSkipSearchDirectory(entry.name, absolutePath, startAbsolute)) {
             skippedDirectoryNames.push(entry.name);
             continue;
           }
           queue.push({ absolutePath });
+          continue;
+        }
+        if (!entryInfo.isFile()) {
           continue;
         }
         files.push({

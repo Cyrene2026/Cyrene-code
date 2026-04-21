@@ -1045,6 +1045,104 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(contentBlocks[2]?.text).toContain("Loop warning:");
   });
 
+  test("anthropic keeps cache_control on text blocks when image attachments are present", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const imagePath = join(root, "sample.png");
+    await writeFile(
+      imagePath,
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0nQAAAAASUVORK5CYII=",
+        "base64"
+      )
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const continuationPrompt = [
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: read_file README.md",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl({
+      text: continuationPrompt,
+      attachments: [
+        {
+          id: "img-1",
+          kind: "image",
+          path: imagePath,
+          name: "sample.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+    for await (const _event of transport.stream(streamUrl)) {
+      void _event;
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const contentBlocks = requestBody.messages[0]?.content;
+    expect(contentBlocks[0]?.type).toBe("image");
+    expect(contentBlocks[0]?.cache_control).toBeUndefined();
+    expect(contentBlocks[1]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
+  });
+
   test("anthropic can snapshot each outbound request body when debug capture is enabled", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     const globalHome = join(root, "global-home");

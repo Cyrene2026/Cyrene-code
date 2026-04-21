@@ -1626,6 +1626,34 @@ const resolveGeminiGenerateContentUrl = (
   return `${normalized}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 };
 const DONE_EVENT = JSON.stringify({ type: "done" });
+const buildCompletionEvent = (completion: {
+  source: "provider" | "runtime";
+  reason: string;
+  detail?: string;
+  expected?: boolean;
+}) =>
+  JSON.stringify({
+    type: "completion",
+    source: completion.source,
+    reason: completion.reason,
+    ...(completion.detail ? { detail: completion.detail } : {}),
+    ...(typeof completion.expected === "boolean"
+      ? { expected: completion.expected }
+      : {}),
+  });
+
+const buildProviderCompletionEvent = (
+  reason: string,
+  detail: string,
+  expected: boolean
+) =>
+  buildCompletionEvent({
+    source: "provider",
+    reason,
+    detail,
+    expected,
+  });
+
 const buildStreamInterruptionEvent = (detail: string) =>
   JSON.stringify({
     type: "text_delta",
@@ -1635,6 +1663,13 @@ const buildStreamInterruptionEvent = (detail: string) =>
 const buildUnexpectedSocketCloseEvent = () =>
   buildStreamInterruptionEvent(
     "The stream closed before the provider sent an explicit completion signal."
+  );
+
+const buildUnexpectedSocketCloseCompletionEvent = () =>
+  buildProviderCompletionEvent(
+    "unexpected_socket_close",
+    "The stream closed before the provider sent an explicit completion signal.",
+    false
   );
 
 const buildOpenAiFinishReasonInterruptionEvent = (finishReason: string) => {
@@ -1653,6 +1688,13 @@ const buildOpenAiFinishReasonInterruptionEvent = (finishReason: string) => {
       );
   }
 };
+
+const buildOpenAiFinishReasonCompletionEvent = (finishReason: string) =>
+  buildProviderCompletionEvent(
+    `finish_reason:${finishReason}`,
+    `The provider ended the response with finish_reason=${finishReason}.`,
+    finishReason === "stop" || finishReason === "tool_calls"
+  );
 
 const extractResponseCompletionDetail = (response: unknown) => {
   if (!response || typeof response !== "object") {
@@ -1702,6 +1744,20 @@ const buildResponsesStatusInterruptionEvent = (
   );
 };
 
+const buildResponsesStatusCompletionEvent = (
+  status: string,
+  response: unknown
+) => {
+  const detail = extractResponseCompletionDetail(response);
+  return buildProviderCompletionEvent(
+    `response_status:${status}`,
+    detail
+      ? `The provider ended the response with status=${status}: ${detail}`
+      : `The provider ended the response with status=${status}.`,
+    status === "completed"
+  );
+};
+
 const isAnthropicExpectedStopReason = (stopReason: string) =>
   stopReason === "end_turn" ||
   stopReason === "tool_use" ||
@@ -1724,6 +1780,35 @@ const buildAnthropicStopReasonInterruptionEvent = (stopReason: string) => {
   }
 };
 
+const buildAnthropicStopReasonCompletionEvent = (stopReason: string) =>
+  buildProviderCompletionEvent(
+    `stop_reason:${stopReason}`,
+    `The provider ended the response with stop_reason=${stopReason}.`,
+    isAnthropicExpectedStopReason(stopReason)
+  );
+
+const extractAnthropicStreamErrorEvent = (payload: unknown) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    type?: unknown;
+    error?: unknown;
+  };
+  if (record.type !== "error") {
+    return null;
+  }
+
+  const detail =
+    extractHttpFailureDetail(record.error) ?? extractHttpFailureDetail(payload);
+  return buildStreamInterruptionEvent(
+    detail
+      ? `Anthropic stream error: ${detail}`
+      : "Anthropic reported a stream error before completion."
+  );
+};
+
 const buildGeminiFinishReasonInterruptionEvent = (finishReason: string) => {
   switch (finishReason) {
     case "MAX_TOKENS":
@@ -1744,6 +1829,13 @@ const buildGeminiFinishReasonInterruptionEvent = (finishReason: string) => {
       );
   }
 };
+
+const buildGeminiFinishReasonCompletionEvent = (finishReason: string) =>
+  buildProviderCompletionEvent(
+    `finish_reason:${finishReason}`,
+    `The provider ended the response with finishReason=${finishReason}.`,
+    finishReason === "STOP"
+  );
 
 const extractGeminiInterruptionEvent = (payload: unknown) => {
   if (!payload || typeof payload !== "object") {
@@ -1775,6 +1867,44 @@ const extractGeminiInterruptionEvent = (payload: unknown) => {
   if (blockReason) {
     return buildStreamInterruptionEvent(
       `The provider blocked the prompt with blockReason=${blockReason}.`
+    );
+  }
+
+  return null;
+};
+
+const extractGeminiCompletionEvent = (payload: unknown) => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as {
+    candidates?: unknown;
+    promptFeedback?: unknown;
+  };
+  if (Array.isArray(record.candidates)) {
+    for (const candidate of record.candidates) {
+      if (!candidate || typeof candidate !== "object") {
+        continue;
+      }
+      const finishReason = (candidate as { finishReason?: unknown }).finishReason;
+      if (typeof finishReason === "string" && finishReason) {
+        return buildGeminiFinishReasonCompletionEvent(finishReason);
+      }
+    }
+  }
+
+  const blockReason =
+    record.promptFeedback &&
+    typeof record.promptFeedback === "object" &&
+    typeof (record.promptFeedback as { blockReason?: unknown }).blockReason === "string"
+      ? String((record.promptFeedback as { blockReason?: unknown }).blockReason)
+      : "";
+  if (blockReason) {
+    return buildProviderCompletionEvent(
+      `prompt_block:${blockReason}`,
+      `The provider blocked the prompt with blockReason=${blockReason}.`,
+      false
     );
   }
 
@@ -2092,6 +2222,11 @@ async function* streamSseOpenAI(
       for (const line of dataLines) {
         if (line === "[DONE]") {
           sawExplicitCompletion = true;
+          yield buildProviderCompletionEvent(
+            "explicit_done",
+            "The provider sent [DONE] without a separate finish_reason chunk.",
+            true
+          );
           yield DONE_EVENT;
           return;
         }
@@ -2197,6 +2332,7 @@ async function* streamSseOpenAI(
 
           if (choice?.finish_reason === "stop") {
             sawExplicitCompletion = true;
+            yield buildOpenAiFinishReasonCompletionEvent(choice.finish_reason);
             yield DONE_EVENT;
             return;
           }
@@ -2207,6 +2343,7 @@ async function* streamSseOpenAI(
             choice.finish_reason !== "tool_calls"
           ) {
             sawExplicitCompletion = true;
+            yield buildOpenAiFinishReasonCompletionEvent(choice.finish_reason);
             yield buildOpenAiFinishReasonInterruptionEvent(choice.finish_reason);
             yield DONE_EVENT;
             return;
@@ -2225,6 +2362,11 @@ async function* streamSseOpenAI(
     for (const line of dataLines) {
       if (line === "[DONE]") {
         sawExplicitCompletion = true;
+        yield buildProviderCompletionEvent(
+          "explicit_done",
+          "The provider sent [DONE] without a separate finish_reason chunk.",
+          true
+        );
         yield DONE_EVENT;
         return;
       }
@@ -2232,6 +2374,7 @@ async function* streamSseOpenAI(
   }
 
   if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseCompletionEvent();
     yield buildUnexpectedSocketCloseEvent();
   }
   yield DONE_EVENT;
@@ -2503,6 +2646,11 @@ async function* streamSseOpenAIResponses(
       for (const line of dataLines) {
         if (line === "[DONE]") {
           sawExplicitCompletion = true;
+          yield buildProviderCompletionEvent(
+            "explicit_done",
+            "The provider sent [DONE] without a response.completed event.",
+            true
+          );
           yield DONE_EVENT;
           return;
         }
@@ -2633,6 +2781,7 @@ async function* streamSseOpenAIResponses(
               typeof parsed.response?.status === "string"
                 ? parsed.response.status
                 : "completed";
+            yield buildResponsesStatusCompletionEvent(status, parsed.response);
             if (status !== "completed") {
               yield buildResponsesStatusInterruptionEvent(status, parsed.response);
             }
@@ -2653,6 +2802,11 @@ async function* streamSseOpenAIResponses(
     for (const line of dataLines) {
       if (line === "[DONE]") {
         sawExplicitCompletion = true;
+        yield buildProviderCompletionEvent(
+          "explicit_done",
+          "The provider sent [DONE] without a response.completed event.",
+          true
+        );
         yield DONE_EVENT;
         return;
       }
@@ -2783,6 +2937,7 @@ async function* streamSseOpenAIResponses(
             typeof parsed.response?.status === "string"
               ? parsed.response.status
               : "completed";
+          yield buildResponsesStatusCompletionEvent(status, parsed.response);
           if (status !== "completed") {
             yield buildResponsesStatusInterruptionEvent(status, parsed.response);
           }
@@ -2795,6 +2950,10 @@ async function* streamSseOpenAIResponses(
     }
   }
 
+  if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseCompletionEvent();
+    yield buildUnexpectedSocketCloseEvent();
+  }
   yield DONE_EVENT;
 }
 
@@ -3032,6 +3191,11 @@ async function* streamSseGeminiGenerateContent(
       for (const line of dataLines) {
         if (line === "[DONE]") {
           sawExplicitCompletion = true;
+          yield buildProviderCompletionEvent(
+            "explicit_done",
+            "The provider sent [DONE] without a separate finishReason payload.",
+            true
+          );
           yield DONE_EVENT;
           return;
         }
@@ -3048,7 +3212,17 @@ async function* streamSseGeminiGenerateContent(
           for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
             yield event;
           }
+          const completionEvent = extractGeminiCompletionEvent(parsed);
           const interruptionEvent = extractGeminiInterruptionEvent(parsed);
+          if (completionEvent) {
+            sawExplicitCompletion = true;
+            yield completionEvent;
+            if (interruptionEvent) {
+              yield interruptionEvent;
+            }
+            yield DONE_EVENT;
+            return;
+          }
           if (interruptionEvent) {
             sawExplicitCompletion = true;
             yield interruptionEvent;
@@ -3069,6 +3243,11 @@ async function* streamSseGeminiGenerateContent(
     for (const line of dataLines) {
       if (line === "[DONE]") {
         sawExplicitCompletion = true;
+        yield buildProviderCompletionEvent(
+          "explicit_done",
+          "The provider sent [DONE] without a separate finishReason payload.",
+          true
+        );
         yield DONE_EVENT;
         return;
       }
@@ -3085,7 +3264,17 @@ async function* streamSseGeminiGenerateContent(
         for (const event of extractGeminiToolEvents(parsed, emittedToolCalls)) {
           yield event;
         }
+        const completionEvent = extractGeminiCompletionEvent(parsed);
         const interruptionEvent = extractGeminiInterruptionEvent(parsed);
+        if (completionEvent) {
+          sawExplicitCompletion = true;
+          yield completionEvent;
+          if (interruptionEvent) {
+            yield interruptionEvent;
+          }
+          yield DONE_EVENT;
+          return;
+        }
         if (interruptionEvent) {
           sawExplicitCompletion = true;
           yield interruptionEvent;
@@ -3098,6 +3287,10 @@ async function* streamSseGeminiGenerateContent(
     }
   }
 
+  if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseCompletionEvent();
+    yield buildUnexpectedSocketCloseEvent();
+  }
   yield DONE_EVENT;
 }
 
@@ -3330,6 +3523,11 @@ async function* streamSseAnthropic(
       for (const line of dataLines) {
         if (line === "[DONE]") {
           sawExplicitCompletion = true;
+          yield buildProviderCompletionEvent(
+            "explicit_done",
+            "The provider sent [DONE] without a message_stop event.",
+            true
+          );
           yield DONE_EVENT;
           return;
         }
@@ -3376,6 +3574,28 @@ async function* streamSseAnthropic(
             yield usageEvent;
           }
 
+          const anthropicErrorEvent = extractAnthropicStreamErrorEvent(parsed);
+          if (anthropicErrorEvent) {
+            sawExplicitCompletion = true;
+            if (snapshotPath && usageEvents.length > 0) {
+              try {
+                await updateAnthropicRequestSnapshot(snapshotPath, {
+                  usageEvents,
+                });
+              } catch {
+                // ignore debug write errors
+              }
+            }
+            yield buildProviderCompletionEvent(
+              "stream_error",
+              "Anthropic reported a stream error before completion.",
+              false
+            );
+            yield anthropicErrorEvent;
+            yield DONE_EVENT;
+            return;
+          }
+
           const eventType =
             typeof parsed.type === "string" ? parsed.type : "";
           const index = typeof parsed.index === "number" ? parsed.index : 0;
@@ -3398,6 +3618,13 @@ async function* streamSseAnthropic(
                 // ignore debug write errors
               }
             }
+            yield stopReason
+              ? buildAnthropicStopReasonCompletionEvent(stopReason)
+              : buildProviderCompletionEvent(
+                  "message_stop",
+                  "The provider ended the response with message_stop.",
+                  true
+                );
             if (stopReason && !isAnthropicExpectedStopReason(stopReason)) {
               yield buildAnthropicStopReasonInterruptionEvent(stopReason);
             }
@@ -3503,6 +3730,11 @@ async function* streamSseAnthropic(
     for (const line of dataLines) {
       if (line === "[DONE]") {
         sawExplicitCompletion = true;
+        yield buildProviderCompletionEvent(
+          "explicit_done",
+          "The provider sent [DONE] without a message_stop event.",
+          true
+        );
         yield DONE_EVENT;
         return;
       }
@@ -3543,6 +3775,28 @@ async function* streamSseAnthropic(
         }
         if (usageEvent) {
           yield usageEvent;
+        }
+
+        const anthropicErrorEvent = extractAnthropicStreamErrorEvent(parsed);
+        if (anthropicErrorEvent) {
+          sawExplicitCompletion = true;
+          if (snapshotPath && usageEvents.length > 0) {
+            try {
+              await updateAnthropicRequestSnapshot(snapshotPath, {
+                usageEvents,
+              });
+            } catch {
+              // ignore debug write errors
+            }
+          }
+          yield buildProviderCompletionEvent(
+            "stream_error",
+            "Anthropic reported a stream error before completion.",
+            false
+          );
+          yield anthropicErrorEvent;
+          yield DONE_EVENT;
+          return;
         }
 
         const eventType = typeof parsed.type === "string" ? parsed.type : "";
@@ -3642,6 +3896,13 @@ async function* streamSseAnthropic(
 
         if (eventType === "message_stop") {
           sawExplicitCompletion = true;
+          yield stopReason
+            ? buildAnthropicStopReasonCompletionEvent(stopReason)
+            : buildProviderCompletionEvent(
+                "message_stop",
+                "The provider ended the response with message_stop.",
+                true
+              );
           if (stopReason && !isAnthropicExpectedStopReason(stopReason)) {
             yield buildAnthropicStopReasonInterruptionEvent(stopReason);
           }
@@ -3665,6 +3926,7 @@ async function* streamSseAnthropic(
   }
 
   if (!sawExplicitCompletion) {
+    yield buildUnexpectedSocketCloseCompletionEvent();
     yield buildUnexpectedSocketCloseEvent();
   }
   yield DONE_EVENT;

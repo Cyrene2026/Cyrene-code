@@ -59,4 +59,33 @@ describe("generatedSkill", () => {
     expect(parsed.skill).toBeNull();
     expect(parsed.parseStatus).toBe("invalid_payload");
   });
+
+  test("ignores literal skill tags inside inline code spans", () => {
+    const raw = [
+      "Explain the protocol tag literally:",
+      `Use \`${CYRENE_SKILL_START_TAG}\` and \`${CYRENE_SKILL_END_TAG}\` in docs only.`,
+    ].join("\n");
+
+    const parsed = parseAssistantSkillUpdate(raw);
+
+    expect(parsed.visibleText).toBe(raw);
+    expect(parsed.skill).toBeNull();
+    expect(parsed.hasSkillTag).toBe(false);
+    expect(parsed.parseStatus).toBe("missing_tag");
+  });
+
+  test("trims trailing partial skill tags during streaming", () => {
+    const visibleAnswer = "Visible answer";
+
+    for (let length = 1; length < CYRENE_SKILL_START_TAG.length; length += 1) {
+      const raw = `${visibleAnswer}${CYRENE_SKILL_START_TAG.slice(0, length)}`;
+      const parsed = parseAssistantSkillUpdate(raw);
+
+      expect(parsed.visibleText).toBe(visibleAnswer);
+      expect(parsed.skill).toBeNull();
+      expect(parsed.hasSkillTag).toBe(false);
+      expect(parsed.isComplete).toBe(false);
+      expect(parsed.parseStatus).toBe("missing_tag");
+    }
+  });
 });

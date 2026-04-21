@@ -61,6 +61,35 @@ describe("executionPlan", () => {
     expect(parsed.plan?.acceptedSummary).toBe("");
   });
 
+  test("ignores literal plan tags inside inline code spans", () => {
+    const raw = [
+      "Explain the protocol tag literally:",
+      `Use \`${CYRENE_PLAN_START_TAG}\` and \`${CYRENE_PLAN_END_TAG}\` in docs only.`,
+    ].join("\n");
+
+    const parsed = parseAssistantPlanUpdate(raw);
+
+    expect(parsed.visibleText).toBe(raw);
+    expect(parsed.plan).toBeNull();
+    expect(parsed.hasPlanTag).toBe(false);
+    expect(parsed.parseStatus).toBe("missing_tag");
+  });
+
+  test("trims trailing partial plan tags during streaming", () => {
+    const visibleAnswer = "Visible answer";
+
+    for (let length = 1; length < CYRENE_PLAN_START_TAG.length; length += 1) {
+      const raw = `${visibleAnswer}${CYRENE_PLAN_START_TAG.slice(0, length)}`;
+      const parsed = parseAssistantPlanUpdate(raw);
+
+      expect(parsed.visibleText).toBe(visibleAnswer);
+      expect(parsed.plan).toBeNull();
+      expect(parsed.hasPlanTag).toBe(false);
+      expect(parsed.isComplete).toBe(false);
+      expect(parsed.parseStatus).toBe("missing_tag");
+    }
+  });
+
   test("links execution plans into summary and pending digest", () => {
     const linked = applyExecutionPlanToWorkingState({
       summary: "",

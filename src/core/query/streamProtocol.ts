@@ -1,10 +1,19 @@
 import { z } from "zod";
 import type { TokenUsage } from "./tokenUsage";
 
+export type QueryCompletionEvent = {
+  type: "completion";
+  source: "provider" | "runtime";
+  reason: string;
+  detail?: string;
+  expected?: boolean;
+};
+
 export type QueryStreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
   | ({ type: "usage" } & TokenUsage)
+  | QueryCompletionEvent
   | { type: "done" };
 
 const textDeltaSchema = z.object({
@@ -26,6 +35,14 @@ const usageSchema = z.object({
   totalTokens: z.number().int().nonnegative(),
 });
 
+const completionSchema = z.object({
+  type: z.literal("completion"),
+  source: z.union([z.literal("provider"), z.literal("runtime")]),
+  reason: z.string(),
+  detail: z.string().optional(),
+  expected: z.boolean().optional(),
+});
+
 const doneSchema = z.object({
   type: z.literal("done"),
 });
@@ -34,6 +51,7 @@ const eventSchema = z.union([
   textDeltaSchema,
   toolCallSchema,
   usageSchema,
+  completionSchema,
   doneSchema,
 ]);
 

@@ -1,4 +1,5 @@
 import type { TokenUsage } from "./tokenUsage";
+import type { QueryCompletionEvent } from "./streamProtocol";
 
 export type QuerySessionStatus =
   | "idle"
@@ -18,6 +19,7 @@ export type QuerySessionState = {
   toolCalls: ToolCallLog[];
   errorMessage: string | null;
   usage: TokenUsage | null;
+  completion: Omit<QueryCompletionEvent, "type"> | null;
 };
 
 type QuerySessionEvent =
@@ -26,6 +28,7 @@ type QuerySessionEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; toolName: string; input?: unknown }
   | ({ type: "usage" } & TokenUsage)
+  | QueryCompletionEvent
   | { type: "suspended" }
   | { type: "complete" }
   | { type: "fail"; message: string };
@@ -36,6 +39,7 @@ export const createQuerySessionState = (): QuerySessionState => ({
   toolCalls: [],
   errorMessage: null,
   usage: null,
+  completion: null,
 });
 
 export const querySessionReducer = (
@@ -50,6 +54,7 @@ export const querySessionReducer = (
         toolCalls: [],
         errorMessage: null,
         usage: null,
+        completion: null,
       };
     case "stream_open":
       return {
@@ -77,6 +82,16 @@ export const querySessionReducer = (
           cachedTokens: event.cachedTokens,
           completionTokens: event.completionTokens,
           totalTokens: event.totalTokens,
+        },
+      };
+    case "completion":
+      return {
+        ...state,
+        completion: {
+          source: event.source,
+          reason: event.reason,
+          detail: event.detail,
+          expected: event.expected,
         },
       };
     case "suspended":

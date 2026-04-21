@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1536,6 +1537,51 @@ func TestFooterShowsFinalizedRequestElapsedTime(t *testing.T) {
 	plainView := ansiPattern.ReplaceAllString(view, "")
 	if !strings.Contains(plainView, "TIME 1m05s") {
 		t.Fatalf("expected finalized request timer in footer, got %q", view)
+	}
+}
+
+func TestFooterClockClampsTransientSixSecondForwardJump(t *testing.T) {
+	base := time.Date(2026, 4, 22, 1, 34, 52, 0, time.Local)
+	expected := base.Add(120 * time.Millisecond)
+	observed := base.Add(6*time.Second + 240*time.Millisecond)
+
+	stabilized := app.StabilizeStatusClockForTest(expected, observed)
+	if !stabilized.Equal(expected) {
+		t.Fatalf("expected transient +6s jump to clamp to %v, got %v", expected, stabilized)
+	}
+}
+
+func TestActiveRequestTimerIgnoresStartedAtClockSkew(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 160
+	model.Height = 32
+	model.Status = app.StatusStreaming
+
+	base := time.Now()
+	current := base
+	restore := app.SetTimeNowForTest(func() time.Time {
+		return current
+	})
+	defer restore()
+
+	model.ObserveTimeForTest(base)
+	payload := fmt.Sprintf(`{
+		"type":"set_request_timing",
+		"requestTiming":{"active":true,"startedAt":"%s","elapsedMs":0}
+	}`, base.Add(-6*time.Second).UTC().Format(time.RFC3339Nano))
+	if err := model.ApplyBridgeEventJSONForTest(payload); err != nil {
+		t.Fatalf("set_request_timing failed: %v", err)
+	}
+
+	current = base.Add(2500 * time.Millisecond)
+	model.ObserveTimeForTest(current)
+
+	footer := ansiPattern.ReplaceAllString(model.RenderBottomStatusBarForTest(160), "")
+	if !regexp.MustCompile(`TIME 2\.[0-9]s`).MatchString(footer) {
+		t.Fatalf("expected local monotonic timer around 2.5s despite startedAt skew, got %q", footer)
+	}
+	if strings.Contains(footer, "TIME 8.") {
+		t.Fatalf("expected startedAt skew to be ignored, got %q", footer)
 	}
 }
 

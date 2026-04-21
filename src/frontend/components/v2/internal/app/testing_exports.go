@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -119,4 +120,28 @@ func SetClipboardImageReaderForTest(reader func() (*ClipboardImage, error)) func
 	return func() {
 		readClipboardImage = previous
 	}
+}
+
+func SetTimeNowForTest(reader func() time.Time) func() {
+	previous := currentTime
+	if reader == nil {
+		currentTime = time.Now
+	} else {
+		currentTime = reader
+	}
+	return func() {
+		currentTime = previous
+	}
+}
+
+func (m *Model) ObserveTimeForTest(now time.Time) {
+	m.observeStatusClock(now)
+}
+
+func (m *Model) RenderBottomStatusBarForTest(width int) string {
+	return m.renderBottomStatusBar(width)
+}
+
+func StabilizeStatusClockForTest(expected, observed time.Time) time.Time {
+	return stabilizeStatusClock(expected, observed)
 }

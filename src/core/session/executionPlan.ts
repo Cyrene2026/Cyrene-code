@@ -65,6 +65,49 @@ const buildSourcePreview = (visibleText: string, plan: SessionExecutionPlan) => 
   return clip(previewSource, 160);
 };
 
+const trimTrailingPartialPlanTag = (text: string) => {
+  for (let length = CYRENE_PLAN_START_TAG.length - 1; length > 0; length -= 1) {
+    const partial = CYRENE_PLAN_START_TAG.slice(0, length);
+    if (text.endsWith(partial)) {
+      return text.slice(0, -length);
+    }
+  }
+  return text;
+};
+
+const isInsideMarkdownCodeContext = (text: string, index: number) => {
+  let inFence = false;
+  const lines = text.slice(0, index).split(/\r?\n/);
+  for (const line of lines) {
+    if (line.trimStart().startsWith("```")) {
+      inFence = !inFence;
+    }
+  }
+  if (inFence) {
+    return true;
+  }
+
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const linePrefix = text.slice(lineStart, index);
+  const inlineBacktickCount = (linePrefix.match(/`/g) ?? []).length;
+  return inlineBacktickCount % 2 === 1;
+};
+
+const findAssistantPlanTagIndex = (text: string) => {
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const candidate = text.indexOf(CYRENE_PLAN_START_TAG, searchFrom);
+    if (candidate < 0) {
+      return -1;
+    }
+    if (!isInsideMarkdownCodeContext(text, candidate)) {
+      return candidate;
+    }
+    searchFrom = candidate + CYRENE_PLAN_START_TAG.length;
+  }
+  return -1;
+};
+
 const normalizePlanStep = (step: RawPlanStep, index: number): SessionExecutionPlanStep | null => {
   const title = typeof step.title === "string" ? normalizeWhitespace(step.title) : "";
   if (!title) {
@@ -157,10 +200,10 @@ export const parseAssistantPlanUpdate = (
   text: string,
   capturedAt = new Date().toISOString()
 ): ParsedAssistantPlanUpdate => {
-  const start = text.indexOf(CYRENE_PLAN_START_TAG);
+  const start = findAssistantPlanTagIndex(text);
   if (start < 0) {
     return {
-      visibleText: text.trim(),
+      visibleText: trimTrailingPartialPlanTag(text).trim(),
       plan: null,
       hasPlanTag: false,
       isComplete: false,

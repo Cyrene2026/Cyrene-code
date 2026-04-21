@@ -1,4 +1,8 @@
-import { parseStreamChunk } from "../../query/streamProtocol";
+import {
+  parseStreamChunk,
+  type QueryCompletionEvent,
+} from "../../query/streamProtocol";
+import { parseAssistantPlanUpdate } from "../../session/executionPlan";
 import {
   createQuerySessionState,
   querySessionReducer,
@@ -45,6 +49,9 @@ const ROUND_PROMPT_TASK_CHAR_LIMIT = 12000;
 const ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT = 16000;
 const ROUND_PROMPT_TOOL_RESULT_ITEM_CHAR_LIMIT = 3000;
 const ROUND_PROMPT_TOOL_RESULT_KEEP_LIMIT = 8;
+const PLAN_EXECUTION_AUTO_CONTINUE_LIMIT = 2;
+const PLAN_EXECUTION_PROMPT_MARKER =
+  "Continue by executing the active execution plan.";
 
 const BROAD_DISCOVERY_ACTIONS = new Set([
   "list_dir",
@@ -860,6 +867,65 @@ const buildNonProgressStopMessage = (
   ].join("\n");
 };
 
+const extractPlanExecutionTargetStepId = (query: string) => {
+  const match = query.match(/Focus on step ([^:\n]+):/);
+  return match?.[1]?.trim() || "";
+};
+
+const shouldAutoContinuePlanExecution = (
+  assistantText: string,
+  targetStepId: string,
+  autoContinueCount: number
+) => {
+  if (autoContinueCount >= PLAN_EXECUTION_AUTO_CONTINUE_LIMIT) {
+    return false;
+  }
+
+  const parsed = parseAssistantPlanUpdate(assistantText);
+  if (!parsed.plan) {
+    return false;
+  }
+
+  const targetStep = targetStepId
+    ? parsed.plan.steps.find(step => step.id === targetStepId)
+    : (parsed.plan.steps.find(step => step.status === "in_progress") ??
+        parsed.plan.steps.find(step => step.status === "pending"));
+
+  if (!targetStep) {
+    return false;
+  }
+
+  return (
+    targetStep.status === "in_progress" ||
+    targetStep.status === "pending"
+  );
+};
+
+const buildPlanExecutionAutoContinuePrompt = (
+  roundPrompt: string,
+  targetStepId: string
+) =>
+  [
+    roundPrompt,
+    [
+      "The previous reply updated the execution plan but did not actually execute the focused step.",
+      targetStepId
+        ? `Continue executing ${targetStepId} now.`
+        : "Continue executing the focused step now.",
+      "Do not stop after another plan-only update with no tool usage.",
+      "Take the next concrete action or explain a real blocker only after attempting execution.",
+    ].join("\n"),
+  ].join("\n\n");
+
+const buildImplicitProviderDoneCompletion = (): QueryCompletionEvent => ({
+  type: "completion",
+  source: "provider",
+  reason: "done_without_reason",
+  detail:
+    "The stream ended with done but no structured provider completion reason was reported.",
+  expected: false,
+});
+
 const shouldAutoContinueNonProgress = (
   assistantText: string,
   uncertainty: UncertaintyState,
@@ -1100,6 +1166,13 @@ const runExecutionRuntime = async ({
     SIMPLE_MULTI_FILE_TASK_PATTERN
   );
   const uncertainty = createUncertaintyState(task, progressLedger);
+  const planExecutionMode = normalizedQuery.text.includes(
+    PLAN_EXECUTION_PROMPT_MARKER
+  );
+  const planExecutionTargetStepId = extractPlanExecutionTargetStepId(
+    normalizedQuery.text
+  );
+  let planExecutionAutoContinueCount = 0;
   const searchMemory = ToolObservationStore.createSearchMemory();
   const readLedger = new Map<string, FileReadLedgerEntry>();
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
@@ -1204,6 +1277,8 @@ const runExecutionRuntime = async ({
     let visibleAnswerChars = 0;
     const toolResults: string[] = [];
     let latestUsage: TokenUsage | null = null;
+    let latestCompletion: QueryCompletionEvent | null = null;
+    let implicitProviderDonePending = false;
     let usageReported = false;
     const shouldDeferRoundText =
       uncertainty.writeFocus ||
@@ -1225,12 +1300,27 @@ const runExecutionRuntime = async ({
       return COMPLETED_RESULT;
     };
 
+    const recordCompletion = (completion: QueryCompletionEvent) => {
+      latestCompletion = completion;
+      dispatch(completion);
+    };
+
     const emitRoundText = (text: string) => {
       if (!text) {
         return;
       }
       dispatch({ type: "text_delta", text });
       onTextDelta(text);
+    };
+
+    const flushDeferredRoundText = () => {
+      if (!deferredRoundText) {
+        return false;
+      }
+      const text = deferredRoundText;
+      deferredRoundText = "";
+      emitRoundText(text);
+      return true;
     };
 
     const createOneShotResume = (
@@ -1277,7 +1367,17 @@ const runExecutionRuntime = async ({
           if (visibleAnswerChars >= LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD) {
             continue;
           }
+          if (shouldDeferRoundText) {
+            flushDeferredRoundText();
+          }
           if (toolStepsUsed >= maxToolSteps) {
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_budget_exhausted",
+              detail: `Used ${toolStepsUsed}/${maxToolSteps} tool steps. Stopping to avoid runaway execution.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool budget exhausted] Used ${toolStepsUsed}/${maxToolSteps} tool steps. Stopping to avoid runaway execution. Split the task or raise query_max_tool_steps to continue.\n`
             );
@@ -1599,6 +1699,13 @@ const runExecutionRuntime = async ({
             ToolLoopGuard.isExploratoryProbe(event.toolName, event.input)
           ) {
             const repeatedPath = getToolPath(event.input) ?? ".";
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_loop_detected",
+              detail: `list_dir ${repeatedPath} was called repeatedly after directory state was already confirmed.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool loop detected] list_dir ${repeatedPath} was called repeatedly after directory state was already confirmed. Stopping to prevent infinite loop.\n`
             );
@@ -1608,12 +1715,26 @@ const runExecutionRuntime = async ({
             seen >= 3 &&
             ToolLoopGuard.isCommandLikeAction(event.toolName, event.input)
           ) {
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_loop_detected",
+              detail: `${action} was called repeatedly with the same command signature.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool loop detected] ${action} was called repeatedly with the same command signature. Stopping to prevent infinite loop.\n`
             );
             return completeRound();
           }
           if (seen >= 4) {
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_loop_detected",
+              detail: `${displayName} was called repeatedly with the same input.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool loop detected] ${displayName} was called repeatedly with same input. Stopping to prevent infinite loop.\n`
             );
@@ -1689,6 +1810,13 @@ const runExecutionRuntime = async ({
               ].join("\n")
             );
             if (repeatedImmediatePostWriteReadCount >= 2) {
+              recordCompletion({
+                type: "completion",
+                source: "runtime",
+                reason: "tool_loop_detected",
+                detail: `read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write.`,
+                expected: false,
+              });
               onTextDelta(
                 `\n[tool loop detected] read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write. Stopping to prevent needless rereads.\n`
               );
@@ -1715,6 +1843,13 @@ const runExecutionRuntime = async ({
             toolResult.message.includes("(empty file)")
           ) {
             const repeatedPath = getToolPath(event.input) ?? ".";
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_loop_detected",
+              detail: `read_file ${repeatedPath} was repeated even though the file was already confirmed empty.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool loop detected] read_file ${repeatedPath} was repeated even though the file was already confirmed empty. Stopping to prevent infinite loop.\n`
             );
@@ -1725,6 +1860,13 @@ const runExecutionRuntime = async ({
             ToolLoopGuard.isCommandLikeAction(event.toolName, event.input) &&
             isFailedCommandResult(toolResult.message)
           ) {
+            recordCompletion({
+              type: "completion",
+              source: "runtime",
+              reason: "tool_loop_detected",
+              detail: `${action} was retried after the same command already failed.`,
+              expected: false,
+            });
             onTextDelta(
               `\n[tool loop detected] ${action} was retried after the same command already failed. Stop rerunning it unchanged and choose a new concrete step.\n`
             );
@@ -1872,7 +2014,16 @@ const runExecutionRuntime = async ({
           continue;
         }
 
+        if (event.type === "completion") {
+          recordCompletion(event);
+          continue;
+        }
+
         if (event.type === "done") {
+          if (!latestCompletion && !sawToolCall) {
+            recordCompletion(buildImplicitProviderDoneCompletion());
+            implicitProviderDonePending = true;
+          }
           completed = true;
           break;
         }
@@ -1883,15 +2034,40 @@ const runExecutionRuntime = async ({
         }
       }
     } catch (error) {
+      if (shouldDeferRoundText) {
+        flushDeferredRoundText();
+      }
       flushUsage();
       throw error;
     }
 
     if (!sawToolCall) {
+      if (
+        planExecutionMode &&
+        shouldAutoContinuePlanExecution(
+          state.assistantText,
+          planExecutionTargetStepId,
+          planExecutionAutoContinueCount
+        )
+      ) {
+        flushUsage();
+        planExecutionAutoContinueCount += 1;
+        return runRounds(
+          buildPlanExecutionAutoContinuePrompt(
+            roundPrompt,
+            planExecutionTargetStepId
+          ),
+          repeatedToolCallCount,
+          loopCorrection,
+          accumulatedToolResults,
+          toolStepsUsed
+        );
+      }
       if (shouldDeferRoundText) {
+        flushDeferredRoundText();
         if (
           shouldAutoContinueNonProgress(
-            deferredRoundText,
+            state.assistantText,
             uncertainty,
             progressLedger
           )
@@ -1930,12 +2106,11 @@ const runExecutionRuntime = async ({
           uncertainty.mode === "simple_multi_file" &&
           uncertainty.phase === "execute" &&
           ProgressTracker.getLedgerRemainingCount(progressLedger) > 0 &&
-          NON_PROGRESS_CHATTER_PATTERN.test(deferredRoundText)
+          NON_PROGRESS_CHATTER_PATTERN.test(state.assistantText)
         ) {
-          emitRoundText(buildNonProgressStopMessage(progressLedger));
+          emitRoundText(`\n${buildNonProgressStopMessage(progressLedger)}\n`);
           return completeRound();
         }
-        emitRoundText(deferredRoundText);
       }
       if (visibleAnswerChars === 0 && options?.allowSilentPostReviewRetry) {
         flushUsage();
@@ -1959,6 +2134,11 @@ const runExecutionRuntime = async ({
           accumulatedToolResults,
           toolStepsUsed,
           { allowSilentPostReviewRetry: false }
+        );
+      }
+      if (implicitProviderDonePending && visibleAnswerChars === 0) {
+        emitRoundText(
+          "\n[model stream interrupted] The stream ended without a structured provider completion reason.\n"
         );
       }
       return completeRound();

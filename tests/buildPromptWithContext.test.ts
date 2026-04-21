@@ -95,8 +95,8 @@ describe("buildPromptWithContext", () => {
     );
     expect(prompt).toContain("KNOWN PATHS:\n- src/app.ts");
     expect(prompt).toContain("Short transcript tail (immediate recency only):");
-    expect(prompt).not.toContain("a".repeat(300));
-    expect(prompt).not.toContain("b".repeat(300));
+    expect(prompt).not.toContain("a".repeat(450));
+    expect(prompt).not.toContain("b".repeat(450));
     expect(prompt).toContain("STATE REDUCER PROTOCOL:");
     expect(prompt).toContain(CYRENE_STATE_UPDATE_START_TAG);
     expect(prompt).toContain(
@@ -300,12 +300,43 @@ describe("buildPromptWithContext", () => {
       }
     );
 
-    expect(prompt.length).toBeLessThan(40000);
+    expect(prompt.length).toBeLessThan(55000);
     expect(prompt).toContain("(truncated)");
     expect(prompt).toContain("...[truncated for prompt budget]...");
     expect(prompt).toContain("Working state (durable reducer):");
     expect(prompt).toContain("Pending turn digest (last completed turn not yet merged):");
     expect(prompt).toContain("Current user query (act on this now):");
     expect(prompt).not.toContain("q".repeat(15000));
+  });
+
+  test("keeps moderately long current queries intact under the expanded prompt budget", () => {
+    const longQuery = `continue the refactor\n${"q".repeat(15000)}`;
+    const prompt = buildPromptWithContext(
+      longQuery,
+      "system",
+      "project",
+      {
+        pins: [],
+        relevantMemories: [],
+        recent: [],
+        latestActionableUserMessage: "",
+        durableSummary: [
+          "OBJECTIVE:",
+          "- finish the refactor",
+          "",
+          "REMAINING:",
+          "- wire the next module",
+        ].join("\n"),
+        pendingDigest: "",
+        executionPlan: null,
+        summaryFallback: "",
+        reducerMode: "merge_and_digest",
+        summaryRecoveryNeeded: false,
+        interruptedTurn: null,
+      }
+    );
+
+    expect(prompt).toContain(longQuery);
+    expect(prompt).not.toContain("...[truncated for prompt budget]...");
   });
 });

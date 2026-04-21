@@ -414,7 +414,7 @@ func (m *Model) renderTopStatusBar(width int) string {
 }
 
 func (m *Model) renderBottomStatusBar(width int) string {
-	now := time.Now()
+	now := m.statusClockNow()
 	items := []footerStatusItem{
 		{Label: "TOKENS", Value: formatUsageCompact(m.UsageSummary), ValueStyle: footerTokenValueStyle},
 		{Label: "TIME", Value: m.renderRequestElapsedLabel(now), ValueStyle: footerDurationValueStyle},
@@ -433,7 +433,12 @@ func (m *Model) renderRequestElapsedLabel(now time.Time) string {
 		return "-"
 	}
 	elapsedMs := m.RequestTimingElapsedMs
-	if m.RequestTimingActive && !m.RequestTimingStartedAt.IsZero() {
+	if m.RequestTimingActive && !m.RequestTimingSyncedAt.IsZero() {
+		activeElapsedMs := m.RequestTimingBaseElapsed + now.Sub(m.RequestTimingSyncedAt).Milliseconds()
+		if activeElapsedMs > elapsedMs {
+			elapsedMs = activeElapsedMs
+		}
+	} else if m.RequestTimingActive && !m.RequestTimingStartedAt.IsZero() {
 		activeElapsedMs := now.Sub(m.RequestTimingStartedAt).Milliseconds()
 		if activeElapsedMs > elapsedMs {
 			elapsedMs = activeElapsedMs

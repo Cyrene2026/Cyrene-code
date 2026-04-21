@@ -1522,6 +1522,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 5,
         totalTokens: 16,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -1606,6 +1613,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 5,
         totalTokens: 16,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -1669,6 +1683,13 @@ describe("createHttpQueryTransport streaming usage", () => {
 
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "visible" }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -1790,7 +1811,16 @@ describe("createHttpQueryTransport streaming usage", () => {
       events.push(event);
     }
 
-    expect(events).toEqual([JSON.stringify({ type: "done" })]);
+    expect(events).toEqual([
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
   });
 
   test("can include reasoning_content and thinking fields when explicitly enabled", async () => {
@@ -1859,6 +1889,13 @@ describe("createHttpQueryTransport streaming usage", () => {
       JSON.stringify({ type: "text_delta", text: "plan: inspect " }),
       JSON.stringify({ type: "text_delta", text: "then patch" }),
       JSON.stringify({ type: "text_delta", text: " now" }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -1976,6 +2013,13 @@ describe("createHttpQueryTransport streaming usage", () => {
     );
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "ok" }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
 
@@ -2430,6 +2474,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         cachedTokens: 18,
         completionTokens: 4,
         totalTokens: 24,
+      }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
       }),
       JSON.stringify({ type: "done" }),
     ]);
@@ -3142,6 +3193,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 5,
         totalTokens: 145,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "message_stop",
+        detail: "The provider ended the response with message_stop.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -3402,6 +3460,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 5,
         totalTokens: 16,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "response_status:completed",
+        detail: "The provider ended the response with status=completed.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -3578,6 +3643,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 2,
         totalTokens: 5,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "response_status:completed",
+        detail: "The provider ended the response with status=completed.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -3666,6 +3738,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         promptTokens: 3,
         completionTokens: 2,
         totalTokens: 5,
+      }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "response_status:completed",
+        detail: "The provider ended the response with status=completed.",
+        expected: true,
       }),
       JSON.stringify({ type: "done" }),
     ]);
@@ -3756,6 +3835,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         completionTokens: 2,
         totalTokens: 5,
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "response_status:completed",
+        detail: "The provider ended the response with status=completed.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -3841,6 +3927,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         promptTokens: 7,
         completionTokens: 3,
         totalTokens: 10,
+      }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "explicit_done",
+        detail: "The provider sent [DONE] without a separate finish_reason chunk.",
+        expected: true,
       }),
       JSON.stringify({ type: "done" }),
     ]);
@@ -4144,6 +4237,8 @@ describe("createHttpQueryTransport streaming usage", () => {
             [
               'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7}}',
               "",
+              'data: {"candidates":[{"finishReason":"STOP"}]}',
+              "",
             ].join("\n")
           )
         );
@@ -4203,6 +4298,13 @@ describe("createHttpQueryTransport streaming usage", () => {
         totalTokens: 7,
       }),
       JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "finish_reason:STOP",
+        detail: "The provider ended the response with finishReason=STOP.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
   });
@@ -4232,6 +4334,8 @@ describe("createHttpQueryTransport streaming usage", () => {
               'data: {"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}',
               "",
               'data: {"candidates":[{"content":{"parts":[{"text":"world"},{"functionCall":{"name":"file","args":{"action":"read_file","path":"README.md"}}}]}}],"usageMetadata":{"promptTokenCount":12,"cachedContentTokenCount":4,"candidatesTokenCount":7,"totalTokenCount":19}}',
+              "",
+              'data: {"candidates":[{"finishReason":"STOP"}]}',
               "",
             ].join("\n")
           )
@@ -4311,8 +4415,82 @@ describe("createHttpQueryTransport streaming usage", () => {
         toolName: "file",
         input: { action: "read_file", path: "README.md" },
       }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "finish_reason:STOP",
+        detail: "The provider ended the response with finishReason=STOP.",
+        expected: true,
+      }),
       JSON.stringify({ type: "done" }),
     ]);
+  });
+
+  test("native Gemini format surfaces unexpected socket closes instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gemini-2.5-flash",
+        "last_used_model: gemini-2.5-flash",
+        "provider_base_url: https://generativelanguage.googleapis.com/v1beta",
+        "models:",
+        "  - gemini-2.5-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"candidates":[{"content":{"parts":[{"text":"partial answer"}]}}]}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://generativelanguage.googleapis.com/v1beta",
+        CYRENE_GEMINI_API_KEY: "gemini-key",
+        CYRENE_MODEL: "gemini-2.5-flash",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    expect(parsedEvents).toContainEqual({
+      type: "completion",
+      source: "provider",
+      reason: "unexpected_socket_close",
+      detail:
+        "The stream closed before the provider sent an explicit completion signal.",
+      expected: false,
+    });
+    expect(parsedEvents).toContainEqual({
+      type: "text_delta",
+      text: expect.stringContaining(
+        "stream closed before the provider sent an explicit completion signal"
+      ),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
   });
 
   test("openai chat stream recovers write_file calls that use `code` instead of `content`", async () => {
@@ -4442,12 +4620,20 @@ describe("createHttpQueryTransport streaming usage", () => {
     });
 
     const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const completionEvent = parsedEvents.find(event => event.type === "completion");
     const interruptionEvent = parsedEvents.find(
       event =>
         event.type === "text_delta" &&
         event.text.includes("[model stream interrupted]")
     );
 
+    expect(completionEvent).toEqual({
+      type: "completion",
+      source: "provider",
+      reason: "finish_reason:length",
+      detail: "The provider ended the response with finish_reason=length.",
+      expected: false,
+    });
     expect(interruptionEvent).toEqual({
       type: "text_delta",
       text: expect.stringContaining("output limit"),
@@ -4504,12 +4690,21 @@ describe("createHttpQueryTransport streaming usage", () => {
     });
 
     const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const completionEvent = parsedEvents.find(event => event.type === "completion");
     const interruptionEvent = parsedEvents.find(
       event =>
         event.type === "text_delta" &&
         event.text.includes("[model stream interrupted]")
     );
 
+    expect(completionEvent).toEqual({
+      type: "completion",
+      source: "provider",
+      reason: "unexpected_socket_close",
+      detail:
+        "The stream closed before the provider sent an explicit completion signal.",
+      expected: false,
+    });
     expect(interruptionEvent).toEqual({
       type: "text_delta",
       text: expect.stringContaining(
@@ -4656,15 +4851,95 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(formatResult?.ok).toBe(true);
 
     const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const completionEvent = parsedEvents.find(event => event.type === "completion");
     const interruptionEvent = parsedEvents.find(
       event =>
         event.type === "text_delta" &&
         event.text.includes("[model stream interrupted]")
     );
 
+    expect(completionEvent).toEqual({
+      type: "completion",
+      source: "provider",
+      reason: "response_status:incomplete",
+      detail: expect.stringContaining("max_output_tokens"),
+      expected: false,
+    });
     expect(interruptionEvent).toEqual({
       type: "text_delta",
       text: expect.stringContaining("max_output_tokens"),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
+  });
+
+  test("openai responses stream surfaces unexpected socket closes instead of ending silently", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.output_text.delta","delta":"partial answer"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const formatResult = await transport.setProviderFormat?.(
+      "https://example.test/v1",
+      "openai_responses"
+    );
+    expect(formatResult?.ok).toBe(true);
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    expect(parsedEvents).toContainEqual({
+      type: "completion",
+      source: "provider",
+      reason: "unexpected_socket_close",
+      detail:
+        "The stream closed before the provider sent an explicit completion signal.",
+      expected: false,
+    });
+    expect(parsedEvents).toContainEqual({
+      type: "text_delta",
+      text: expect.stringContaining(
+        "stream closed before the provider sent an explicit completion signal"
+      ),
     });
     expect(parsedEvents.at(-1)).toEqual({ type: "done" });
   });
@@ -4724,15 +4999,94 @@ describe("createHttpQueryTransport streaming usage", () => {
     });
 
     const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const completionEvent = parsedEvents.find(event => event.type === "completion");
     const interruptionEvent = parsedEvents.find(
       event =>
         event.type === "text_delta" &&
         event.text.includes("[model stream interrupted]")
     );
 
+    expect(completionEvent).toEqual({
+      type: "completion",
+      source: "provider",
+      reason: "stop_reason:max_tokens",
+      detail: "The provider ended the response with stop_reason=max_tokens.",
+      expected: false,
+    });
     expect(interruptionEvent).toEqual({
       type: "text_delta",
       text: expect.stringContaining("output limit"),
+    });
+    expect(parsedEvents.at(-1)).toEqual({ type: "done" });
+  });
+
+  test("anthropic stream surfaces SSE error events after partial output", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}',
+              "",
+              "event: error",
+              'data: {"type":"error","error":{"type":"overloaded_error","message":"server overloaded"}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const parsedEvents = await collectParsedStreamEvents(transport, "continue the task");
+    const completionEvent = parsedEvents.find(event => event.type === "completion");
+    expect(parsedEvents).toContainEqual({
+      type: "text_delta",
+      text: "partial answer",
+    });
+    expect(completionEvent).toEqual({
+      type: "completion",
+      source: "provider",
+      reason: "stream_error",
+      detail: "Anthropic reported a stream error before completion.",
+      expected: false,
+    });
+    expect(parsedEvents).toContainEqual({
+      type: "text_delta",
+      text: expect.stringContaining("Anthropic stream error: server overloaded"),
     });
     expect(parsedEvents.at(-1)).toEqual({ type: "done" });
   });

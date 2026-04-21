@@ -621,6 +621,7 @@ describe("runQuerySession", () => {
   test("stops with explicit message when tool budget is exhausted", async () => {
     const transport = createToolLoopTransport([3, 3, 0]);
     const textDeltas: string[] = [];
+    const completionReasons: Array<string | null> = [];
     let toolCallCount = 0;
 
     const result = await runQuerySession({
@@ -628,7 +629,9 @@ describe("runQuerySession", () => {
       originalTask: "scan files",
       queryMaxToolSteps: 5,
       transport,
-      onState: () => {},
+      onState: state => {
+        completionReasons.push(state.completion?.reason ?? null);
+      },
       onTextDelta: text => {
         textDeltas.push(text);
       },
@@ -643,6 +646,7 @@ describe("runQuerySession", () => {
     expect(toolCallCount).toBe(5);
     expect(textDeltas.join("")).toContain("[tool budget exhausted]");
     expect(textDeltas.join("")).toContain("5/5");
+    expect(completionReasons).toContain("tool_budget_exhausted");
   });
 
   test("preserves tool budget across suspend and resume", async () => {
@@ -681,6 +685,99 @@ describe("runQuerySession", () => {
     expect(resumed.status).toBe("completed");
     expect(toolCallCount).toBe(5);
     expect(textDeltas.join("")).toContain("[tool budget exhausted]");
+  });
+
+  test("stores structured provider completion reasons in session state", async () => {
+    const transport: QueryTransport = {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async () => "stream://1",
+      stream: async function* () {
+        yield JSON.stringify({ type: "text_delta", text: "partial answer" });
+        yield JSON.stringify({
+          type: "completion",
+          source: "provider",
+          reason: "finish_reason:length",
+          detail: "The provider ended the response with finish_reason=length.",
+          expected: false,
+        });
+        yield JSON.stringify({ type: "done" });
+      },
+    };
+
+    const completions: Array<{
+      reason: string | null;
+      detail: string | null;
+      expected: boolean | null;
+    }> = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      transport,
+      onState: state => {
+        completions.push({
+          reason: state.completion?.reason ?? null,
+          detail: state.completion?.detail ?? null,
+          expected:
+            typeof state.completion?.expected === "boolean"
+              ? state.completion.expected
+              : null,
+        });
+      },
+      onTextDelta: () => {},
+      onToolCall: async () => ({ message: "ok" }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(completions).toContainEqual({
+      reason: "finish_reason:length",
+      detail: "The provider ended the response with finish_reason=length.",
+      expected: false,
+    });
+  });
+
+  test("surfaces silent done as an explicit provider completion diagnostic", async () => {
+    const transport: QueryTransport = {
+      getModel: () => "gpt-test",
+      getProvider: () => "https://provider.test/v1",
+      listProviders: async () => ["https://provider.test/v1"],
+      setProvider: async provider => ({ ok: true, message: `provider ${provider}`, currentProvider: provider, providers: [provider], models: ["gpt-test"] }),
+      setModel: async model => ({ ok: true, message: `set ${model}` }),
+      listModels: async () => ["gpt-test"],
+      refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+      requestStreamUrl: async () => "stream://1",
+      stream: async function* () {
+        yield JSON.stringify({ type: "done" });
+      },
+    };
+
+    const textDeltas: string[] = [];
+    const completionReasons: Array<string | null> = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      transport,
+      onState: state => {
+        completionReasons.push(state.completion?.reason ?? null);
+      },
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => ({ message: "ok" }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(completionReasons).toContain("done_without_reason");
+    expect(textDeltas.join("")).toContain(
+      "[model stream interrupted] The stream ended without a structured provider completion reason."
+    );
   });
 
   test("stores usage events from the stream in session state", async () => {
@@ -860,7 +957,8 @@ describe("runQuerySession", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(states).toEqual(["requesting", "idle"]);
+    expect(states[0]).toBe("requesting");
+    expect(states.at(-1)).toBe("idle");
   });
 
   test("ignores late tool calls after a substantial final answer and does not re-enter another round", async () => {
@@ -2266,7 +2364,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[2]).toContain("a confirmed code mutation already exists");
   });
 
-  test("short non-progress chatter auto-continues once and drops the chatter from visible output", async () => {
+  test("short non-progress chatter auto-continues once and preserves the chatter in visible output", async () => {
     const { transport, prompts } = createPromptCaptureScriptedTransport([
       [
         {
@@ -2296,7 +2394,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
-    expect(textDeltas.join("")).toBe("已完成剩余文件");
+    expect(textDeltas.join("")).toBe("继续拆分剩余模块已完成剩余文件");
     expect(prompts).toHaveLength(3);
     expect(prompts[2]).toContain(
       "The previous reply narrated progress without completing the remaining files."
@@ -2341,7 +2439,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
 
     expect(result.status).toBe("completed");
     expect(toolCalls).toEqual(["write_file"]);
-    expect(textDeltas.join("")).toBe("done");
+    expect(textDeltas.join("")).toBe("我来继续修改这个文件done");
     expect(prompts).toHaveLength(3);
     expect(prompts[1]).toContain(
       "The previous reply narrated progress before taking a concrete code step."
@@ -2379,9 +2477,83 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
+    expect(textDeltas.join("")).toContain("继续拆分剩余模块");
+    expect(textDeltas.join("")).toContain("继续补齐剩余文件");
     expect(textDeltas.join("")).toContain("[execution paused]");
     expect(textDeltas.join("")).toContain("Known remaining paths: test_files/b.py, test_files/c.py.");
-    expect(textDeltas.join("")).not.toContain("继续补齐剩余文件");
+  });
+
+  test("plan execution auto-continues when the model only updates the plan without any tool call", async () => {
+    const { transport, prompts } = createPromptCaptureScriptedTransport([
+      [
+        {
+          type: "text_delta",
+          text: [
+            "Plan updated.",
+            '<cyrene_plan>{"version":1,"projectRoot":"/workspace/demo","summary":"Finish the task","objective":"finish the task","acceptedAt":"","acceptedSummary":"","steps":[{"id":"step-1","title":"Patch reducer","details":"Implement the reducer change","status":"in_progress","evidence":[],"filePaths":["src/reducer.ts"],"recentToolResult":""},{"id":"step-2","title":"Run tests","details":"Verify the change","status":"pending","evidence":[],"filePaths":[],"recentToolResult":""}]}</cyrene_plan>',
+          ].join("\n"),
+        },
+      ],
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: {
+            action: "write_file",
+            path: "src/reducer.ts",
+            content: "patched\n",
+          },
+        },
+      ],
+      [
+        {
+          type: "text_delta",
+          text: [
+            "Patched the reducer step.",
+            '<cyrene_plan>{"version":1,"projectRoot":"/workspace/demo","summary":"Finish the task","objective":"finish the task","acceptedAt":"","acceptedSummary":"","steps":[{"id":"step-1","title":"Patch reducer","details":"Implement the reducer change","status":"completed","evidence":["Wrote src/reducer.ts"],"filePaths":["src/reducer.ts"],"recentToolResult":"Wrote file: src/reducer.ts"},{"id":"step-2","title":"Run tests","details":"Verify the change","status":"pending","evidence":[],"filePaths":[],"recentToolResult":""}]}</cyrene_plan>',
+          ].join("\n"),
+        },
+      ],
+    ]);
+    const textDeltas: string[] = [];
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: [
+        "Continue by executing the active execution plan.",
+        "Focus on step step-1: Patch reducer",
+        "Do the work instead of only restating the plan.",
+        "If the step is finished, mark it completed yourself in an updated <cyrene_plan> JSON block.",
+      ].join("\n\n"),
+      originalTask: "finish the task",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message:
+            "[tool result] write_file src/reducer.ts\nWrote file: src/reducer.ts\n[confirmed file mutation] write_file src/reducer.ts",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(textDeltas.join("")).toContain("Plan updated.");
+    expect(textDeltas.join("")).toContain("Patched the reducer step.");
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain(
+      "The previous reply updated the execution plan but did not actually execute the focused step."
+    );
+    expect(prompts[1]).toContain("Continue executing step-1 now.");
   });
 
   test("round prompts truncate oversized accumulated tool results", async () => {

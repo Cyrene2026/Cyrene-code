@@ -54,6 +54,49 @@ const normalizeSkillId = (value: unknown) => {
     .replace(/^[._-]+|[._-]+$/g, "");
 };
 
+const trimTrailingPartialSkillTag = (text: string) => {
+  for (let length = CYRENE_SKILL_START_TAG.length - 1; length > 0; length -= 1) {
+    const partial = CYRENE_SKILL_START_TAG.slice(0, length);
+    if (text.endsWith(partial)) {
+      return text.slice(0, -length);
+    }
+  }
+  return text;
+};
+
+const isInsideMarkdownCodeContext = (text: string, index: number) => {
+  let inFence = false;
+  const lines = text.slice(0, index).split(/\r?\n/);
+  for (const line of lines) {
+    if (line.trimStart().startsWith("```")) {
+      inFence = !inFence;
+    }
+  }
+  if (inFence) {
+    return true;
+  }
+
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const linePrefix = text.slice(lineStart, index);
+  const inlineBacktickCount = (linePrefix.match(/`/g) ?? []).length;
+  return inlineBacktickCount % 2 === 1;
+};
+
+const findAssistantSkillTagIndex = (text: string) => {
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const candidate = text.indexOf(CYRENE_SKILL_START_TAG, searchFrom);
+    if (candidate < 0) {
+      return -1;
+    }
+    if (!isInsideMarkdownCodeContext(text, candidate)) {
+      return candidate;
+    }
+    searchFrom = candidate + CYRENE_SKILL_START_TAG.length;
+  }
+  return -1;
+};
+
 const normalizeSkillPayload = (payload: RawSkillPayload): SkillCreationInput | null => {
   if (payload.version !== 1) {
     return null;
@@ -92,10 +135,10 @@ const normalizeSkillPayload = (payload: RawSkillPayload): SkillCreationInput | n
 export const parseAssistantSkillUpdate = (
   text: string
 ): ParsedAssistantSkillUpdate => {
-  const start = text.indexOf(CYRENE_SKILL_START_TAG);
+  const start = findAssistantSkillTagIndex(text);
   if (start < 0) {
     return {
-      visibleText: text.trim(),
+      visibleText: trimTrailingPartialSkillTag(text).trim(),
       skill: null,
       hasSkillTag: false,
       isComplete: false,

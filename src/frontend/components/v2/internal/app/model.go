@@ -74,7 +74,9 @@ const (
 	maxImageAttachmentBytes  = 10 * 1024 * 1024
 )
 
-type statusSpinnerTickMsg struct{}
+type statusSpinnerTickMsg struct {
+	At time.Time
+}
 
 type ComposerCompositionMsg struct {
 	Text   []rune
@@ -216,6 +218,7 @@ var slashPinnedDisplayCommands = []string{"/resume", "/clear"}
 
 var readClipboardText = defaultClipboardTextReader
 var readClipboardImage = defaultClipboardImageReader
+var currentTime = time.Now
 
 var errClipboardNoImage = errors.New("clipboard has no image")
 
@@ -333,6 +336,10 @@ type Model struct {
 	RequestTimingActive      bool
 	RequestTimingStartedAt   time.Time
 	RequestTimingElapsedMs   int64
+	RequestTimingBaseElapsed int64
+	RequestTimingSyncedAt    time.Time
+	StatusClockObservedAt    time.Time
+	StatusClockDisplayAt     time.Time
 	CurrentModel             string
 	CurrentProvider          string
 	CurrentProviderFormat    string
@@ -370,6 +377,7 @@ type Model struct {
 }
 
 func NewModel() *Model {
+	now := currentTime()
 	model := &Model{
 		Width:                  100,
 		Height:                 30,
@@ -389,6 +397,8 @@ func NewModel() *Model {
 			Kind: "system_hint",
 			Text: "Starting Bubble Tea v2 bridge...",
 		}},
+		StatusClockObservedAt: now,
+		StatusClockDisplayAt:  now,
 	}
 	model.ensureComposerTextarea()
 	return model
@@ -501,6 +511,12 @@ func (m *Model) Init() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	sampleNow := currentTime()
+	if tick, ok := msg.(statusSpinnerTickMsg); ok && !tick.At.IsZero() {
+		sampleNow = tick.At
+	}
+	m.observeStatusClock(sampleNow)
+
 	switch value := msg.(type) {
 	case bridgeStartedMsg:
 		m.bridge = value.Client
@@ -539,13 +555,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.withStatusSpinner(waitForBridgeEvent(m.bridge))
 	case bridgeErrorMsg:
-		m.freezeRequestTiming(time.Now())
+		m.freezeRequestTiming(m.statusClockNow())
 		m.Status = StatusError
 		m.AuthSaving = false
 		m.setNotice(value.Message, true)
 		return m, m.withStatusSpinner(nil)
 	case bridgeExitedMsg:
-		m.freezeRequestTiming(time.Now())
+		m.freezeRequestTiming(m.statusClockNow())
 		m.BridgeReady = false
 		m.bridge = nil
 		m.AuthSaving = false
@@ -595,7 +611,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.withStatusSpinner(nil)
 			}
 			if m.MouseCapture {
-				m.IgnorePasteUntil = time.Now().Add(rightClickPasteWindow)
+				m.IgnorePasteUntil = sampleNow.Add(rightClickPasteWindow)
 				m.setNotice("Right-click paste is blocked in mouse mode. Press F6 for terminal paste.", false)
 			}
 		default:
@@ -729,9 +745,49 @@ func (m *Model) isAnimatingStatus() bool {
 }
 
 func statusSpinnerTickCmd() tea.Cmd {
-	return tea.Tick(statusSpinnerInterval, func(time.Time) tea.Msg {
-		return statusSpinnerTickMsg{}
+	return tea.Tick(statusSpinnerInterval, func(at time.Time) tea.Msg {
+		return statusSpinnerTickMsg{At: at}
 	})
+}
+
+const (
+	statusClockJumpTolerance   = 2 * time.Second
+	statusClockResyncThreshold = 30 * time.Second
+)
+
+func stabilizeStatusClock(expected, observed time.Time) time.Time {
+	if expected.IsZero() {
+		return observed
+	}
+	drift := observed.Sub(expected)
+	if drift > statusClockResyncThreshold || drift < -statusClockResyncThreshold {
+		return observed
+	}
+	if drift > statusClockJumpTolerance || drift < -statusClockJumpTolerance {
+		return expected
+	}
+	return observed
+}
+
+func (m *Model) observeStatusClock(now time.Time) {
+	if now.IsZero() {
+		now = currentTime()
+	}
+	if m.StatusClockObservedAt.IsZero() || m.StatusClockDisplayAt.IsZero() {
+		m.StatusClockObservedAt = now
+		m.StatusClockDisplayAt = now
+		return
+	}
+	expected := m.StatusClockDisplayAt.Add(now.Sub(m.StatusClockObservedAt))
+	m.StatusClockObservedAt = now
+	m.StatusClockDisplayAt = stabilizeStatusClock(expected, now)
+}
+
+func (m *Model) statusClockNow() time.Time {
+	if m.StatusClockDisplayAt.IsZero() {
+		return currentTime()
+	}
+	return m.StatusClockDisplayAt
 }
 
 func (m *Model) withStatusSpinner(cmd tea.Cmd) tea.Cmd {
@@ -757,6 +813,11 @@ func (m *Model) applyBridgeRequestTiming(timing BridgeRequestTiming) {
 	} else {
 		m.RequestTimingElapsedMs = 0
 	}
+	m.RequestTimingBaseElapsed = m.RequestTimingElapsedMs
+	m.RequestTimingSyncedAt = time.Time{}
+	if timing.Active {
+		m.RequestTimingSyncedAt = m.statusClockNow()
+	}
 	m.RequestTimingStartedAt = time.Time{}
 	if strings.TrimSpace(timing.StartedAt) != "" {
 		if parsed, err := time.Parse(time.RFC3339Nano, timing.StartedAt); err == nil {
@@ -769,12 +830,19 @@ func (m *Model) freezeRequestTiming(now time.Time) {
 	if !m.RequestTimingActive {
 		return
 	}
-	if !m.RequestTimingStartedAt.IsZero() {
+	if !m.RequestTimingSyncedAt.IsZero() {
+		elapsed := m.RequestTimingBaseElapsed + now.Sub(m.RequestTimingSyncedAt).Milliseconds()
+		if elapsed > m.RequestTimingElapsedMs {
+			m.RequestTimingElapsedMs = elapsed
+		}
+	} else if !m.RequestTimingStartedAt.IsZero() {
 		elapsed := now.Sub(m.RequestTimingStartedAt).Milliseconds()
 		if elapsed > m.RequestTimingElapsedMs {
 			m.RequestTimingElapsedMs = elapsed
 		}
 	}
+	m.RequestTimingBaseElapsed = m.RequestTimingElapsedMs
+	m.RequestTimingSyncedAt = time.Time{}
 	m.RequestTimingActive = false
 }
 

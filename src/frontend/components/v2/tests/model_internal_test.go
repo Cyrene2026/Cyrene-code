@@ -464,6 +464,22 @@ func TestRenderMarkdownBodyLinesClampsTableWidth(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownBodyLinesWrapsLongTableCellsInsteadOfTruncating(t *testing.T) {
+	lines := app.RenderMarkdownBodyLinesForTest(
+		"| 项目维度 | 正式表述 |\n| --- | --- |\n| 建设背景 | 随着复杂开发任务、运维任务及知识处理任务对智能化辅助的要求提升，传统单轮问答式助手已难以满足多步骤执行、上下文持续维护、工具联动处理等实际场景需求。 |",
+		48,
+		lipgloss.NewStyle(),
+	)
+	rendered := strings.Join(lines, "\n")
+
+	if !strings.Contains(rendered, "传统单轮问答式助手已难以满足") {
+		t.Fatalf("expected long table cell text preserved after wrapping, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "骤执行、上下文持续维护、工具联动") {
+		t.Fatalf("expected later wrapped table content preserved, got %q", rendered)
+	}
+}
+
 func TestRenderTranscriptClampsStyledLinesToWidth(t *testing.T) {
 	model := app.NewModel()
 	model.Items = []app.Message{

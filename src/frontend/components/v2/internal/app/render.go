@@ -2672,12 +2672,14 @@ func renderMarkdownTable(table markdownTable, width int, baseStyle lipgloss.Styl
 
 	lines := []string{
 		renderMarkdownTableRule("┌", "┬", "┐", columnWidths),
-		renderMarkdownTableRow(table.Header, columnWidths, baseStyle.Copy().Bold(true)),
-		renderMarkdownTableRule("├", "┼", "┤", columnWidths),
 	}
+	lines = append(lines, renderMarkdownTableRowLines(table.Header, columnWidths, baseStyle.Copy().Bold(true))...)
+	lines = append(lines,
+		renderMarkdownTableRule("├", "┼", "┤", columnWidths),
+	)
 
 	for _, row := range table.Rows {
-		lines = append(lines, renderMarkdownTableRow(row, columnWidths, baseStyle))
+		lines = append(lines, renderMarkdownTableRowLines(row, columnWidths, baseStyle)...)
 	}
 	lines = append(lines, renderMarkdownTableRule("└", "┴", "┘", columnWidths))
 	return lines
@@ -2734,19 +2736,38 @@ func renderMarkdownTableRule(left, middle, right string, widths []int) string {
 	return left + strings.Join(parts, middle) + right
 }
 
-func renderMarkdownTableRow(row []string, widths []int, style lipgloss.Style) string {
-	cells := make([]string, 0, len(widths))
+func renderMarkdownTableRowLines(row []string, widths []int, style lipgloss.Style) []string {
+	wrappedCells := make([][]string, len(widths))
+	rowHeight := 1
 	for index, width := range widths {
 		value := ""
 		if index < len(row) {
 			value = strings.TrimSpace(row[index])
 		}
-		rendered := renderInlineMarkdown(value, style)
-		padded := fitToWidth(rendered, width)
-		padding := strings.Repeat(" ", maxInt(0, width-lipgloss.Width(padded)))
-		cells = append(cells, " "+padded+padding+" ")
+		wrapped := wrapPlainText(value, maxInt(1, width))
+		if len(wrapped) == 0 {
+			wrapped = []string{""}
+		}
+		wrappedCells[index] = wrapped
+		if len(wrapped) > rowHeight {
+			rowHeight = len(wrapped)
+		}
 	}
-	return "│" + strings.Join(cells, "│") + "│"
+
+	lines := make([]string, 0, rowHeight)
+	for lineIndex := 0; lineIndex < rowHeight; lineIndex++ {
+		cells := make([]string, 0, len(widths))
+		for index, width := range widths {
+			segment := ""
+			if lineIndex < len(wrappedCells[index]) {
+				segment = wrappedCells[index][lineIndex]
+			}
+			rendered := renderInlineMarkdown(segment, style)
+			cells = append(cells, " "+fitDisplayWidth(rendered, width)+" ")
+		}
+		lines = append(lines, "│"+strings.Join(cells, "│")+"│")
+	}
+	return lines
 }
 
 func renderInlineMarkdown(value string, baseStyle lipgloss.Style) string {

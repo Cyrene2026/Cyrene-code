@@ -157,6 +157,34 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(actionEnum).toContain("read_range");
     expect(actionEnum).toContain("read_json");
     expect(actionEnum).toContain("read_yaml");
+    expect(actionEnum).toContain("cat");
+    expect(actionEnum).toContain("ls");
+    expect(actionEnum).toContain("stat");
+    expect(actionEnum).toContain("json");
+    expect(actionEnum).toContain("yaml");
+    expect(actionEnum).toContain("mkdir");
+    expect(actionEnum).toContain("touch");
+    expect(actionEnum).toContain("write");
+    expect(actionEnum).toContain("edit");
+    expect(actionEnum).toContain("patch");
+    expect(actionEnum).toContain("delete");
+    expect(actionEnum).toContain("remove");
+    expect(actionEnum).toContain("rm");
+    expect(actionEnum).toContain("copy");
+    expect(actionEnum).toContain("cp");
+    expect(actionEnum).toContain("move");
+    expect(actionEnum).toContain("mv");
+    expect(actionEnum).toContain("rename");
+    expect(actionEnum).toContain("grep");
+    expect(actionEnum).toContain("find");
+    expect(actionEnum).toContain("glob");
+    expect(actionEnum).toContain("search");
+    expect(actionEnum).toContain("search_context");
+    expect(actionEnum).toContain("grep_context");
+    expect(actionEnum).toContain("symbol");
+    expect(actionEnum).toContain("symbols_find");
+    expect(actionEnum).toContain("references");
+    expect(actionEnum).toContain("refs");
     expect(actionEnum).toContain("stat_path");
     expect(actionEnum).toContain("stat_paths");
     expect(actionEnum).toContain("outline_file");
@@ -270,8 +298,12 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use read_yaml for YAML configuration files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use stat_paths when you need existence or metadata for several exact paths");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use outline_file before full reads on large source files");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_symbol when you need to locate symbol definitions");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use find_references when you need cross-file symbol usages");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "If you know an identifier and want its definition or declaration, use symbol/find_symbol"
+    );
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "If you know an identifier and want its usages, use references/find_references"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Treat lsp_* as the canonical semantic-navigation tool family");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Treat ts_* as TypeScript/JavaScript compatibility aliases");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use ts_hover for TypeScript/JavaScript quick info");
@@ -294,7 +326,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_rename to apply a reviewed generic language-server rename");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_code_actions to list available generic language-server code actions");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use lsp_format_document to apply reviewed generic language-server formatting edits");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use search_text_context when surrounding lines around each match matter");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Use search_context/search_text_context when surrounding lines around each match matter"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_log to inspect recent commits");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_show to inspect one revision in detail");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use git_blame to inspect who last changed specific lines");
@@ -308,8 +342,8 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_range, provide 1-based inclusive `startLine` and `endLine`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_json, provide `jsonPath` only when you want one nested field");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For read_yaml, provide `yamlPath` only when you want one nested field");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_symbol, provide the exact symbol name in `symbol`");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For find_references, provide the exact symbol name in `symbol`");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For symbol/find_symbol, provide the exact symbol name in `symbol`");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For references/find_references, provide the exact symbol name in `symbol`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
       "For ts_hover, ts_definition, ts_references, lsp_hover, lsp_definition, lsp_implementation, lsp_type_definition, and lsp_references, provide exact 1-based `line` and `column`"
     );
@@ -338,7 +372,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For git_blame, provide a file path");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For write_file, provide `content` with the full desired file body");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("For edit_file and apply_patch, provide both `find` and `replace`");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use apply_patch for targeted patches");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Use patch or apply_patch for targeted patches"
+    );
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not put shell syntax");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("When a persistent shell may already exist, call shell_status before opening another one");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use open_shell and write_shell when shell state must persist across steps");
@@ -347,18 +383,25 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Low-risk write_shell inputs");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Medium-risk write_shell inputs still require review");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use close_shell to terminate the active persistent shell session");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Avoid repetitive list_dir/read_file probing");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("confirmed directory state");
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not repeat the same tool call with the same input");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Do not send read_file together with `paths`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Choose the narrowest action");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Intuitive aliases are first-class");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("`rm` -> delete_file");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("`ls` -> list_dir");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If you know the filename or path pattern, use find/find_files");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If you remember text content but not the file, use search/search_text");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If you know an identifier and want its definition or declaration, use symbol/find_symbol");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Prefer `write`/write_file as the default file-write action");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Use delete/remove/rm for path removal");
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("move/mv/rename or move_path");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If the user asked to create files");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Stop exploring once you have enough information to act");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("If read_file returns `(empty file)`");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain(
       "After successful create_file, write_file, edit_file, or apply_patch, treat that result as a confirmed mutation"
     );
-    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain('set `path` to `"."`');
+    expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("omit `path` to search the whole workspace");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Omit every optional field you do not need");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("`args` is only for run_command");
     expect(TOOL_USAGE_SYSTEM_PROMPT).toContain("Match the user's language for all progress and final responses");
@@ -379,13 +422,22 @@ describe("createHttpQueryTransport tool exposure", () => {
       "Do not send placeholders"
     );
     expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
-      "For workspace-wide find_files/search_text/search_text_context, set `path` to `.`."
+      "For workspace-wide find/find_files/search/search_text/search_context/search_text_context/symbol/find_symbol/references/find_references, omit `path` unless you need to narrow the scope."
     );
     expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
       "after a confirmed write/edit/patch, continue instead of rereading just to confirm"
     );
     expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
       "Use open_shell/write_shell/read_shell/shell_status/interrupt_shell/close_shell only when persistent shell state is required."
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Intuitive aliases are allowed when clearer"
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "prefer stat/find/search/symbol/outline/range reads"
+    );
+    expect(ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT).toContain(
+      "Prefer write/write_file for normal create-or-overwrite file writes"
     );
   });
 
@@ -1003,8 +1055,8 @@ describe("createHttpQueryTransport tool exposure", () => {
       "Heuristic nudges:",
       "1. Continue from confirmed facts.",
       "",
-      "Loop warning:",
-      "Tool call was repeated.",
+      "Runtime note:",
+      "Tool result guidance was added.",
       "",
       "Tool results:",
       "[tool_result] file",
@@ -1045,7 +1097,7 @@ describe("createHttpQueryTransport tool exposure", () => {
       })
     );
     expect(contentBlocks[2]?.cache_control).toBeUndefined();
-    expect(contentBlocks[2]?.text).toContain("Loop warning:");
+    expect(contentBlocks[2]?.text).toContain("Runtime note:");
   });
 
   test("anthropic keeps cache_control on text blocks when image attachments are present", async () => {

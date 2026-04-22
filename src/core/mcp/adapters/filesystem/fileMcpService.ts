@@ -111,6 +111,16 @@ type UndoEntry =
       sourceAction: ToolRequest["action"];
     }
   | {
+      kind: "restore_path_tree";
+      rootPath: string;
+      directories: string[];
+      files: Array<{
+        path: string;
+        content: Uint8Array;
+      }>;
+      sourceAction: ToolRequest["action"];
+    }
+  | {
       kind: "move_path";
       from: string;
       to: string;
@@ -1570,11 +1580,43 @@ const resolveRecordAction = (
   normalizeAction(record.name) ??
   normalizeAction(toolName);
 
-const buildSearchInputGuidance = (
-  action: "find_files" | "search_text" | "search_text_context",
-  field: "pattern" | "query"
-) =>
-  `Invalid tool input for ${action}: ${action} requires \`${field}\`. Use \`path: "."\` when searching the whole workspace and omit unrelated empty fields.`;
+type IntentSearchAction =
+  | "find_files"
+  | "search_text"
+  | "search_text_context"
+  | "find_symbol"
+  | "find_references";
+
+const getIntentSearchMissingNeed = (action: IntentSearchAction) => {
+  switch (action) {
+    case "find_files":
+      return "a filename or path pattern";
+    case "find_symbol":
+    case "find_references":
+      return "a symbol name";
+    case "search_text":
+    case "search_text_context":
+      return "a text query";
+  }
+};
+
+const getIntentSearchScopeHint = () =>
+  "Omit `path` to search the whole workspace, or provide `path` only to narrow the scope.";
+
+const buildIntentSearchInputGuidance = (action: IntentSearchAction) =>
+  `Invalid tool input for ${action}: ${action} is missing ${getIntentSearchMissingNeed(
+    action
+  )}. ${getIntentSearchScopeHint()}`;
+
+const buildIntentSearchValidationMessage = (action: IntentSearchAction) =>
+  `${action} is missing ${getIntentSearchMissingNeed(action)}. ${getIntentSearchScopeHint()}`;
+
+const formatIntentHitSummary = (label: string, count: number) => `${label}: ${count}`;
+
+const formatIntentNoHits = (
+  label: "file hits" | "text hits" | "definition hits" | "reference hits",
+  target: string
+) => `(no ${label} for: ${target})`;
 
 const buildNormalizedFileRequest = (
   action: FileAction,
@@ -2266,7 +2308,7 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       const pattern =
         pickString(record, ["pattern", "glob"]) ?? pickFirstNonEmptyValue(rawArgs);
       if (!pattern) {
-        return buildSearchInputGuidance("find_files", "pattern");
+        return buildIntentSearchInputGuidance("find_files");
       }
     }
 
@@ -2274,7 +2316,7 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       const query =
         pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
       if (!query) {
-        return buildSearchInputGuidance("search_text", "query");
+        return buildIntentSearchInputGuidance("search_text");
       }
     }
 
@@ -2282,7 +2324,7 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
       const query =
         pickString(record, ["query", "needle"]) ?? pickFirstNonEmptyValue(rawArgs);
       if (!query) {
-        return buildSearchInputGuidance("search_text_context", "query");
+        return buildIntentSearchInputGuidance("search_text_context");
       }
     }
 
@@ -2320,7 +2362,7 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
         pickString(record, ["symbol", "name", "identifier"]) ??
         pickString(record, ["query", "needle"]);
       if (!symbol) {
-        return "Invalid tool input for find_symbol: find_symbol requires `symbol`.";
+        return buildIntentSearchInputGuidance("find_symbol");
       }
     }
 
@@ -2329,7 +2371,7 @@ const describeInvalidToolInput = (toolName: string, input: unknown) => {
         pickString(record, ["symbol", "name", "identifier"]) ??
         pickString(record, ["query", "needle"]);
       if (!symbol) {
-        return "Invalid tool input for find_references: find_references requires `symbol`.";
+        return buildIntentSearchInputGuidance("find_references");
       }
     }
 
@@ -2544,23 +2586,23 @@ const validateRequest = (request: ToolRequest): string | null => {
       return null;
     case "find_files":
       if (!request.pattern.trim()) {
-        return "find_files requires `pattern`.";
+        return buildIntentSearchValidationMessage("find_files");
       }
       return null;
     case "find_symbol":
     case "find_references":
       if (!request.symbol.trim()) {
-        return `${request.action} requires \`symbol\`.`;
+        return buildIntentSearchValidationMessage(request.action);
       }
       return null;
     case "search_text":
       if (!request.query.trim()) {
-        return "search_text requires `query`.";
+        return buildIntentSearchValidationMessage("search_text");
       }
       return null;
     case "search_text_context":
       if (!request.query.trim()) {
-        return "search_text_context requires `query`.";
+        return buildIntentSearchValidationMessage("search_text_context");
       }
       if (
         typeof request.before === "number" &&
@@ -5342,6 +5384,59 @@ export class FileMcpService {
     }
   }
 
+  private async snapshotPathTree(inputPath: string) {
+    const absoluteRoot = this.resolvePath(inputPath);
+    const normalizedRoot = this.normalizeWorkspacePath(inputPath);
+    const directories = [normalizedRoot];
+    const files: Array<{ path: string; content: Uint8Array }> = [];
+    const queue: string[] = [absoluteRoot];
+
+    while (queue.length > 0) {
+      const currentAbsolute = queue.shift();
+      if (!currentAbsolute) {
+        continue;
+      }
+      const entries = await readdir(currentAbsolute, { withFileTypes: true });
+      for (const entry of entries) {
+        const absolutePath = resolve(currentAbsolute, entry.name);
+        if (!this.canAccessAbsolutePathInsideWorkspaceRoot(absolutePath)) {
+          continue;
+        }
+        let info;
+        try {
+          info = await stat(absolutePath);
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code === "ENOENT") {
+            continue;
+          }
+          throw error;
+        }
+        const workspacePath = this.normalizeWorkspacePathFromAbsolute(absolutePath);
+        if (info.isDirectory()) {
+          directories.push(workspacePath);
+          queue.push(absolutePath);
+          continue;
+        }
+        if (!info.isFile()) {
+          continue;
+        }
+        files.push({
+          path: workspacePath,
+          content: await readFile(absolutePath),
+        });
+      }
+    }
+
+    directories.sort((left, right) => left.length - right.length || left.localeCompare(right));
+    files.sort((left, right) => left.path.localeCompare(right.path));
+    return {
+      rootPath: normalizedRoot,
+      directories,
+      files,
+    };
+  }
+
   private async applyUndoEntry(entry: UndoEntry) {
     if (entry.kind === "restore_file") {
       const absolute = this.resolvePath(entry.path);
@@ -5377,6 +5472,18 @@ export class FileMcpService {
         await writeFile(absolute, file.content);
       }
       return `reverted ${entry.sourceAction}: restored ${entry.files.length} file(s)`;
+    }
+
+    if (entry.kind === "restore_path_tree") {
+      for (const directory of entry.directories) {
+        await mkdir(this.resolvePath(directory), { recursive: true });
+      }
+      for (const file of entry.files) {
+        const absolute = this.resolvePath(file.path);
+        await mkdir(dirname(absolute), { recursive: true });
+        await writeFile(absolute, file.content);
+      }
+      return `reverted ${entry.sourceAction}: restored ${entry.rootPath}`;
     }
 
     if (entry.kind === "delete_path") {
@@ -5552,11 +5659,28 @@ export class FileMcpService {
     const maxLines = mode === "summary" ? MAX_PREVIEW_SUMMARY_LINES : undefined;
     if (request.action === "delete_file") {
       try {
+        const info = await stat(abs);
+        if (info.isDirectory()) {
+          const entries = await readdir(abs, { withFileTypes: true });
+          const visibleEntries = entries
+            .slice(0, maxLines ?? entries.length)
+            .map(entry => `${entry.isDirectory() ? "[D]" : "[F]"} ${entry.name}`);
+          return [
+            "[delete preview]",
+            "kind: directory",
+            `path: ${request.path}`,
+            `entries: ${entries.length}`,
+            entries.length === 0 ? "(empty directory)" : visibleEntries.join("\n"),
+            maxLines && entries.length > maxLines
+              ? `... ${entries.length - maxLines} more entr${entries.length - maxLines === 1 ? "y" : "ies"}`
+              : "",
+            "Directory and its contents will be removed after approval.",
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
         const before = await readFile(abs, "utf8");
-        return [
-          "[delete preview]",
-          formatDiffLines("-", before, 1, maxLines),
-        ].join("\n");
+        return ["[delete preview]", formatDiffLines("-", before, 1, maxLines)].join("\n");
       } catch {
         return "[delete preview]\nPath will be removed after approval.";
       }
@@ -6312,16 +6436,18 @@ export class FileMcpService {
         return matcher.test(basename(file.workspacePath));
       })
       .slice(0, request.maxResults ?? DEFAULT_SEARCH_RESULTS)
-      .map(file => file.workspacePath);
+      .map(file => `[file] ${file.workspacePath}`);
     const notes = this.formatWalkFilesNotes(walkResult);
 
     if (matches.length === 0) {
-      return [`(no matches for pattern: ${request.pattern})`, ...notes]
+      return [formatIntentNoHits("file hits", request.pattern), ...notes]
         .filter(Boolean)
         .join("\n");
     }
 
-    return [`Found ${matches.length} file(s):`, ...notes, ...matches].join("\n");
+    return [formatIntentHitSummary("File hits", matches.length), ...notes, ...matches].join(
+      "\n"
+    );
   }
 
   private async executeSearchText(request: SearchTextToolRequest): Promise<string> {
@@ -6351,7 +6477,7 @@ export class FileMcpService {
             if (!haystack.includes(query)) {
               return false;
             }
-            matches.push(`${file.workspacePath}:${lineNumber} | ${clipSnippet(line)}`);
+            matches.push(`[text] ${file.workspacePath}:${lineNumber} | ${clipSnippet(line)}`);
             return matches.length >= limit;
           }
         );
@@ -6361,7 +6487,7 @@ export class FileMcpService {
             partialScanCount
           );
           return [
-            `Found ${matches.length} match(es):`,
+            formatIntentHitSummary("Text hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -6377,14 +6503,14 @@ export class FileMcpService {
         if (!haystack.includes(query)) {
           continue;
         }
-        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(line)}`);
+        matches.push(`[text] ${file.workspacePath}:${index + 1} | ${clipSnippet(line)}`);
         if (matches.length >= limit) {
           const note = this.formatLargeFileSearchNote(
             scannedOversizedFiles,
             partialScanCount
           );
           return [
-            `Found ${matches.length} match(es):`,
+            formatIntentHitSummary("Text hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -6398,13 +6524,13 @@ export class FileMcpService {
       partialScanCount
     );
     if (matches.length === 0) {
-      return [`(no text matches for query: ${request.query})`, ...walkNotes, note]
+      return [formatIntentNoHits("text hits", request.query), ...walkNotes, note]
         .filter(Boolean)
         .join("\n");
     }
 
     return [
-      `Found ${matches.length} match(es):`,
+      formatIntentHitSummary("Text hits", matches.length),
       ...walkNotes,
       ...(note ? [note] : []),
       ...matches,
@@ -6471,10 +6597,10 @@ export class FileMcpService {
               ];
               createdMatchCount += 1;
               if (after <= 0) {
-                matches.push([`[match] ${file.workspacePath}:${lineNumber}`, ...body].join("\n"));
+                matches.push([`[text] ${file.workspacePath}:${lineNumber}`, ...body].join("\n"));
               } else {
                 pendingWindows.push({
-                  header: `[match] ${file.workspacePath}:${lineNumber}`,
+                  header: `[text] ${file.workspacePath}:${lineNumber}`,
                   body,
                   remainingAfter: after,
                 });
@@ -6503,7 +6629,7 @@ export class FileMcpService {
             partialScanCount
           );
           return [
-            `Found ${matches.length} contextual match(es):`,
+            formatIntentHitSummary("Text hits with context", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -6522,7 +6648,7 @@ export class FileMcpService {
         }
 
         matches.push(
-          [`[match] ${file.workspacePath}:${index + 1}`, formatContextWindow(lines, index, before, after)].join(
+          [`[text] ${file.workspacePath}:${index + 1}`, formatContextWindow(lines, index, before, after)].join(
             "\n"
           )
         );
@@ -6532,7 +6658,7 @@ export class FileMcpService {
             partialScanCount
           );
           return [
-            `Found ${matches.length} contextual match(es):`,
+            formatIntentHitSummary("Text hits with context", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -6546,13 +6672,13 @@ export class FileMcpService {
       partialScanCount
     );
     if (matches.length === 0) {
-      return [`(no text matches for query: ${request.query})`, ...walkNotes, note]
+      return [formatIntentNoHits("text hits", request.query), ...walkNotes, note]
         .filter(Boolean)
         .join("\n");
     }
 
     return [
-      `Found ${matches.length} contextual match(es):`,
+      formatIntentHitSummary("Text hits with context", matches.length),
       ...walkNotes,
       ...(note ? [note] : []),
       ...matches,
@@ -7011,7 +7137,7 @@ export class FileMcpService {
               return false;
             }
             matches.push(
-              `${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
+              `[definition] ${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
             );
             return matches.length >= limit;
           }
@@ -7022,7 +7148,7 @@ export class FileMcpService {
             partialScanCount
           );
           return [
-            `Found ${matches.length} symbol match(es):`,
+            formatIntentHitSummary("Definition hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -7041,14 +7167,16 @@ export class FileMcpService {
         if (!patterns.some(pattern => pattern.test(trimmed))) {
           continue;
         }
-        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
+        matches.push(
+          `[definition] ${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`
+        );
         if (matches.length >= limit) {
           const note = this.formatLargeFileSearchNote(
             scannedOversizedFiles,
             partialScanCount
           );
           return [
-            `Found ${matches.length} symbol match(es):`,
+            formatIntentHitSummary("Definition hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -7062,13 +7190,13 @@ export class FileMcpService {
       partialScanCount
     );
     if (matches.length === 0) {
-      return [`(no symbol matches for: ${request.symbol})`, ...walkNotes, note]
+      return [formatIntentNoHits("definition hits", request.symbol), ...walkNotes, note]
         .filter(Boolean)
         .join("\n");
     }
 
     return [
-      `Found ${matches.length} symbol match(es):`,
+      formatIntentHitSummary("Definition hits", matches.length),
       ...walkNotes,
       ...(note ? [note] : []),
       ...matches,
@@ -7112,7 +7240,7 @@ export class FileMcpService {
               return false;
             }
             matches.push(
-              `${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
+              `[reference] ${file.workspacePath}:${lineNumber} | ${clipSnippet(trimmed)}`
             );
             return matches.length >= limit;
           }
@@ -7123,7 +7251,7 @@ export class FileMcpService {
             partialScanCount
           );
           return [
-            `Found ${matches.length} reference match(es):`,
+            formatIntentHitSummary("Reference hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -7145,14 +7273,16 @@ export class FileMcpService {
         if (!referencePattern.test(line)) {
           continue;
         }
-        matches.push(`${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`);
+        matches.push(
+          `[reference] ${file.workspacePath}:${index + 1} | ${clipSnippet(trimmed)}`
+        );
         if (matches.length >= limit) {
           const note = this.formatLargeFileSearchNote(
             scannedOversizedFiles,
             partialScanCount
           );
           return [
-            `Found ${matches.length} reference match(es):`,
+            formatIntentHitSummary("Reference hits", matches.length),
             ...walkNotes,
             ...(note ? [note] : []),
             ...matches,
@@ -7166,13 +7296,13 @@ export class FileMcpService {
       partialScanCount
     );
     if (matches.length === 0) {
-      return [`(no reference matches for symbol: ${request.symbol})`, ...walkNotes, note]
+      return [formatIntentNoHits("reference hits", request.symbol), ...walkNotes, note]
         .filter(Boolean)
         .join("\n");
     }
 
     return [
-      `Found ${matches.length} reference match(es):`,
+      formatIntentHitSummary("Reference hits", matches.length),
       ...walkNotes,
       ...(note ? [note] : []),
       ...matches,
@@ -8478,17 +8608,30 @@ export class FileMcpService {
         );
       }
       case "delete_file": {
-        const before = await readFile(abs);
-        await rm(abs, { force: false, recursive: false });
-        this.pushUndoEntry({
-          kind: "restore_file",
-          path: this.normalizeWorkspacePath(request.path),
-          existedBefore: true,
-          content: before,
-          sourceAction: request.action,
-        });
+        const info = await stat(abs);
+        if (info.isDirectory()) {
+          const snapshot = await this.snapshotPathTree(request.path);
+          await rm(abs, { force: false, recursive: true });
+          this.pushUndoEntry({
+            kind: "restore_path_tree",
+            rootPath: snapshot.rootPath,
+            directories: snapshot.directories,
+            files: snapshot.files,
+            sourceAction: request.action,
+          });
+        } else {
+          const before = await readFile(abs);
+          await rm(abs, { force: false, recursive: false });
+          this.pushUndoEntry({
+            kind: "restore_file",
+            path: this.normalizeWorkspacePath(request.path),
+            existedBefore: true,
+            content: before,
+            sourceAction: request.action,
+          });
+        }
         this.noteFilesystemMutation();
-        return `Deleted file: ${request.path}`;
+        return `Deleted path: ${request.path}`;
       }
       case "copy_path":
         return this.executeCopyPath(request);

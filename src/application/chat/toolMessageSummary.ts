@@ -176,6 +176,28 @@ const summarizeReadFilesBody = (body: string) => {
   return `${visible} (${files.length} files${more > 0 ? `, +${more} more` : ""})`;
 };
 
+const summarizeTaggedToolBody = (
+  body: string,
+  tag: "file" | "text" | "definition" | "reference",
+  singularLabel: string,
+  pluralLabel: string,
+  aliases: string[] = []
+) => {
+  const tags = [tag, ...aliases];
+  const hits = body
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => tags.some(current => line.startsWith(`[${current}] `)))
+    .map(line => line.replace(/^\[[^\]]+\]\s+/, ""));
+  if (hits.length === 0) {
+    return `(no ${pluralLabel})`;
+  }
+  const visible = hits.slice(0, 3).join(", ");
+  const more = hits.length - Math.min(hits.length, 3);
+  const label = hits.length === 1 ? singularLabel : pluralLabel;
+  return `${visible} (${hits.length} ${label}${more > 0 ? `, +${more} more` : ""})`;
+};
+
 const FILE_MUTATION_ACTIONS = new Set([
   "create_file",
   "write_file",
@@ -300,6 +322,52 @@ export const summarizeToolMessage = (raw: string): {
       return {
         ...normalized,
         text: `Tool: ${detail} | ${summarizeReadFilesBody(body)}`,
+      };
+    }
+    if (detail.startsWith("find_files ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeTaggedToolBody(body, "file", "file hit", "file hits")}`,
+      };
+    }
+    if (detail.startsWith("search_text ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeTaggedToolBody(body, "text", "text hit", "text hits")}`,
+      };
+    }
+    if (detail.startsWith("search_text_context ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeTaggedToolBody(
+          body,
+          "text",
+          "text hit with context",
+          "text hits with context",
+          ["match"]
+        )}`,
+      };
+    }
+    if (detail.startsWith("find_symbol ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeTaggedToolBody(
+          body,
+          "definition",
+          "definition hit",
+          "definition hits"
+        )}`,
+      };
+    }
+    if (detail.startsWith("find_references ")) {
+      return {
+        ...normalized,
+        text: `Tool: ${detail} | ${summarizeTaggedToolBody(
+          body,
+          "reference",
+          "reference hit",
+          "reference hits"
+        )}`,
       };
     }
     const fileMutationSummary = summarizeFileMutationToolMessage(detail, body);

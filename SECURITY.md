@@ -74,7 +74,7 @@ on a few core boundaries:
 When changing code, please preserve or improve these properties:
 
 - prevent duplicate request submission and duplicate completion handling
-- avoid command/tool loops that cause accidental repeated execution
+- keep command/tool execution bounded by explicit runtime budgets
 - keep approval flows one-shot and idempotent where possible
 - do not allow hidden reducer metadata to leak into visible assistant output
 - keep large-file and large-output handling bounded to protect terminal stability

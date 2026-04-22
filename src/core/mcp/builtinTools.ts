@@ -64,6 +64,31 @@ export const getNamespacedToolId = (serverId: string, action: string) =>
 export const getToolLabel = (action: string) => action.replace(/_/g, " ");
 
 const BUILTIN_TOOL_DESCRIPTIONS: Partial<Record<ToolRequest["action"], string>> = {
+  read_file: "Read one file. Aliases: `read`, `cat`.",
+  read_json: "Read one JSON file as structured data. Alias: `json`.",
+  read_yaml: "Read one YAML file as structured data. Alias: `yaml`.",
+  list_dir: "List one directory. Aliases: `list`, `ls`.",
+  create_dir: "Create a directory path. Aliases: `create`, `mkdir`.",
+  create_file:
+    "Create a brand-new file only when fail-if-exists semantics matter. Aliases: `new`, `touch`.",
+  write_file:
+    "Default file write action for create-or-overwrite behavior. Aliases: `write`, `save`, `overwrite`.",
+  edit_file: "Replace a targeted substring in one file. Aliases: `edit`, `replace`.",
+  apply_patch: "Apply a targeted single-file patch using find/replace. Alias: `patch`.",
+  delete_file: "Remove a file or directory path. Aliases: `delete`, `remove`, `rm`.",
+  stat_path: "Inspect one path and report whether it is a file or directory. Aliases: `stat`, `info`.",
+  find_files:
+    "Find file paths when you know a filename or glob-like pattern. Omit `path` to search the whole workspace. Aliases: `find`, `glob`.",
+  find_symbol:
+    "Find symbol definitions when you know an identifier and want its declaration. Omit `path` to search the whole workspace. Aliases: `symbol`, `symbols_find`.",
+  find_references:
+    "Find symbol usages when you know an identifier and want its references. Omit `path` to search the whole workspace. Aliases: `references`, `refs`.",
+  search_text:
+    "Search file contents when you remember text but not the file path. Omit `path` to search the whole workspace. Aliases: `search`, `grep`.",
+  search_text_context:
+    "Search file contents and return surrounding lines around each hit. Omit `path` to search the whole workspace. Aliases: `search_context`, `grep_context`.",
+  copy_path: "Copy a file or directory path. Aliases: `copy`, `cp`.",
+  move_path: "Move or rename a file or directory path. Aliases: `move`, `mv`, `rename`.",
   ts_hover: "TypeScript/JavaScript quick info at an exact file position.",
   ts_definition: "TypeScript/JavaScript definition lookup at an exact file position.",
   ts_references: "TypeScript/JavaScript references at an exact file position.",

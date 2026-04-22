@@ -1231,6 +1231,160 @@ describe("FileMcpService", () => {
     expect(await readFile(join(root, "remove-me.txt"), "utf8")).toBe("bye");
   });
 
+  test("rm alias removes a directory recursively and undo restores it", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "scratch", "nested"), { recursive: true });
+    await writeFile(join(root, "scratch", "nested", "note.txt"), "keep me", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "rm",
+      path: "scratch",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending).toBeDefined();
+    expect(queued.pending?.previewSummary).toContain("kind: directory");
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(approved.message).toContain("Deleted path: scratch");
+    await expect(readFile(join(root, "scratch", "nested", "note.txt"), "utf8")).rejects.toThrow();
+
+    const undone = await service.undoLastMutation();
+
+    expect(undone.ok).toBe(true);
+    expect(await readFile(join(root, "scratch", "nested", "note.txt"), "utf8")).toBe(
+      "keep me"
+    );
+  });
+
+  test("write alias creates a new file with normal create-or-overwrite semantics", async () => {
+    const { root, service } = await createService();
+
+    const queued = await service.handleToolCall("file", {
+      action: "write",
+      path: "notes/new.txt",
+      content: "hello\n",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending).toBeDefined();
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    expect(await readFile(join(root, "notes", "new.txt"), "utf8")).toBe("hello\n");
+  });
+
+  test("move alias renames a directory path", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "before", "nested"), { recursive: true });
+    await writeFile(join(root, "before", "nested", "note.txt"), "data", "utf8");
+
+    const queued = await service.handleToolCall("file", {
+      action: "move",
+      path: "before",
+      destination: "after",
+    });
+
+    expect(queued.ok).toBe(true);
+    expect(queued.pending).toBeDefined();
+
+    const approved = await service.approve(queued.pending!.id);
+
+    expect(approved.ok).toBe(true);
+    await expect(readFile(join(root, "before", "nested", "note.txt"), "utf8")).rejects.toThrow();
+    expect(await readFile(join(root, "after", "nested", "note.txt"), "utf8")).toBe("data");
+  });
+
+  test("find alias discovers files by pattern", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "main.ts"), "export const main = true;\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "find",
+      path: ".",
+      pattern: "main.ts",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("src/main.ts");
+  });
+
+  test("search alias finds text when only content is known", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "main.ts"),
+      "const MAGIC_TOKEN = 'needle';\nconsole.log(MAGIC_TOKEN);\n",
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search",
+      path: ".",
+      query: "MAGIC_TOKEN",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("src/main.ts:1");
+  });
+
+  test("search_context alias returns surrounding lines", async () => {
+    const { root, service } = await createService();
+    await writeFile(
+      join(root, "context.txt"),
+      ["before line", "needle line", "after line"].join("\n"),
+      "utf8"
+    );
+
+    const result = await service.handleToolCall("file", {
+      action: "search_context",
+      path: ".",
+      query: "needle",
+      before: 1,
+      after: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("before line");
+    expect(result.message).toContain("needle line");
+    expect(result.message).toContain("after line");
+  });
+
+  test("symbol and references aliases resolve declaration-vs-usage intent", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src", "demo.ts"),
+      [
+        "function greet() {",
+        "  return 'hi';",
+        "}",
+        "console.log(greet());",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const symbolResult = await service.handleToolCall("file", {
+      action: "symbol",
+      path: ".",
+      symbol: "greet",
+    });
+    const referencesResult = await service.handleToolCall("file", {
+      action: "references",
+      path: ".",
+      symbol: "greet",
+    });
+
+    expect(symbolResult.ok).toBe(true);
+    expect(symbolResult.message).toContain("function greet()");
+    expect(referencesResult.ok).toBe(true);
+    expect(referencesResult.message).toContain("console.log(greet());");
+  });
+
   test("edit_file rejects before queue when find text does not exist", async () => {
     const { root, service } = await createService();
     await writeFile(join(root, "edit.txt"), "hello world", "utf8");
@@ -1330,8 +1484,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
-    expect(result.message).toContain("docs/oauth-notes.txt:1");
+    expect(result.message).toContain("Text hits: 1");
+    expect(result.message).toContain("[text] docs/oauth-notes.txt:1");
     expect(result.message).toContain("oauth callback flow");
   });
 
@@ -1358,8 +1512,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 file(s):");
-    expect(result.message).toContain("features/oauth-client.ts");
+    expect(result.message).toContain("File hits: 1");
+    expect(result.message).toContain("[file] features/oauth-client.ts");
   });
 
   test("search_text returns targeted guidance when query is still missing", async () => {
@@ -1383,8 +1537,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Invalid tool input for search_text");
-    expect(result.message).toContain("search_text requires `query`");
-    expect(result.message).toContain('Use `path: "."` when searching the whole workspace');
+    expect(result.message).toContain("search_text is missing a text query");
+    expect(result.message).toContain("Omit `path` to search the whole workspace");
   });
 
   test("find_files returns targeted guidance when pattern is still missing", async () => {
@@ -1408,8 +1562,57 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Invalid tool input for find_files");
-    expect(result.message).toContain("find_files requires `pattern`");
-    expect(result.message).toContain('Use `path: "."` when searching the whole workspace');
+    expect(result.message).toContain("find_files is missing a filename or path pattern");
+    expect(result.message).toContain("Omit `path` to search the whole workspace");
+  });
+
+  test("find_symbol returns targeted guidance when symbol name is still missing", async () => {
+    const { service } = await createService();
+
+    const result = await service.handleToolCall("file", {
+      action: "find_symbol",
+      path: "",
+      symbol: "",
+      query: "",
+      args: [],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Invalid tool input for find_symbol");
+    expect(result.message).toContain("find_symbol is missing a symbol name");
+    expect(result.message).toContain("Omit `path` to search the whole workspace");
+  });
+
+  test("search_text treats omitted path as workspace scope", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "docs"), { recursive: true });
+    await writeFile(join(root, "docs", "notes.txt"), "workspace needle\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "search_text",
+      query: "workspace needle",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] search_text .");
+    expect(result.message).toContain("Text hits: 1");
+    expect(result.message).toContain("[text] docs/notes.txt:1 | workspace needle");
+  });
+
+  test("find_symbol treats omitted path as workspace scope", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "main.ts"), "export function startApp() {}\n", "utf8");
+
+    const result = await service.handleToolCall("file", {
+      action: "find_symbol",
+      symbol: "startApp",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("[tool result] find_symbol .");
+    expect(result.message).toContain("Definition hits: 1");
+    expect(result.message).toContain("[definition] src/main.ts:1 | export function startApp() {}");
   });
 
   test("blocks paths that escape workspace root", async () => {
@@ -1980,8 +2183,8 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] find_symbol src");
-    expect(result.message).toContain("Found 1 symbol match(es):");
-    expect(result.message).toContain("src/app.ts:2 | export function runApp()");
+    expect(result.message).toContain("Definition hits: 1");
+    expect(result.message).toContain("[definition] src/app.ts:2 | export function runApp()");
   });
 
   test("find_symbol falls back to large-file scan for oversized source files", async () => {
@@ -2026,9 +2229,9 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 symbol match(es):");
+    expect(result.message).toContain("Definition hits: 1");
     expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
-    expect(result.message).toContain("src/huge.ts:2502 | export function runHugeDemo()");
+    expect(result.message).toContain("[definition] src/huge.ts:2502 | export function runHugeDemo()");
   });
 
   test("find_references executes immediately and returns usage lines instead of symbol definitions", async () => {
@@ -2055,9 +2258,9 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] find_references src");
-    expect(result.message).toContain("Found 3 reference match(es):");
-    expect(result.message).toContain('src/app.ts:1 | import { DemoService } from "./demo";');
-    expect(result.message).toContain("src/app.ts:2 | const service = new DemoService();");
+    expect(result.message).toContain("Reference hits: 3");
+    expect(result.message).toContain('[reference] src/app.ts:1 | import { DemoService } from "./demo";');
+    expect(result.message).toContain("[reference] src/app.ts:2 | const service = new DemoService();");
     expect(result.message).not.toContain("src/demo.ts:1 | export class DemoService {}");
   });
 
@@ -2101,9 +2304,9 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 reference match(es):");
+    expect(result.message).toContain("Reference hits: 1");
     expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
-    expect(result.message).toContain("src/huge-ref.ts:2502 | console.log(HugeDemoService);");
+    expect(result.message).toContain("[reference] src/huge-ref.ts:2502 | console.log(HugeDemoService);");
     expect(result.message).not.toContain("src/huge-ref.ts:1 | export class HugeDemoService {}");
   });
 
@@ -2920,8 +3123,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 file(s):");
-    expect(result.message).toContain("test_files/u1.py");
+    expect(result.message).toContain("File hits: 1");
+    expect(result.message).toContain("[file] test_files/u1.py");
     expect(result.message).not.toContain("test_files/u2.ts");
   });
 
@@ -2942,8 +3145,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 file(s):");
-    expect(result.message).toContain("src/entrypoint/cli.tsx");
+    expect(result.message).toContain("File hits: 1");
+    expect(result.message).toContain("[file] src/entrypoint/cli.tsx");
   });
 
   test("search_text executes immediately and returns line-level matches", async () => {
@@ -2961,7 +3164,7 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("Text hits: 1");
     expect(result.message).toContain("docs/");
     expect(result.message).toContain("needle");
   });
@@ -2988,11 +3191,11 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("Text hits: 1");
     expect(result.message).toContain("note: skipped common large directories:");
     expect(result.message).toContain(".git");
     expect(result.message).toContain("node_modules");
-    expect(result.message).toContain("src/app.ts:1 | import queryRunner from './query';");
+    expect(result.message).toContain("[text] src/app.ts:1 | import queryRunner from './query';");
     expect(result.message).not.toContain("node_modules/demo-pkg/index.ts");
   });
 
@@ -3015,8 +3218,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
-    expect(result.message).toContain("src/app.ts:1 | const marker = 'needle';");
+    expect(result.message).toContain("Text hits: 1");
+    expect(result.message).toContain("[text] src/app.ts:1 | const marker = 'needle';");
     expect(result.message).not.toContain("linked-src/app.ts");
   });
 
@@ -3040,7 +3243,7 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("(no text matches for query: secret-from-outside-workspace)");
+    expect(result.message).toContain("(no text hits for: secret-from-outside-workspace)");
     expect(result.message).not.toContain("outside-link.txt");
   });
 
@@ -3062,8 +3265,8 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
-    expect(result.message).toContain("node_modules/demo-pkg/index.ts:1 | import queryRunner from 'pkg';");
+    expect(result.message).toContain("Text hits: 1");
+    expect(result.message).toContain("[text] node_modules/demo-pkg/index.ts:1 | import queryRunner from 'pkg';");
     expect(result.message).not.toContain("note: skipped common large directories:");
   });
 
@@ -3107,9 +3310,9 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 match(es):");
+    expect(result.message).toContain("Text hits: 1");
     expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
-    expect(result.message).toContain("docs/huge.txt:2501 | needle is here");
+    expect(result.message).toContain("[text] docs/huge.txt:2501 | needle is here");
   });
 
   test("search_text_context executes immediately and returns match windows with surrounding lines", async () => {
@@ -3129,8 +3332,8 @@ describe("FileMcpService", () => {
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
     expect(result.message).toContain("[tool result] search_text_context docs");
-    expect(result.message).toContain("Found 1 contextual match(es):");
-    expect(result.message).toContain("[match] docs/context.txt:2");
+    expect(result.message).toContain("Text hits with context: 1");
+    expect(result.message).toContain("[text] docs/context.txt:2");
     expect(result.message).toContain("1 | alpha");
     expect(result.message).toContain(">    2 | needle here");
     expect(result.message).toContain("3 | omega");
@@ -3180,9 +3383,9 @@ describe("FileMcpService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.pending).toBeUndefined();
-    expect(result.message).toContain("Found 1 contextual match(es):");
+    expect(result.message).toContain("Text hits with context: 1");
     expect(result.message).toContain("note: large-file mode scanned 1 oversized file(s)");
-    expect(result.message).toContain("[match] docs/huge-context.txt:2501");
+    expect(result.message).toContain("[text] docs/huge-context.txt:2501");
     expect(result.message).toContain("2500 | before line");
     expect(result.message).toContain("> 2501 | needle is here");
     expect(result.message).toContain("2502 | after line");

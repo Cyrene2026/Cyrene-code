@@ -352,3 +352,124 @@ func TestReviewStatusConfirmedApplyPatchCollapsesMutationReceipt(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewStatusApprovalRequiredUsesLayeredColors(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "review_status", Text: strings.Join([]string{
+			`Approval required | run_shell . | 898a05dc`,
+			`action=run_shell | path=. | shell=sh | command=uv run alembic revision --autogenerate -m "add migration" | cwd=.`,
+			`[shell preview]`,
+			`shell: sh`,
+			`risk: low`,
+		}, "\n")},
+	}
+
+	rendered := model.RenderTranscriptForTest(140, 8)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	for _, expected := range []string{
+		"Approval required | run_shell . | 898a05dc",
+		"╭─ approval preview",
+		`ACTION=run_shell | PATH=. | SHELL=sh | COMMAND=uv run alembic revision --autogenerate -m "add migration" | CWD=.`,
+		"▌ shell preview",
+		"SHELL  sh",
+		"RISK  low",
+	} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("expected %q in layered review status, got %q", expected, plain)
+		}
+	}
+	for _, ansi := range []string{
+		"38;2;242;204;96",
+		"38;2;238;195;91",
+		"38;2;121;192;255",
+		"38;2;139;147;158",
+		"38;2;126;231;135",
+	} {
+		if !strings.Contains(rendered, ansi) {
+			t.Fatalf("expected ANSI color %s in layered review status, got %q", ansi, rendered)
+		}
+	}
+}
+
+func TestReviewStatusApprovedUsesLayeredColors(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "review_status", Text: `Approved | run_shell . | 898a05dc | [approved] 898a05dc`},
+	}
+
+	rendered := model.RenderTranscriptForTest(100, 2)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	if !strings.Contains(plain, "Approved | run_shell . | 898a05dc | [approved] 898a05dc") {
+		t.Fatalf("expected approved review line preserved, got %q", plain)
+	}
+	if !strings.Contains(rendered, "38;2;126;231;135") {
+		t.Fatalf("expected approved status green, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;238;195;91") {
+		t.Fatalf("expected run_shell action shell color, got %q", rendered)
+	}
+}
+
+func TestGitDiffToolStatusUsesBorderedDiffBlock(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: strings.Join([]string{
+			"Tool: git_diff src/app.ts | [unstaged]",
+			"[unstaged]",
+			"diff --git a/src/app.ts b/src/app.ts",
+			"@@ -1 +1 @@",
+			"-console.log('old')",
+			"+console.log('new')",
+			"[staged]",
+			"(none)",
+		}, "\n")},
+	}
+
+	rendered := model.RenderTranscriptForTest(88, 10)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	plain := stripANSI.ReplaceAllString(rendered, "")
+
+	for _, expected := range []string{
+		"Tool: git_diff src/app.ts | [unstaged]",
+		"╭─ diff preview",
+		"▌ unstaged",
+		"diff --git a/src/app.ts b/src/app.ts",
+		"console.log('old')",
+		"console.log('new')",
+		"▌ staged",
+		"(none)",
+	} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("expected %q in bordered git diff status, got %q", expected, plain)
+		}
+	}
+	blockStart := strings.Index(plain, "╭─ diff preview")
+	if blockStart < 0 {
+		t.Fatalf("expected diff block start, got %q", plain)
+	}
+	blockBody := plain[blockStart:]
+	blockEnd := strings.Index(blockBody, "╰")
+	if blockEnd < 0 || !strings.Contains(blockBody[:blockEnd], "(none)") {
+		t.Fatalf("expected staged empty marker to stay inside diff block, got %q", plain)
+	}
+	if !strings.Contains(rendered, "38;2;126;231;135;48;2;16;63;43") {
+		t.Fatalf("expected added git diff line colors, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "38;2;255;161;152;48;2;93;30;39") {
+		t.Fatalf("expected removed git diff line colors, got %q", rendered)
+	}
+}

@@ -52,7 +52,7 @@ const createTransport = (): { transport: QueryTransport; prompts: string[] } => 
   };
 };
 
-const createToolLoopTransport = (toolCallsPerStream: number[]): QueryTransport => {
+const createToolBudgetTransport = (toolCallsPerStream: number[]): QueryTransport => {
   let streamCount = 0;
   return {
     getModel: () => "gpt-test",
@@ -597,7 +597,7 @@ describe("runQuerySession", () => {
   });
 
   test("allows more than 6 tool steps before completion", async () => {
-    const transport = createToolLoopTransport([7, 0]);
+    const transport = createToolBudgetTransport([7, 0]);
     const toolCalls: string[] = [];
 
     const result = await runQuerySession({
@@ -619,7 +619,7 @@ describe("runQuerySession", () => {
   });
 
   test("stops with explicit message when tool budget is exhausted", async () => {
-    const transport = createToolLoopTransport([3, 3, 0]);
+    const transport = createToolBudgetTransport([3, 3, 0]);
     const textDeltas: string[] = [];
     const completionReasons: Array<string | null> = [];
     let toolCallCount = 0;
@@ -650,7 +650,7 @@ describe("runQuerySession", () => {
   });
 
   test("preserves tool budget across suspend and resume", async () => {
-    const transport = createToolLoopTransport([1, 4, 1, 0]);
+    const transport = createToolBudgetTransport([1, 4, 1, 0]);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
 
@@ -1053,7 +1053,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(order[1]).toBe("tool:search_text");
   });
 
-  test("stops repeated same list_dir probe earlier than generic loop guard", async () => {
+  test("does not stop repeated same list_dir probes before the tool budget", async () => {
     const transport = createSameProbeTransport(3);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
@@ -1061,6 +1061,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     const result = await runQuerySession({
       query: "session prompt",
       originalTask: "inspect and then create files",
+      queryMaxToolSteps: 5,
       transport,
       onState: () => {},
       onTextDelta: text => {
@@ -1074,11 +1075,11 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
-    expect(toolCallCount).toBe(2);
-    expect(textDeltas.join("")).toContain("directory state was already confirmed");
+    expect(toolCallCount).toBe(3);
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
   });
 
-  test("stops repeated empty-file read earlier", async () => {
+  test("skips repeated empty-file read through the read ledger", async () => {
     const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
       {
         toolName: "file",
@@ -1729,7 +1730,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[2]).toContain("read_range starting at line 21");
   });
 
-  test("stops repeated failed run_command earlier than generic loop guard", async () => {
+  test("allows repeated failed run_command until the tool budget is exhausted", async () => {
     const transport = createRepeatedRunCommandTransport(2);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
@@ -1737,6 +1738,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     const result = await runQuerySession({
       query: "session prompt",
       originalTask: "run the same command again if needed",
+      queryMaxToolSteps: 2,
       transport,
       onState: () => {},
       onTextDelta: text => {
@@ -1754,10 +1756,10 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
 
     expect(result.status).toBe("completed");
     expect(toolCallCount).toBe(2);
-    expect(textDeltas.join("")).toContain("run_command was retried after the same command already failed");
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
   });
 
-  test("stops repeated failed run_shell earlier than generic loop guard", async () => {
+  test("allows repeated failed run_shell until the tool budget is exhausted", async () => {
     const transport = createRepeatedRunShellTransport(2);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
@@ -1765,6 +1767,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     const result = await runQuerySession({
       query: "session prompt",
       originalTask: "run the same shell command again if needed",
+      queryMaxToolSteps: 2,
       transport,
       onState: () => {},
       onTextDelta: text => {
@@ -1782,10 +1785,10 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
 
     expect(result.status).toBe("completed");
     expect(toolCallCount).toBe(2);
-    expect(textDeltas.join("")).toContain("run_shell was retried after the same command already failed");
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
   });
 
-  test("generic repeated file-loop message names the concrete action", async () => {
+  test("repeated search falls back to the tool budget", async () => {
     const transport = createSameSearchTransport(4);
     const textDeltas: string[] = [];
     let toolCallCount = 0;
@@ -1793,6 +1796,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     const result = await runQuerySession({
       query: "session prompt",
       originalTask: "search for the same thing repeatedly",
+      queryMaxToolSteps: 5,
       transport,
       onState: () => {},
       onTextDelta: text => {
@@ -1810,15 +1814,10 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
 
     expect(result.status).toBe("completed");
     expect(toolCallCount).toBe(3);
-    expect(textDeltas.join("")).toContain(
-      "[tool loop detected] search_text was called repeatedly with same input"
-    );
-    expect(textDeltas.join("")).not.toContain(
-      "[tool loop detected] file was called repeatedly with same input"
-    );
+    expect(textDeltas.join("")).toContain("[tool budget exhausted]");
   });
 
-  test("repeating the same search after each successful write does not trip the loop guard", async () => {
+  test("repeating the same search after each successful write continues normally", async () => {
     const transport = createRoundSequenceTransport([
       {
         toolName: "file",
@@ -1891,7 +1890,6 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
       "search_text",
     ]);
     expect(textDeltas.join("")).toContain("done");
-    expect(textDeltas.join("")).not.toContain("[tool loop detected]");
   });
 
   test("shared broad discovery budget collapses mixed search tools in the same scope", async () => {
@@ -2287,7 +2285,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(prompts[2]).toContain("Reuse the previous read result or move to the next concrete file");
   });
 
-  test("repeated broad discovery collapses early and blocks when a split task still lacks concrete facts", async () => {
+  test("broad discovery blocks after budget when a split task still lacks concrete facts", async () => {
     const { transport } = createPromptCaptureRoundSequenceTransport([
       { toolName: "file", input: { action: "list_dir", path: "." } },
       { toolName: "file", input: { action: "list_dir", path: "." } },
@@ -2316,7 +2314,7 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     });
 
     expect(result.status).toBe("completed");
-    expect(toolCallCount).toBe(2);
+    expect(toolCallCount).toBe(3);
     expect(textDeltas.join("")).toContain("still lacks a concrete source file or target file count");
   });
 

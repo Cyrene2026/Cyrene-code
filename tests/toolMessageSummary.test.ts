@@ -131,6 +131,35 @@ describe("toolMessageSummary", () => {
     expect(result.text).not.toContain("beta");
   });
 
+  test("summarizes search_text with explicit text-hit labels", () => {
+    const result = summarizeToolMessage(
+      [
+        "[tool result] search_text src",
+        "Text hits: 2",
+        "[text] src/a.ts:4 | needle one",
+        "[text] src/b.ts:9 | needle two",
+      ].join("\n")
+    );
+
+    expect(result.text).toContain("Tool: search_text src |");
+    expect(result.text).toContain("src/a.ts:4 | needle one, src/b.ts:9 | needle two");
+    expect(result.text).toContain("2 text hits");
+  });
+
+  test("summarizes find_symbol with explicit definition-hit labels", () => {
+    const result = summarizeToolMessage(
+      [
+        "[tool result] find_symbol src",
+        "Definition hits: 1",
+        "[definition] src/app.ts:2 | export function runApp()",
+      ].join("\n")
+    );
+
+    expect(result.text).toBe(
+      "Tool: find_symbol src | src/app.ts:2 | export function runApp() (1 definition hit)"
+    );
+  });
+
   test("preserves approved terminal transcript bodies for shell actions", () => {
     const raw = [
       "[approved] shell-1",

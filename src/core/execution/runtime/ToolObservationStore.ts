@@ -46,6 +46,8 @@ const MUTATION_RESULT_MARKERS = [
   "Edited file:",
   "Patched file:",
   "Deleted file:",
+  "Deleted directory:",
+  "Deleted path:",
   "Copied path:",
   "Moved path:",
 ];

@@ -756,11 +756,21 @@ describe("createMcpRuntime", () => {
 
     const tsHover = runtime.listTools("filesystem").find(tool => tool.name === "ts_hover");
     const lspHover = runtime.listTools("filesystem").find(tool => tool.name === "lsp_hover");
+    const writeFile = runtime.listTools("filesystem").find(tool => tool.name === "write_file");
+    const deleteFile = runtime.listTools("filesystem").find(tool => tool.name === "delete_file");
+    const findFiles = runtime.listTools("filesystem").find(tool => tool.name === "find_files");
+    const searchText = runtime.listTools("filesystem").find(tool => tool.name === "search_text");
+    const findSymbol = runtime.listTools("filesystem").find(tool => tool.name === "find_symbol");
 
     expect(tsHover?.description).toBe(
       "TypeScript/JavaScript quick info at an exact file position."
     );
     expect(lspHover?.description).toContain("configured `lsp_servers`");
+    expect(writeFile?.description).toContain("Default file write action");
+    expect(deleteFile?.description).toContain("file or directory path");
+    expect(findFiles?.description).toContain("filename or glob-like pattern");
+    expect(searchText?.description).toContain("remember text but not the file path");
+    expect(findSymbol?.description).toContain("identifier and want its declaration");
 
     runtime.dispose();
   });

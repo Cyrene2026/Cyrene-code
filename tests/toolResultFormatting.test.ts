@@ -27,20 +27,20 @@ describe("toolResultFormatting", () => {
     const result = formatReadToolResultDisplay(
       "search_text_context docs",
       [
-        "Found 2 contextual match(es):",
-        "[match] docs/a.txt:4",
+        "Text hits with context: 2",
+        "[text] docs/a.txt:4",
         "3 | alpha",
         ">    4 | needle",
         "5 | omega",
         "",
-        "[match] docs/b.txt:9",
+        "[text] docs/b.txt:9",
         "8 | before",
         ">    9 | needle again",
       ].join("\n")
     );
 
     expect(result).toContain("docs/a.txt:4, docs/b.txt:9");
-    expect(result).toContain("2 matches");
+    expect(result).toContain("2 text hits with context");
     expect(result).not.toContain("needle again");
   });
 });

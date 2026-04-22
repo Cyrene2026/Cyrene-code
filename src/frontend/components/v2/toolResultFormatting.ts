@@ -13,15 +13,33 @@ const trimWhitespaceOnlyEdges = (value: string) => {
 
 const summarizeNamedItems = (
   items: string[],
-  label: string,
+  singularLabel: string,
+  pluralLabel: string,
   maxItems = 3
 ) => {
   if (items.length === 0) {
-    return `(no ${label})`;
+    return `(no ${pluralLabel})`;
   }
   const visible = items.slice(0, maxItems).join(", ");
   const more = items.length - Math.min(items.length, maxItems);
+  const label = items.length === 1 ? singularLabel : pluralLabel;
   return `${visible} (${items.length} ${label}${more > 0 ? `, +${more} more` : ""})`;
+};
+
+const summarizeTaggedBody = (
+  body: string,
+  tag: string,
+  singularLabel: string,
+  pluralLabel: string,
+  aliases: string[] = []
+) => {
+  const tags = [tag, ...aliases];
+  const items = body
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => tags.some(current => line.startsWith(`[${current}] `)))
+    .map(line => line.replace(/^\[[^\]]+\]\s+/, ""));
+  return summarizeNamedItems(items, singularLabel, pluralLabel);
 };
 
 const summarizeReadFilesBody = (body: string) => {
@@ -30,16 +48,7 @@ const summarizeReadFilesBody = (body: string) => {
     .map(line => line.trim())
     .filter(line => line.startsWith("[file] "))
     .map(line => line.replace(/^\[file\]\s+/, ""));
-  return summarizeNamedItems(files, "files");
-};
-
-const summarizeSearchTextContextBody = (body: string) => {
-  const matches = body
-    .split("\n")
-    .map(line => line.trim())
-    .filter(line => line.startsWith("[match] "))
-    .map(line => line.replace(/^\[match\]\s+/, ""));
-  return summarizeNamedItems(matches, "matches");
+  return summarizeNamedItems(files, "file", "files");
 };
 
 export const formatReadToolResultDisplay = (detail: string, body: string) => {
@@ -47,8 +56,26 @@ export const formatReadToolResultDisplay = (detail: string, body: string) => {
   if (detail.startsWith("read_files ")) {
     return summarizeReadFilesBody(trimmed);
   }
+  if (detail.startsWith("find_files ")) {
+    return summarizeTaggedBody(trimmed, "file", "file hit", "file hits");
+  }
+  if (detail.startsWith("search_text ")) {
+    return summarizeTaggedBody(trimmed, "text", "text hit", "text hits");
+  }
   if (detail.startsWith("search_text_context ")) {
-    return summarizeSearchTextContextBody(trimmed);
+    return summarizeTaggedBody(
+      trimmed,
+      "text",
+      "text hit with context",
+      "text hits with context",
+      ["match"]
+    );
+  }
+  if (detail.startsWith("find_symbol ")) {
+    return summarizeTaggedBody(trimmed, "definition", "definition hit", "definition hits");
+  }
+  if (detail.startsWith("find_references ")) {
+    return summarizeTaggedBody(trimmed, "reference", "reference hit", "reference hits");
   }
   if (!trimmed) {
     return "(empty)";
@@ -70,4 +97,3 @@ export const formatReadToolResultDisplay = (detail: string, body: string) => {
   }
   return "content hidden";
 };
-

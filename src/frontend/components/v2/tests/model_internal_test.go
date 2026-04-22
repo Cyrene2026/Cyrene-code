@@ -423,10 +423,13 @@ func TestRenderMarkdownDiffPadsTrailingBackgroundAcrossLine(t *testing.T) {
 
 	lines := app.RenderMarkdownBodyLinesForTest("+    1 | x", 24, lipgloss.NewStyle())
 	rendered := strings.Join(lines, "\n")
-	trailingBackground := regexp.MustCompile(`48;2;16;59;42m +\x1b\[0m$`)
+	trailingBackground := regexp.MustCompile(`48;2;16;59;42m +\x1b\[0m`)
 
 	if !trailingBackground.MatchString(rendered) {
 		t.Fatalf("expected diff row background to extend through trailing padding, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "╭─ diff preview") || !strings.Contains(rendered, "╰") {
+		t.Fatalf("expected markdown diff rows to render inside a bordered block, got %q", rendered)
 	}
 }
 

@@ -32,7 +32,6 @@ import type {
 } from "./ExecutionSnapshot";
 import * as ProgressTracker from "./ProgressTracker";
 import * as ToolObservationStore from "./ToolObservationStore";
-import * as ToolLoopGuard from "./ToolLoopGuard";
 
 const COMPLETED_RESULT: RunQuerySessionResult = { status: "completed" };
 const SILENT_REVIEW_RESUME_RECOVERY_NOTE = [
@@ -180,6 +179,16 @@ const toRecord = (input: unknown): Record<string, unknown> | null =>
 const pickFiniteNumber = (record: Record<string, unknown>, key: string) => {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+};
+
+const pickTrimmedString = (record: Record<string, unknown>, key: string) => {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+};
+
+const pickBoolean = (record: Record<string, unknown>, key: string) => {
+  const value = record[key];
+  return typeof value === "boolean" ? value : undefined;
 };
 
 const clipRoundPromptText = (text: string, maxChars: number) => {
@@ -363,25 +372,109 @@ const formatPathList = (paths: string[], maxItems = 5) => {
   return hidden > 0 ? `${visible} (+${hidden} more)` : visible;
 };
 
-const stableSerialize = (value: unknown): string => {
-  if (Array.isArray(value)) {
-    return `[${value.map(item => stableSerialize(item)).join(",")}]`;
-  }
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record)
-      .filter(key => record[key] !== undefined)
-      .sort();
-    return `{${keys
-      .map(key => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-};
+const truncatePreview = (value: string, maxLength = 88) =>
+  value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 
-const getLoopDisplayName = (toolName: string, input: unknown) => {
+const formatQuotedPreview = (value: string, maxLength = 40) =>
+  JSON.stringify(truncatePreview(value, maxLength));
+
+const getToolDisplayName = (toolName: string, input: unknown) => {
   const action = getToolAction(toolName, input);
   return toolName === "file" && action ? action : toolName;
+};
+
+const buildToolStatusMessage = (toolName: string, input: unknown) => {
+  const displayName = getToolDisplayName(toolName, input);
+  const record = toRecord(input);
+  if (!record) {
+    return `Running ${displayName}...`;
+  }
+
+  const action = getToolAction(toolName, input);
+  const path = getToolPath(input);
+  let detail: string | undefined;
+  if (action === "search_text" || action === "search_text_context") {
+    const query = pickTrimmedString(record, "query");
+    detail = query ? `query ${formatQuotedPreview(query)}` : undefined;
+  } else if (action === "find_files") {
+    const pattern = pickTrimmedString(record, "pattern");
+    detail = pattern ? `pattern ${formatQuotedPreview(pattern)}` : undefined;
+  } else if (action === "find_symbol" || action === "find_references") {
+    const symbol =
+      pickTrimmedString(record, "symbol") ?? pickTrimmedString(record, "query");
+    detail = symbol ? `symbol ${formatQuotedPreview(symbol)}` : undefined;
+  } else if (action === "lsp_workspace_symbols") {
+    const query = pickTrimmedString(record, "query");
+    detail = query ? `query ${formatQuotedPreview(query)}` : undefined;
+  } else if (
+    action === "ts_hover" ||
+    action === "ts_definition" ||
+    action === "ts_references" ||
+    action === "lsp_hover" ||
+    action === "lsp_definition" ||
+    action === "lsp_implementation" ||
+    action === "lsp_type_definition" ||
+    action === "lsp_references"
+  ) {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    detail =
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined;
+  } else if (
+    action === "ts_prepare_rename" ||
+    action === "lsp_prepare_rename" ||
+    action === "lsp_rename"
+  ) {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    const newName = pickTrimmedString(record, "newName");
+    detail = [
+      newName ? `to ${formatQuotedPreview(newName)}` : undefined,
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  } else if (action === "lsp_code_actions") {
+    const line = pickFiniteNumber(record, "line");
+    const column = pickFiniteNumber(record, "column");
+    const title = pickTrimmedString(record, "title");
+    const kind = pickTrimmedString(record, "kind");
+    detail = [
+      title ? `title ${formatQuotedPreview(title)}` : "list",
+      kind ? `kind ${formatQuotedPreview(kind)}` : undefined,
+      typeof line === "number" && typeof column === "number"
+        ? `at ${line}:${column}`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  } else if (action === "lsp_format_document") {
+    const tabSize = pickFiniteNumber(record, "tabSize");
+    const insertSpaces = pickBoolean(record, "insertSpaces");
+    detail = [
+      typeof tabSize === "number" ? `tabSize ${tabSize}` : undefined,
+      typeof insertSpaces === "boolean" ? `insertSpaces ${insertSpaces}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  } else if (action === "git_show") {
+    const revision = pickTrimmedString(record, "revision");
+    detail = revision ? `revision ${revision}` : undefined;
+  } else if (action === "copy_path" || action === "move_path") {
+    const destination = pickTrimmedString(record, "destination");
+    detail = destination ? `to ${destination}` : undefined;
+  }
+
+  const summary = truncatePreview(
+    [displayName, path && path !== "." ? path : path === "." ? "workspace" : undefined, detail]
+      .filter(Boolean)
+      .join(" | ")
+  );
+  return `Running ${summary || displayName}...`;
 };
 
 const normalizeForIntent = (text: string) => text.toLowerCase();
@@ -415,6 +508,54 @@ const isProjectAnalysisHighSignalAction = (toolName: string, input: unknown) =>
 
 const isSemanticNavigationAction = (toolName: string, input: unknown) =>
   SEMANTIC_NAVIGATION_ACTIONS.has(getToolAction(toolName, input));
+
+const isScopeBudgetedBroadDiscoveryAction = (toolName: string, input: unknown) =>
+  BROAD_DISCOVERY_ACTIONS.has(getToolAction(toolName, input)) ||
+  PROJECT_ANALYSIS_BROAD_DISCOVERY_ACTIONS.has(getToolAction(toolName, input));
+
+const getBroadDiscoveryScope = (toolName: string, input: unknown) => {
+  if (!isScopeBudgetedBroadDiscoveryAction(toolName, input)) {
+    return null;
+  }
+  return normalizeComparedPath(getToolPath(input) ?? ".") || ".";
+};
+
+const getScopedBroadDiscoveryBudgetKey = (
+  toolName: string,
+  input: unknown,
+  filesystemMutationRevision: number
+) => {
+  const scope = getBroadDiscoveryScope(toolName, input);
+  return scope ? `${filesystemMutationRevision}:${scope}` : null;
+};
+
+const isReadFileAction = (toolName: string, input: unknown) =>
+  getToolAction(toolName, input) === "read_file";
+
+const isImmediateRedundantPostWriteRead = (
+  toolName: string,
+  input: unknown,
+  latestConfirmedFileMutation: { path: string } | null,
+  allowPostWriteVerification: boolean
+) => {
+  if (
+    !latestConfirmedFileMutation ||
+    allowPostWriteVerification ||
+    !isReadFileAction(toolName, input)
+  ) {
+    return false;
+  }
+
+  const path = getToolPath(input);
+  if (!path) {
+    return false;
+  }
+
+  return (
+    normalizeComparedPath(path) ===
+    normalizeComparedPath(latestConfirmedFileMutation.path)
+  );
+};
 
 const taskSuggestsProjectAnalysis = (task: string) =>
   !taskSuggestsWriting(task) && PROJECT_ANALYSIS_TASK_PATTERN.test(task);
@@ -1053,7 +1194,7 @@ const buildHeuristicNudges = (
 const buildRoundPrompt = (
   originalTask: string,
   toolResults: string[],
-  loopCorrection: string,
+  runtimeCorrection: string,
   recentConfirmedFileMutations: ConfirmedFileMutation[],
   progressLedger: MultiFileProgressLedger,
   uncertainty: UncertaintyState,
@@ -1133,16 +1274,12 @@ const buildRoundPrompt = (
     fileReadLedgerFacts ? `File read ledger:\n${fileReadLedgerFacts}` : "",
     executionState,
     heuristicNudges ? `Heuristic nudges:\n${heuristicNudges}` : "",
-    loopCorrection ? `\n${loopCorrection}\n` : "",
+    runtimeCorrection ? `\n${runtimeCorrection}\n` : "",
     "Tool results:",
     formatToolResultsForRoundPrompt(toolResults),
     "If more tool usage is needed, call tools again. Otherwise provide final answer.",
   ].join("\n\n");
 };
-
-const isFailedCommandResult = (message: string) =>
-  /status:\s*(failed|timed_out)/i.test(message) ||
-  /exit:\s*(?!0\b)[^\s]+/i.test(message);
 
 const runExecutionRuntime = async ({
   query,
@@ -1176,7 +1313,6 @@ const runExecutionRuntime = async ({
   const searchMemory = ToolObservationStore.createSearchMemory();
   const readLedger = new Map<string, FileReadLedgerEntry>();
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
-  let repeatedImmediatePostWriteReadCount = 0;
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
       ? Math.floor(queryMaxToolSteps)
@@ -1219,7 +1355,6 @@ const runExecutionRuntime = async ({
         confirmedFileMutation.path
       );
       latestConfirmedFileMutation = confirmedFileMutation;
-      repeatedImmediatePostWriteReadCount = 0;
       uncertainty.phase =
         ProgressTracker.getLedgerRemainingCount(progressLedger) === 0 &&
         uncertainty.verifyRequested
@@ -1259,8 +1394,7 @@ const runExecutionRuntime = async ({
 
   const runRounds = async (
     roundPrompt: string,
-    repeatedToolCallCount: Map<string, number>,
-    loopCorrection: string,
+    runtimeCorrection: string,
     accumulatedToolResults: string[],
     toolStepsUsed: number,
     options?: RunRoundsOptions
@@ -1387,7 +1521,6 @@ const runExecutionRuntime = async ({
           sawToolCall = true;
           const action = getToolAction(event.toolName, event.input);
           const toolPath = getToolPath(event.input);
-          const displayName = getLoopDisplayName(event.toolName, event.input);
           if (
             uncertainty.writeFocus &&
             !uncertainty.verifyRequested &&
@@ -1402,7 +1535,7 @@ const runExecutionRuntime = async ({
               : searchMemory.discoveredPaths.size > 0
                 ? "concrete target paths are already known"
                 : "the explicit target path was already read once";
-            loopCorrection = [
+            runtimeCorrection = [
               "Write-focused discovery blocked:",
               `Skipped ${action} ${toolPath ?? "."} because ${skipReason}.`,
               "Use the known path directly for the next read/edit/write step instead of reopening broad discovery.",
@@ -1439,7 +1572,7 @@ const runExecutionRuntime = async ({
                     ? "remaining files are already known"
                     : "completed files are authoritative"
                   : "the broad discovery budget is already exhausted";
-              loopCorrection = [
+              runtimeCorrection = [
                 "Exploration collapsed:",
                 `Skipped ${action} ${toolPath ?? "."} because ${skipReason}.`,
                 "Stop broad exploration and continue with the remaining concrete file actions directly.",
@@ -1486,7 +1619,7 @@ const runExecutionRuntime = async ({
               if (uncertainty.phase === "discover") {
                 uncertainty.phase = "trace";
               }
-              loopCorrection = [
+              runtimeCorrection = [
                 "Project analysis semantic navigation preferred:",
                 `Skipped ${action} ${toolPath ?? "."} because concrete source anchors are already known: ${formatPathList(semanticAnchors, 3)}.`,
                 "Before more broad search, use lsp_document_symbols/lsp_workspace_symbols for structure or lsp_definition/ts_definition/lsp_references/ts_references to trace the main code path.",
@@ -1514,7 +1647,7 @@ const runExecutionRuntime = async ({
                 accumulatedToolResults,
                 toolResults
               );
-              loopCorrection = [
+              runtimeCorrection = [
                 "Project analysis exploration collapsed:",
                 `Skipped ${action} ${toolPath ?? "."} because the initial repo snapshot budget is already exhausted.`,
                 knownPaths.length > 0
@@ -1545,7 +1678,7 @@ const runExecutionRuntime = async ({
               toolResults
             )
           ) {
-            loopCorrection = [
+            runtimeCorrection = [
               "Targeted source read blocked:",
               `Skipped ${action} ${toolPath ?? "."}.`,
               "Read the explicitly requested source path once or use a path that was just discovered for the split/write step.",
@@ -1575,7 +1708,7 @@ const runExecutionRuntime = async ({
               !taskSuggestsPostWriteVerification(task)
             ) {
               const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
-              loopCorrection = [
+              runtimeCorrection = [
                 "Repeated full-file read blocked:",
                 `${repeatedPath} was already fully read in the current file revision.`,
                 "Do not read the whole file again unless it changes. Continue from the known content or switch to a different file.",
@@ -1596,7 +1729,7 @@ const runExecutionRuntime = async ({
               typeof readLedgerEntry.nextSuggestedStartLine === "number"
             ) {
               const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
-              loopCorrection = [
+              runtimeCorrection = [
                 "Whole-file reread blocked after partial reads:",
                 `${repeatedPath} already has partial read coverage in the current revision.`,
                 `Continue with read_range starting at line ${readLedgerEntry.nextSuggestedStartLine} instead of restarting from the top.`,
@@ -1626,7 +1759,7 @@ const runExecutionRuntime = async ({
                 )
               ) {
                 const repeatedPath = getToolPath(event.input) ?? readLedgerEntry.path;
-                loopCorrection = [
+                runtimeCorrection = [
                   "Repeated range read blocked:",
                   `${repeatedPath} lines ${startLine}-${endLine} were already read in the current file revision.`,
                   "Continue from the next unread range or switch to a different target.",
@@ -1645,102 +1778,7 @@ const runExecutionRuntime = async ({
             }
           }
 
-          const signature = ToolLoopGuard.getLoopSignature(
-            event.toolName,
-            event.input,
-            filesystemMutationRevision
-          );
-          const seen = (repeatedToolCallCount.get(signature) ?? 0) + 1;
-          repeatedToolCallCount.set(signature, seen);
-          if (
-            uncertainty.mode === "simple_multi_file" &&
-            seen >= 2 &&
-            (isBroadDiscoveryAction(event.toolName, event.input) ||
-              ToolLoopGuard.isExploratoryProbe(event.toolName, event.input))
-          ) {
-            uncertainty.phase = uncertainty.phase === "discover" ? "collapse" : uncertainty.phase;
-          }
-          if (
-            seen >= 2 &&
-            ToolLoopGuard.isExploratoryProbe(event.toolName, event.input)
-          ) {
-            const repeatedPath = getToolPath(event.input) ?? ".";
-            loopCorrection = [
-              "Repeated directory probe warning:",
-              `Directory state for ${repeatedPath} was already confirmed.`,
-              "Do NOT call list_dir for the same path again unless a write or directory mutation happened.",
-              "Choose the next concrete action toward the original task.",
-            ].join("\n");
-          } else if (
-            seen >= 2 &&
-            ToolLoopGuard.isCommandLikeAction(event.toolName, event.input)
-          ) {
-            const commandKind = action === "run_shell" ? "shell command" : "bounded command";
-            loopCorrection = [
-              `Repeated ${commandKind} warning:`,
-              `Command call was repeated: ${displayName} ${stableSerialize(
-                ToolLoopGuard.getNormalizedLoopInput(event.toolName, event.input)
-              )}`,
-              `Do NOT rerun the same ${action} unchanged unless the prior result shows a concrete new reason.`,
-              "Prefer the next concrete fix, file edit, or adjusted command.",
-            ].join("\n");
-          } else if (seen >= 2) {
-            loopCorrection = [
-              "Loop warning:",
-              `Tool call was repeated: ${displayName} ${stableSerialize(
-                ToolLoopGuard.getNormalizedLoopInput(event.toolName, event.input)
-              )}`,
-              "Do NOT call the same tool with the same input again.",
-              "Choose the next concrete step toward completing the original task.",
-            ].join("\n");
-          }
-          if (
-            seen >= 3 &&
-            ToolLoopGuard.isExploratoryProbe(event.toolName, event.input)
-          ) {
-            const repeatedPath = getToolPath(event.input) ?? ".";
-            recordCompletion({
-              type: "completion",
-              source: "runtime",
-              reason: "tool_loop_detected",
-              detail: `list_dir ${repeatedPath} was called repeatedly after directory state was already confirmed.`,
-              expected: false,
-            });
-            onTextDelta(
-              `\n[tool loop detected] list_dir ${repeatedPath} was called repeatedly after directory state was already confirmed. Stopping to prevent infinite loop.\n`
-            );
-            return completeRound();
-          }
-          if (
-            seen >= 3 &&
-            ToolLoopGuard.isCommandLikeAction(event.toolName, event.input)
-          ) {
-            recordCompletion({
-              type: "completion",
-              source: "runtime",
-              reason: "tool_loop_detected",
-              detail: `${action} was called repeatedly with the same command signature.`,
-              expected: false,
-            });
-            onTextDelta(
-              `\n[tool loop detected] ${action} was called repeatedly with the same command signature. Stopping to prevent infinite loop.\n`
-            );
-            return completeRound();
-          }
-          if (seen >= 4) {
-            recordCompletion({
-              type: "completion",
-              source: "runtime",
-              reason: "tool_loop_detected",
-              detail: `${displayName} was called repeatedly with the same input.`,
-              expected: false,
-            });
-            onTextDelta(
-              `\n[tool loop detected] ${displayName} was called repeatedly with same input. Stopping to prevent infinite loop.\n`
-            );
-            return completeRound();
-          }
-          const scopedBudgetKey = ToolLoopGuard.getScopedBroadDiscoveryBudgetKey(
+          const scopedBudgetKey = getScopedBroadDiscoveryBudgetKey(
             event.toolName,
             event.input,
             filesystemMutationRevision
@@ -1750,15 +1788,14 @@ const runExecutionRuntime = async ({
               searchMemory.scopedBroadDiscoveryBudget.get(scopedBudgetKey) ?? 0;
             if (scopedBudgetUsed >= BROAD_DISCOVERY_SCOPE_BUDGET) {
               const repeatedScope =
-                ToolLoopGuard.getBroadDiscoveryScope(event.toolName, event.input) ??
-                ".";
+                getBroadDiscoveryScope(event.toolName, event.input) ?? ".";
               if (uncertainty.mode === "simple_multi_file" && uncertainty.phase === "discover") {
                 uncertainty.phase = "collapse";
               }
               if (uncertainty.mode === "project_analysis" && uncertainty.phase === "discover") {
                 uncertainty.phase = "trace";
               }
-              loopCorrection = [
+              runtimeCorrection = [
                 "Broad discovery budget exhausted:",
                 `Skipped ${action} ${repeatedScope} because this scope already used ${scopedBudgetUsed}/${BROAD_DISCOVERY_SCOPE_BUDGET} broad discovery steps.`,
                 "Use a known hit path or move to read_range/read_file/outline_file instead of reopening broad search in the same scope.",
@@ -1776,7 +1813,7 @@ const runExecutionRuntime = async ({
               scopedBudgetKey,
               scopedBudgetUsed + 1
             );
-            const broadScope = ToolLoopGuard.getBroadDiscoveryScope(
+            const broadScope = getBroadDiscoveryScope(
               event.toolName,
               event.input
             );
@@ -1785,7 +1822,7 @@ const runExecutionRuntime = async ({
             }
           }
           if (
-            ToolLoopGuard.isImmediateRedundantPostWriteRead(
+            isImmediateRedundantPostWriteRead(
               event.toolName,
               event.input,
               latestConfirmedFileMutation,
@@ -1794,9 +1831,8 @@ const runExecutionRuntime = async ({
           ) {
             const repeatedPath =
               getToolPath(event.input) ?? latestConfirmedFileMutation?.path ?? ".";
-            repeatedImmediatePostWriteReadCount += 1;
             const sourceAction = latestConfirmedFileMutation?.action ?? "write_file";
-            loopCorrection = [
+            runtimeCorrection = [
               "Immediate post-write read blocked:",
               `${repeatedPath} was just updated successfully via ${sourceAction}.`,
               "Do NOT call read_file on the same path just to confirm the write.",
@@ -1809,69 +1845,18 @@ const runExecutionRuntime = async ({
                 "Treat the successful write result as authoritative and continue the task unless explicit verification is required.",
               ].join("\n")
             );
-            if (repeatedImmediatePostWriteReadCount >= 2) {
-              recordCompletion({
-                type: "completion",
-                source: "runtime",
-                reason: "tool_loop_detected",
-                detail: `read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write.`,
-                expected: false,
-              });
-              onTextDelta(
-                `\n[tool loop detected] read_file ${repeatedPath} was attempted repeatedly immediately after a confirmed write. Stopping to prevent needless rereads.\n`
-              );
-              return completeRound();
-            }
             continue;
           }
           if (latestConfirmedFileMutation) {
             latestConfirmedFileMutation = null;
-            repeatedImmediatePostWriteReadCount = 0;
           }
           dispatch({
             type: "tool_call",
             toolName: event.toolName,
             input: event.input,
           });
-          onToolStatus?.(
-            ToolLoopGuard.buildToolStatusMessage(event.toolName, event.input)
-          );
+          onToolStatus?.(buildToolStatusMessage(event.toolName, event.input));
           const toolResult = await onToolCall(event.toolName, event.input);
-          if (
-            seen >= 2 &&
-            ToolLoopGuard.isReadFileAction(event.toolName, event.input) &&
-            toolResult.message.includes("(empty file)")
-          ) {
-            const repeatedPath = getToolPath(event.input) ?? ".";
-            recordCompletion({
-              type: "completion",
-              source: "runtime",
-              reason: "tool_loop_detected",
-              detail: `read_file ${repeatedPath} was repeated even though the file was already confirmed empty.`,
-              expected: false,
-            });
-            onTextDelta(
-              `\n[tool loop detected] read_file ${repeatedPath} was repeated even though the file was already confirmed empty. Stopping to prevent infinite loop.\n`
-            );
-            return completeRound();
-          }
-          if (
-            seen >= 2 &&
-            ToolLoopGuard.isCommandLikeAction(event.toolName, event.input) &&
-            isFailedCommandResult(toolResult.message)
-          ) {
-            recordCompletion({
-              type: "completion",
-              source: "runtime",
-              reason: "tool_loop_detected",
-              detail: `${action} was retried after the same command already failed.`,
-              expected: false,
-            });
-            onTextDelta(
-              `\n[tool loop detected] ${action} was retried after the same command already failed. Stop rerunning it unchanged and choose a new concrete step.\n`
-            );
-            return completeRound();
-          }
           if (
             ToolObservationStore.didApplyFileMutation(
               event.toolName,
@@ -1881,7 +1866,7 @@ const runExecutionRuntime = async ({
             )
           ) {
             filesystemMutationRevision += 1;
-            loopCorrection = "";
+            runtimeCorrection = "";
           }
           applyToolResultSideEffects(
             event.toolName,
@@ -1929,7 +1914,7 @@ const runExecutionRuntime = async ({
                 )
               ) {
                 filesystemMutationRevision += 1;
-                loopCorrection = "";
+                runtimeCorrection = "";
               }
               applyToolResultSideEffects(
                 event.toolName,
@@ -1973,7 +1958,7 @@ const runExecutionRuntime = async ({
               const nextPrompt = buildRoundPrompt(
                 task,
                 nextToolResults,
-                loopCorrection,
+                runtimeCorrection,
                 recentConfirmedFileMutations,
                 progressLedger,
                 uncertainty,
@@ -1983,8 +1968,7 @@ const runExecutionRuntime = async ({
               );
               return runRounds(
                 nextPrompt,
-                repeatedToolCallCount,
-                loopCorrection,
+                runtimeCorrection,
                 nextToolResults,
                 toolStepsUsed,
                 { allowSilentPostReviewRetry: true }
@@ -2057,8 +2041,7 @@ const runExecutionRuntime = async ({
             roundPrompt,
             planExecutionTargetStepId
           ),
-          repeatedToolCallCount,
-          loopCorrection,
+          runtimeCorrection,
           accumulatedToolResults,
           toolStepsUsed
         );
@@ -2096,8 +2079,7 @@ const runExecutionRuntime = async ({
           );
           return runRounds(
             nextPrompt,
-            repeatedToolCallCount,
-            loopCorrection,
+            runtimeCorrection,
             accumulatedToolResults,
             toolStepsUsed
           );
@@ -2117,7 +2099,7 @@ const runExecutionRuntime = async ({
         const nextPrompt = buildRoundPrompt(
           task,
           accumulatedToolResults,
-          [loopCorrection, SILENT_REVIEW_RESUME_RECOVERY_NOTE]
+          [runtimeCorrection, SILENT_REVIEW_RESUME_RECOVERY_NOTE]
             .filter(Boolean)
             .join("\n\n"),
           recentConfirmedFileMutations,
@@ -2129,8 +2111,7 @@ const runExecutionRuntime = async ({
         );
         return runRounds(
           nextPrompt,
-          repeatedToolCallCount,
-          loopCorrection,
+          runtimeCorrection,
           accumulatedToolResults,
           toolStepsUsed,
           { allowSilentPostReviewRetry: false }
@@ -2149,7 +2130,7 @@ const runExecutionRuntime = async ({
     const nextPrompt = buildRoundPrompt(
       task,
       accumulatedToolResults,
-      loopCorrection,
+      runtimeCorrection,
       recentConfirmedFileMutations,
       progressLedger,
       uncertainty,
@@ -2159,8 +2140,7 @@ const runExecutionRuntime = async ({
     );
     return runRounds(
       nextPrompt,
-      repeatedToolCallCount,
-      loopCorrection,
+      runtimeCorrection,
       accumulatedToolResults,
       toolStepsUsed,
       options
@@ -2175,7 +2155,6 @@ const runExecutionRuntime = async ({
         uncertainty,
         progressLedger
       ),
-      new Map<string, number>(),
       "",
       [],
       0

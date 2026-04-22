@@ -455,6 +455,10 @@ const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text">
     const detail = firstLine.replace("Tool result:", "").trim();
     const action = detail.split(/\s+/, 1)[0] ?? "";
     if (
+      detail.startsWith("find_files ") ||
+      detail.startsWith("find_symbol ") ||
+      detail.startsWith("find_references ") ||
+      detail.startsWith("search_text ") ||
       detail.startsWith("read_file ") ||
       detail.startsWith("read_files ") ||
       detail.startsWith("read_range ") ||

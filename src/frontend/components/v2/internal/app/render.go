@@ -194,6 +194,12 @@ var (
 	approvalMetaKeyStyle      = dimStyle.Copy().Bold(true)
 	approvalMetaValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6EDF3"))
 	approvalPathStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF")).Bold(true)
+	approvalIDStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B949E")).Bold(true)
+	approvalDetailStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAB6C3"))
+	approvalRequiredStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#F2CC60")).Bold(true)
+	approvalApprovedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
+	approvalRejectedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA198")).Bold(true)
+	approvalSeparatorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681"))
 	approvalDetailBannerStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("#0D1117")).
 					Background(lipgloss.Color("#E6EDF3")).
@@ -1036,6 +1042,10 @@ func renderMessageLines(message Message, width int) []string {
 		return renderStyledPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, style, style)
 	}
 
+	if message.Kind == "review_status" {
+		return renderReviewStatusTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width)
+	}
+
 	if shouldRenderCompactTranscript(message) {
 		lines := renderPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, transcriptBodyStyle(message))
 		if len(lines) == 0 {
@@ -1307,14 +1317,397 @@ func renderStyledPrefixedTranscriptLines(prefix string, value string, width int,
 	return lines
 }
 
+func renderReviewStatusTranscriptLines(prefix string, value string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	bodyWidth := maxInt(1, width-lipgloss.Width(prefix))
+	bodyLines := renderReviewStatusBodyLines(value, bodyWidth)
+	if len(bodyLines) == 0 {
+		return []string{""}
+	}
+
+	lines := make([]string, 0, len(bodyLines))
+	firstLine := value
+	if line, _, ok := strings.Cut(value, "\n"); ok {
+		firstLine = line
+	}
+	styledPrefix := approvalStatusStyle(firstLine).Render(prefix)
+	prefixPadding := strings.Repeat(" ", lipgloss.Width(prefix))
+	for index, row := range bodyLines {
+		if index == 0 {
+			lines = append(lines, styledPrefix+row)
+			continue
+		}
+		lines = append(lines, prefixPadding+row)
+	}
+	return lines
+}
+
+func renderReviewStatusBodyLines(value string, width int) []string {
+	rawLines := strings.Split(value, "\n")
+	if len(rawLines) == 0 {
+		return []string{""}
+	}
+
+	lines := make([]string, 0, len(rawLines))
+	for index, raw := range rawLines {
+		if index == 0 {
+			lines = append(lines, renderReviewStatusHeaderRows(raw, width)...)
+			continue
+		}
+		detailLines := make([]string, 0, len(rawLines)-1)
+		for _, detailRaw := range rawLines[1:] {
+			detailLines = append(detailLines, renderReviewStatusDetailRows(detailRaw, maxInt(1, width-4))...)
+		}
+		if len(detailLines) > 0 {
+			lines = append(lines, renderBorderedTranscriptBlock("approval preview", detailLines, width, approvalRequiredStyle)...)
+		}
+		break
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func renderReviewStatusHeaderRows(raw string, width int) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return []string{""}
+	}
+	parts := splitReviewStatusHeader(trimmed)
+	if len(parts) < 2 {
+		return renderStyledWrappedLine(trimmed, width, approvalStatusStyle(trimmed))
+	}
+
+	status := parts[0]
+	action, path := splitToolStatusActionDetail(parts[1])
+	id := ""
+	if len(parts) > 2 {
+		id = parts[2]
+	}
+	detail := ""
+	if len(parts) > 3 {
+		detail = strings.Join(parts[3:], " | ")
+	}
+	return []string{renderReviewStatusHeaderLine(status, action, path, id, detail, width)}
+}
+
+func splitReviewStatusHeader(raw string) []string {
+	pieces := strings.Split(raw, "|")
+	parts := make([]string, 0, len(pieces))
+	for _, piece := range pieces {
+		trimmed := strings.TrimSpace(piece)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
+}
+
+func renderReviewStatusHeaderLine(status, action, path, id, detail string, width int) string {
+	separator := approvalSeparatorStyle.Render(" | ")
+	statusText := approvalStatusStyle(status).Render(status)
+	actionText := ""
+	if action != "" {
+		actionText = toolStatusStyleForText("Tool: " + action).Bold(true).Render(action)
+	}
+	pathText := ""
+	if strings.TrimSpace(path) != "" {
+		pathText = " " + approvalPathStyle.Render(strings.TrimSpace(path))
+	}
+	idText := ""
+	if strings.TrimSpace(id) != "" {
+		idText = separator + approvalIDStyle.Render(strings.TrimSpace(id))
+	}
+	detailText := ""
+	if strings.TrimSpace(detail) != "" {
+		fixedWidth := lipgloss.Width(status) + 3 + lipgloss.Width(action) + lipgloss.Width(path) + lipgloss.Width(id) + 6
+		detailBudget := maxInt(8, width-fixedWidth)
+		detailText = separator + approvalDetailStyle.Render(truncatePlain(strings.TrimSpace(detail), detailBudget))
+	}
+
+	if actionText == "" {
+		return statusText + idText + detailText
+	}
+	return statusText + separator + actionText + pathText + idText + detailText
+}
+
+func approvalStatusStyle(text string) lipgloss.Style {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	switch {
+	case strings.Contains(normalized, "approved"):
+		return approvalApprovedStyle
+	case strings.Contains(normalized, "reject"), strings.Contains(normalized, "error"), strings.Contains(normalized, "fail"):
+		return approvalRejectedStyle
+	case strings.Contains(normalized, "required"), strings.Contains(normalized, "pending"):
+		return approvalRequiredStyle
+	default:
+		return reviewStyle
+	}
+}
+
+func renderReviewStatusDetailRows(raw string, width int) []string {
+	trimmed := strings.TrimSpace(raw)
+	switch {
+	case diffStatsPattern.MatchString(raw):
+		return renderDiffStatsLine(raw, width, approvalDetailStyle)
+	case isRecognizedDiffPreviewLine(raw):
+		sign, lineNumber, content, _ := parseRenderedDiffLine(raw)
+		return renderDiffRows(sign, lineNumber, content, width)
+	case strings.HasPrefix(trimmed, "@@"):
+		return renderStyledWrappedLine(raw, width, diffHunkStyle)
+	case strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"):
+		section := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		return []string{approvalSectionStyle.Render(truncatePlain("▌ "+emptyFallback(section, "preview"), maxInt(1, width)))}
+	case trimmed == "":
+		return []string{""}
+	case isPipeKVPreviewLine(trimmed):
+		return renderPipeKVPreviewLine(trimmed, width)
+	}
+
+	key, val, ok := splitPreviewKV(raw)
+	if ok {
+		return renderApprovalPreviewLines(approvalPreviewLine{Kind: "kv", Key: key, Val: val, Text: raw}, width)
+	}
+	return renderStyledWrappedLine(raw, width, approvalDetailStyle)
+}
+
+func renderStyledWrappedLine(raw string, width int, style lipgloss.Style) []string {
+	rows := wrapPlainText(raw, maxInt(1, width))
+	if len(rows) == 0 {
+		return []string{""}
+	}
+	rendered := make([]string, 0, len(rows))
+	for _, row := range rows {
+		rendered = append(rendered, style.Render(row))
+	}
+	return rendered
+}
+
+func isPipeKVPreviewLine(trimmed string) bool {
+	if !strings.Contains(trimmed, "|") || !strings.Contains(trimmed, "=") {
+		return false
+	}
+	parts := strings.Split(trimmed, "|")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !headerKVPattern.MatchString(strings.TrimSpace(part)) {
+			return false
+		}
+	}
+	return true
+}
+
+func renderPipeKVPreviewLine(trimmed string, width int) []string {
+	parts := strings.Split(trimmed, "|")
+	renderedParts := make([]string, 0, len(parts))
+	plainParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		key, val, ok := splitPipeKVPart(part)
+		if !ok {
+			continue
+		}
+		plainParts = append(plainParts, key+"="+val)
+		renderedParts = append(renderedParts, renderPipeKVPart(key, val))
+	}
+	if len(renderedParts) == 0 {
+		return renderStyledWrappedLine(trimmed, width, approvalDetailStyle)
+	}
+	plain := strings.Join(plainParts, " | ")
+	if lipgloss.Width(plain) <= width {
+		return []string{strings.Join(renderedParts, approvalSeparatorStyle.Render(" | "))}
+	}
+	return renderStyledWrappedLine(plain, width, approvalDetailStyle)
+}
+
+func splitPipeKVPart(part string) (string, string, bool) {
+	pieces := strings.SplitN(strings.TrimSpace(part), "=", 2)
+	if len(pieces) != 2 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(pieces[0])
+	val := strings.TrimSpace(pieces[1])
+	return key, val, key != ""
+}
+
+func renderPipeKVPart(key, val string) string {
+	keyText := approvalMetaKeyStyle.Render(strings.ToUpper(key))
+	valueStyle := approvalMetaValueStyle
+	switch strings.ToLower(key) {
+	case "action":
+		valueStyle = toolStatusStyleForText("Tool: " + val).Bold(true)
+	case "path", "destination", "cwd":
+		valueStyle = approvalPathStyle
+	case "id":
+		valueStyle = approvalIDStyle
+	case "risk":
+		valueStyle = approvalRiskStyle(val)
+	}
+	return keyText + approvalSeparatorStyle.Render("=") + valueStyle.Render(val)
+}
+
+func approvalRiskStyle(value string) lipgloss.Style {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low":
+		return approvalApprovedStyle
+	case "medium":
+		return approvalRequiredStyle
+	case "high":
+		return approvalRejectedStyle
+	default:
+		return approvalMetaValueStyle
+	}
+}
+
+func renderBorderedTranscriptBlock(title string, lines []string, width int, borderStyle lipgloss.Style) []string {
+	if width < 8 {
+		return lines
+	}
+	innerWidth := maxInt(1, width-4)
+	label := strings.TrimSpace(title)
+	topText := "╭"
+	if label != "" {
+		visibleTitle := truncatePlain(label, maxInt(1, width-6))
+		topText += "─ " + visibleTitle + " "
+	}
+	topText += strings.Repeat("─", maxInt(0, width-lipgloss.Width(topText)-1)) + "╮"
+	bottomText := "╰" + strings.Repeat("─", maxInt(0, width-2)) + "╯"
+
+	rendered := make([]string, 0, len(lines)+2)
+	rendered = append(rendered, borderStyle.Render(topText))
+	for _, line := range lines {
+		content := fitDisplayWidth(line, innerWidth)
+		rendered = append(rendered,
+			borderStyle.Render("│ ")+content+borderStyle.Render(" │"),
+		)
+	}
+	rendered = append(rendered, borderStyle.Render(bottomText))
+	return rendered
+}
+
+func renderDiffTranscriptBlock(rawLines []string, width int, title string) ([]string, int) {
+	return renderDiffTranscriptBlockMatching(rawLines, width, title, isDiffBlockLine)
+}
+
+func renderMarkdownDiffTranscriptBlock(rawLines []string, width int, title string) ([]string, int) {
+	return renderDiffTranscriptBlockMatching(rawLines, width, title, isMarkdownDiffBlockLine)
+}
+
+func renderDiffTranscriptBlockMatching(rawLines []string, width int, title string, matches func(string) bool) ([]string, int) {
+	innerWidth := maxInt(1, width-4)
+	blockLines := make([]string, 0, len(rawLines))
+	consumed := 0
+	for _, raw := range rawLines {
+		if consumed > 0 && isDiffContinuationLine(raw) {
+			blockLines = append(blockLines, renderDiffBlockLineRows(raw, innerWidth)...)
+			consumed++
+			continue
+		}
+		if consumed > 0 && !matches(raw) {
+			break
+		}
+		if !matches(raw) {
+			break
+		}
+		blockLines = append(blockLines, renderDiffBlockLineRows(raw, innerWidth)...)
+		consumed++
+	}
+	if consumed == 0 {
+		return nil, 0
+	}
+	return renderBorderedTranscriptBlock(title, blockLines, width, diffHunkStyle), consumed
+}
+
+func isDiffContinuationLine(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	return trimmed == "(none)"
+}
+
+func isDiffBlockLine(raw string) bool {
+	if isMarkdownDiffBlockLine(raw) {
+		return true
+	}
+	return strings.HasPrefix(raw, "+") || strings.HasPrefix(raw, "-")
+}
+
+func isMarkdownDiffBlockLine(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	if diffStatsPattern.MatchString(raw) ||
+		diffPreviewOmittedPattern.MatchString(trimmed) ||
+		isRecognizedDiffPreviewLine(raw) ||
+		strings.HasPrefix(trimmed, "@@") ||
+		strings.HasPrefix(trimmed, "diff --git ") ||
+		strings.HasPrefix(trimmed, "index ") ||
+		strings.HasPrefix(trimmed, "--- ") ||
+		strings.HasPrefix(trimmed, "+++ ") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		section := strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+		return strings.Contains(section, "diff") ||
+			strings.Contains(section, "preview") ||
+			section == "unstaged" ||
+			section == "staged" ||
+			strings.Contains(section, "old -") ||
+			strings.Contains(section, "new +")
+	}
+	return false
+}
+
+func renderDiffBlockLineRows(raw string, width int) []string {
+	trimmed := strings.TrimSpace(raw)
+	switch {
+	case diffStatsPattern.MatchString(raw):
+		return renderDiffStatsLine(raw, width, approvalDetailStyle)
+	case diffPreviewOmittedPattern.MatchString(trimmed):
+		matches := diffPreviewOmittedPattern.FindStringSubmatch(trimmed)
+		if len(matches) == 2 {
+			return []string{dimStyle.Render(truncatePlain("... "+matches[1]+" more changed line(s)", width))}
+		}
+	case isRecognizedDiffPreviewLine(raw):
+		sign, lineNumber, content, _ := parseRenderedDiffLine(raw)
+		return renderDiffRows(sign, lineNumber, content, width)
+	case strings.HasPrefix(trimmed, "@@"),
+		strings.HasPrefix(trimmed, "diff --git "),
+		strings.HasPrefix(trimmed, "index "),
+		strings.HasPrefix(trimmed, "--- "),
+		strings.HasPrefix(trimmed, "+++ "):
+		return renderStyledWrappedLine(raw, width, diffHunkStyle)
+	case strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"):
+		section := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		return []string{approvalSectionStyle.Render(truncatePlain("▌ "+emptyFallback(section, "diff preview"), width))}
+	case trimmed == "(none)":
+		return renderStyledWrappedLine(raw, width, dimStyle)
+	case strings.HasPrefix(raw, "+"):
+		return renderDiffRows("+", "", strings.TrimPrefix(raw, "+"), width)
+	case strings.HasPrefix(raw, "-"):
+		return renderDiffRows("-", "", strings.TrimPrefix(raw, "-"), width)
+	}
+	return renderStyledWrappedLine(raw, width, approvalDetailStyle)
+}
+
 func renderToolStatusBodyLines(value string, width int, baseStyle lipgloss.Style) []string {
 	if width <= 0 {
 		return []string{""}
 	}
 	rawLines := strings.Split(value, "\n")
 	lines := make([]string, 0, len(rawLines))
-	for _, raw := range rawLines {
+	for index := 0; index < len(rawLines); index++ {
+		raw := rawLines[index]
 		trimmed := strings.TrimSpace(raw)
+		if isDiffBlockLine(raw) {
+			blockRows, consumed := renderDiffTranscriptBlock(rawLines[index:], width, "diff preview")
+			lines = append(lines, blockRows...)
+			index += consumed - 1
+			continue
+		}
 		switch {
 		case diffStatsPattern.MatchString(raw):
 			lines = append(lines, renderDiffStatsLine(raw, width, baseStyle)...)
@@ -1739,6 +2132,13 @@ func renderMarkdownBodyLines(value string, width int, baseStyle lipgloss.Style) 
 			quotePrefix = renderMarkdownQuotePrefix(quoteDepth)
 			raw = quoteContent
 			trimmed = strings.TrimSpace(quoteContent)
+		}
+
+		if !hasQuote && isMarkdownDiffBlockLine(raw) {
+			blockRows, consumed := renderMarkdownDiffTranscriptBlock(rawLines[index:], width, "diff preview")
+			lines = append(lines, blockRows...)
+			index += consumed - 1
+			continue
 		}
 
 		switch {
@@ -3587,9 +3987,11 @@ func (m *Model) renderApprovals(width, height int) string {
 	)
 	previewRendered := make([]string, 0, len(previewWindow.Lines))
 	for _, line := range previewWindow.Lines {
-		previewRendered = append(previewRendered, renderApprovalPreviewLines(line, bodyWidth)...)
+		previewRendered = append(previewRendered, renderApprovalPreviewLines(line, maxInt(1, bodyWidth-6))...)
 	}
-	bodyLines = append(bodyLines, renderScrollableBlock(previewRendered, bodyWidth, panelScrollState{
+	previewBlockWidth := maxInt(8, bodyWidth-2)
+	previewBlock := renderBorderedTranscriptBlock("approval preview", previewRendered, previewBlockWidth, approvalRequiredStyle)
+	bodyLines = append(bodyLines, renderScrollableBlock(previewBlock, bodyWidth, panelScrollState{
 		Offset:  previewWindow.Start,
 		Visible: minInt(previewWindow.Total, approvalPreviewPageLines),
 		Total:   previewWindow.Total,
@@ -4318,6 +4720,8 @@ func renderApprovalPreviewLines(line approvalPreviewLine, width int) []string {
 		switch strings.ToLower(keyPlain) {
 		case "path", "destination", "cwd":
 			valueStyle = approvalPathStyle
+		case "risk":
+			valueStyle = approvalRiskStyle(line.Val)
 		}
 		for index, row := range wrapped {
 			if index == 0 {

@@ -1129,6 +1129,9 @@ func TestApprovalPreviewLooksLikeTerminalDiff(t *testing.T) {
 	if !strings.Contains(plainView, "-   10 │") {
 		t.Fatalf("expected terminal diff remove gutter, got %q", view)
 	}
+	if !strings.Contains(plainView, "╭─ approval preview") {
+		t.Fatalf("expected approval preview bordered block, got %q", view)
+	}
 	if !strings.Contains(plainView, "KIND") || !strings.Contains(plainView, "PATH") || !strings.Contains(plainView, "CREATED") {
 		t.Fatalf("expected approval detail metadata and styled preview sections, got %q", view)
 	}

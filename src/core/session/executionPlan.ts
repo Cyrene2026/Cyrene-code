@@ -1,5 +1,6 @@
 import {
   WORKING_STATE_SECTION_ORDER,
+  getWorkingStateEntryText,
   parseWorkingStateSummary,
   type WorkingStateSectionMap,
   type WorkingStateSectionName,
@@ -322,6 +323,7 @@ const PLAN_BLOCKED_PREFIX = "Blocked plan step: ";
 const PLAN_ACCEPTED_PREFIX = "Execution plan accepted at ";
 
 const normalizePlanLinkedLine = (line: string) =>
+  getWorkingStateEntryText(line) ||
   line
     .trim()
     .replace(/^-\s+/, "")

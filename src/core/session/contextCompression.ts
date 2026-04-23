@@ -1,6 +1,6 @@
 import type { SessionMessage } from "./types";
 
-const clip = (text: string, max = 140) => {
+const clip = (text: string, max = 220) => {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) {
     return normalized;
@@ -10,8 +10,8 @@ const clip = (text: string, max = 140) => {
 
 export const compressContext = (
   messages: SessionMessage[],
-  recentKeep = 8,
-  maxBullets = 6
+  recentKeep = 10,
+  maxBullets = 10
 ) => {
   const head = messages.slice(0, Math.max(0, messages.length - recentKeep));
   const recent = messages.slice(-recentKeep);
@@ -29,4 +29,3 @@ export const compressContext = (
     recent,
   };
 };
-

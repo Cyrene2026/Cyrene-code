@@ -16,6 +16,30 @@ export type WorkingStateSectionMap = Partial<
   Record<WorkingStateSectionName, string[]>
 >;
 
+export type WorkingStateSourceRefKind =
+  | "tool_result"
+  | "error"
+  | "approval"
+  | "message"
+  | "memory"
+  | "plan"
+  | "note";
+
+export type WorkingStateSourceRef = {
+  kind: WorkingStateSourceRefKind;
+  label?: string;
+  path?: string;
+  startLine?: number;
+  endLine?: number;
+};
+
+export type WorkingStateEntry = {
+  text: string;
+  sourceRefs: WorkingStateSourceRef[];
+};
+
+const WORKING_STATE_REFS_PREFIX = "refs:";
+
 const asWorkingStateHeading = (
   line: string
 ): WorkingStateSectionName | null => {
@@ -76,6 +100,161 @@ const trimBlankEdges = (lines: string[]) => {
   return lines.slice(start, end);
 };
 
+const normalizeRefPath = (value: string) => value.trim().replace(/\\/g, "/");
+
+const isValidSourceRef = (value: unknown): value is WorkingStateSourceRef => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.kind !== "string" || !candidate.kind.trim()) {
+    return false;
+  }
+  if (candidate.label !== undefined && typeof candidate.label !== "string") {
+    return false;
+  }
+  if (candidate.path !== undefined && typeof candidate.path !== "string") {
+    return false;
+  }
+  if (
+    candidate.startLine !== undefined &&
+    (typeof candidate.startLine !== "number" || !Number.isFinite(candidate.startLine))
+  ) {
+    return false;
+  }
+  if (
+    candidate.endLine !== undefined &&
+    (typeof candidate.endLine !== "number" || !Number.isFinite(candidate.endLine))
+  ) {
+    return false;
+  }
+  return true;
+};
+
+const normalizeSourceRefs = (refs: WorkingStateSourceRef[]) => {
+  const deduped = new Map<string, WorkingStateSourceRef>();
+  for (const ref of refs) {
+    const normalized: WorkingStateSourceRef = {
+      kind: ref.kind,
+      label: ref.label?.trim() ?? "",
+      path: ref.path ? normalizeRefPath(ref.path) : undefined,
+      startLine:
+        typeof ref.startLine === "number" && Number.isFinite(ref.startLine)
+          ? Math.max(1, Math.trunc(ref.startLine))
+          : undefined,
+      endLine:
+        typeof ref.endLine === "number" && Number.isFinite(ref.endLine)
+          ? Math.max(1, Math.trunc(ref.endLine))
+          : undefined,
+    };
+    if (!normalized.kind.trim()) {
+      continue;
+    }
+    const key = JSON.stringify(normalized);
+    deduped.set(key, normalized);
+  }
+  return [...deduped.values()];
+};
+
+const parseSourceRefs = (raw: string): WorkingStateSourceRef[] => {
+  const payload = raw.trim();
+  if (!payload) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return normalizeSourceRefs(parsed.filter(isValidSourceRef));
+  } catch {
+    return [];
+  }
+};
+
+const formatSourceRefs = (refs: WorkingStateSourceRef[]) =>
+  JSON.stringify(normalizeSourceRefs(refs));
+
+export const parseWorkingStateEntry = (raw: string): WorkingStateEntry => {
+  const lines = raw
+    .split(/\r?\n/)
+    .map(line => line.trimEnd())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return {
+      text: "",
+      sourceRefs: [],
+    };
+  }
+
+  const [head = "", ...rest] = lines;
+  const text = head
+    .trim()
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    .trim();
+  const refs = rest.flatMap(line => {
+    const trimmed = line.trim();
+    if (!trimmed.toLowerCase().startsWith(WORKING_STATE_REFS_PREFIX)) {
+      return [];
+    }
+    return parseSourceRefs(trimmed.slice(WORKING_STATE_REFS_PREFIX.length));
+  });
+  return {
+    text,
+    sourceRefs: normalizeSourceRefs(refs),
+  };
+};
+
+export const renderWorkingStateEntry = (entry: WorkingStateEntry) => {
+  const text = entry.text.trim();
+  if (!text) {
+    return "";
+  }
+  const refs = normalizeSourceRefs(entry.sourceRefs);
+  if (refs.length === 0) {
+    return text;
+  }
+  return [text, `  ${WORKING_STATE_REFS_PREFIX} ${formatSourceRefs(refs)}`].join("\n");
+};
+
+export const getWorkingStateEntryText = (raw: string) => parseWorkingStateEntry(raw).text;
+
+export const getWorkingStateEntrySourceRefs = (raw: string) =>
+  parseWorkingStateEntry(raw).sourceRefs;
+
+export const attachWorkingStateSourceRefs = (
+  raw: string,
+  refs: WorkingStateSourceRef[]
+) => {
+  const parsed = parseWorkingStateEntry(raw);
+  return renderWorkingStateEntry({
+    text: parsed.text,
+    sourceRefs: [...parsed.sourceRefs, ...refs],
+  });
+};
+
+export const formatWorkingStateEntryForPrompt = (raw: string) => {
+  const parsed = parseWorkingStateEntry(raw);
+  if (!parsed.text) {
+    return "";
+  }
+  if (parsed.sourceRefs.length === 0) {
+    return parsed.text;
+  }
+  const refs = parsed.sourceRefs
+    .map(ref => {
+      const path =
+        ref.path && typeof ref.startLine === "number"
+          ? `${ref.path}#L${ref.startLine}${typeof ref.endLine === "number" ? `-L${ref.endLine}` : ""}`
+          : ref.path ?? "";
+      return [ref.kind, ref.label || "", path].filter(Boolean).join(" ");
+    })
+    .filter(Boolean)
+    .join("; ");
+  return refs ? `${parsed.text} [refs: ${refs}]` : parsed.text;
+};
+
 const renderSectionBody = (lines: string[]) => {
   const trimmed = trimBlankEdges(lines)
     .map(line => line.trimEnd())
@@ -83,6 +262,17 @@ const renderSectionBody = (lines: string[]) => {
     .trim();
 
   return trimmed || "(none)";
+};
+
+const REPAIRED_WORKING_STATE_SECTION_LIMITS: Record<WorkingStateSectionName, number> = {
+  OBJECTIVE: 1,
+  "CONFIRMED FACTS": 8,
+  CONSTRAINTS: 6,
+  COMPLETED: 8,
+  REMAINING: 6,
+  "KNOWN PATHS": 8,
+  "RECENT FAILURES": 6,
+  "NEXT BEST ACTIONS": 4,
 };
 
 const formatLegacyWorkingState = (text: string) => {
@@ -103,7 +293,7 @@ const formatLegacyWorkingState = (text: string) => {
   ].join("\n");
 };
 
-const clipSectionLine = (text: string, max = 220) => {
+const clipSectionLine = (text: string, max = 320) => {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) {
     return normalized;
@@ -125,10 +315,22 @@ const renderBulletWorkingState = (sections: WorkingStateSectionMap) =>
     if (lines.length === 0) {
       return `${section}:\n- (none)`;
     }
-    return `${section}:\n${lines.map(line => `- ${line}`).join("\n")}`;
+    return `${section}:\n${lines
+      .map(line => {
+        const rendered = renderWorkingStateEntry(parseWorkingStateEntry(line));
+        return rendered
+          ? rendered
+              .split("\n")
+              .map((entryLine, index) => (index === 0 ? `- ${entryLine}` : entryLine))
+              .join("\n")
+          : "";
+      })
+      .filter(Boolean)
+      .join("\n")}`;
   }).join("\n\n");
 
 const normalizeLooseBullet = (line: string) =>
+  getWorkingStateEntryText(line) ||
   line
     .trim()
     .replace(/^[-*+]\s+/, "")
@@ -170,9 +372,23 @@ export const parseWorkingStateSummary = (text: string): WorkingStateSectionMap =
   let currentSection: WorkingStateSectionName | null = null;
   let detectedSectionCount = 0;
 
+  let currentEntryLines: string[] = [];
+  const flushCurrentEntry = () => {
+    if (!currentSection || currentEntryLines.length === 0) {
+      currentEntryLines = [];
+      return;
+    }
+    const rendered = renderWorkingStateEntry(parseWorkingStateEntry(currentEntryLines.join("\n")));
+    if (rendered) {
+      sections.get(currentSection)?.push(rendered);
+    }
+    currentEntryLines = [];
+  };
+
   for (const rawLine of trimmed.split(/\r?\n/)) {
     const heading = asWorkingStateHeading(rawLine);
     if (heading) {
+      flushCurrentEntry();
       currentSection = heading;
       detectedSectionCount += 1;
       if (!sections.has(heading)) {
@@ -185,8 +401,24 @@ export const parseWorkingStateSummary = (text: string): WorkingStateSectionMap =
       continue;
     }
 
-    sections.get(currentSection)?.push(rawLine);
+    const trimmedLine = rawLine.trim();
+    if (!trimmedLine) {
+      flushCurrentEntry();
+      continue;
+    }
+    if (
+      currentEntryLines.length > 0 &&
+      trimmedLine.toLowerCase().startsWith(WORKING_STATE_REFS_PREFIX)
+    ) {
+      currentEntryLines.push(`  ${trimmedLine}`);
+      continue;
+    }
+
+    flushCurrentEntry();
+    currentEntryLines = [rawLine];
   }
+
+  flushCurrentEntry();
 
   if (detectedSectionCount === 0) {
     return {};
@@ -211,10 +443,19 @@ export const normalizeWorkingStateSummary = (text: string) => {
   }
 
   return WORKING_STATE_SECTION_ORDER.map(section => {
-    const body = renderSectionBody(
-      trimBlankEdges(parsed[section] ?? []).map(line => line.trimEnd())
-    );
-    return `${section}:\n${body}`;
+    const lines = parsed[section] ?? [];
+    if (lines.length === 0) {
+      return `${section}:\n(none)`;
+    }
+    return `${section}:\n${lines
+      .map(line => {
+        const rendered = renderWorkingStateEntry(parseWorkingStateEntry(line));
+        return rendered
+          .split("\n")
+          .map((entryLine, index) => (index === 0 ? `- ${entryLine}` : entryLine))
+          .join("\n");
+      })
+      .join("\n")}`;
   }).join("\n\n");
 };
 
@@ -252,7 +493,10 @@ export const repairWorkingStateSummary = (
       return;
     }
     const bucket = sections[section];
-    if (!bucket.includes(normalized) && bucket.length < 5) {
+    if (
+      !bucket.includes(normalized) &&
+      bucket.length < REPAIRED_WORKING_STATE_SECTION_LIMITS[section]
+    ) {
       bucket.push(normalized);
     }
   };

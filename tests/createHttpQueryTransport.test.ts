@@ -613,10 +613,8 @@ describe("createHttpQueryTransport tool exposure", () => {
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
-    expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
-      "file",
-      "maps_geo",
-    ]);
+    expect(requestBody.tools.map((tool: any) => tool.name)).toEqual(["file", "maps_geo"]);
+    expect(requestBody.tools[0]?.function).toBeUndefined();
     expect(requestBody.instructions).toContain("maps_geo");
   });
 
@@ -3497,6 +3495,8 @@ describe("createHttpQueryTransport streaming usage", () => {
         content: [{ type: "input_text", text: "hello" }],
       },
     ]);
+    expect(requestBody.tools[0]?.name).toBe("file");
+    expect(requestBody.tools[0]?.function).toBeUndefined();
     expect(requestBody.instructions).toBe(TOOL_USAGE_SYSTEM_PROMPT);
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "hello" }),
@@ -3511,6 +3511,89 @@ describe("createHttpQueryTransport streaming usage", () => {
         cachedTokens: 9,
         completionTokens: 5,
         totalTokens: 16,
+      }),
+      JSON.stringify({
+        type: "completion",
+        source: "provider",
+        reason: "response_status:completed",
+        detail: "The provider ended the response with status=completed.",
+        expected: true,
+      }),
+      JSON.stringify({ type: "done" }),
+    ]);
+  });
+
+  test("openai responses format retries without temperature when provider rejects it", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { detail: "Unsupported parameter: temperature" },
+          { status: 400 }
+        );
+      }
+      return new Response(
+        [
+          'data: {"type":"response.output_text.delta","delta":"hello"}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      requestTemperature: 0.35,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
+    expect(fetchCalls[1]?.url).toBe("https://example.test/v1/responses");
+    expect(JSON.parse(String(fetchCalls[0]?.init?.body)).temperature).toBe(0.35);
+    expect(JSON.parse(String(fetchCalls[1]?.init?.body)).temperature).toBeUndefined();
+    expect(events).toEqual([
+      JSON.stringify({ type: "text_delta", text: "hello" }),
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 3,
+        completionTokens: 2,
+        totalTokens: 5,
       }),
       JSON.stringify({
         type: "completion",

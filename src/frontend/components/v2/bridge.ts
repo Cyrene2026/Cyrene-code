@@ -53,6 +53,7 @@ import { normalizeProviderBaseUrl } from "../../../infra/http/createHttpQueryTra
 import {
   applyLocalFallbackStateUpdate,
   applyParsedStateUpdate,
+  applyToolResultPendingDigestUpdate,
   buildFallbackPendingDigest,
   parseAssistantStateUpdate,
 } from "../../../core/session/stateReducer";
@@ -79,6 +80,7 @@ import {
 } from "../../../application/chat/chatMcpSkillsFormatting";
 import { normalizeToolDisplayText } from "./toolDisplay";
 import { formatReadToolResultDisplay } from "./toolResultFormatting";
+import type { SessionMemoryInput } from "../../../core/session/memoryIndex";
 
 type BridgeCommand =
   | { type: "init"; root?: string }
@@ -443,6 +445,140 @@ const collectTrackedPaths = (toolInput: unknown, message: string) => {
   }
 
   return [...collected].slice(0, 8);
+};
+
+const TOOL_LOCATION_ANCHOR_PATTERN =
+  /([A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+(?::\d+)?(?:-\d+(?::\d+)?)?)/g;
+
+const toUnknownRecord = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const pickTrimmedUnknownString = (
+  record: Record<string, unknown> | null,
+  key: string
+) => {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+};
+
+const pickFiniteNumber = (record: Record<string, unknown> | null, key: string) => {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+};
+
+const getToolActionFromInput = (toolName: string, toolInput: unknown) => {
+  const record = toUnknownRecord(toolInput);
+  const action = pickTrimmedUnknownString(record, "action");
+  return action || toolName.trim();
+};
+
+const getToolWorkspacePath = (toolInput: unknown, toolMetadata?: unknown) => {
+  const inputRecord = toUnknownRecord(toolInput);
+  const metadataRecord = toUnknownRecord(toolMetadata);
+  const workspacePath = pickTrimmedUnknownString(metadataRecord, "workspacePath");
+  if (workspacePath) {
+    return normalizeTrackedPath(workspacePath);
+  }
+  const path = pickTrimmedUnknownString(inputRecord, "path");
+  return path ? normalizeTrackedPath(path) : "";
+};
+
+const getToolReadRangeLabel = (toolInput: unknown, toolMetadata?: unknown) => {
+  const inputRecord = toUnknownRecord(toolInput);
+  const metadataRecord = toUnknownRecord(toolMetadata);
+  const readRecord = toUnknownRecord(metadataRecord?.read);
+  const start =
+    pickFiniteNumber(readRecord, "startLine") ?? pickFiniteNumber(inputRecord, "startLine");
+  const end =
+    pickFiniteNumber(readRecord, "endLine") ?? pickFiniteNumber(inputRecord, "endLine");
+  if (typeof start !== "number" || typeof end !== "number") {
+    return "";
+  }
+  return `${start}-${end}`;
+};
+
+const extractToolLocationAnchor = (toolMessage: string) =>
+  toolMessage.match(TOOL_LOCATION_ANCHOR_PATTERN)?.[0] ?? "";
+
+const extractToolMessageDetail = (toolMessage: string) => {
+  const normalized = normalizeMcpMessage(toolMessage).text;
+  const lines = normalized
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  return lines[1] ?? lines[0] ?? "";
+};
+
+const buildToolMemoryInput = (params: {
+  toolName: string;
+  toolInput: unknown;
+  toolMessage: string;
+  toolMetadata?: unknown;
+}): SessionMemoryInput | null => {
+  const action = getToolActionFromInput(params.toolName, params.toolInput);
+  if (!action) {
+    return null;
+  }
+
+  const trackedPaths = collectTrackedPaths(params.toolInput, params.toolMessage);
+  const workspacePath = getToolWorkspacePath(params.toolInput, params.toolMetadata);
+  const primaryPath = workspacePath || trackedPaths[0] || "";
+  const readRange = getToolReadRangeLabel(params.toolInput, params.toolMetadata);
+  const locationAnchor = extractToolLocationAnchor(params.toolMessage);
+  const detail = clipBridgeLine(extractToolMessageDetail(params.toolMessage), 220);
+  const failed = /^\[tool error\]/i.test(params.toolMessage);
+
+  if (failed) {
+    const text = primaryPath
+      ? `${action} \`${primaryPath}\` 失败: ${detail || "工具调用失败"}`
+      : `${action} 失败: ${detail || "工具调用失败"}`;
+    return {
+      kind: "error",
+      text,
+      priority: 92,
+      entities: {
+        path: trackedPaths,
+        action: [action],
+        toolName: [params.toolName],
+        status: ["error"],
+      },
+      dedupeKey: [
+        "error",
+        action,
+        primaryPath || "none",
+        readRange || locationAnchor || detail || "error",
+      ].join(":"),
+    };
+  }
+
+  const text =
+    action === "read_range" && primaryPath && readRange
+      ? `read_range \`${primaryPath}\` 覆盖第 ${readRange} 行`
+      : locationAnchor
+        ? `${action} 命中 \`${locationAnchor}\``
+        : primaryPath
+          ? `${action} 涉及 \`${primaryPath}\``
+          : `tool ${action}: ${detail || "ok"}`;
+
+  return {
+    kind: "tool_result",
+    text,
+    priority: 78,
+    entities: {
+      path: trackedPaths,
+      action: [action],
+      toolName: [params.toolName],
+      status: ["ok"],
+    },
+    dedupeKey: [
+      "tool_result",
+      action,
+      primaryPath || "none",
+      readRange || locationAnchor || "ok",
+    ].join(":"),
+  };
 };
 
 const formatBridgeToolMessage = (raw: string): Pick<BridgeItem, "kind" | "text"> => {
@@ -1339,6 +1475,30 @@ export class BubbleTeaBridge {
   ) {
     await this.queueSessionMutation(sessionId, async () => {
       await this.sessionStore!.updateWorkingState(sessionId, state);
+    });
+  }
+
+  private async recordToolActivityMemory(
+    sessionId: string,
+    toolName: string,
+    toolInput: unknown,
+    toolMessage: string,
+    toolMetadata?: unknown
+  ) {
+    if (!this.sessionStore || !sessionId.trim() || !toolMessage.trim()) {
+      return;
+    }
+    const memoryInput = buildToolMemoryInput({
+      toolName,
+      toolInput,
+      toolMessage,
+      toolMetadata,
+    });
+    if (!memoryInput) {
+      return;
+    }
+    await this.queueSessionMutation(sessionId, async () => {
+      await this.sessionStore!.recordMemory(sessionId, memoryInput);
     });
   }
 
@@ -2956,6 +3116,14 @@ export class BubbleTeaBridge {
             toolInput: input,
             message: result.message,
           });
+          await this.applyToolResultPendingDigest(
+            session.id,
+            userText,
+            toolName,
+            input,
+            result.message,
+            result.metadata
+          );
           return { message: result.message, metadata: result.metadata };
         },
         onError: message => {
@@ -3294,6 +3462,49 @@ export class BubbleTeaBridge {
     await this.updateSessionPendingChoice(sessionId, nextPendingChoice);
   }
 
+  private async applyToolResultPendingDigest(
+    sessionId: string,
+    userText: string,
+    toolName: string,
+    toolInput: unknown,
+    toolMessage: string,
+    toolMetadata?: unknown
+  ) {
+    if (!this.sessionStore || !sessionId.trim() || !toolMessage.trim()) {
+      return;
+    }
+
+    const latest = await this.loadSessionAfterPendingMutations(sessionId);
+    if (!latest) {
+      return;
+    }
+
+    const applied = applyToolResultPendingDigestUpdate({
+      durableSummary: latest.summary,
+      pendingDigest: latest.pendingDigest,
+      userText,
+      toolName,
+      toolInput,
+      toolMessage,
+      toolMetadata,
+    });
+    await this.recordToolActivityMemory(
+      sessionId,
+      toolName,
+      toolInput,
+      toolMessage,
+      toolMetadata
+    );
+    if (!applied.updated) {
+      return;
+    }
+
+    await this.updateSessionWorkingState(sessionId, {
+      summary: applied.summary,
+      pendingDigest: applied.pendingDigest,
+    });
+  }
+
   private async finalizeAssistant(
     sessionId: string,
     assistantText: string,
@@ -3378,6 +3589,14 @@ export class BubbleTeaBridge {
     }
 
     this.suspended = null;
+    await this.applyToolResultPendingDigest(
+      suspended.sessionId,
+      suspended.userText,
+      target?.serverId ?? target?.request.action ?? "file",
+      target?.request,
+      result.message,
+      result.metadata
+    );
     this.startRequestTiming();
     const nextResult = await suspended.resume({
       message: result.message,

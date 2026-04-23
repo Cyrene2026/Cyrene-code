@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   applyParsedStateUpdate,
+  applyToolResultPendingDigestUpdate,
   buildFallbackPendingDigest,
   buildStateReducerPrompt,
   CYRENE_STATE_UPDATE_END_TAG,
@@ -148,6 +149,94 @@ describe("stateReducer", () => {
     expect(digest).toContain("KNOWN PATHS:\n- src/query.ts");
     expect(digest).not.toContain("我来看看这个项目");
     expect(digest).not.toContain("plain visible answer only");
+  });
+
+  test("applyToolResultPendingDigestUpdate persists read coverage and next action before assistant finalizes", () => {
+    const applied = applyToolResultPendingDigestUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      userText: "fix src/app.ts only",
+      toolName: "file",
+      toolInput: {
+        action: "read_range",
+        path: "src/app.ts",
+        startLine: 1,
+        endLine: 80,
+      },
+      toolMessage:
+        "[tool result] read_range src/app.ts\n1 | export const current = true;\n",
+      toolMetadata: {
+        kind: "file",
+        action: "read_range",
+        workspacePath: "src/app.ts",
+        read: {
+          mode: "range",
+          startLine: 1,
+          endLine: 80,
+        },
+      },
+    });
+
+    expect(applied.updated).toBe(true);
+    expect(applied.pendingDigest).toContain("OBJECTIVE:\n- fix src/app.ts only");
+    expect(applied.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 目标文件是 `src/app.ts`"
+    );
+    expect(applied.pendingDigest).toContain("`src/app.ts` 的已读范围是 `1-80`");
+    expect(applied.pendingDigest).toContain("COMPLETED:\n- 已确认读取 `src/app.ts` 第 1-80 行");
+    expect(applied.pendingDigest).toContain("KNOWN PATHS:\n- src/app.ts");
+    expect(applied.pendingDigest).toContain("NEXT BEST ACTIONS:\n- 直接编辑 `src/app.ts`");
+    expect(applied.pendingDigest).toContain(
+      'refs: [{"kind":"tool_result","label":"read_range","path":"src/app.ts","startLine":1,"endLine":80}]'
+    );
+  });
+
+  test("applyToolResultPendingDigestUpdate persists discovered target path from tool results", () => {
+    const applied = applyToolResultPendingDigestUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      userText: "split the output implementation into helper files",
+      toolName: "file",
+      toolInput: {
+        action: "search_text",
+        path: "src",
+        query: "output(",
+      },
+      toolMessage:
+        "[tool result] search_text src\nFound 1 match(es):\nsrc/output.ts:12 | export function output()",
+    });
+
+    expect(applied.updated).toBe(true);
+    expect(applied.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 目标文件是 `src/output.ts`"
+    );
+    expect(applied.pendingDigest).toContain("COMPLETED:\n- 已确认匹配路径 `src/output.ts`");
+    expect(applied.pendingDigest).toContain("KNOWN PATHS:\n- src/output.ts");
+    expect(applied.pendingDigest).toContain("NEXT BEST ACTIONS:\n- 查看 `src/output.ts`");
+  });
+
+  test("applyToolResultPendingDigestUpdate persists real tool failures immediately", () => {
+    const applied = applyToolResultPendingDigestUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      userText: "fix src/missing.ts only",
+      toolName: "file",
+      toolInput: {
+        action: "read_file",
+        path: "src/missing.ts",
+      },
+      toolMessage:
+        "[tool error] read_file src/missing.ts\nENOENT: no such file or directory, open 'src/missing.ts'",
+    });
+
+    expect(applied.updated).toBe(true);
+    expect(applied.pendingDigest).toContain(
+      "RECENT FAILURES:\n- read_file `src/missing.ts` 失败: ENOENT: no such file or directory"
+    );
+    expect(applied.pendingDigest).not.toContain("KNOWN PATHS:\n- src/missing.ts");
+    expect(applied.pendingDigest).not.toContain(
+      "NEXT BEST ACTIONS:\n- 改用更小的 read_range 或 search_text_context 查看 `src/missing.ts`"
+    );
   });
 
   test("sanitizeStoredWorkingState repairs polluted persisted state and drops unknown paths", () => {
@@ -396,6 +485,62 @@ describe("stateReducer", () => {
     );
   });
 
+  test("sanitizeStoredWorkingState converges absent directories against conflicting paths and steps", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: [
+        "CONFIRMED FACTS:",
+        "- src 目录不存在",
+        "- 入口文件是 `src/main.tsx`",
+        "",
+        "COMPLETED:",
+        "- 已确认读取 `src/main.tsx`",
+        "",
+        "KNOWN PATHS:",
+        "- src/main.tsx",
+        "- src/tasks.ts",
+        "",
+        "NEXT BEST ACTIONS:",
+        "- 直接编辑 `src/main.tsx`",
+      ].join("\n"),
+      pendingDigest: [
+        "CONFIRMED FACTS:",
+        "- src 目录不存在",
+        "",
+        "REMAINING:",
+        "- 查看 `src/tasks.ts`",
+        "",
+        "KNOWN PATHS:",
+        "- src/main.tsx",
+        "- src/tasks.ts",
+      ].join("\n"),
+    });
+
+    expect(sanitized.summary).toBe("");
+
+    expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:\n- 项目中不存在 `src` 目录");
+    expect(sanitized.pendingDigest).not.toContain("查看 `src/tasks.ts`");
+    expect(sanitized.pendingDigest).not.toContain("src/main.tsx");
+    expect(sanitized.pendingDigest).not.toContain("src/tasks.ts");
+  });
+
+  test("sanitizeStoredWorkingState reroutes unresolved gaps out of confirmed facts", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: "",
+      pendingDigest: [
+        "CONFIRMED FACTS:",
+        "- appendSystemPrompt 的最终落点未定位",
+        "- `appendSystemPrompt` 可能是最后注入点",
+      ].join("\n"),
+    });
+
+    expect(sanitized.pendingDigest).not.toContain("appendSystemPrompt 的最终落点未定位");
+    expect(sanitized.pendingDigest).not.toContain("可能是最后注入点");
+    expect(sanitized.pendingDigest).toContain(
+      "REMAINING:\n- 定位 appendSystemPrompt 的最终落点"
+    );
+    expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:\n- (none)");
+  });
+
   test("applyParsedStateUpdate keeps sparse rebuilt state in pendingDigest until durable baseline exists", () => {
     const applied = applyParsedStateUpdate({
       durableSummary: "",
@@ -431,6 +576,39 @@ describe("stateReducer", () => {
       "CONFIRMED FACTS:\n- 入口文件是 main.py"
     );
     expect(applied.pendingDigest).toContain("KNOWN PATHS:\n- main.py");
+  });
+
+  test("applyParsedStateUpdate keeps a larger pending digest before trimming", () => {
+    const applied = applyParsedStateUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      update: {
+        version: 1,
+        mode: "digest_only",
+        nextPendingDigest: {
+          "CONFIRMED FACTS": [
+            "模块 A 位于 `src/a.ts`",
+            "模块 B 位于 `src/b.ts`",
+            "模块 C 位于 `src/c.ts`",
+            "模块 D 位于 `src/d.ts`",
+          ],
+          "KNOWN PATHS": ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+          "NEXT BEST ACTIONS": [
+            "查看 `src/a.ts` 的导出",
+            "查看 `src/b.ts` 的导出",
+            "查看 `src/c.ts` 的导出",
+            "查看 `src/d.ts` 的导出",
+          ],
+        },
+      },
+    });
+
+    expect(applied.pendingDigest).toContain("模块 A 位于 `src/a.ts`");
+    expect(applied.pendingDigest).toContain("模块 D 位于 `src/d.ts`");
+    expect(applied.pendingDigest).toContain(
+      "KNOWN PATHS:\n- src/a.ts\n- src/b.ts\n- src/c.ts\n- src/d.ts"
+    );
+    expect(applied.pendingDigest).toContain("- 查看 `src/d.ts` 的导出");
   });
 
   test("parseAssistantStateUpdate ignores literal state tags inside inline code spans", () => {

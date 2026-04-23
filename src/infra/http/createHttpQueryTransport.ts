@@ -296,6 +296,20 @@ const formatHttpFailure = async (
     : `${label}: ${response.status} ${response.statusText} | url ${resolvedUrl}`;
 };
 
+const isUnsupportedTemperatureFailureDetail = (detail: string | null) => {
+  if (!detail) {
+    return false;
+  }
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("temperature") &&
+    (normalized.includes("unsupported parameter") ||
+      normalized.includes("unknown parameter") ||
+      normalized.includes("does not support") ||
+      normalized.includes("not support"))
+  );
+};
+
 export const FILE_TOOL = {
   type: "function",
   function: {
@@ -699,6 +713,13 @@ type OpenAIFunctionTool = {
   };
 };
 
+type OpenAIResponsesFunctionTool = {
+  type: "function";
+  name: string;
+  description?: string;
+  parameters: unknown;
+};
+
 const FILE_ACTION_NAMES = new Set<string>([
   "read_file",
   "read_files",
@@ -792,6 +813,16 @@ const buildDynamicFunctionTools = (
 
   return tools;
 };
+
+const buildOpenAIResponsesTools = (
+  mcpTools: McpToolDescriptor[]
+): OpenAIResponsesFunctionTool[] =>
+  buildDynamicFunctionTools(mcpTools).map(tool => ({
+    type: tool.type,
+    name: tool.function.name,
+    ...(tool.function.description ? { description: tool.function.description } : {}),
+    parameters: tool.function.parameters,
+  }));
 
 const buildGeminiFunctionTools = (mcpTools: McpToolDescriptor[]) => ({
   functionDeclarations: buildDynamicFunctionTools(mcpTools).map(tool => ({
@@ -2206,6 +2237,25 @@ const buildOpenAIResponsesInput = (
   },
 ];
 
+const buildOpenAIResponsesRequestBody = (options: {
+  model: string;
+  input: QueryInput;
+  attachments: EncodedImageAttachment[];
+  temperature?: number;
+  systemPrompt?: string;
+  mcpTools: McpToolDescriptor[];
+}) => ({
+  model: options.model,
+  ...(typeof options.temperature === "number"
+    ? { temperature: options.temperature }
+    : {}),
+  stream: true,
+  tool_choice: "auto" as const,
+  tools: buildOpenAIResponsesTools(options.mcpTools),
+  instructions: options.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+  input: buildOpenAIResponsesInput(options.input, options.attachments),
+});
+
 const buildGeminiUserParts = (
   input: QueryInput,
   attachments: EncodedImageAttachment[]
@@ -2660,15 +2710,25 @@ async function* streamSseOpenAIResponses(
     headers["x-goog-api-key"] = apiKey;
   }
 
-  const body = JSON.stringify({
-    model,
-    temperature: options?.temperature ?? 0.2,
-    stream: true,
-    tool_choice: "auto",
-    tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
-    instructions: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
-    input: buildOpenAIResponsesInput(input, attachments),
-  });
+  const requestBodyWithTemperature = JSON.stringify(
+    buildOpenAIResponsesRequestBody({
+      model,
+      input,
+      attachments,
+      temperature: options?.temperature ?? 0.2,
+      systemPrompt: options?.systemPrompt,
+      mcpTools: options?.mcpTools ?? [],
+    })
+  );
+  const requestBodyWithoutTemperature = JSON.stringify(
+    buildOpenAIResponsesRequestBody({
+      model,
+      input,
+      attachments,
+      systemPrompt: options?.systemPrompt,
+      mcpTools: options?.mcpTools ?? [],
+    })
+  );
   const candidateUrls = resolveResponsesUrls(
     baseUrl,
     options?.endpointOverride
@@ -2677,7 +2737,7 @@ async function* streamSseOpenAIResponses(
   let response = await fetch(attemptedUrl, {
     method: "POST",
     headers,
-    body,
+    body: requestBodyWithTemperature,
   });
 
   if (
@@ -2692,8 +2752,19 @@ async function* streamSseOpenAIResponses(
     response = await fetch(attemptedUrl, {
       method: "POST",
       headers,
-      body,
+      body: requestBodyWithTemperature,
     });
+  }
+
+  if (!response.ok && requestBodyWithTemperature !== requestBodyWithoutTemperature) {
+    const failureDetail = await readHttpFailureDetail(response.clone());
+    if (isUnsupportedTemperatureFailureDetail(failureDetail)) {
+      response = await fetch(attemptedUrl, {
+        method: "POST",
+        headers,
+        body: requestBodyWithoutTemperature,
+      });
+    }
   }
 
   if (!response.ok || !response.body) {

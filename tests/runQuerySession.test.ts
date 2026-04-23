@@ -2278,11 +2278,116 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
     expect(result.status).toBe("completed");
     expect(toolCalls).toEqual(["read_file"]);
     expect(prompts[1]).toContain("write focus: pre_mutation");
+    expect(prompts[1]).toContain("enough_to_act paths: src/app.ts");
     expect(prompts[1]).toContain(
-      "use at most one targeted source read, then move directly to the next write/edit step"
+      "enough facts already exist for the actionable path; stop reading it and move directly to edit/write/apply_patch"
     );
     expect(prompts[2]).toContain("[tool skipped] read_file src/app.ts");
-    expect(prompts[2]).toContain("Reuse the previous read result or move to the next concrete file");
+    expect(prompts[2]).toContain(
+      "this path is already marked enough_to_act for the current write task"
+    );
+  });
+
+  test("single-file write focus blocks a second read_range before any mutation", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/app.ts", startLine: 1, endLine: 80 },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/app.ts", startLine: 81, endLine: 160 },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "fix src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] read_range src/app.ts\n1 | export const current = true;\n",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["read_range"]);
+    expect(prompts[1]).toContain("write focus: pre_mutation");
+    expect(prompts[1]).toContain("enough_to_act paths: src/app.ts");
+    expect(prompts[2]).toContain("[tool skipped] read_range src/app.ts");
+    expect(prompts[2]).toContain(
+      "this path is already marked enough_to_act for the current write task"
+    );
+  });
+
+  test("write focus marks discovered paths enough_to_act after the first concrete read", async () => {
+    const { transport, prompts } = createPromptCaptureRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "search_text", path: "src", query: "output(" },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/output.ts", startLine: 1, endLine: 80 },
+      },
+      {
+        toolName: "file",
+        input: { action: "read_range", path: "src/output.ts", startLine: 81, endLine: 160 },
+      },
+      null,
+    ]);
+    const toolCalls: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "split the output implementation into helper files",
+      transport,
+      onState: () => {},
+      onTextDelta: () => {},
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        if (action === "search_text") {
+          return {
+            message:
+              "[tool result] search_text src\nFound 1 match(es):\nsrc/output.ts:12 | export function output()",
+          };
+        }
+        return {
+          message:
+            "[tool result] read_range src/output.ts\n1 | export function output() {\n2 |   return true;\n",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["search_text", "read_range"]);
+    expect(prompts[2]).toContain("enough_to_act paths: src/output.ts");
+    expect(prompts[2]).toContain(
+      "directive: enough facts already exist for the actionable path; stop reading it and move directly to edit/write/apply_patch"
+    );
+    expect(prompts[3]).toContain("[tool skipped] read_range src/output.ts");
+    expect(prompts[3]).toContain(
+      "this path is already marked enough_to_act for the current write task"
+    );
+    expect(prompts[3]).toContain(
+      "Use edit/write/apply_patch on this path now instead of collecting more source reads."
+    );
   });
 
   test("broad discovery blocks after budget when a split task still lacks concrete facts", async () => {
@@ -2443,6 +2548,122 @@ test("suspended resume is one-shot and does not re-enter rounds twice", async ()
       "The previous reply narrated progress before taking a concrete code step."
     );
     expect(prompts[1]).toContain("Do not narrate. Use the next concrete read/edit/write action now.");
+  });
+
+  test("long repetitive self-narration auto-continues before the next concrete write step", async () => {
+    const repetitiveText = Array(6)
+      .fill("Let me read the current state of the file before writing. ")
+      .join("");
+    const { transport, prompts } = createPromptCaptureScriptedTransport([
+      [{ type: "text_delta", text: repetitiveText }],
+      [
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "done" }],
+    ]);
+    const toolCalls: string[] = [];
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] write_file src/app.ts\nWrote file: src/app.ts\n[confirmed file mutation] write_file src/app.ts",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain(
+      "The previous reply narrated progress before taking a concrete code step."
+    );
+    expect(textDeltas.join("")).toContain("done");
+  });
+
+  test("late tool call is not dropped after suppressed repetitive self-narration", async () => {
+    const repetitiveText = Array(6)
+      .fill("Let me read the current state of the file before writing. ")
+      .join("");
+    const { transport } = createPromptCaptureScriptedTransport([
+      [
+        { type: "text_delta", text: repetitiveText },
+        {
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "write_file", path: "src/app.ts", content: "patched\n" },
+        },
+      ],
+      [{ type: "text_delta", text: "done" }],
+    ]);
+    const toolCalls: string[] = [];
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async (_toolName, input) => {
+        const action =
+          input && typeof input === "object" && "action" in (input as Record<string, unknown>)
+            ? String((input as Record<string, unknown>).action)
+            : "unknown";
+        toolCalls.push(action);
+        return {
+          message: "[tool result] write_file src/app.ts\nWrote file: src/app.ts\n[confirmed file mutation] write_file src/app.ts",
+        };
+      },
+      onError: () => {},
+    });
+
+    const letMeCount = (textDeltas.join("").match(/Let me read the current state/gi) ?? []).length;
+    expect(result.status).toBe("completed");
+    expect(toolCalls).toEqual(["write_file"]);
+    expect(letMeCount).toBeLessThan(6);
+    expect(textDeltas.join("")).toContain("done");
+  });
+
+  test("write focus streams text deltas incrementally instead of batching a whole round", async () => {
+    const { transport } = createPromptCaptureScriptedTransport([
+      [{ type: "text_delta", text: "先看一下" }, { type: "text_delta", text: "，然后修改" }],
+    ]);
+    const textDeltas: string[] = [];
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "update src/app.ts only",
+      transport,
+      onState: () => {},
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => ({ message: "ok" }),
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(textDeltas).toEqual(["先看一下", "，然后修改"]);
   });
 
   test("a second short non-progress chatter stops with an explicit remaining-files pause message", async () => {

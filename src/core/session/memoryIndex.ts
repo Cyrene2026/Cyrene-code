@@ -3,6 +3,8 @@ import type { SessionInFlightTurn } from "./types";
 import type { SessionExecutionPlan } from "./types";
 import type { ReducerMode } from "./stateReducer";
 import {
+  getWorkingStateEntrySourceRefs,
+  getWorkingStateEntryText,
   WORKING_STATE_SECTION_ORDER,
   parseWorkingStateSummary,
   type WorkingStateSectionMap,
@@ -91,8 +93,8 @@ const SUMMARY_LINE_LIMIT = 5;
 const MEMORY_COMPACTION_HARD_LIMIT = 140;
 const MEMORY_COMPACTION_TARGET_SIZE = 140;
 const MEMORY_COMPACTION_RECENT_KEEP = 36;
-const DEFAULT_ARCHIVE_SECTION_LIMIT = 2;
-const KNOWN_PATH_ARCHIVE_LIMIT = 4;
+const DEFAULT_ARCHIVE_SECTION_LIMIT = 4;
+const KNOWN_PATH_ARCHIVE_LIMIT = 8;
 const LOW_SIGNAL_TASK_PATTERN =
   /^(?:ok(?:ay)?|sure|yes|yep|go|thanks?|thank you|cool|nice|good|done|来吧?|好(?:的)?|行|可以|收到|嗯|开始吧?|继续)$/iu;
 const PROCESS_NARRATION_PATTERN =
@@ -867,9 +869,19 @@ const buildWorkingStateSignalTokens = (
 
   for (const section of WORKING_STATE_SECTION_ORDER) {
     const lines = [...(parsed[section] ?? []), ...(pendingParsed[section] ?? [])];
-    const joined = lines.join(" ");
+    const joined = lines
+      .map(line => getWorkingStateEntryText(line))
+      .filter(Boolean)
+      .join(" ");
+    const refPaths = lines.flatMap(line =>
+      getWorkingStateEntrySourceRefs(line)
+        .map(ref => ref.path?.trim().replace(/\\/g, "/") ?? "")
+        .filter(Boolean)
+    );
     tokensBySection[section] = tokenizeText(joined, 18);
-    pathsBySection[section] = collectPathCandidates(joined);
+    pathsBySection[section] = Array.from(
+      new Set([...collectPathCandidates(joined), ...refPaths])
+    );
   }
 
   return {
@@ -1139,7 +1151,7 @@ export const getPromptContextFromMemoryIndex = (
     summaryRecoveryNeeded?: boolean;
     interruptedTurn?: SessionInFlightTurn | null;
   },
-  relevantLimit = 6
+  relevantLimit = 10
 ): SessionPromptContext => {
   const queryTokens = tokenizeText(query);
   const queryPaths = collectPathCandidates(query);

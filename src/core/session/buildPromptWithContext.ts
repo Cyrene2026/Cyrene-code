@@ -6,6 +6,8 @@ import {
 } from "./executionPlan";
 import { buildStateReducerPrompt } from "./stateReducer";
 import {
+  formatWorkingStateEntryForPrompt,
+  getWorkingStateEntryText,
   normalizeWorkingStateSummary,
   parseWorkingStateSummary,
   WORKING_STATE_SECTION_ORDER,
@@ -70,6 +72,7 @@ const clipPromptLine = (text: string, max = PROMPT_RECENT_TEXT_LIMIT) => {
 };
 
 const stripBulletPrefix = (text: string) =>
+  getWorkingStateEntryText(text) ||
   text
     .trim()
     .replace(/^[-*+]\s+/, "")
@@ -131,12 +134,15 @@ const clipWorkingStateForPrompt = (
   }
 
   const rendered = WORKING_STATE_SECTION_ORDER.map(section => {
-    const sourceLines = (parsed[section] ?? [])
-      .map(stripBulletPrefix)
-      .filter(line => Boolean(line) && line !== "(none)");
+    const sourceLines = (parsed[section] ?? []).filter(line => {
+      const text = stripBulletPrefix(line);
+      return Boolean(text) && text !== "(none)";
+    });
     const limitedLines = sourceLines
       .slice(0, PROMPT_WORKING_STATE_ITEM_LIMITS[section])
-      .map(line => clipPromptLine(line, PROMPT_WORKING_STATE_LINE_LIMIT));
+      .map(line =>
+        clipPromptLine(formatWorkingStateEntryForPrompt(line), PROMPT_WORKING_STATE_LINE_LIMIT)
+      );
     const truncated = sourceLines.length > limitedLines.length;
     const bodyLines =
       limitedLines.length > 0

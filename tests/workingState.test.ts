@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatWorkingStateEntryForPrompt,
+  parseWorkingStateEntry,
   normalizeWorkingStateSummary,
   parseWorkingStateSummary,
   repairWorkingStateSummary,
@@ -44,5 +46,32 @@ describe("workingState", () => {
     expect(repaired).toContain("KNOWN PATHS:\n- src/app.ts");
     expect(repaired).not.toContain("OBJECTIVE:\n- do x");
     expect(repaired).not.toContain("CONFIRMED FACTS:\n- do x");
+  });
+
+  test("parses source refs attached to working-state entries", () => {
+    const parsed = parseWorkingStateSummary(
+      [
+        "CONFIRMED FACTS:",
+        '- 目标文件是 `src/app.ts`',
+        '  refs: [{"kind":"tool_result","label":"read_range","path":"src/app.ts","startLine":41,"endLine":80}]',
+      ].join("\n")
+    );
+
+    const first = parsed["CONFIRMED FACTS"]?.[0] ?? "";
+    const entry = parseWorkingStateEntry(first);
+
+    expect(entry.text).toBe("目标文件是 `src/app.ts`");
+    expect(entry.sourceRefs).toEqual([
+      {
+        kind: "tool_result",
+        label: "read_range",
+        path: "src/app.ts",
+        startLine: 41,
+        endLine: 80,
+      },
+    ]);
+    expect(formatWorkingStateEntryForPrompt(first)).toContain(
+      "[refs: tool_result read_range src/app.ts#L41-L80]"
+    );
   });
 });

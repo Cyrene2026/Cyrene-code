@@ -1,4 +1,5 @@
 import {
+  getWorkingStateEntryText,
   normalizeWorkingStateSummary,
   parseWorkingStateSummary,
   type WorkingStateSectionMap,
@@ -121,6 +122,7 @@ const SKILL_RELATED_SIGNAL =
   /\bskill\b|skills\.ya?ml|cyrene_skill|\/skills?\s+create|生成.?skill|创建.?skill|技能/iu;
 
 const stripBullet = (line: string) =>
+  getWorkingStateEntryText(line) ||
   line
     .trim()
     .replace(/^[-*+]\s+/, "")

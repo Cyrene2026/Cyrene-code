@@ -921,6 +921,29 @@ describe("FileMcpService", () => {
     );
   });
 
+  test("read_file missing path returns workspace-aware recovery guidance", async () => {
+    const { root, service } = await createService();
+    await mkdir(join(root, ".hermes", "agent"), { recursive: true });
+
+    const result = await service.handleToolCall("file", {
+      action: "read_file",
+      path: ".hermes/agent/memory_provider.py",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("[tool error] read_file .hermes/agent/memory_provider.py");
+    expect(result.message).toContain(
+      "Path not found inside workspace: .hermes/agent/memory_provider.py"
+    );
+    expect(result.message).toContain(`workspace_root: ${root.replace(/\\/g, "/")}`);
+    expect(result.message).toContain(
+      `resolved_path: ${join(root, ".hermes", "agent", "memory_provider.py").replace(/\\/g, "/")}`
+    );
+    expect(result.message).toContain("nearest_existing_parent: .hermes/agent");
+    expect(result.message).toContain("use list_dir on the nearest existing parent");
+    expect(result.message).toContain("original_error: ENOENT");
+  });
+
   test("list_dir confirms directory state in result output", async () => {
     const { root, service } = await createService();
     await mkdir(join(root, "test_files"), { recursive: true });

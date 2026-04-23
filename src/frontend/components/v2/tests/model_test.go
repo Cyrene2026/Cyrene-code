@@ -1218,15 +1218,38 @@ func TestComposerUsesTextareaCursorRendering(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
 
 	rendered := model.RenderComposerForTest(40)
+	plainRendered := ansiPattern.ReplaceAllString(rendered, "")
 
-	if !strings.Contains(rendered, "hello") {
+	if !strings.Contains(plainRendered, "hello") {
 		t.Fatalf("expected composer textarea to render input text, got %q", rendered)
 	}
-	if strings.Contains(rendered, "hello|") {
+	if strings.Contains(plainRendered, "hello|") {
 		t.Fatalf("expected composer textarea to stop rendering pipe cursor, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "48;2;22;27;34") {
 		t.Fatalf("expected composer to render with gray background, got %q", rendered)
+	}
+}
+
+func TestComposerKeepsBackgroundColorOnTypedText(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+
+	rendered := model.RenderComposerForTest(40)
+	lineWithInput := ""
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.Contains(ansiPattern.ReplaceAllString(line, ""), "hello") {
+			lineWithInput = line
+			break
+		}
+	}
+	if lineWithInput == "" {
+		t.Fatalf("expected rendered composer line containing input, got %q", rendered)
+	}
+	if strings.Count(lineWithInput, "48;2;22;27;34") < 2 {
+		t.Fatalf("expected typed text to keep composer background after prompt styling reset, got %q", lineWithInput)
 	}
 }
 

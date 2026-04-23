@@ -82,6 +82,11 @@ const TARGETED_SOURCE_READ_ACTIONS = new Set([
   "read_yaml",
 ]);
 
+const ACTIONABLE_PRE_MUTATION_ACTIONS = new Set([
+  ...TARGETED_SOURCE_READ_ACTIONS,
+  "outline_file",
+]);
+
 const PROJECT_ANALYSIS_HIGH_SIGNAL_ACTIONS = new Set([
   "read_file",
   "read_range",
@@ -148,6 +153,12 @@ const PROJECT_ANALYSIS_TASK_PATTERN =
 
 const NON_PROGRESS_CHATTER_PATTERN =
   /(继续拆分|继续补齐|我来继续|再看一下|继续完善|继续处理|继续剩余|继续模块化|i(?:'| wi)ll continue|let me continue|continue splitting|continue with the remaining|keep going with the remaining)/i;
+
+const SELF_NARRATION_MARKER_PATTERN =
+  /\b(?:let me|i(?:'ll| will)|i should|i need to)\b|(?:我来|我先|让我|我会|先看|先读|先检查|看一下|读一下|继续看|继续读)/giu;
+
+const LONG_REPETITIVE_CHATTER_VISIBLE_CHAR_THRESHOLD = 140;
+const LONG_REPETITIVE_CHATTER_MARKER_THRESHOLD = 3;
 
 const getToolAction = (toolName: string, input: unknown) => {
   if (
@@ -597,6 +608,10 @@ const createUncertaintyState = (
     nonProgressAutoContinueCount: 0,
     explicitSourceReads: new Set<string>(),
     explicitTaskPaths: new Set(extractExplicitTaskPaths(task)),
+    enoughToActPaths: new Set<string>(),
+    targetedReadStreakPath: null,
+    targetedReadStreakCount: 0,
+    stalledTargetedReadPaths: new Set<string>(),
     verifyRequested: taskSuggestsPostWriteVerification(task),
     blockedReason: null,
   };
@@ -632,6 +647,28 @@ const formatExecutionState = (
     );
     if (explicitPaths.length > 0) {
       lines.push(`explicit task paths: ${formatPathList(explicitPaths, 4)}`);
+    }
+    if (
+      !uncertainty.mutationStarted &&
+      uncertainty.enoughToActPaths.size > 0
+    ) {
+      lines.push(
+        `enough_to_act paths: ${formatPathList(
+          Array.from(uncertainty.enoughToActPaths).sort(),
+          4
+        )}`
+      );
+    }
+    if (
+      !uncertainty.mutationStarted &&
+      uncertainty.stalledTargetedReadPaths.size > 0
+    ) {
+      lines.push(
+        `stalled read paths: ${formatPathList(
+          Array.from(uncertainty.stalledTargetedReadPaths).sort(),
+          4
+        )}`
+      );
     }
   }
 
@@ -685,7 +722,11 @@ const formatExecutionState = (
     uncertainty.phase !== "blocked"
   ) {
     lines.push(
-      "directive: use at most one targeted source read, then move directly to the next write/edit step"
+      uncertainty.enoughToActPaths.size > 0
+        ? "directive: enough facts already exist for the actionable path; stop reading it and move directly to edit/write/apply_patch"
+        : uncertainty.stalledTargetedReadPaths.size > 0
+        ? "directive: stop rereading stalled paths; switch to outline_file/search_text_context or a smaller read_range around the suspected lines"
+        : "directive: use at most one targeted source read, then move directly to the next write/edit step"
     );
   } else if (
     uncertainty.writeFocus &&
@@ -854,6 +895,22 @@ const shouldAllowTargetedSourceRead = (
     getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
   );
 
+  if (
+    uncertainty.writeFocus &&
+    !uncertainty.mutationStarted &&
+    uncertainty.enoughToActPaths.has(normalizedPath)
+  ) {
+    return false;
+  }
+
+  if (
+    uncertainty.writeFocus &&
+    !uncertainty.mutationStarted &&
+    uncertainty.stalledTargetedReadPaths.has(normalizedPath)
+  ) {
+    return false;
+  }
+
   if (uncertainty.writeFocus && !uncertainty.mutationStarted && !uncertainty.verifyRequested) {
     const pathIsConcreteTarget =
       uncertainty.explicitTaskPaths.has(normalizedPath) ||
@@ -896,6 +953,102 @@ const maybeMarkExplicitSourceRead = (
   const normalizedPath = normalizeComparedPath(path);
   if (uncertainty.explicitTaskPaths.has(normalizedPath)) {
     uncertainty.explicitSourceReads.add(normalizedPath);
+  }
+};
+
+const resetEnoughToActState = (uncertainty: UncertaintyState) => {
+  uncertainty.enoughToActPaths.clear();
+};
+
+const resetTargetedReadFailureTracking = (uncertainty: UncertaintyState) => {
+  uncertainty.targetedReadStreakPath = null;
+  uncertainty.targetedReadStreakCount = 0;
+  uncertainty.stalledTargetedReadPaths.clear();
+};
+
+const maybeMarkEnoughToActPath = (
+  uncertainty: UncertaintyState,
+  toolName: string,
+  input: unknown,
+  message: string,
+  searchMemory: SearchMemory,
+  accumulatedToolResults: string[],
+  roundToolResults: string[]
+) => {
+  if (
+    !uncertainty.writeFocus ||
+    uncertainty.mutationStarted ||
+    uncertainty.verifyRequested ||
+    message.startsWith("[tool error]")
+  ) {
+    return;
+  }
+
+  const action = getToolAction(toolName, input);
+  if (!ACTIONABLE_PRE_MUTATION_ACTIONS.has(action)) {
+    return;
+  }
+
+  const path = getToolPath(input);
+  if (!path) {
+    return;
+  }
+  const normalizedPath = normalizeComparedPath(path);
+  if (!normalizedPath || !isLikelySemanticSourcePath(normalizedPath)) {
+    return;
+  }
+
+  const recentlyDiscovered = new Set(
+    getRecentDiscoveredPaths(accumulatedToolResults, roundToolResults)
+  );
+  const isConcreteTarget =
+    uncertainty.explicitTaskPaths.has(normalizedPath) ||
+    searchMemory.discoveredPaths.has(normalizedPath) ||
+    recentlyDiscovered.has(normalizedPath);
+  if (!isConcreteTarget) {
+    return;
+  }
+
+  uncertainty.enoughToActPaths.add(normalizedPath);
+};
+
+const updateTargetedReadFailureTracking = (
+  uncertainty: UncertaintyState,
+  toolName: string,
+  input: unknown
+) => {
+  if (!uncertainty.writeFocus || uncertainty.mutationStarted || uncertainty.verifyRequested) {
+    return;
+  }
+
+  if (!isTargetedSourceReadAction(toolName, input)) {
+    uncertainty.targetedReadStreakPath = null;
+    uncertainty.targetedReadStreakCount = 0;
+    return;
+  }
+
+  const path = getToolPath(input);
+  if (!path) {
+    uncertainty.targetedReadStreakPath = null;
+    uncertainty.targetedReadStreakCount = 0;
+    return;
+  }
+  const normalizedPath = normalizeComparedPath(path);
+  if (!normalizedPath) {
+    uncertainty.targetedReadStreakPath = null;
+    uncertainty.targetedReadStreakCount = 0;
+    return;
+  }
+
+  if (uncertainty.targetedReadStreakPath === normalizedPath) {
+    uncertainty.targetedReadStreakCount += 1;
+  } else {
+    uncertainty.targetedReadStreakPath = normalizedPath;
+    uncertainty.targetedReadStreakCount = 1;
+  }
+
+  if (uncertainty.targetedReadStreakCount >= 2) {
+    uncertainty.stalledTargetedReadPaths.add(normalizedPath);
   }
 };
 
@@ -1067,6 +1220,23 @@ const buildImplicitProviderDoneCompletion = (): QueryCompletionEvent => ({
   expected: false,
 });
 
+const countPatternMatches = (text: string, pattern: RegExp) => {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const matcher = new RegExp(pattern.source, flags);
+  return Array.from(text.matchAll(matcher)).length;
+};
+
+const isLongRepetitiveSelfNarration = (assistantText: string) => {
+  const visibleChars = assistantText.replace(/\s+/g, "").length;
+  if (visibleChars < LONG_REPETITIVE_CHATTER_VISIBLE_CHAR_THRESHOLD) {
+    return false;
+  }
+  return (
+    countPatternMatches(assistantText, SELF_NARRATION_MARKER_PATTERN) >=
+    LONG_REPETITIVE_CHATTER_MARKER_THRESHOLD
+  );
+};
+
 const shouldAutoContinueNonProgress = (
   assistantText: string,
   uncertainty: UncertaintyState,
@@ -1075,6 +1245,7 @@ const shouldAutoContinueNonProgress = (
   const visibleChars = assistantText.replace(/\s+/g, "").length;
   const autoContinueLimit =
     uncertainty.writeFocus && !uncertainty.mutationStarted ? 2 : 1;
+  const repetitiveSelfNarration = isLongRepetitiveSelfNarration(assistantText);
   return (
     ((uncertainty.mode === "simple_multi_file" &&
       uncertainty.phase === "execute" &&
@@ -1082,8 +1253,9 @@ const shouldAutoContinueNonProgress = (
       (uncertainty.writeFocus && !uncertainty.mutationStarted)) &&
     !uncertainty.blockedReason &&
     visibleChars > 0 &&
-    visibleChars < MAX_NON_PROGRESS_CHATTER_CHARS &&
-    NON_PROGRESS_CHATTER_PATTERN.test(assistantText) &&
+    ((visibleChars < MAX_NON_PROGRESS_CHATTER_CHARS &&
+      NON_PROGRESS_CHATTER_PATTERN.test(assistantText)) ||
+      repetitiveSelfNarration) &&
     uncertainty.nonProgressAutoContinueCount < autoContinueLimit
   );
 };
@@ -1341,6 +1513,8 @@ const runExecutionRuntime = async ({
     );
     if (confirmedFileMutation) {
       uncertainty.mutationStarted = true;
+      resetEnoughToActState(uncertainty);
+      resetTargetedReadFailureTracking(uncertainty);
       recentConfirmedFileMutations =
         ToolObservationStore.pushRecentConfirmedFileMutation(
           recentConfirmedFileMutations,
@@ -1361,6 +1535,16 @@ const runExecutionRuntime = async ({
           ? "verify"
           : "execute";
     } else {
+      maybeMarkEnoughToActPath(
+        uncertainty,
+        toolName,
+        input,
+        message,
+        searchMemory,
+        accumulatedToolResults,
+        roundToolResults
+      );
+      updateTargetedReadFailureTracking(uncertainty, toolName, input);
       maybeAdvanceUncertaintyAfterToolResult(
         uncertainty,
         toolName,
@@ -1372,7 +1556,8 @@ const runExecutionRuntime = async ({
         uncertainty.writeFocus &&
         !uncertainty.mutationStarted &&
         uncertainty.phase === "discover" &&
-        uncertainty.explicitSourceReads.size > 0
+        (uncertainty.explicitSourceReads.size > 0 ||
+          uncertainty.enoughToActPaths.size > 0)
       ) {
         uncertainty.phase = "collapse";
       }
@@ -1414,12 +1599,8 @@ const runExecutionRuntime = async ({
     let latestCompletion: QueryCompletionEvent | null = null;
     let implicitProviderDonePending = false;
     let usageReported = false;
-    const shouldDeferRoundText =
-      uncertainty.writeFocus ||
-      (uncertainty.mode === "simple_multi_file" &&
-        uncertainty.phase === "execute");
-    let deferredRoundText = "";
-
+    let preToolNarrationText = "";
+    let suppressPreToolNarrationOutput = false;
     const flushUsage = () => {
       if (usageReported || !latestUsage) {
         return;
@@ -1445,16 +1626,6 @@ const runExecutionRuntime = async ({
       }
       dispatch({ type: "text_delta", text });
       onTextDelta(text);
-    };
-
-    const flushDeferredRoundText = () => {
-      if (!deferredRoundText) {
-        return false;
-      }
-      const text = deferredRoundText;
-      deferredRoundText = "";
-      emitRoundText(text);
-      return true;
     };
 
     const createOneShotResume = (
@@ -1488,11 +1659,21 @@ const runExecutionRuntime = async ({
           if (sawToolCall) {
             continue;
           }
-          visibleAnswerChars += event.text.trim() ? event.text.length : 0;
-          if (shouldDeferRoundText) {
-            deferredRoundText += event.text;
-          } else {
-            emitRoundText(event.text);
+          const nextPreToolNarration = preToolNarrationText + event.text;
+          const shouldSuppressNarration =
+            ((uncertainty.writeFocus && !uncertainty.mutationStarted) ||
+              (uncertainty.mode === "simple_multi_file" &&
+                uncertainty.phase === "execute" &&
+                ProgressTracker.getLedgerRemainingCount(progressLedger) > 0)) &&
+            isLongRepetitiveSelfNarration(nextPreToolNarration);
+          if (shouldSuppressNarration) {
+            suppressPreToolNarrationOutput = true;
+          }
+          preToolNarrationText = nextPreToolNarration;
+          dispatch({ type: "text_delta", text: event.text });
+          if (!suppressPreToolNarrationOutput) {
+            visibleAnswerChars += event.text.trim() ? event.text.length : 0;
+            onTextDelta(event.text);
           }
           continue;
         }
@@ -1500,9 +1681,6 @@ const runExecutionRuntime = async ({
         if (event.type === "tool_call") {
           if (visibleAnswerChars >= LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD) {
             continue;
-          }
-          if (shouldDeferRoundText) {
-            flushDeferredRoundText();
           }
           if (toolStepsUsed >= maxToolSteps) {
             recordCompletion({
@@ -1667,8 +1845,13 @@ const runExecutionRuntime = async ({
             }
           }
 
+          const enforceTargetedSourceReadBudget =
+            uncertainty.mode === "simple_multi_file" ||
+            (uncertainty.writeFocus &&
+              !uncertainty.mutationStarted &&
+              !uncertainty.verifyRequested);
           if (
-            uncertainty.mode === "simple_multi_file" &&
+            enforceTargetedSourceReadBudget &&
             isTargetedSourceReadAction(event.toolName, event.input) &&
             !shouldAllowTargetedSourceRead(
               toolPath,
@@ -1678,16 +1861,66 @@ const runExecutionRuntime = async ({
               toolResults
             )
           ) {
+            const skipReason =
+              uncertainty.writeFocus &&
+              !uncertainty.mutationStarted &&
+              toolPath &&
+              uncertainty.enoughToActPaths.has(
+                normalizeComparedPath(toolPath)
+              )
+                ? "this path is already marked enough_to_act for the current write task"
+                : uncertainty.writeFocus &&
+                !uncertainty.mutationStarted &&
+                toolPath &&
+              uncertainty.stalledTargetedReadPaths.has(
+                normalizeComparedPath(toolPath)
+              )
+                ? "this path already hit the repeated-read failure limit before any concrete edit"
+                : uncertainty.mode === "simple_multi_file"
+                ? "this path was neither explicitly requested nor just discovered for the current multi-file task"
+                : "write-focused pre-mutation tasks only allow one targeted source read per concrete target path";
             runtimeCorrection = [
               "Targeted source read blocked:",
               `Skipped ${action} ${toolPath ?? "."}.`,
-              "Read the explicitly requested source path once or use a path that was just discovered for the split/write step.",
+              uncertainty.writeFocus &&
+              !uncertainty.mutationStarted &&
+              toolPath &&
+              uncertainty.enoughToActPaths.has(
+                normalizeComparedPath(toolPath)
+              )
+                ? "Enough facts are already available for this path. Stop reading and move directly to edit/write/apply_patch."
+                : uncertainty.writeFocus &&
+                !uncertainty.mutationStarted &&
+                toolPath &&
+              uncertainty.stalledTargetedReadPaths.has(
+                normalizeComparedPath(toolPath)
+              )
+                ? "Stop rereading this path. Switch to outline_file for structure, search_text_context for a concrete symbol/string, or a smaller read_range around the suspected lines."
+                : uncertainty.mode === "simple_multi_file"
+                ? "Read the explicitly requested source path once or use a path that was just discovered for the split/write step."
+                : "Reuse the previous read result and move directly to the next write/edit step instead of rereading source.",
             ].join("\n");
             toolResults.push(
               [
                 `[tool skipped] ${action} ${toolPath ?? "."}`.trim(),
-                `Skipped ${action} because this path was neither explicitly requested nor just discovered for the current multi-file task.`,
-                "Continue with the concrete remaining write/edit steps instead of adding more source reads.",
+                `Skipped ${action} because ${skipReason}.`,
+                uncertainty.writeFocus &&
+                !uncertainty.mutationStarted &&
+                toolPath &&
+                uncertainty.enoughToActPaths.has(
+                  normalizeComparedPath(toolPath)
+                )
+                  ? "Use edit/write/apply_patch on this path now instead of collecting more source reads."
+                  : uncertainty.writeFocus &&
+                !uncertainty.mutationStarted &&
+                toolPath &&
+                uncertainty.stalledTargetedReadPaths.has(
+                  normalizeComparedPath(toolPath)
+                )
+                  ? "Use outline_file/search_text_context or a smaller read_range instead of another full retry on the same path."
+                  : uncertainty.mode === "simple_multi_file"
+                  ? "Continue with the concrete remaining write/edit steps instead of adding more source reads."
+                  : "Continue with the concrete write/edit step instead of adding more source reads.",
               ].join("\n")
             );
             continue;
@@ -2018,9 +2251,6 @@ const runExecutionRuntime = async ({
         }
       }
     } catch (error) {
-      if (shouldDeferRoundText) {
-        flushDeferredRoundText();
-      }
       flushUsage();
       throw error;
     }
@@ -2046,53 +2276,50 @@ const runExecutionRuntime = async ({
           toolStepsUsed
         );
       }
-      if (shouldDeferRoundText) {
-        flushDeferredRoundText();
-        if (
-          shouldAutoContinueNonProgress(
-            state.assistantText,
-            uncertainty,
-            progressLedger
-          )
-        ) {
-          flushUsage();
-          uncertainty.nonProgressAutoContinueUsed = true;
-          uncertainty.nonProgressAutoContinueCount += 1;
-          const nextPrompt = buildRoundPrompt(
-            task,
-            accumulatedToolResults,
-            uncertainty.writeFocus && !uncertainty.mutationStarted
-              ? [
-                  "The previous reply narrated progress before taking a concrete code step.",
-                  "Do not narrate. Use the next concrete read/edit/write action now.",
-                ].join("\n")
-              : [
-                  "The previous reply narrated progress without completing the remaining files.",
-                  "Do not narrate. Execute the remaining files directly.",
-                ].join("\n"),
-            recentConfirmedFileMutations,
-            progressLedger,
-            uncertainty,
-            searchMemory,
-            readLedger,
-            filesystemMutationRevision
-          );
-          return runRounds(
-            nextPrompt,
-            runtimeCorrection,
-            accumulatedToolResults,
-            toolStepsUsed
-          );
-        }
-        if (
-          uncertainty.mode === "simple_multi_file" &&
-          uncertainty.phase === "execute" &&
-          ProgressTracker.getLedgerRemainingCount(progressLedger) > 0 &&
-          NON_PROGRESS_CHATTER_PATTERN.test(state.assistantText)
-        ) {
-          emitRoundText(`\n${buildNonProgressStopMessage(progressLedger)}\n`);
-          return completeRound();
-        }
+      if (
+        shouldAutoContinueNonProgress(
+          state.assistantText,
+          uncertainty,
+          progressLedger
+        )
+      ) {
+        flushUsage();
+        uncertainty.nonProgressAutoContinueUsed = true;
+        uncertainty.nonProgressAutoContinueCount += 1;
+        const nextPrompt = buildRoundPrompt(
+          task,
+          accumulatedToolResults,
+          uncertainty.writeFocus && !uncertainty.mutationStarted
+            ? [
+                "The previous reply narrated progress before taking a concrete code step.",
+                "Do not narrate. Use the next concrete read/edit/write action now.",
+              ].join("\n")
+            : [
+                "The previous reply narrated progress without completing the remaining files.",
+                "Do not narrate. Execute the remaining files directly.",
+              ].join("\n"),
+          recentConfirmedFileMutations,
+          progressLedger,
+          uncertainty,
+          searchMemory,
+          readLedger,
+          filesystemMutationRevision
+        );
+        return runRounds(
+          nextPrompt,
+          runtimeCorrection,
+          accumulatedToolResults,
+          toolStepsUsed
+        );
+      }
+      if (
+        uncertainty.mode === "simple_multi_file" &&
+        uncertainty.phase === "execute" &&
+        ProgressTracker.getLedgerRemainingCount(progressLedger) > 0 &&
+        NON_PROGRESS_CHATTER_PATTERN.test(state.assistantText)
+      ) {
+        emitRoundText(`\n${buildNonProgressStopMessage(progressLedger)}\n`);
+        return completeRound();
       }
       if (visibleAnswerChars === 0 && options?.allowSilentPostReviewRetry) {
         flushUsage();

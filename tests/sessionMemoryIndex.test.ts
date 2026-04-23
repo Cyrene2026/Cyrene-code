@@ -585,6 +585,45 @@ describe("session memory index", () => {
     expect(context.relevantMemories.some(item => item.includes("src/auth/oauth.ts"))).toBe(true);
   });
 
+  test("prompt context retrieves a larger archive slice for low-information continuations", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("archive budget");
+
+    for (const [index, path] of [
+      "src/refactor/a.ts",
+      "src/refactor/b.ts",
+      "src/refactor/c.ts",
+      "src/refactor/d.ts",
+      "src/refactor/e.ts",
+    ].entries()) {
+      await store.recordMemory(session.id, {
+        kind: "tool_result",
+        text: `Tool: write_file ${path} | Wrote file: ${path}`,
+        priority: 78,
+        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        entities: {
+          path: [path],
+          action: ["write_file"],
+          toolName: ["write_file"],
+          status: ["ok"],
+        },
+      });
+    }
+
+    const context = await store.getPromptContext(session.id, "continue");
+
+    expect(context.archiveSections?.COMPLETED).toHaveLength(4);
+    expect(context.archiveSections?.COMPLETED?.some(item => item.includes("src/refactor/e.ts"))).toBe(
+      true
+    );
+    expect(context.archiveSections?.COMPLETED?.some(item => item.includes("src/refactor/d.ts"))).toBe(
+      true
+    );
+    expect(context.archiveSections?.["KNOWN PATHS"]).toHaveLength(5);
+    expect(context.archiveSections?.["KNOWN PATHS"]).toContain("src/refactor/a.ts");
+    expect(context.archiveSections?.["KNOWN PATHS"]).toContain("src/refactor/e.ts");
+  });
+
   test("compacts oversized memory indexes while preserving high-signal entries", async () => {
     const { store } = await createStore();
     const session = await store.createSession("compaction");

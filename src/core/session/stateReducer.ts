@@ -1,8 +1,12 @@
 import { z } from "zod";
 import {
+  attachWorkingStateSourceRefs,
+  getWorkingStateEntrySourceRefs,
+  getWorkingStateEntryText,
   WORKING_STATE_SECTION_ORDER,
   parseWorkingStateSummary,
   repairWorkingStateSummary,
+  type WorkingStateSourceRef,
   type WorkingStateSectionMap,
   type WorkingStateSectionName,
 } from "./workingState";
@@ -59,19 +63,19 @@ type BuildReducerPromptOptions = {
   summaryRecoveryNeeded: boolean;
 };
 
-const STATE_LINE_LIMIT = 220;
-const PENDING_DIGEST_TOTAL_CHAR_LIMIT = 800;
-const PENDING_SECTION_ITEM_LIMIT = 2;
+const STATE_LINE_LIMIT = 320;
+const PENDING_DIGEST_TOTAL_CHAR_LIMIT = 3200;
+const PENDING_SECTION_ITEM_LIMIT = 4;
 
 const SECTION_ITEM_LIMITS: Record<WorkingStateSectionName, number> = {
   OBJECTIVE: 1,
-  "CONFIRMED FACTS": 5,
-  CONSTRAINTS: 5,
-  COMPLETED: 5,
-  REMAINING: 4,
-  "KNOWN PATHS": 5,
-  "RECENT FAILURES": 4,
-  "NEXT BEST ACTIONS": 3,
+  "CONFIRMED FACTS": 8,
+  CONSTRAINTS: 6,
+  COMPLETED: 8,
+  REMAINING: 6,
+  "KNOWN PATHS": 8,
+  "RECENT FAILURES": 6,
+  "NEXT BEST ACTIONS": 4,
 };
 
 const PENDING_DIGEST_TRIM_ORDER: WorkingStateSectionName[] = [
@@ -145,7 +149,7 @@ const clipStateLine = (text: string, max = STATE_LINE_LIMIT) => {
 
 const normalizeLooseLine = (line: string) =>
   clipStateLine(
-    line
+    (getWorkingStateEntryText(line) || line)
       .trim()
       .replace(/^[-*+]\s+/, "")
       .replace(/^\d+[.)]\s+/, "")
@@ -306,7 +310,19 @@ const STARTUP_FACT_LABEL_SIGNAL =
   /^(?:启动命令|运行命令|launch command|run command|bootstrap chain|bootstrap flow|启动链|启动链路|启动流程)(?:\s*[：:]\s*|\s*是\s+).+$/iu;
 
 const PATH_ABSENCE_FACT_SIGNAL =
-  /^`?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`?\s*(?:[：:]\s*)?(?:不存在|未找到|does not exist|doesn't exist|is missing|missing|not found|is not present)$/iu;
+  /^`?([A-Za-z0-9_./-]+)`?\s*(目录|文件)?\s*(?:[：:]\s*)?(?:不存在|未找到|does not exist|doesn't exist|is missing|missing|not found|is not present)$/iu;
+
+const LEADING_PATH_ABSENCE_FACT_SIGNAL =
+  /^(?:项目中|仓库中|工作区里?|workspace中|workspace里?)不存在\s+`?([A-Za-z0-9_./-]+)`?\s*(目录|文件)?$/iu;
+
+const CANONICAL_PATH_ABSENCE_FACT_SIGNAL =
+  /^项目中不存在\s+`([^`]+)`(?:\s+(目录|文件))?$/u;
+
+const NOT_FOUND_FAILURE_SIGNAL =
+  /\b(?:ENOENT|no such file or directory|not found|is missing|missing)\b|(?:未找到|缺失)/iu;
+
+const UNCERTAIN_FACT_SIGNAL =
+  /\b(?:maybe|might|possibly|probably|likely|apparently|appears?|seems?|suspect|guess|inferred?|uncertain|unclear|unverified|tentative|pending confirmation|pending verification)\b|(?:可能|也许|大概|似乎|看起来|疑似|推测|猜测|未确认|尚未确认|待确认|待验证|未定位|尚未定位|还没定位|未查明|未闭合|未对齐|未解决)/iu;
 
 const trimLeadingSeparators = (value: string) =>
   value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
@@ -334,6 +350,8 @@ const sanitizeCandidatePrefix = (value: string) =>
 
 const trimTrailingPunctuation = (value: string) =>
   value.replace(/[\s,，;；。.!！?？]+$/u, "").trim();
+
+const firstLine = (value: string) => value.split(/\r?\n/, 1)[0]?.trim() ?? "";
 
 const wrapFactLiteral = (value: string) => {
   const normalized = trimTrailingPunctuation(
@@ -372,6 +390,69 @@ const takePrimaryClause = (value: string) =>
     .split(/[。！？!?；;]\s*/u)
     .map(part => part.trim())
     .find(Boolean) ?? "";
+
+const extractLinePathLiterals = (line: string) => {
+  const entryText = getWorkingStateEntryText(line) || line;
+  const collected = new Set<string>(collectPathCandidates(entryText));
+  for (const ref of getWorkingStateEntrySourceRefs(line)) {
+    if (ref.path?.trim()) {
+      collected.add(ref.path.trim().replace(/\\/g, "/"));
+    }
+  }
+  for (const match of entryText.matchAll(/`([^`\n]+)`/g)) {
+    const candidate = match[1]?.trim().replace(/\\/g, "/") ?? "";
+    if (!candidate || /\s/.test(candidate) || !/^[A-Za-z0-9_./-]+$/.test(candidate)) {
+      continue;
+    }
+    collected.add(candidate);
+  }
+  return [...collected];
+};
+
+const normalizeGapAction = (line: string) => {
+  const clause = trimTrailingPunctuation(takePrimaryClause(line));
+  if (!clause || !UNCERTAIN_FACT_SIGNAL.test(clause)) {
+    return "";
+  }
+
+  const patterns: Array<{
+    signal: RegExp;
+    verb: string;
+    suffix?: string;
+  }> = [
+    {
+      signal: /^(.+?)\s*(?:的\s*)?最终落点\s*(?:仍|还)?(?:未|没)定位$/u,
+      verb: "定位",
+      suffix: " 的最终落点",
+    },
+    {
+      signal: /^(.+?)\s*(?:仍|还)?(?:未|没)定位$/u,
+      verb: "定位",
+    },
+    {
+      signal: /^(.+?)\s*(?:仍|还)?(?:未|没)确认$/u,
+      verb: "确认",
+    },
+    {
+      signal: /^(.+?)\s*(?:仍|还)?待确认$/u,
+      verb: "确认",
+    },
+    {
+      signal: /^(.+?)\s*(?:仍|还)?待验证$/u,
+      verb: "验证",
+    },
+  ];
+
+  for (const { signal, verb, suffix = "" } of patterns) {
+    const match = clause.match(signal);
+    const subject = trimTrailingPunctuation(match?.[1] ?? "");
+    if (subject) {
+      return `${verb} ${subject}${suffix}`;
+    }
+  }
+
+  return "";
+};
 
 const normalizeTaskClause = (value: string) => {
   const clause = takePrimaryClause(value).replace(/[：:]+$/u, "").trim();
@@ -415,11 +496,12 @@ const isIncompleteConditionalLine = (line: string) =>
   CONDITIONAL_PREFIX.test(line) && !CONDITIONAL_OUTCOME_SIGNAL.test(line);
 
 const isPurePathLine = (line: string) => {
-  const paths = collectPathCandidates(line);
+  const entryText = getWorkingStateEntryText(line) || line;
+  const paths = collectPathCandidates(entryText);
   if (paths.length !== 1) {
     return false;
   }
-  const collapsed = line
+  const collapsed = entryText
     .replace(/[`\s"'()[\]{}]/g, "")
     .replace(/\\/g, "/")
     .trim();
@@ -429,23 +511,27 @@ const isPurePathLine = (line: string) => {
 const isExecutableTaskLine = (line: string) =>
   EXECUTABLE_TASK_SIGNAL.test(stripLeadingPhrases(line, TASK_LEADIN_PREFIXES));
 
+const isRealFailureLine = (line: string) =>
+  REAL_FAILURE_SIGNAL.test(
+    line.replace(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g, " ")
+  ) &&
+  !META_FAILURE_PREFIX.test(line) &&
+  !META_FAILURE_SIGNAL.test(line) &&
+  !QUESTION_OR_OPTION_SIGNAL.test(line);
+
 const isStableFactLine = (line: string) =>
   !QUESTION_OR_OPTION_SIGNAL.test(line) &&
-  !REAL_FAILURE_SIGNAL.test(line) &&
+  !isRealFailureLine(line) &&
   (STARTUP_FACT_LABEL_SIGNAL.test(line) ||
     (!isExecutableTaskLine(line) &&
       (STABLE_FACT_SIGNAL.test(line) ||
         collectPathCandidates(line).length > 0 ||
         /`[^`]+`/.test(line))));
 
-const isRealFailureLine = (line: string) =>
-  REAL_FAILURE_SIGNAL.test(line) &&
-  !META_FAILURE_PREFIX.test(line) &&
-  !META_FAILURE_SIGNAL.test(line) &&
-  !QUESTION_OR_OPTION_SIGNAL.test(line);
-
 const isAnchoredTaskLine = (line: string) =>
-  collectPathCandidates(line).length > 0 || /`[^`]+`/.test(line) || line.length >= 6;
+  collectPathCandidates(getWorkingStateEntryText(line) || line).length > 0 ||
+  /`[^`]+`/.test(getWorkingStateEntryText(line) || line) ||
+  (getWorkingStateEntryText(line) || line).length >= 6;
 
 const isDiscardableChatter = (line: string) =>
   !line ||
@@ -472,9 +558,18 @@ const isConstraintCandidate = (line: string) =>
     (CONSTRAINT_MODAL_SIGNAL.test(line) && !isExecutableTaskLine(line)));
 
 const isSafeFactFragment = (line: string) => {
-  const pathAbsenceMatch = line.match(PATH_ABSENCE_FACT_SIGNAL);
+  const pathAbsenceMatch =
+    line.match(PATH_ABSENCE_FACT_SIGNAL) ?? line.match(LEADING_PATH_ABSENCE_FACT_SIGNAL);
   if (pathAbsenceMatch?.[1]) {
-    return `项目中不存在 \`${pathAbsenceMatch[1]}\``;
+    const path = pathAbsenceMatch[1].trim();
+    const kind = (pathAbsenceMatch[2] ?? "").trim();
+    if (path) {
+      return kind === "目录"
+        ? `项目中不存在 \`${path}\` 目录`
+        : kind === "文件"
+          ? `项目中不存在 \`${path}\` 文件`
+          : `项目中不存在 \`${path}\``;
+    }
   }
 
   const endpointMatch = line.match(ENDPOINT_LABEL_SIGNAL);
@@ -603,10 +698,14 @@ const normalizeCompletedClause = (line: string) =>
     .replace(/^回答了/u, "已回答")
     .replace(/^编写了/u, "已编写");
 
+const withCandidateRefs = (line: string, refs: WorkingStateSourceRef[]) =>
+  refs.length > 0 ? attachWorkingStateSourceRefs(line, refs) : line;
+
 const normalizeCandidateForSection = (
   targetSection: WorkingStateSectionName,
   line: string
 ): NormalizedCandidate | null => {
+  const sourceRefs = getWorkingStateEntrySourceRefs(line);
   const candidate = canonicalizeCandidate(line);
   if (
     isDiscardableChatter(candidate) ||
@@ -619,30 +718,34 @@ const normalizeCandidateForSection = (
 
   if (isPurePathLine(candidate)) {
     const [firstPath] = collectPathCandidates(candidate);
-    return firstPath ? { section: "KNOWN PATHS", line: clipStateLine(firstPath) } : null;
+    return firstPath
+      ? { section: "KNOWN PATHS", line: withCandidateRefs(clipStateLine(firstPath), sourceRefs) }
+      : null;
   }
 
   if (isRealFailureLine(candidate)) {
-    return { section: "RECENT FAILURES", line: candidate };
+    return { section: "RECENT FAILURES", line: withCandidateRefs(candidate, sourceRefs) };
   }
 
   if (isConstraintCandidate(candidate)) {
     const normalized = normalizeConstraintClause(candidate);
     return normalized
-      ? { section: "CONSTRAINTS", line: normalized }
+      ? { section: "CONSTRAINTS", line: withCandidateRefs(normalized, sourceRefs) }
       : null;
   }
 
   if (isCompletedCandidate(candidate)) {
     const normalized = normalizeCompletedClause(candidate);
     return normalized
-      ? { section: "COMPLETED", line: normalized }
+      ? { section: "COMPLETED", line: withCandidateRefs(normalized, sourceRefs) }
       : null;
   }
 
   if (targetSection === "KNOWN PATHS") {
     const [firstPath] = collectPathCandidates(candidate);
-    return firstPath ? { section: "KNOWN PATHS", line: clipStateLine(firstPath) } : null;
+    return firstPath
+      ? { section: "KNOWN PATHS", line: withCandidateRefs(clipStateLine(firstPath), sourceRefs) }
+      : null;
   }
 
   if (targetSection === "OBJECTIVE") {
@@ -661,13 +764,20 @@ const normalizeCandidateForSection = (
     ) {
       return null;
     }
-    return { section: "OBJECTIVE", line: objective };
+    return { section: "OBJECTIVE", line: withCandidateRefs(objective, sourceRefs) };
   }
 
   if (targetSection === "CONFIRMED FACTS") {
+    const unresolvedAction = normalizeGapAction(candidate);
+    if (unresolvedAction) {
+      return { section: "REMAINING", line: withCandidateRefs(unresolvedAction, sourceRefs) };
+    }
     const salvagedFact = isSafeFactFragment(candidate);
     if (salvagedFact) {
-      return { section: "CONFIRMED FACTS", line: salvagedFact };
+      return {
+        section: "CONFIRMED FACTS",
+        line: withCandidateRefs(salvagedFact, sourceRefs),
+      };
     }
     if (
       candidate.length < 4 ||
@@ -675,12 +785,13 @@ const normalizeCandidateForSection = (
       PATH_LABEL_ONLY_SIGNAL.test(candidate) ||
       isBareSymbolLikeLine(candidate) ||
       isPurePathLine(candidate) ||
+      UNCERTAIN_FACT_SIGNAL.test(candidate) ||
       !isStableFactLine(candidate) ||
       !STRICT_FACT_PREDICATE_SIGNAL.test(candidate)
     ) {
       return null;
     }
-    return { section: "CONFIRMED FACTS", line: candidate };
+    return { section: "CONFIRMED FACTS", line: withCandidateRefs(candidate, sourceRefs) };
   }
 
   if (targetSection === "CONSTRAINTS") {
@@ -709,7 +820,7 @@ const normalizeCandidateForSection = (
     return null;
   }
 
-  return { section: targetSection, line: action };
+  return { section: targetSection, line: withCandidateRefs(action, sourceRefs) };
 };
 
 const normalizeSectionLine = (
@@ -748,6 +859,71 @@ const normalizeUniqueLines = (
     }
   }
   return normalized;
+};
+
+type AbsentPathSpec = {
+  path: string;
+  directory: boolean;
+};
+
+const extractAbsentPathSpecs = (sections: WorkingStateSectionMap) => {
+  const specs = new Map<string, AbsentPathSpec>();
+  const pushSpec = (path: string, directory = false) => {
+    const normalized = path.trim().replace(/\\/g, "/");
+    if (!normalized) {
+      return;
+    }
+    const key = `${directory ? "dir" : "path"}:${normalized}`;
+    specs.set(key, {
+      path: normalized,
+      directory,
+    });
+  };
+
+  for (const line of sections["CONFIRMED FACTS"] ?? []) {
+    const match = line.match(CANONICAL_PATH_ABSENCE_FACT_SIGNAL);
+    if (match?.[1]) {
+      pushSpec(match[1], (match[2] ?? "").trim() === "目录");
+    }
+  }
+
+  for (const line of sections["RECENT FAILURES"] ?? []) {
+    if (!NOT_FOUND_FAILURE_SIGNAL.test(line)) {
+      continue;
+    }
+    for (const path of extractLinePathLiterals(line)) {
+      pushSpec(path, false);
+    }
+  }
+
+  return [...specs.values()];
+};
+
+const pathMatchesAbsentSpec = (path: string, spec: AbsentPathSpec) =>
+  spec.directory ? path === spec.path || path.startsWith(`${spec.path}/`) : path === spec.path;
+
+const lineReferencesAbsentSpec = (line: string, specs: AbsentPathSpec[]) =>
+  extractLinePathLiterals(line).some(path =>
+    specs.some(spec => pathMatchesAbsentSpec(path, spec))
+  );
+
+const keepLineWithinAllowedPaths = (
+  section: WorkingStateSectionName,
+  line: string,
+  allowedPaths: ReadonlySet<string>
+) => {
+  if (section === "KNOWN PATHS") {
+    return allowedPaths.has(line);
+  }
+  if (section === "RECENT FAILURES" || section === "CONSTRAINTS" || section === "OBJECTIVE") {
+    return true;
+  }
+
+  const referencedPaths = extractLinePathLiterals(line);
+  if (referencedPaths.length === 0) {
+    return true;
+  }
+  return referencedPaths.some(path => allowedPaths.has(path));
 };
 
 const finalizeSectionMap = (
@@ -812,10 +988,32 @@ const finalizeSectionMap = (
     );
   }
 
-  if (allowedPaths && allowedPaths.size > 0) {
-    finalized["KNOWN PATHS"] = finalized["KNOWN PATHS"].filter(path =>
-      allowedPaths.has(path)
+  const absentPathSpecs = extractAbsentPathSpecs(finalized);
+  if (absentPathSpecs.length > 0) {
+    finalized["KNOWN PATHS"] = finalized["KNOWN PATHS"].filter(
+      path => !absentPathSpecs.some(spec => pathMatchesAbsentSpec(path, spec))
     );
+    for (const section of [
+      "CONFIRMED FACTS",
+      "COMPLETED",
+      "REMAINING",
+      "NEXT BEST ACTIONS",
+    ] as const) {
+      finalized[section] = finalized[section].filter(line => {
+        if (section === "CONFIRMED FACTS" && CANONICAL_PATH_ABSENCE_FACT_SIGNAL.test(line)) {
+          return true;
+        }
+        return !lineReferencesAbsentSpec(line, absentPathSpecs);
+      });
+    }
+  }
+
+  if (allowedPaths && allowedPaths.size > 0) {
+    for (const section of WORKING_STATE_SECTION_ORDER) {
+      finalized[section] = finalized[section].filter(line =>
+        keepLineWithinAllowedPaths(section, line, allowedPaths)
+      );
+    }
   }
 
   if (finalized.OBJECTIVE.length > 1) {
@@ -1157,6 +1355,301 @@ export const buildFallbackPendingDigest = (params: {
   });
 };
 
+type ToolResultPendingDigestParams = {
+  durableSummary: string;
+  pendingDigest: string;
+  userText: string;
+  toolName: string;
+  toolInput?: unknown;
+  toolMessage: string;
+  toolMetadata?: unknown;
+};
+
+const isFileLikePath = (path: string) => /[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+$/i.test(path);
+
+const toUnknownRecord = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const pickTrimmedUnknownString = (
+  record: Record<string, unknown> | null,
+  key: string
+) => {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+};
+
+const getToolActionFromResult = (
+  toolName: string,
+  toolInput: unknown
+) => {
+  const record = toUnknownRecord(toolInput);
+  const action = pickTrimmedUnknownString(record, "action");
+  return action || toolName.trim();
+};
+
+const getToolPathFromResult = (toolInput: unknown, toolMetadata?: unknown) => {
+  const inputRecord = toUnknownRecord(toolInput);
+  const metadataRecord = toUnknownRecord(toolMetadata);
+  const workspacePath = pickTrimmedUnknownString(metadataRecord, "workspacePath");
+  if (workspacePath) {
+    return workspacePath.replace(/\\/g, "/");
+  }
+  const path = pickTrimmedUnknownString(inputRecord, "path");
+  return path ? path.replace(/\\/g, "/") : "";
+};
+
+const getToolReadRangeLabel = (toolInput: unknown, toolMetadata?: unknown) => {
+  const inputRecord = toUnknownRecord(toolInput);
+  const metadataRecord = toUnknownRecord(toolMetadata);
+  const readRecord = toUnknownRecord(metadataRecord?.read);
+  const start =
+    typeof readRecord?.startLine === "number"
+      ? readRecord.startLine
+      : typeof inputRecord?.startLine === "number"
+        ? inputRecord.startLine
+        : null;
+  const end =
+    typeof readRecord?.endLine === "number"
+      ? readRecord.endLine
+      : typeof inputRecord?.endLine === "number"
+        ? inputRecord.endLine
+        : null;
+  if (typeof start !== "number" || typeof end !== "number") {
+    return "";
+  }
+  return `${start}-${end}`;
+};
+
+const parseLineRangeLabel = (label: string) => {
+  const match = label.match(/^(\d+)-(\d+)$/);
+  if (!match) {
+    return {
+      startLine: undefined,
+      endLine: undefined,
+    };
+  }
+  return {
+    startLine: Number(match[1]),
+    endLine: Number(match[2]),
+  };
+};
+
+const buildToolSourceRefs = (
+  toolName: string,
+  toolInput: unknown,
+  toolMetadata?: unknown
+): WorkingStateSourceRef[] => {
+  const action = getToolActionFromResult(toolName, toolInput);
+  const path = getToolPathFromResult(toolInput, toolMetadata);
+  const readRange = getToolReadRangeLabel(toolInput, toolMetadata);
+  const { startLine, endLine } = parseLineRangeLabel(readRange);
+  return [
+    {
+      kind: action === "read_range" ? "tool_result" : "tool_result",
+      label: action || toolName,
+      path: path || undefined,
+      startLine,
+      endLine,
+    },
+  ];
+};
+
+const synthesizeToolFailureLine = (
+  action: string,
+  path: string,
+  toolMessage: string
+) => {
+  const lines = collectFallbackDigestLines(toolMessage).filter(
+    line => !/^\[tool (?:result|error)\]/i.test(line)
+  );
+  const detail =
+    lines.find(line => !isPurePathLine(line) && !/^\d+\s+\|/.test(line)) ??
+    lines[0] ??
+    firstLine(toolMessage);
+  const normalizedDetail = trimTrailingPunctuation(detail ?? "");
+  if (path) {
+    return `${action} \`${path}\` 失败: ${normalizedDetail || "工具调用失败"}`;
+  }
+  return `${action} 失败: ${normalizedDetail || "工具调用失败"}`;
+};
+
+const mergePendingSections = (
+  current: WorkingStateSectionMap,
+  incoming: WorkingStateSectionMap
+) => {
+  const merged = createEmptySectionMap();
+  for (const section of WORKING_STATE_SECTION_ORDER) {
+    if (section === "OBJECTIVE") {
+      merged[section] = [
+        ...(current[section] ?? []),
+        ...(incoming[section] ?? []),
+      ];
+      continue;
+    }
+    merged[section] = [
+      ...(incoming[section] ?? []),
+      ...(current[section] ?? []),
+    ];
+  }
+  return merged;
+};
+
+export const applyToolResultPendingDigestUpdate = (
+  params: ToolResultPendingDigestParams
+) => {
+  const normalizedSummary = params.durableSummary.trim()
+    ? renderDurableSummary(parseStructuredStateText(params.durableSummary))
+    : "";
+  const currentSections = params.pendingDigest.trim()
+    ? parseStructuredStateText(params.pendingDigest)
+    : createEmptySectionMap();
+  const incoming = createEmptySectionMap();
+  const objective = normalizeCandidateForSection("OBJECTIVE", params.userText);
+  if (objective?.section === "OBJECTIVE") {
+    incoming.OBJECTIVE.push(objective.line);
+  }
+
+  const action = getToolActionFromResult(params.toolName, params.toolInput);
+  const path = getToolPathFromResult(params.toolInput, params.toolMetadata);
+  const toolSourceRefs = buildToolSourceRefs(
+    params.toolName,
+    params.toolInput,
+    params.toolMetadata
+  );
+  const messagePaths = collectPathCandidates(params.toolMessage);
+  const knownPaths = Array.from(
+    new Set([path, ...messagePaths].filter(Boolean))
+  );
+  for (const candidatePath of knownPaths) {
+    incoming["KNOWN PATHS"].push(candidatePath);
+  }
+
+  const primaryPath =
+    knownPaths.find(candidate => isFileLikePath(candidate)) ??
+    (isFileLikePath(path) ? path : "");
+  const readRange = getToolReadRangeLabel(params.toolInput, params.toolMetadata);
+  const messageLooksLikeError =
+    /^\[tool error\]/i.test(params.toolMessage) || isRealFailureLine(params.toolMessage);
+
+  if (messageLooksLikeError) {
+    incoming["RECENT FAILURES"].push(
+      attachWorkingStateSourceRefs(synthesizeToolFailureLine(action, path, params.toolMessage), [
+        {
+          ...toolSourceRefs[0],
+          kind: "error",
+        },
+      ])
+    );
+    if (primaryPath) {
+      incoming["NEXT BEST ACTIONS"].push(
+        attachWorkingStateSourceRefs(
+          `改用更小的 read_range 或 search_text_context 查看 \`${primaryPath}\``,
+          [
+            {
+              ...toolSourceRefs[0],
+              kind: "error",
+            },
+          ]
+        )
+      );
+    }
+  } else if (
+    action === "read_range" &&
+    primaryPath &&
+    readRange
+  ) {
+    incoming["CONFIRMED FACTS"].push(
+      attachWorkingStateSourceRefs(`目标文件是 \`${primaryPath}\``, toolSourceRefs)
+    );
+    incoming["CONFIRMED FACTS"].push(
+      attachWorkingStateSourceRefs(`\`${primaryPath}\` 的已读范围是 \`${readRange}\``, toolSourceRefs)
+    );
+    incoming.COMPLETED.push(
+      attachWorkingStateSourceRefs(`已确认读取 \`${primaryPath}\` 第 ${readRange} 行`, toolSourceRefs)
+    );
+    incoming["NEXT BEST ACTIONS"].push(
+      attachWorkingStateSourceRefs(`直接编辑 \`${primaryPath}\``, toolSourceRefs)
+    );
+  } else if (
+    (action === "read_file" ||
+      action === "read_json" ||
+      action === "read_yaml" ||
+      action === "outline_file") &&
+    primaryPath
+  ) {
+    incoming["CONFIRMED FACTS"].push(
+      attachWorkingStateSourceRefs(`目标文件是 \`${primaryPath}\``, toolSourceRefs)
+    );
+    incoming.COMPLETED.push(
+      attachWorkingStateSourceRefs(
+        action === "outline_file"
+          ? `已确认 \`${primaryPath}\` 的文件结构`
+          : `已确认读取 \`${primaryPath}\``,
+        toolSourceRefs
+      )
+    );
+    incoming["NEXT BEST ACTIONS"].push(
+      attachWorkingStateSourceRefs(`直接编辑 \`${primaryPath}\``, toolSourceRefs)
+    );
+  } else if (
+    (action === "search_text" ||
+      action === "search_text_context" ||
+      action === "find_files" ||
+      action === "find_symbol" ||
+      action === "find_references" ||
+      action === "lsp_definition" ||
+      action === "lsp_references" ||
+      action === "ts_definition" ||
+      action === "ts_references") &&
+    primaryPath
+  ) {
+    incoming["CONFIRMED FACTS"].push(
+      attachWorkingStateSourceRefs(`目标文件是 \`${primaryPath}\``, toolSourceRefs)
+    );
+    incoming.COMPLETED.push(
+      attachWorkingStateSourceRefs(`已确认匹配路径 \`${primaryPath}\``, toolSourceRefs)
+    );
+    incoming["NEXT BEST ACTIONS"].push(
+      attachWorkingStateSourceRefs(`查看 \`${primaryPath}\``, toolSourceRefs)
+    );
+  } else if (
+    (action === "create_file" ||
+      action === "write_file" ||
+      action === "edit_file" ||
+      action === "apply_patch" ||
+      action === "move_path" ||
+      action === "copy_path" ||
+      action === "delete_file") &&
+    primaryPath
+  ) {
+    incoming["CONFIRMED FACTS"].push(
+      attachWorkingStateSourceRefs(`最新修改文件是 \`${primaryPath}\``, toolSourceRefs)
+    );
+    incoming.COMPLETED.push(
+      attachWorkingStateSourceRefs(
+        action === "create_file"
+          ? `已创建 \`${primaryPath}\``
+          : action === "delete_file"
+            ? `已删除 \`${primaryPath}\``
+            : `已更新 \`${primaryPath}\``,
+        toolSourceRefs
+      )
+    );
+  }
+
+  const nextPendingDigest = renderSectionMap(
+    mergePendingSections(currentSections, incoming),
+    { pending: true }
+  );
+  return {
+    summary: normalizedSummary,
+    pendingDigest: nextPendingDigest,
+    updated: nextPendingDigest.trim() !== params.pendingDigest.trim(),
+  };
+};
+
 const buildSummaryPatchFromStructuredText = (text: string) => {
   const sectionMap = parseStructuredStateText(text);
   const patch: Partial<
@@ -1311,6 +1804,7 @@ export const buildStateReducerPrompt = ({
     "Hard rules: RECENT FAILURES only stores real failures, conflicts, or blockers. Explanations about error handling do not belong there.",
     "Hard rules: COMPLETED and REMAINING must stay mutually exclusive. Remove finished items from REMAINING and NEXT BEST ACTIONS.",
     "Hard rules: KNOWN PATHS only stores concrete repo paths.",
+    "When a line is grounded in a concrete tool read, tool result, or file-local failure, preserve its source by appending an indented refs line such as: refs: [{\"kind\":\"tool_result\",\"label\":\"read_range\",\"path\":\"src/app.ts\",\"startLine\":41,\"endLine\":80}]",
     "JSON shape:",
     `{"version":1,"mode":"${mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."]}}`,
   ]

@@ -3087,6 +3087,88 @@ export class FileMcpService {
     return normalized || ".";
   }
 
+  private async findNearestExistingWorkspaceParent(absolutePath: string) {
+    let current = dirname(absolutePath);
+    while (true) {
+      if (!this.canAccessAbsolutePathInsideWorkspaceRoot(current)) {
+        return ".";
+      }
+      try {
+        const info = await stat(current);
+        if (info.isDirectory()) {
+          return this.normalizeWorkspacePathFromAbsolute(current);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+      if (current === this.workspaceRootAbsolute) {
+        return ".";
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        return ".";
+      }
+      current = parent;
+    }
+  }
+
+  private async buildPathNotFoundMessage(request: ToolRequest, originalError: string) {
+    const targets =
+      request.action === "read_files"
+        ? this.getReadFilesTargets(request)
+        : request.action === "stat_paths"
+          ? this.getStatPathsTargets(request)
+          : "path" in request && typeof request.path === "string"
+            ? [request.path]
+            : [];
+    if (targets.length === 0) {
+      return originalError;
+    }
+
+    for (const target of targets) {
+      let resolvedPath: string;
+      try {
+        resolvedPath = this.resolvePath(target);
+      } catch {
+        continue;
+      }
+
+      try {
+        await stat(resolvedPath);
+        continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          continue;
+        }
+      }
+
+      const nearestExistingParent = await this.findNearestExistingWorkspaceParent(
+        resolvedPath
+      );
+      return [
+        `Path not found inside workspace: ${target}`,
+        `workspace_root: ${this.workspaceRootAbsolute.replace(/\\/g, "/")}`,
+        `resolved_path: ${resolvedPath.replace(/\\/g, "/")}`,
+        `nearest_existing_parent: ${nearestExistingParent}`,
+        "next: use list_dir on the nearest existing parent or find_files with a filename pattern before retrying this read.",
+        `original_error: ${originalError}`,
+      ].join("\n");
+    }
+
+    return originalError;
+  }
+
+  private async formatToolExecutionError(request: ToolRequest, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const errno = error as NodeJS.ErrnoException;
+    if (errno?.code === "ENOENT") {
+      return this.buildPathNotFoundMessage(request, message);
+    }
+    return message;
+  }
+
   private detectPathKind(info: Awaited<ReturnType<typeof stat>> | null) {
     if (!info) {
       return "missing" as const;
@@ -8859,9 +8941,7 @@ export class FileMcpService {
       } catch (error) {
         return {
           ok: false,
-          message: `[tool error] ${requestLabel}\n${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          message: `[tool error] ${requestLabel}\n${await this.formatToolExecutionError(request, error)}`,
         };
       }
     }
@@ -8887,9 +8967,7 @@ export class FileMcpService {
       } catch (error) {
         return {
           ok: false,
-          message: `[tool error] ${requestLabel}\n${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          message: `[tool error] ${requestLabel}\n${await this.formatToolExecutionError(request, error)}`,
         };
       }
     }
@@ -8914,9 +8992,7 @@ export class FileMcpService {
     } catch (error) {
       return {
         ok: false,
-        message: `[tool error] ${requestLabel}\n${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        message: `[tool error] ${requestLabel}\n${await this.formatToolExecutionError(request, error)}`,
       };
     }
   }

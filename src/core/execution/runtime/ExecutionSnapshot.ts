@@ -81,6 +81,10 @@ export type UncertaintyState = {
   nonProgressAutoContinueCount: number;
   explicitSourceReads: Set<string>;
   explicitTaskPaths: Set<string>;
+  enoughToActPaths: Set<string>;
+  targetedReadStreakPath: string | null;
+  targetedReadStreakCount: number;
+  stalledTargetedReadPaths: Set<string>;
   verifyRequested: boolean;
   blockedReason: string | null;
 };

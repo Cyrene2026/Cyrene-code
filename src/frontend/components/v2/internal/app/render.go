@@ -53,17 +53,14 @@ var (
 	sectionStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("13"))
 	codeBlockStyle  = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E6EDF3")).
-			Background(lipgloss.Color("#0D1117")).
 			ColorWhitespace(true)
 	codeBlockHeaderStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#D1E9FF")).
-				Background(lipgloss.Color("#172235")).
 				Bold(true)
 	codeBlockBorderStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#3B82F6"))
 	codeBlockLineNoStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#6E7681")).
-				Background(lipgloss.Color("#0D1117"))
+				Foreground(lipgloss.Color("#6E7681"))
 	inlineCodeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Bold(true)
@@ -113,11 +110,17 @@ var (
 	composerContinuationStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("#8B949E")).
 					Background(lipgloss.Color("#161B22"))
+	composerTextStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E6EDF3")).
+				Background(lipgloss.Color("#161B22")).
+				ColorWhitespace(true)
 	composerDividerStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#30363D"))
 	compositionStyle = lipgloss.NewStyle().
 				Underline(true).
 				Foreground(lipgloss.Color("#D2A8FF")).
+				Background(lipgloss.Color("#161B22"))
+	composerCursorStyle = cursorStyle.Copy().
 				Background(lipgloss.Color("#161B22"))
 	attachmentChipStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#E6EDF3")).
@@ -3575,7 +3578,9 @@ func (m *Model) renderAttachmentInputLine() string {
 }
 
 func (m *Model) renderComposer(width int) string {
-	promptStyle := promptStyleForStatus(m.Status)
+	promptStyle := promptStyleForStatus(m.Status).
+		Background(lipgloss.Color("#161B22")).
+		ColorWhitespace(true)
 	style := focusedInputBoxStyle
 	if m.ActivePanel != PanelNone {
 		style = inputBoxStyle
@@ -3881,13 +3886,13 @@ func renderComposerSegments(segments []composerSegment, width int) []composerRow
 			}
 			switch kind {
 			case "cursor":
-				current.WriteString(cursorStyle.Render(string(r)))
+				current.WriteString(composerCursorStyle.Render(string(r)))
 			case "composition":
 				current.WriteString(compositionStyle.Render(string(r)))
 			case "collapsed":
 				current.WriteString(collapsedPasteStyle.Render(string(r)))
 			default:
-				current.WriteRune(r)
+				current.WriteString(composerTextStyle.Render(string(r)))
 			}
 			currentWidth += cellWidth
 		}

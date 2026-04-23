@@ -302,6 +302,24 @@ func TestRenderMarkdownBodyLinesKeepsCodeBlockFrameAcrossWrappedAndBlankLines(t 
 	}
 }
 
+func TestRenderMarkdownCodeBlockDoesNotUseBackgroundFill(t *testing.T) {
+	originalProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(originalProfile)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	lines := app.RenderMarkdownBodyLinesForTest("```py\nprint('x')\n```", 48, lipgloss.NewStyle())
+	rendered := strings.Join(lines, "\n")
+
+	if strings.Contains(rendered, "48;2;13;17;23") {
+		t.Fatalf("expected code block body background removed, got %q", rendered)
+	}
+	if strings.Contains(rendered, "48;2;23;34;53") {
+		t.Fatalf("expected code block header background removed, got %q", rendered)
+	}
+}
+
 func TestRenderMarkdownBodyLinesKeepsNumericSeparatorsInSingleToken(t *testing.T) {
 	enableColorRenderingForTest(t)
 

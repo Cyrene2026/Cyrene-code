@@ -12,9 +12,26 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/rivo/uniseg"
 )
 
 var (
+	uiBorderMutedColor     = lipgloss.Color("#263244")
+	uiBorderStrongColor    = lipgloss.Color("#3B82F6")
+	uiTextPrimaryColor     = lipgloss.Color("#E6EDF3")
+	uiTextSecondaryColor   = lipgloss.Color("#AAB6C3")
+	uiTextMutedColor       = lipgloss.Color("#7D8590")
+	uiAccentBlueColor      = lipgloss.Color("#79C0FF")
+	uiAccentCyanColor      = lipgloss.Color("#56D4DD")
+	uiAccentGreenColor     = lipgloss.Color("#7EE787")
+	uiAccentYellowColor    = lipgloss.Color("#F2CC60")
+	uiAccentOrangeColor    = lipgloss.Color("#FFA657")
+	uiAccentPurpleColor    = lipgloss.Color("#D2A8FF")
+	uiAccentRedColor       = lipgloss.Color("#FFA198")
+	uiComposerSurfaceColor = lipgloss.Color("#161B22")
+	uiPanelHeaderColor     = lipgloss.Color("#172235")
+	uiPanelHeaderTextColor = lipgloss.Color("#D1E9FF")
+
 	rootStyle = lipgloss.NewStyle()
 
 	startupLogoTrueColorStart = rgbColor{R: 0x2F, G: 0x81, B: 0xFF}
@@ -26,6 +43,7 @@ var (
 			Padding(0)
 
 	frameStyle = lipgloss.NewStyle().
+			Foreground(uiTextPrimaryColor).
 			Padding(1, 1, 0, 1)
 
 	activeFrameStyle = frameStyle.Copy()
@@ -42,8 +60,8 @@ var (
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	userStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	userBubbleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(lipgloss.Color("#30363D")).
+			Foreground(uiTextPrimaryColor).
+			Background(lipgloss.Color("#1E293B")).
 			ColorWhitespace(true).
 			Padding(0, 1, 0, 0)
 	asstStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
@@ -99,32 +117,35 @@ var (
 			Bold(true)
 
 	inputBoxStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E6EDF3")).
-			Background(lipgloss.Color("#161B22")).
+			Foreground(uiTextPrimaryColor).
+			Background(uiComposerSurfaceColor).
 			ColorWhitespace(true).
 			Padding(0, 1)
+	composerFocusAccentStyle = lipgloss.NewStyle().
+					Foreground(uiAccentBlueColor).
+					Bold(true)
 	composerPlaceholderStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#7D8590")).
-					Background(lipgloss.Color("#161B22")).
+					Background(uiComposerSurfaceColor).
+					Foreground(uiTextMutedColor).
 					Italic(true)
 	composerContinuationStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#8B949E")).
-					Background(lipgloss.Color("#161B22"))
+					Background(uiComposerSurfaceColor).
+					Foreground(lipgloss.Color("#8B949E"))
 	composerTextStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E6EDF3")).
-				Background(lipgloss.Color("#161B22")).
+				Background(uiComposerSurfaceColor).
+				Foreground(uiTextPrimaryColor).
 				ColorWhitespace(true)
 	composerDividerStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#30363D"))
+				Foreground(uiBorderMutedColor)
 	compositionStyle = lipgloss.NewStyle().
+				Background(uiComposerSurfaceColor).
 				Underline(true).
-				Foreground(lipgloss.Color("#D2A8FF")).
-				Background(lipgloss.Color("#161B22"))
+				Foreground(uiAccentPurpleColor)
 	composerCursorStyle = cursorStyle.Copy().
-				Background(lipgloss.Color("#161B22"))
+				Background(uiComposerSurfaceColor)
 	attachmentChipStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E6EDF3")).
-				Background(lipgloss.Color("#1F2A37")).
+				Foreground(uiTextPrimaryColor).
+				Background(lipgloss.Color("#1B2A44")).
 				ColorWhitespace(true)
 	attachmentAddStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("14")).
@@ -137,38 +158,70 @@ var (
 			Foreground(lipgloss.Color("#8B949E")).
 			Bold(true)
 	toolDetailStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#AAB6C3"))
+			Foreground(uiTextSecondaryColor)
 	toolErrorPrefixStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FFA198")).
 				Bold(true)
+	toolChipStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#0D1117")).
+			Background(lipgloss.Color("#8B949E")).
+			ColorWhitespace(true).
+			Bold(true).
+			Padding(0, 1)
+	toolDetailDimStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#8B949E"))
 
 	focusedInputBoxStyle = inputBoxStyle.Copy()
 
 	panelBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("15")).
+			BorderForeground(uiBorderMutedColor).
+			Foreground(uiTextPrimaryColor).
 			Padding(0, 1)
 
 	panelHeaderBarStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("#FFF"))
+				Foreground(uiPanelHeaderTextColor).
+				Background(lipgloss.Color("#172235")).
+				ColorWhitespace(true)
 
 	panelSummaryStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("#FFF"))
+				Foreground(uiTextSecondaryColor).
+				Background(lipgloss.Color("#0D1626")).
+				ColorWhitespace(true)
+	panelTitleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#08111F")).
+			Background(uiAccentBlueColor).
+			ColorWhitespace(true)
+	panelTitleMutedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#B8C4D6")).
+				Background(lipgloss.Color("#172235")).
+				ColorWhitespace(true)
+	panelSectionStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#D1E9FF")).
+				Background(lipgloss.Color("#10233A")).
+				ColorWhitespace(true).
+				Bold(true)
+	panelErrorBannerStyle = lipgloss.NewStyle().
+				Foreground(uiAccentRedColor).
+				Background(lipgloss.Color("#301318")).
+				ColorWhitespace(true).
+				Bold(true)
+	footerBarStyle = lipgloss.NewStyle().
+			Foreground(uiTextSecondaryColor)
 	footerStatusLabelStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#8B949E")).
 				Bold(true)
-	footerTokenValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
-	footerBranchValueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#F2CC60"))
-	footerProjectValueStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#79C0FF"))
-	footerModelValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#D2A8FF"))
-	footerProviderValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#56D4DD"))
-	footerDurationValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA657")).Bold(true)
-	footerStatusValueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7EE787")).Bold(true)
-	footerTimeStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAB6C3"))
+	footerTokenValueStyle    = lipgloss.NewStyle().Foreground(uiAccentGreenColor).Bold(true)
+	footerBranchValueStyle   = lipgloss.NewStyle().Foreground(uiAccentYellowColor)
+	footerProjectValueStyle  = lipgloss.NewStyle().Foreground(uiAccentBlueColor)
+	footerModelValueStyle    = lipgloss.NewStyle().Foreground(uiAccentPurpleColor)
+	footerProviderValueStyle = lipgloss.NewStyle().Foreground(uiAccentCyanColor)
+	footerDurationValueStyle = lipgloss.NewStyle().Foreground(uiAccentOrangeColor).Bold(true)
+	footerStatusValueStyle   = lipgloss.NewStyle().Foreground(uiAccentGreenColor).Bold(true)
+	footerTimeStyle          = lipgloss.NewStyle().Foreground(uiTextSecondaryColor)
 	pageHeroStyle            = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("#D1E9FF")).
 					Background(lipgloss.Color("#172235")).
@@ -178,6 +231,17 @@ var (
 	pageSelectedBannerStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#0D1117")).
 				Background(lipgloss.Color("#7EE787")).
+				Bold(true)
+	startupNameStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#D1E9FF")).
+				Bold(true)
+	startupTaglineStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#AAB6C3"))
+	startupCommandStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#79C0FF")).
+				Bold(true)
+	startupHintLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#8B949E")).
 				Bold(true)
 
 	cursorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -257,6 +321,8 @@ const (
 	diffAddANSIStart                        = "\x1b[38;2;126;231;135;48;2;16;63;43m"
 	diffRemoveANSIStart                     = "\x1b[38;2;255;161;152;48;2;93;30;39m"
 	diffANSIEnd                             = "\x1b[0m"
+	composerFocusRailGlyph                  = "┃"
+	composerMinInputRows                    = 3
 	composerVisibleRowLimit                 = 6
 	composerCollapsedPasteCharThreshold     = 280
 	composerCollapsedPasteTailChars         = 96
@@ -326,9 +392,14 @@ func (m *Model) View() string {
 	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
 
 	header := m.renderTopStatusBar(contentWidth)
-	composer := m.renderComposer(contentWidth)
-	topComposerDivider := renderComposerTopDivider(contentWidth)
-	bottomComposerDivider := renderComposerBottomDivider(contentWidth)
+	composer := ""
+	topComposerDivider := ""
+	bottomComposerDivider := ""
+	if !m.shouldHideComposerForPanel() {
+		composer = m.renderComposer(contentWidth)
+		topComposerDivider = renderComposerTopDivider(contentWidth)
+		bottomComposerDivider = renderComposerBottomDivider(contentWidth)
+	}
 	footer := m.renderBottomStatusBar(contentWidth)
 	fixedHeight := lipgloss.Height(header) +
 		lipgloss.Height(composer) +
@@ -337,7 +408,11 @@ func (m *Model) View() string {
 		lipgloss.Height(footer)
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
 	body := m.renderMainArea(contentWidth, bodyHeight)
-	m.updateTerminalCursorAnchor(contentWidth, lipgloss.Height(composer), lipgloss.Height(bottomComposerDivider), lipgloss.Height(footer))
+	if composer == "" {
+		m.setTerminalCursorAnchor(TerminalCursorAnchor{})
+	} else {
+		m.updateTerminalCursorAnchor(contentWidth, lipgloss.Height(composer), lipgloss.Height(bottomComposerDivider), lipgloss.Height(footer))
+	}
 
 	parts := []string{
 		header,
@@ -348,9 +423,10 @@ func (m *Model) View() string {
 		footer,
 	}
 	content := joinNonEmptyLines(parts...)
-	return rootStyle.Width(width).Height(height).Render(
+	rendered := rootStyle.Width(width).Height(height).Render(
 		appShellStyle.Width(contentWidth).Render(content),
 	)
+	return truncateMultilineDisplayWidth(rendered, width)
 }
 
 func (m *Model) renderMainArea(width, height int) string {
@@ -425,15 +501,18 @@ func (m *Model) renderTopStatusBar(width int) string {
 func (m *Model) renderBottomStatusBar(width int) string {
 	now := m.statusClockNow()
 	items := []footerStatusItem{
-		{Label: "TOKENS", Value: formatUsageCompact(m.UsageSummary), ValueStyle: footerTokenValueStyle},
-		{Label: "TIME", Value: m.renderRequestElapsedLabel(now), ValueStyle: footerDurationValueStyle},
-		{Label: "BRANCH", Value: emptyFallback(m.GitBranch, "none"), ValueStyle: footerBranchValueStyle},
-		{Label: "PROJECT", Value: formatProjectPathLabel(m.AppRoot, maxInt(12, width/8)), ValueStyle: footerProjectValueStyle},
-		{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), ValueStyle: footerModelValueStyle},
-		{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), ValueStyle: footerProviderValueStyle},
-		{Label: "STATUS", Value: m.renderAnimatedStatusLabel(), ValueStyle: footerStatusValueStyle},
+		{Label: "TOKENS", Value: formatUsageCompact(m.UsageSummary.TotalTokens), ValueStyle: footerTokenValueStyle, Priority: 10},
+		{Label: "CACHE", Value: formatUsageCompact(m.UsageSummary.CachedTokens), ValueStyle: footerTokenValueStyle, Priority: 20},
+		{Label: "MODEL", Value: emptyFallback(m.CurrentModel, "none"), ValueStyle: footerModelValueStyle, Priority: 30},
+		{Label: "PROVIDER", Value: m.providerDisplayName(m.CurrentProvider), ValueStyle: footerProviderValueStyle, Priority: 40},
+		{Label: "STATUS", Value: m.renderAnimatedStatusLabel(), ValueStyle: footerStatusValueStyle, Priority: 50},
+		{Label: "TIME", Value: m.renderRequestElapsedLabel(now), ValueStyle: footerDurationValueStyle, Priority: 60},
+		{Label: "BRANCH", Value: emptyFallback(m.GitBranch, "none"), ValueStyle: footerBranchValueStyle, Priority: 70},
+		{Label: "PROJECT", Value: formatProjectPathLabel(m.AppRoot, maxInt(12, width/8)), ValueStyle: footerProjectValueStyle, Priority: 80},
 	}
-	return renderSegmentedStatusBar(width, items, now.Format("2006-01-02 15:04:05"))
+	return footerBarStyle.Width(width).MaxWidth(width).Render(
+		renderSegmentedStatusBar(width, items, now.Format("2006-01-02 15:04:05")),
+	)
 }
 
 func (m *Model) renderRequestElapsedLabel(now time.Time) string {
@@ -474,6 +553,7 @@ type footerStatusItem struct {
 	Label      string
 	Value      string
 	ValueStyle lipgloss.Style
+	Priority   int
 }
 
 type rgbColor struct {
@@ -646,18 +726,49 @@ func renderSegmentedStatusBar(width int, items []footerStatusItem, right string)
 		return ""
 	}
 
-	left := renderFooterStatusItems(items, footerStatusGap(width))
 	right = footerTimeStyle.Render(strings.TrimSpace(right))
-	rightWidth := ansi.StringWidth(right)
-	if rightWidth >= width {
-		return ansi.Truncate(right, width, "")
+	rightWidth := displayWidth(right)
+	showClock := width >= 140 && rightWidth < width
+	if !showClock {
+		right = ""
+		rightWidth = 0
 	}
 
 	gapWidth := footerRightGap(width)
+	if rightWidth == 0 {
+		gapWidth = 0
+	}
 	leftWidth := maxInt(1, width-rightWidth-gapWidth)
-	left = ansi.Truncate(left, leftWidth, "~")
-	padding := strings.Repeat(" ", maxInt(gapWidth, width-ansi.StringWidth(left)-rightWidth))
+	items = footerItemsForWidth(items, leftWidth)
+	left := renderFooterStatusItems(items, footerStatusGap(width))
+	left = truncateDisplayWidth(left, leftWidth, "~")
+	padding := strings.Repeat(" ", maxInt(gapWidth, width-displayWidth(left)-rightWidth))
 	return left + padding + right
+}
+
+func footerItemsForWidth(items []footerStatusItem, width int) []footerStatusItem {
+	filtered := make([]footerStatusItem, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.Label) == "" || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	for len(filtered) > 1 && renderFooterStatusItems(filtered, footerStatusGap(width)) != "" && displayWidth(renderFooterStatusItems(filtered, footerStatusGap(width))) > width {
+		dropIndex := -1
+		dropPriority := -1
+		for index, item := range filtered {
+			if item.Priority > dropPriority {
+				dropPriority = item.Priority
+				dropIndex = index
+			}
+		}
+		if dropIndex < 0 {
+			break
+		}
+		filtered = append(filtered[:dropIndex], filtered[dropIndex+1:]...)
+	}
+	return filtered
 }
 
 func renderFooterStatusItems(items []footerStatusItem, gap string) string {
@@ -668,10 +779,11 @@ func renderFooterStatusItems(items []footerStatusItem, gap string) string {
 		if label == "" || value == "" {
 			continue
 		}
-		valueStyle := item.ValueStyle
-		parts = append(parts, footerStatusLabelStyle.Render(label)+" "+valueStyle.Render(value))
+		labelStyle := footerStatusLabelStyle.Copy()
+		valueStyle := item.ValueStyle.Copy()
+		parts = append(parts, labelStyle.Render(label)+" "+valueStyle.Render(value))
 	}
-	return strings.Join(parts, gap)
+	return footerBarStyle.Render(strings.Join(parts, gap))
 }
 
 func footerStatusGap(width int) string {
@@ -692,8 +804,8 @@ func footerRightGap(width int) int {
 	return 2
 }
 
-func formatUsageCompact(summary BridgeUsageSummary) string {
-	total := maxInt(0, summary.TotalTokens)
+func formatUsageCompact(tokens int) string {
+	total := maxInt(0, tokens)
 	switch {
 	case total >= 1_000_000:
 		return fmt.Sprintf("%.1fm", float64(total)/1_000_000)
@@ -730,7 +842,16 @@ func formatRequestElapsed(elapsedMs int64) string {
 
 func usesPagePanelLayout(panel Panel) bool {
 	switch panel {
-	case PanelSessions, PanelModels, PanelProviders, PanelAuth:
+	case PanelSessions, PanelModels, PanelProviders, PanelAuth, PanelPlans:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Model) shouldHideComposerForPanel() bool {
+	switch m.ActivePanel {
+	case PanelAuth, PanelProviders, PanelModels, PanelPlans:
 		return true
 	default:
 		return false
@@ -803,7 +924,10 @@ func renderPageHeroLine(width int, title, summary string) string {
 	if summary = strings.TrimSpace(summary); summary != "" {
 		text += "  |  " + summary
 	}
-	return pageHeroStyle.Render(truncatePlain(text, maxInt(1, width)))
+	return pageHeroStyle.
+		Width(width).
+		MaxWidth(width).
+		Render(fitDisplayWidth(text, maxInt(1, width)))
 }
 
 func renderPageHintLines(width int, text string) []string {
@@ -818,6 +942,83 @@ func renderPageHintLines(width int, text string) []string {
 	return lines
 }
 
+func renderPanelTitleLine(width int, panel Panel, title, summary string) string {
+	if width <= 0 {
+		return ""
+	}
+	accent := panelAccentColor(panel)
+	titleStyle := panelTitleStyle.Copy().Background(accent)
+	mutedStyle := panelTitleMutedStyle.Copy()
+	titleText := " " + strings.ToUpper(strings.TrimSpace(title)) + " "
+	if strings.TrimSpace(title) == "" {
+		titleText = " PANEL "
+	}
+	renderedTitle := titleStyle.Render(titleText)
+	summaryText := strings.TrimSpace(summary)
+	if summaryText != "" {
+		summaryText = " " + summaryText + " "
+	}
+	bodyWidth := maxInt(0, width-displayWidth(renderedTitle))
+	return renderedTitle + mutedStyle.
+		Width(bodyWidth).
+		MaxWidth(bodyWidth).
+		Render(fitDisplayWidth(summaryText, bodyWidth))
+}
+
+func panelAccentColor(panel Panel) lipgloss.Color {
+	switch panel {
+	case PanelAuth:
+		return uiAccentYellowColor
+	case PanelProviders:
+		return uiAccentCyanColor
+	case PanelModels:
+		return uiAccentPurpleColor
+	case PanelPlans:
+		return uiAccentGreenColor
+	case PanelApprovals:
+		return uiAccentOrangeColor
+	default:
+		return uiAccentBlueColor
+	}
+}
+
+func renderPanelSectionLabel(label string) string {
+	trimmed := strings.ToUpper(strings.TrimSpace(label))
+	if trimmed == "" {
+		trimmed = "SECTION"
+	}
+	return panelSectionStyle.Render(" " + trimmed + " ")
+}
+
+func renderPanelErrorBanner(width int, text string) []string {
+	if width <= 0 {
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	prefix := " ERROR "
+	wrapWidth := maxInt(1, width-displayWidth(prefix)-2)
+	rows := wrapPlainText(text, wrapWidth)
+	if len(rows) == 0 {
+		rows = []string{text}
+	}
+	lines := make([]string, 0, len(rows))
+	for index, row := range rows {
+		label := strings.Repeat(" ", displayWidth(prefix))
+		if index == 0 {
+			label = prefix
+		}
+		line := label + " " + row
+		lines = append(lines, panelErrorBannerStyle.
+			Width(width).
+			MaxWidth(width).
+			Render(fitDisplayWidth(line, width)))
+	}
+	return lines
+}
+
 func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScrollState) {
 	allLines := m.renderTranscriptLines(width)
 	total := len(allLines)
@@ -825,6 +1026,10 @@ func (m *Model) renderTranscriptWindow(width, height int) ([]string, panelScroll
 		end := minInt(total, height)
 		window := allLines[:end]
 		lines := make([]string, 0, height)
+		topPadding := maxInt(0, (height-len(window))/2)
+		for len(lines) < topPadding {
+			lines = append(lines, "")
+		}
 		for _, line := range window {
 			lines = append(lines, fitDisplayWidth(line, width))
 		}
@@ -1028,11 +1233,101 @@ func (m *Model) shouldShowStartupView() bool {
 }
 
 func (m *Model) renderStartupLines(width int) []string {
-	return nil
+	if width <= 0 {
+		return []string{""}
+	}
+
+	lines := make([]string, 0, 18)
+	lines = append(lines, "")
+	logoLines, logoWidth := startupLogoLinesForWidth(maxInt(1, minInt(width-2, 72)))
+	if len(logoLines) > 0 && width >= 64 {
+		for index, line := range logoLines {
+			rendered := renderGradientLogoLine(line, index, len(logoLines), logoWidth)
+			lines = append(lines, centerLine(rendered, width))
+		}
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, centerLine(startupNameStyle.Render("Start with a task, or use a command:"), width))
+	for _, hint := range startupGuideHints(width) {
+		lines = append(lines, centerLine(hint, width))
+	}
+	if status := m.startupRuntimeStatusLine(width); status != "" {
+		lines = append(lines, "")
+		lines = append(lines, centerLine(status, width))
+	}
+	return lines
 }
 
 func (m *Model) renderCompactStartupLines(width int) []string {
-	return nil
+	if width <= 0 {
+		return []string{""}
+	}
+	return []string{
+		centerLine(startupTaglineStyle.Render("Type a task below. Use ")+startupCommandStyle.Render("/help")+startupTaglineStyle.Render(" for commands."), width),
+	}
+}
+
+func startupGuideHints(width int) []string {
+	hints := []struct {
+		Command string
+		Detail  string
+	}{
+		{Command: "Ask naturally", Detail: "describe the change or question"},
+		{Command: "/model", Detail: "switch models"},
+		{Command: "/provider", Detail: "change provider"},
+		{Command: "Ctrl+O", Detail: "attach images"},
+	}
+	if width < 72 {
+		hints = hints[:2]
+	}
+
+	lines := make([]string, 0, len(hints))
+	for _, hint := range hints {
+		line := startupCommandStyle.Render(hint.Command) +
+			startupHintLabelStyle.Render("  ->  ") +
+			startupTaglineStyle.Render(hint.Detail)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func (m *Model) startupRuntimeStatusLine(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	workspace := startupWorkspaceLabel(m.AppRoot)
+	model := emptyFallback(m.CurrentModel, "none")
+	provider := m.providerDisplayName(m.CurrentProvider)
+	parts := []string{
+		startupHintLabelStyle.Render("WORKSPACE ") + startupTaglineStyle.Render(workspace),
+		startupHintLabelStyle.Render("MODEL ") + startupTaglineStyle.Render(model),
+		startupHintLabelStyle.Render("PROVIDER ") + startupTaglineStyle.Render(provider),
+	}
+	return truncateDisplayWidth(strings.Join(parts, startupHintLabelStyle.Render("  ·  ")), width, "")
+}
+
+func startupWorkspaceLabel(appRoot string) string {
+	trimmed := strings.TrimSpace(appRoot)
+	if trimmed == "" || trimmed == "none" {
+		return "none"
+	}
+	base := filepath.Base(trimmed)
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return formatProjectPathLabel(trimmed, 24)
+	}
+	return truncatePlain(base, 24)
+}
+
+func centerLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(value) >= width {
+		return truncateDisplayWidth(value, width, "")
+	}
+	left := maxInt(0, (width-displayWidth(value))/2)
+	return strings.Repeat(" ", left) + value
 }
 
 func renderMessageLines(message Message, width int) []string {
@@ -1042,7 +1337,7 @@ func renderMessageLines(message Message, width int) []string {
 
 	if message.Kind == "tool_status" {
 		style := toolStatusStyleForText(message.Text)
-		return renderStyledPrefixedTranscriptLines("❯ ", sanitizeTranscriptDisplayText(message), width, style, style)
+		return renderStyledPrefixedTranscriptLines("", sanitizeTranscriptDisplayText(message), width, style, style)
 	}
 
 	if message.Kind == "review_status" {
@@ -1751,6 +2046,10 @@ func renderToolStatusLineRows(raw string, width int, baseStyle lipgloss.Style) [
 		return rendered
 	}
 
+	if rows := renderToolStatusChipRows(prefix, detail, width); rows != nil {
+		return rows
+	}
+
 	plain := prefix + " " + detail
 	rows := wrapPlainText(plain, width)
 	if len(rows) == 0 {
@@ -1760,6 +2059,41 @@ func renderToolStatusLineRows(raw string, width int, baseStyle lipgloss.Style) [
 	rendered = append(rendered, renderToolStatusStructuredRow(prefix, detail, rows[0]))
 	for _, row := range rows[1:] {
 		rendered = append(rendered, toolDetailStyle.Render(row))
+	}
+	return rendered
+}
+
+func renderToolStatusChipRows(prefix, detail string, width int) []string {
+	action, rest := splitToolStatusActionDetail(detail)
+	if action == "" {
+		return nil
+	}
+	source := prefix + " " + detail
+	family := toolStatusFamilyForAction(canonicalizeToolStatusAction(action))
+	if family == "" {
+		family = "tool"
+	}
+	chip := toolChipStyle.Copy().
+		Background(lipgloss.Color(toolStatusANSIColorForText(source))).
+		Render(family + " " + canonicalizeToolStatusAction(action))
+	detailText := strings.TrimSpace(rest)
+	detailText = strings.TrimSuffix(detailText, "...")
+	detailText = strings.TrimPrefix(detailText, "|")
+	detailText = strings.TrimSpace(detailText)
+	detailText = emptyFallback(detailText, "running")
+	bodyWidth := maxInt(1, width-displayWidth(chip)-1)
+	bodyRows := wrapPlainText(detailText, bodyWidth)
+	if len(bodyRows) == 0 {
+		bodyRows = []string{""}
+	}
+	rendered := make([]string, 0, len(bodyRows))
+	padding := strings.Repeat(" ", displayWidth(chip)+1)
+	for index, row := range bodyRows {
+		if index == 0 {
+			rendered = append(rendered, chip+" "+toolDetailDimStyle.Render(row))
+			continue
+		}
+		rendered = append(rendered, padding+toolDetailDimStyle.Render(row))
 	}
 	return rendered
 }
@@ -3314,10 +3648,10 @@ func renderDiffCodeSegment(value string, width int, lineStyle lipgloss.Style) st
 
 	renderedCode := renderCodeLineWithPalette(value, diffCodePalette(lineStyle))
 	maxCodeWidth := maxInt(0, segmentWidth-1)
-	if ansi.StringWidth(renderedCode) > maxCodeWidth {
-		renderedCode = ansi.Truncate(renderedCode, maxCodeWidth, "")
+	if displayWidth(renderedCode) > maxCodeWidth {
+		renderedCode = truncateDisplayWidth(renderedCode, maxCodeWidth, "")
 	}
-	padding := maxInt(0, maxCodeWidth-ansi.StringWidth(renderedCode))
+	padding := maxInt(0, maxCodeWidth-displayWidth(renderedCode))
 	return lineStyle.Render(" ") + renderedCode + lineStyle.Render(strings.Repeat(" ", padding))
 }
 
@@ -3579,13 +3913,15 @@ func (m *Model) renderAttachmentInputLine() string {
 
 func (m *Model) renderComposer(width int) string {
 	promptStyle := promptStyleForStatus(m.Status).
-		Background(lipgloss.Color("#161B22")).
+		Background(uiComposerSurfaceColor).
 		ColorWhitespace(true)
 	style := focusedInputBoxStyle
 	if m.ActivePanel != PanelNone {
 		style = inputBoxStyle
 	}
-	contentWidth := framedInnerWidth(style, width)
+	railWidth := composerRailWidth(m.ActivePanel)
+	innerWidth := maxInt(1, width-railWidth)
+	contentWidth := framedInnerWidth(style, innerWidth)
 
 	lines := make([]string, 0, 8)
 	if m.Notice != "" {
@@ -3608,6 +3944,10 @@ func (m *Model) renderComposer(width int) string {
 	}
 
 	rows := m.visibleComposerRows(contentWidth)
+	inputLines := make([]string, 0, composerMinInputRows)
+	for index := 0; index < composerInputTopPadding(len(rows), m.shouldCenterComposerPlaceholder()); index++ {
+		inputLines = append(inputLines, renderComposerBlankInputRow(contentWidth))
+	}
 	for _, row := range rows {
 		prefix := "❯ "
 		if row.Continued {
@@ -3615,20 +3955,64 @@ func (m *Model) renderComposer(width int) string {
 		}
 
 		if row.Placeholder {
-			lines = append(lines, promptStyle.Render(prefix)+composerPlaceholderStyle.Render(row.Text))
+			placeholder := truncatePlain(row.Text, maxInt(1, contentWidth-displayWidth(prefix)))
+			inputLines = append(inputLines, promptStyle.Render(prefix)+composerPlaceholderStyle.Render(placeholder))
 			continue
 		}
 		prefixStyle := promptStyle
 		if row.Continued {
 			prefixStyle = composerContinuationStyle
 		}
-		lines = append(lines, prefixStyle.Render(prefix)+row.Text)
+		inputLines = append(inputLines, prefixStyle.Render(prefix)+row.Text)
 	}
+	for len(inputLines) < composerMinInputRows {
+		inputLines = append(inputLines, renderComposerBlankInputRow(contentWidth))
+	}
+	lines = append(lines, inputLines...)
 
-	return style.
-		Width(framedRenderWidth(style, width)).
-		MaxWidth(width).
+	body := style.
+		Width(framedRenderWidth(style, innerWidth)).
+		MaxWidth(innerWidth).
 		Render(strings.Join(lines, "\n"))
+	return renderComposerRail(body, width, m.ActivePanel)
+}
+
+func composerRailWidth(activePanel Panel) int {
+	if activePanel != PanelNone {
+		return 0
+	}
+	return lipgloss.Width(composerFocusRailGlyph)
+}
+
+func renderComposerRail(body string, width int, activePanel Panel) string {
+	if activePanel != PanelNone {
+		return body
+	}
+	bodyWidth := maxInt(1, width-lipgloss.Width(composerFocusRailGlyph))
+	rail := composerFocusAccentStyle.Render(composerFocusRailGlyph)
+	lines := strings.Split(body, "\n")
+	for index, line := range lines {
+		lines[index] = rail + fitDisplayWidth(line, bodyWidth)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) shouldCenterComposerPlaceholder() bool {
+	return len(m.Input) == 0 && len(m.Composition) == 0
+}
+
+func composerInputTopPadding(rowCount int, center bool) int {
+	if center && rowCount > 0 && rowCount < composerMinInputRows {
+		return 1
+	}
+	return 0
+}
+
+func renderComposerBlankInputRow(width int) string {
+	prefixWidth := minInt(2, maxInt(0, width))
+	bodyWidth := maxInt(0, width-prefixWidth)
+	return composerContinuationStyle.Render(strings.Repeat(" ", prefixWidth)) +
+		composerTextStyle.Render(strings.Repeat(" ", bodyWidth))
 }
 
 func (m *Model) renderComposerTextarea(width int, promptStyle lipgloss.Style) []string {
@@ -3664,7 +4048,8 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	contentWidth := maxInt(1, width)
+	railWidth := composerRailWidth(m.ActivePanel)
+	contentWidth := maxInt(1, width-railWidth)
 	prefixLines := 0
 	if m.Notice != "" {
 		prefixLines += len(wrapPlainText(m.Notice, contentWidth))
@@ -3677,9 +4062,10 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 	if m.AttachmentInputActive {
 		paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
 		prefixWidth := lipgloss.Width("img> ")
-		return prefixLines, paddingLeft + prefixWidth + lipgloss.Width(string(m.AttachmentInput[:clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))])), true
+		return prefixLines, railWidth + paddingLeft + prefixWidth + lipgloss.Width(string(m.AttachmentInput[:clampInt(m.AttachmentCursor, 0, len(m.AttachmentInput))])), true
 	}
 
+	prefixLines += composerInputTopPadding(len(m.visibleComposerRows(contentWidth)), m.shouldCenterComposerPlaceholder())
 	row, col, ok := m.composerInputCursorPosition(contentWidth)
 	if !ok {
 		return 0, 0, false
@@ -3687,7 +4073,7 @@ func (m *Model) composerCursorAnchorInComposer(width int) (int, int, bool) {
 
 	paddingLeft := focusedInputBoxStyle.GetPaddingLeft()
 	prefixWidth := lipgloss.Width("❯ ")
-	return prefixLines + row, paddingLeft + prefixWidth + col, true
+	return prefixLines + row, railWidth + paddingLeft + prefixWidth + col, true
 }
 
 func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
@@ -3737,18 +4123,11 @@ func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
 }
 
 func renderComposerTopDivider(width int) string {
-	return renderComposerDividerLine(width)
+	return ""
 }
 
 func renderComposerBottomDivider(width int) string {
-	return renderComposerDividerLine(width)
-}
-
-func renderComposerDividerLine(width int) string {
-	if width <= 0 {
-		return ""
-	}
-	return composerDividerStyle.Render(strings.Repeat("─", width))
+	return ""
 }
 
 func slashAlternateSummary(item slashCommandSpec) string {
@@ -3864,10 +4243,22 @@ func renderComposerSegments(segments []composerSegment, width int) []composerRow
 
 	rows := make([]composerRow, 0, 2)
 	var current strings.Builder
+	var chunk strings.Builder
 	currentWidth := 0
 	continued := false
+	chunkKind := ""
+
+	flushChunk := func() {
+		if chunk.Len() == 0 {
+			return
+		}
+		current.WriteString(renderComposerChunk(chunk.String(), chunkKind))
+		chunk.Reset()
+		chunkKind = ""
+	}
 
 	flush := func() {
+		flushChunk()
 		rows = append(rows, composerRow{Text: current.String(), Continued: continued})
 		current.Reset()
 		currentWidth = 0
@@ -3884,16 +4275,14 @@ func renderComposerSegments(segments []composerSegment, width int) []composerRow
 			if currentWidth > 0 && currentWidth+cellWidth > width {
 				flush()
 			}
-			switch kind {
-			case "cursor":
-				current.WriteString(composerCursorStyle.Render(string(r)))
-			case "composition":
-				current.WriteString(compositionStyle.Render(string(r)))
-			case "collapsed":
-				current.WriteString(collapsedPasteStyle.Render(string(r)))
-			default:
-				current.WriteString(composerTextStyle.Render(string(r)))
+
+			if chunk.Len() > 0 && chunkKind != kind {
+				flushChunk()
 			}
+			if chunkKind == "" {
+				chunkKind = kind
+			}
+			chunk.WriteRune(r)
 			currentWidth += cellWidth
 		}
 	}
@@ -3901,10 +4290,24 @@ func renderComposerSegments(segments []composerSegment, width int) []composerRow
 	for _, segment := range segments {
 		appendSegment(segment.Text, segment.Kind)
 	}
+	flushChunk()
 	if current.Len() > 0 || len(rows) == 0 {
 		rows = append(rows, composerRow{Text: current.String(), Continued: continued})
 	}
 	return rows
+}
+
+func renderComposerChunk(text string, kind string) string {
+	switch kind {
+	case "cursor":
+		return composerCursorStyle.Render(text)
+	case "composition":
+		return compositionStyle.Render(text)
+	case "collapsed":
+		return collapsedPasteStyle.Render(text)
+	default:
+		return composerTextStyle.Render(text)
+	}
 }
 
 func renderSlashSuggestionBlock(items []slashCommandSpec, width int, selected int) []string {
@@ -4051,14 +4454,14 @@ func (m *Model) renderPlans(width, height int) string {
 
 	if len(m.ExecutionPlan.Steps) == 0 {
 		bodyLines = append(bodyLines,
-			sectionStyle.Render("execution plan"),
+			renderPanelTitleLine(bodyWidth, PanelPlans, "plan", "no active execution plan"),
 			dimStyle.Render("No active execution plan."),
 			dimStyle.Render("Use /plan create <task> to build one, then /plan run to execute it."),
 		)
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
 
-	bodyLines = append(bodyLines, sectionStyle.Render("overview"))
+	bodyLines = append(bodyLines, renderPanelTitleLine(bodyWidth, PanelPlans, "plan", fmt.Sprintf("%d step(s)", len(m.ExecutionPlan.Steps))))
 	if strings.TrimSpace(m.ExecutionPlan.Summary) != "" {
 		for _, row := range wrapPlainText(m.ExecutionPlan.Summary, bodyWidth) {
 			bodyLines = append(bodyLines, dimStyle.Render(row))
@@ -4084,7 +4487,7 @@ func (m *Model) renderPlans(width, height int) string {
 		}
 	}
 
-	bodyLines = append(bodyLines, sectionStyle.Render("steps"))
+	bodyLines = append(bodyLines, renderPanelSectionLabel("steps"))
 	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
 	for index := page.Start; index < page.End; index++ {
 		step := m.ExecutionPlan.Steps[index]
@@ -4118,7 +4521,7 @@ func (m *Model) renderPlans(width, height int) string {
 	})...)
 
 	selected := m.ExecutionPlan.Steps[clampInt(m.PlanIndex, 0, len(m.ExecutionPlan.Steps)-1)]
-	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, "", renderPanelSectionLabel("detail"))
 	bodyLines = append(bodyLines, dimStyle.Render(fmt.Sprintf("id %s  |  status %s", selected.ID, planStepStatusLabel(selected.Status))))
 	if strings.TrimSpace(selected.Details) != "" {
 		for _, row := range wrapPlainText(selected.Details, bodyWidth) {
@@ -4126,7 +4529,7 @@ func (m *Model) renderPlans(width, height int) string {
 		}
 	}
 	if len(selected.FilePaths) > 0 {
-		bodyLines = append(bodyLines, sectionStyle.Render("paths"))
+		bodyLines = append(bodyLines, renderPanelSectionLabel("paths"))
 		for _, path := range selected.FilePaths {
 			for _, row := range wrapPlainText(path, bodyWidth) {
 				bodyLines = append(bodyLines, dimStyle.Render(row))
@@ -4134,13 +4537,13 @@ func (m *Model) renderPlans(width, height int) string {
 		}
 	}
 	if strings.TrimSpace(selected.RecentToolResult) != "" {
-		bodyLines = append(bodyLines, sectionStyle.Render("latest tool"))
+		bodyLines = append(bodyLines, renderPanelSectionLabel("latest tool"))
 		for _, row := range wrapPlainText(selected.RecentToolResult, bodyWidth) {
 			bodyLines = append(bodyLines, dimStyle.Render(row))
 		}
 	}
 	if len(selected.Evidence) > 0 {
-		bodyLines = append(bodyLines, sectionStyle.Render("evidence"))
+		bodyLines = append(bodyLines, renderPanelSectionLabel("evidence"))
 		for _, item := range selected.Evidence {
 			for _, row := range wrapPlainText(item, bodyWidth) {
 				bodyLines = append(bodyLines, dimStyle.Render(row))
@@ -4226,13 +4629,13 @@ func (m *Model) renderModels(width, height int) string {
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "models", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
 	bodyLines := []string{}
-	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "models", fmt.Sprintf("current %s", emptyFallback(m.CurrentModel, "none"))))
+	bodyLines = append(bodyLines, renderPanelTitleLine(bodyWidth, PanelModels, "models", fmt.Sprintf("current %s", emptyFallback(m.CurrentModel, "none"))))
 	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, modelCustomHint)...)
 	if len(m.AvailableModels) == 0 {
 		bodyLines = append(bodyLines, dimStyle.Render("No models available."))
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
-	bodyLines = append(bodyLines, sectionStyle.Render("list"))
+	bodyLines = append(bodyLines, renderPanelSectionLabel("list"))
 	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*2))
 	for index := page.Start; index < page.End; index++ {
 		model := m.AvailableModels[index]
@@ -4260,7 +4663,7 @@ func (m *Model) renderModels(width, height int) string {
 		Total:   maxInt(1, page.TotalPages),
 	})...)
 	selected := m.AvailableModels[clampInt(m.ModelIndex, 0, len(m.AvailableModels)-1)]
-	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, "", renderPanelSectionLabel("detail"))
 	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", selected), bodyWidth)))
 	bodyLines = append(bodyLines, renderApprovalMetaRow("family", modelFamily(selected), bodyWidth))
 	bodyLines = append(bodyLines, renderApprovalMetaRow("provider", emptyFallback(m.CurrentProvider, "none"), bodyWidth))
@@ -4279,14 +4682,14 @@ func (m *Model) renderProviders(width, height int) string {
 	bodyLines := []string{}
 	if len(m.AvailableProviders) == 0 {
 		bodyLines = append(bodyLines,
-			renderPageHeroLine(bodyWidth, "providers", "0 configured"),
+			renderPanelTitleLine(bodyWidth, PanelProviders, "providers", "0 configured"),
 		)
 		bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "No providers available. Use /login or /provider <url> to configure one.")...)
 		return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 	}
-	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "providers", fmt.Sprintf("current %s", m.providerDisplayName(m.CurrentProvider))))
+	bodyLines = append(bodyLines, renderPanelTitleLine(bodyWidth, PanelProviders, "providers", fmt.Sprintf("current %s", m.providerDisplayName(m.CurrentProvider))))
 	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, "Enter switch | refresh reloads providers and models | Esc back")...)
-	bodyLines = append(bodyLines, sectionStyle.Render("list"))
+	bodyLines = append(bodyLines, renderPanelSectionLabel("list"))
 	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*3))
 	for index := page.Start; index < page.End; index++ {
 		provider := m.AvailableProviders[index]
@@ -4321,7 +4724,7 @@ func (m *Model) renderProviders(width, height int) string {
 		Total:   maxInt(1, page.TotalPages),
 	})...)
 	selected := m.AvailableProviders[clampInt(m.ProviderIndex, 0, len(m.AvailableProviders)-1)]
-	bodyLines = append(bodyLines, "", sectionStyle.Render("detail"))
+	bodyLines = append(bodyLines, "", renderPanelSectionLabel("detail"))
 	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", m.providerDisplayName(selected)), bodyWidth)))
 	bodyLines = append(bodyLines, renderApprovalMetaRow("url", selected, bodyWidth))
 	bodyLines = append(bodyLines, renderApprovalMetaRow("profile", formatProviderProfileLabel(m.providerProfile(selected)), bodyWidth))
@@ -4344,8 +4747,9 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	}
 	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "auth", "step "+stepLabel)}
 	bodyLines := []string{}
-	bodyLines = append(bodyLines, renderPageHeroLine(bodyWidth, "login", "step "+stepLabel))
+	bodyLines = append(bodyLines, renderPanelTitleLine(bodyWidth, PanelAuth, "login", "step "+stepLabel))
 	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, fmt.Sprintf("mode %s  |  persistence %s", emptyFallback(m.Auth.Mode, "local"), emptyFallback(m.Auth.PersistenceLabel, "unavailable")))...)
+	bodyLines = append(bodyLines, renderPanelErrorBanner(bodyWidth, m.AuthError)...)
 
 	providerLine := formatAuthFieldLine(1, "Provider", string(m.AuthProvider), m.AuthStep == AuthStepProvider, bodyWidth)
 	typeLine := formatAuthFieldLine(2, "Provider Type", string(m.AuthProviderType), m.AuthStep == AuthStepProviderType, bodyWidth)
@@ -4355,15 +4759,15 @@ func (m *Model) renderAuthPanel(width, height int) string {
 	if m.AuthStep == AuthStepConfirm {
 		confirmLine = renderFullWidthStyledLine(selectedPanelItemStyle, confirmLine, bodyWidth)
 	}
-	bodyLines = append(bodyLines, sectionStyle.Render("fields"), providerLine, typeLine, apiLine, modelLine, confirmLine)
+	bodyLines = append(bodyLines, renderPanelSectionLabel("fields"), providerLine, typeLine, apiLine, modelLine, confirmLine)
 	if strings.TrimSpace(m.Auth.PersistencePath) != "" {
 		bodyLines = append(bodyLines, renderApprovalMetaRow("path", m.Auth.PersistencePath, bodyWidth))
 	}
 
 	if m.AuthStep == AuthStepConfirm {
-		bodyLines = append(bodyLines, "", sectionStyle.Render("detail"), pageSelectedBannerStyle.Render(truncatePlain("Press Enter to save login and rebuild the transport.", bodyWidth)))
+		bodyLines = append(bodyLines, "", renderPanelSectionLabel("detail"), pageSelectedBannerStyle.Render(truncatePlain("Press Enter to save login and rebuild the transport.", bodyWidth)))
 	} else {
-		bodyLines = append(bodyLines, "", sectionStyle.Render("editor"))
+		bodyLines = append(bodyLines, "", renderPanelSectionLabel("editor"))
 		for _, row := range m.authEditorLines(bodyWidth) {
 			bodyLines = append(bodyLines, row)
 		}
@@ -5074,7 +5478,7 @@ func wrapLinesToWidth(lines []string, width int) []string {
 	wrapped := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if containsANSIEscape(line) {
-			wrapped = append(wrapped, fitDisplayWidth(line, width))
+			wrapped = append(wrapped, wrapANSIText(line, width)...)
 			continue
 		}
 		wrapped = append(wrapped, wrapPlainText(line, width)...)
@@ -5090,7 +5494,7 @@ func limitBoxLines(lines []string, width, height int) string {
 	for _, line := range lines {
 		var wrappedRows []string
 		if containsANSIEscape(line) {
-			wrappedRows = []string{fitDisplayWidth(line, width)}
+			wrappedRows = wrapANSIText(line, maxInt(1, width))
 		} else {
 			wrappedRows = wrapPlainText(line, maxInt(1, width))
 		}
@@ -5115,7 +5519,7 @@ func expandBoxLines(lines []string, width int) []string {
 	for _, line := range lines {
 		var wrappedRows []string
 		if containsANSIEscape(line) {
-			wrappedRows = []string{fitDisplayWidth(line, width)}
+			wrappedRows = wrapANSIText(line, maxInt(1, width))
 		} else {
 			wrappedRows = wrapPlainText(line, maxInt(1, width))
 		}
@@ -5175,7 +5579,8 @@ func renderScrollableBlock(lines []string, width int, scroll panelScrollState) [
 	if len(lines) == 0 {
 		return nil
 	}
-	contentWidth := maxInt(1, width-2)
+	scrollbarWidth := 2
+	contentWidth := maxInt(1, width-scrollbarWidth)
 	trackHeight := maxInt(0, len(lines)-2)
 	thumbStart, thumbSize := scrollbarThumb(scroll, trackHeight)
 	rendered := make([]string, 0, len(lines))
@@ -5189,7 +5594,7 @@ func renderScrollableBlock(lines []string, width int, scroll panelScrollState) [
 				glyph = scrollbarThumbStyle().Render("█")
 			}
 		}
-		rendered = append(rendered, base+" "+glyph)
+		rendered = append(rendered, fitDisplayWidth(base+" "+glyph, width))
 	}
 	return rendered
 }
@@ -5225,11 +5630,11 @@ func scrollbarSeparatorStyle() lipgloss.Style {
 }
 
 func scrollbarTrackStyle() lipgloss.Style {
-	return dimStyle.Copy().Foreground(lipgloss.Color("15"))
+	return dimStyle.Copy().Foreground(uiBorderMutedColor)
 }
 
 func scrollbarThumbStyle() lipgloss.Style {
-	return asstStyle.Copy().Foreground(lipgloss.Color("11")).Bold(true)
+	return asstStyle.Copy().Foreground(uiAccentYellowColor).Bold(true)
 }
 
 func containsANSIEscape(value string) bool {
@@ -5347,69 +5752,57 @@ func truncatePlain(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if lipgloss.Width(value) <= width {
+	if displayWidth(value) <= width {
 		return value
 	}
 	if width == 1 {
 		return "~"
 	}
-	runes := []rune(value)
-	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > width {
-		runes = runes[:len(runes)-1]
-	}
-	return string(runes) + "~"
+	return truncateDisplayWidth(value, width, "~")
 }
 
 func fitDisplayWidth(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	truncated := ansi.Truncate(value, width, "")
-	padding := maxInt(0, width-ansi.StringWidth(truncated))
+	truncated := truncateDisplayWidth(value, width, "")
+	padding := maxInt(0, width-displayWidth(truncated))
 	if padding == 0 {
 		return truncated
 	}
 	return truncated + strings.Repeat(" ", padding)
 }
 
+func truncateMultilineDisplayWidth(value string, width int) string {
+	if width <= 0 || value == "" {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		if displayWidth(line) > width {
+			lines[index] = truncateDisplayWidth(line, width, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func truncateMiddlePlain(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if lipgloss.Width(value) <= width {
+	if displayWidth(value) <= width {
 		return value
 	}
 	if width <= 3 {
 		return strings.Repeat(".", width)
 	}
 
-	runes := []rune(value)
 	leftBudget := (width - 3) / 2
 	rightBudget := width - 3 - leftBudget
 
-	left := make([]rune, 0, leftBudget)
-	leftWidth := 0
-	for _, r := range runes {
-		rw := lipgloss.Width(string(r))
-		if leftWidth+rw > leftBudget {
-			break
-		}
-		left = append(left, r)
-		leftWidth += rw
-	}
-
-	right := make([]rune, 0, rightBudget)
-	rightWidth := 0
-	for index := len(runes) - 1; index >= 0; index-- {
-		rw := lipgloss.Width(string(runes[index]))
-		if rightWidth+rw > rightBudget {
-			break
-		}
-		right = append([]rune{runes[index]}, right...)
-		rightWidth += rw
-	}
-
-	return string(left) + "..." + string(right)
+	left := cutDisplayWidth(value, 0, leftBudget)
+	right := cutDisplayWidth(value, maxInt(0, displayWidth(value)-rightBudget), displayWidth(value))
+	return left + "..." + right
 }
 
 func wrapPlainText(value string, width int) []string {
@@ -5425,23 +5818,40 @@ func wrapPlainText(value string, width int) []string {
 			continue
 		}
 
-		var current []rune
+		var current strings.Builder
 		currentWidth := 0
-		for _, r := range segment {
-			rw := runeDisplayWidth(r)
-			if currentWidth+rw > width && len(current) > 0 {
-				lines = append(lines, string(current))
-				current = current[:0]
+		graphemes := uniseg.NewGraphemes(segment)
+		for graphemes.Next() {
+			cluster := graphemes.Str()
+			clusterWidth := safeClusterDisplayWidth(cluster, graphemes.Width())
+			if currentWidth+clusterWidth > width && currentWidth > 0 {
+				lines = append(lines, current.String())
+				current.Reset()
 				currentWidth = 0
 			}
-			current = append(current, r)
-			currentWidth += rw
+			current.WriteString(cluster)
+			currentWidth += clusterWidth
 		}
-		if len(current) > 0 {
-			lines = append(lines, string(current))
+		if current.Len() > 0 {
+			lines = append(lines, current.String())
 		}
 	}
 
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func wrapANSIText(value string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	if value == "" {
+		return []string{""}
+	}
+	wrapped := ansi.Wrap(value, width, "")
+	lines := strings.Split(wrapped, "\n")
 	if len(lines) == 0 {
 		return []string{""}
 	}
@@ -5459,6 +5869,148 @@ func runeDisplayWidth(r rune) int {
 	default:
 		return lipgloss.Width(string(r))
 	}
+}
+
+func displayWidth(value string) int {
+	return maxInt(ansi.StringWidth(value), ansi.StringWidthWc(value))
+}
+
+func truncateDisplayWidth(value string, width int, tail string) string {
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(value) <= width {
+		return value
+	}
+	tailWidth := displayWidth(tail)
+	contentWidth := width - tailWidth
+	if contentWidth < 0 {
+		return ""
+	}
+	return cutRightDisplayWidth(value, contentWidth) + tail
+}
+
+func cutDisplayWidth(value string, left, right int) string {
+	if right <= left {
+		return ""
+	}
+	if left <= 0 {
+		return cutRightDisplayWidth(value, right)
+	}
+	return cutRightDisplayWidth(cutLeftDisplayWidth(value, left), right-left)
+}
+
+func cutLeftDisplayWidth(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	if displayWidth(value) <= width {
+		return ""
+	}
+
+	var builder strings.Builder
+	skipping := true
+	currentWidth := 0
+	for index := 0; index < len(value); {
+		if sequence, size, ok := readANSIEscape(value[index:]); ok {
+			if !skipping {
+				builder.WriteString(sequence)
+			}
+			index += size
+			continue
+		}
+
+		cluster, clusterWidth := nextDisplayCluster(value[index:])
+		if cluster == "" {
+			break
+		}
+		index += len(cluster)
+		if skipping {
+			currentWidth += clusterWidth
+			if currentWidth <= width {
+				continue
+			}
+			skipping = false
+		}
+		builder.WriteString(cluster)
+	}
+	return builder.String()
+}
+
+func cutRightDisplayWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(value) <= width {
+		return value
+	}
+
+	var builder strings.Builder
+	currentWidth := 0
+	truncated := false
+	for index := 0; index < len(value); {
+		if sequence, size, ok := readANSIEscape(value[index:]); ok {
+			builder.WriteString(sequence)
+			index += size
+			continue
+		}
+
+		cluster, clusterWidth := nextDisplayCluster(value[index:])
+		if cluster == "" {
+			break
+		}
+		if currentWidth+clusterWidth > width {
+			truncated = true
+			break
+		}
+		builder.WriteString(cluster)
+		currentWidth += clusterWidth
+		index += len(cluster)
+	}
+	if truncated && containsANSIEscape(value) {
+		builder.WriteString("\x1b[0m")
+	}
+	return builder.String()
+}
+
+func nextDisplayCluster(value string) (string, int) {
+	if value == "" {
+		return "", 0
+	}
+	graphemes := uniseg.NewGraphemes(value)
+	if !graphemes.Next() {
+		return "", 0
+	}
+	cluster := graphemes.Str()
+	return cluster, safeClusterDisplayWidth(cluster, graphemes.Width())
+}
+
+func safeClusterDisplayWidth(cluster string, fallback int) int {
+	return maxInt(fallback, maxInt(ansi.StringWidth(cluster), ansi.StringWidthWc(cluster)))
+}
+
+func readANSIEscape(value string) (string, int, bool) {
+	if len(value) < 2 || value[0] != '\x1b' {
+		return "", 0, false
+	}
+	switch value[1] {
+	case '[':
+		for index := 2; index < len(value); index++ {
+			if value[index] >= 0x40 && value[index] <= 0x7E {
+				return value[:index+1], index + 1, true
+			}
+		}
+	case ']':
+		for index := 2; index < len(value); index++ {
+			if value[index] == '\a' {
+				return value[:index+1], index + 1, true
+			}
+			if value[index] == '\x1b' && index+1 < len(value) && value[index+1] == '\\' {
+				return value[:index+2], index + 2, true
+			}
+		}
+	}
+	return "", 0, false
 }
 
 func minInt(left, right int) int {

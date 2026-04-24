@@ -2872,3 +2872,409 @@ test("replays image attachments on follow-up rounds", async () => {
     attachments,
   });
 });
+
+test("waits briefly between tool rounds for DeepSeek providers to let prompt cache settle", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "deepseek-chat",
+    getProvider: () => "https://api.deepseek.com",
+    listProviders: async () => ["https://api.deepseek.com"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["deepseek-chat"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["deepseek-chat"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["deepseek-chat"] }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_DEEPSEEK_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const deepSeekRoundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(deepSeekRoundGapMs).toBeGreaterThanOrEqual(25);
+});
+
+test("waits between tool rounds when an OpenAI provider is using a DeepSeek model", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "deepseek-v4-flash",
+    getProvider: () => "https://api.openai.com/v1",
+    listProviders: async () => ["https://api.openai.com/v1"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["deepseek-v4-flash"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["deepseek-v4-flash"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["deepseek-v4-flash"] }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_DEEPSEEK_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const deepSeekModelRoundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(deepSeekModelRoundGapMs).toBeGreaterThanOrEqual(25);
+});
+
+test("cancels during DeepSeek cache settle delay before creating the next round", async () => {
+  const controller = new AbortController();
+  let requestCount = 0;
+  const states: string[] = [];
+  const transport: QueryTransport = {
+    getModel: () => "deepseek-chat",
+    getProvider: () => "https://api.deepseek.com",
+    listProviders: async () => ["https://api.deepseek.com"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["deepseek-chat"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["deepseek-chat"],
+    refreshModels: async () => ({
+      ok: true,
+      message: "ok",
+      models: ["deepseek-chat"],
+    }),
+    requestStreamUrl: async () => {
+      requestCount += 1;
+      return `stream://${requestCount}`;
+    },
+    stream: async function* () {
+      yield JSON.stringify({
+        type: "tool_call",
+        toolName: "file",
+        input: { action: "read_file", path: "README.md" },
+      });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    abortSignal: controller.signal,
+    transport,
+    env: {
+      CYRENE_DEEPSEEK_CACHE_SETTLE_MS: "10000",
+    },
+    onState: state => {
+      states.push(state.status);
+    },
+    onTextDelta: () => {},
+    onToolCall: async () => {
+      controller.abort();
+      return { message: "ok" };
+    },
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestCount).toBe(1);
+  expect(states).toContain("idle");
+});
+
+test("waits briefly between tool rounds for native Anthropic providers to let prompt cache settle", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "claude-sonnet-test",
+    getProvider: () => "https://api.anthropic.com",
+    getProviderFormat: () => "anthropic_messages",
+    listProviders: async () => ["https://api.anthropic.com"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["claude-sonnet-test"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["claude-sonnet-test"],
+    refreshModels: async () => ({
+      ok: true,
+      message: "ok",
+      models: ["claude-sonnet-test"],
+    }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_ANTHROPIC_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const anthropicRoundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(anthropicRoundGapMs).toBeGreaterThanOrEqual(25);
+});
+
+test("does not wait between tool rounds for Anthropic providers using non-native formats", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "claude-relay-test",
+    getProvider: () => "https://relay.test/v1",
+    getProviderFormat: () => "openai_chat",
+    listProviders: async () => ["https://relay.test/v1"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["claude-relay-test"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["claude-relay-test"],
+    refreshModels: async () => ({
+      ok: true,
+      message: "ok",
+      models: ["claude-relay-test"],
+    }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_ANTHROPIC_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const relayRoundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(relayRoundGapMs).toBeLessThan(25);
+});
+
+test("does not wait between tool rounds for non-DeepSeek providers", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["gpt-test"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["gpt-test"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_DEEPSEEK_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const nonDeepSeekRoundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(nonDeepSeekRoundGapMs).toBeLessThan(25);
+});
+
+test("cancels an in-flight stream without reporting a runtime error", async () => {
+  const controller = new AbortController();
+  const errors: string[] = [];
+  const states: string[] = [];
+  let streamSignal: AbortSignal | undefined;
+  let requested = false;
+
+  const transport: QueryTransport = {
+    getModel: () => "gpt-test",
+    getProvider: () => "https://provider.test/v1",
+    listProviders: async () => ["https://provider.test/v1"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["gpt-test"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["gpt-test"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["gpt-test"] }),
+    requestStreamUrl: async () => {
+      requested = true;
+      return "stream://cancel";
+    },
+    stream: async function* (_streamUrl, options) {
+      streamSignal = options?.signal;
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) {
+          resolve();
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => resolve(), {
+          once: true,
+        });
+      });
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    },
+  };
+
+  const run = runQuerySession({
+    query: "cancel this request",
+    abortSignal: controller.signal,
+    transport,
+    onState: state => {
+      states.push(state.status);
+    },
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: message => {
+      errors.push(message);
+    },
+  });
+
+  await Promise.resolve();
+  controller.abort();
+
+  const result = await run;
+  expect(result.status).toBe("completed");
+  expect(requested).toBe(true);
+  expect(streamSignal).toBe(controller.signal);
+  expect(errors).toEqual([]);
+  expect(states).toContain("idle");
+});

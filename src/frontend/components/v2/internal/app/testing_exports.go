@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -57,6 +58,14 @@ func RenderMarkdownBodyLinesForTest(text string, width int, base lipgloss.Style)
 	return renderMarkdownBodyLines(text, width, base)
 }
 
+func RenderedLineWidthForTest(text string) int {
+	return displayWidth(text)
+}
+
+func WrapLinesToWidthForTest(lines []string, width int) []string {
+	return wrapLinesToWidth(lines, width)
+}
+
 func StartupLogoColorForTest(row, col, rowCount, colCount int) lipgloss.CompleteColor {
 	return startupLogoColorAt(row, col, rowCount, colCount)
 }
@@ -85,6 +94,23 @@ func (m *Model) ApplyBridgeEventJSONForTest(payload string) error {
 	}
 	m.handleBridgeEvent(event)
 	return nil
+}
+
+func (m *Model) ApplyBridgeEventJSONNeedsClearForTest(payload string) (bool, error) {
+	var event bridgeEvent
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return false, err
+	}
+	return m.handleBridgeEvent(event), nil
+}
+
+func (m *Model) UpdateBridgeEventJSONForTest(payload string) (tea.Cmd, error) {
+	var event bridgeEvent
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return nil, err
+	}
+	_, cmd := m.Update(bridgeEventMsg{Event: event})
+	return cmd, nil
 }
 
 func (m *Model) TranscriptMessageCacheCountForTest() int {

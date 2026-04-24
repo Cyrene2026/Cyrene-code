@@ -83,6 +83,17 @@ When they are present, they remain the **highest-priority source** for that run.
 Cyrene will report them as `process_env` via `/auth` and will not overwrite them
 behind your back.
 
+OpenAI-compatible providers use automatic prompt-cache routing by default:
+
+```bash
+CYRENE_OPENAI_PROMPT_CACHE=0              # disable prompt_cache_key
+CYRENE_OPENAI_PROMPT_CACHE_KEY=my-project # override the stable cache key
+CYRENE_OPENAI_PROMPT_CACHE_RETENTION=24h  # optional: 24h or in_memory
+```
+
+Provider-side cache hits still require the provider/model to support prompt
+caching and a repeated prompt prefix of at least 1024 tokens.
+
 ### First-run login onboarding
 
 If usable HTTP credentials are missing, Cyrene auto-opens a skippable login

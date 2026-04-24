@@ -178,6 +178,10 @@ export type ProviderEndpointSetResult = {
   endpoint?: string;
 };
 
+export type QueryTransportStreamOptions = {
+  signal?: AbortSignal;
+};
+
 export type QueryTransport = {
   getModel: () => string;
   getProvider: () => string;
@@ -222,5 +226,8 @@ export type QueryTransport = {
   setProvider: (provider: string) => Promise<ProviderSetResult>;
   refreshModels: () => Promise<ModelRefreshResult>;
   requestStreamUrl: (query: string | QueryInput) => Promise<string>;
-  stream: (streamUrl: string) => AsyncGenerator<string>;
+  stream: (
+    streamUrl: string,
+    options?: QueryTransportStreamOptions
+  ) => AsyncGenerator<string>;
 };

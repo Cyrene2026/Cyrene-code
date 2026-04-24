@@ -155,9 +155,14 @@ func (m *Model) mouseLayout() mouseLayout {
 	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
 
 	header := m.renderTopStatusBar(contentWidth)
-	composer := m.renderComposer(contentWidth)
-	topComposerDivider := renderComposerTopDivider(contentWidth)
-	bottomComposerDivider := renderComposerBottomDivider(contentWidth)
+	composer := ""
+	topComposerDivider := ""
+	bottomComposerDivider := ""
+	if !m.shouldHideComposerForPanel() {
+		composer = m.renderComposer(contentWidth)
+		topComposerDivider = renderComposerTopDivider(contentWidth)
+		bottomComposerDivider = renderComposerBottomDivider(contentWidth)
+	}
 	footer := m.renderBottomStatusBar(contentWidth)
 	headerHeight := lipgloss.Height(header)
 	composerHeight := lipgloss.Height(composer)
@@ -192,7 +197,7 @@ func (m *Model) mouseLayout() mouseLayout {
 			Left:   0,
 			Top:    bodyTop + bodyHeight + topDividerHeight,
 			Width:  contentWidth,
-			Height: maxInt(1, composerHeight),
+			Height: composerHeight,
 		},
 		HasPanel: m.ActivePanel != PanelNone,
 	}
@@ -270,6 +275,10 @@ func (m *Model) composerMouseHit(composerRect mouseRect, mouseX, mouseY int) (mo
 		style = inputBoxStyle
 	}
 	inner := insetRectForStyle(composerRect, style)
+	if railWidth := composerRailWidth(m.ActivePanel); railWidth > 0 {
+		inner.Left += railWidth
+		inner.Width = maxInt(0, inner.Width-railWidth)
+	}
 	if !inner.contains(mouseX, mouseY) {
 		return mouseHit{}, false
 	}

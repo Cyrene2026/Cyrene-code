@@ -21,7 +21,7 @@ func TestToolStatusUsesNeutralColorForUnknownActions(t *testing.T) {
 	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	plain := stripANSI.ReplaceAllString(rendered, "")
 
-	if !strings.Contains(plain, "Tool: mystery_tool foo | waiting") {
+	if !strings.Contains(plain, "tool mystery_tool") || !strings.Contains(plain, "foo | waiting") {
 		t.Fatalf("expected tool status text preserved, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "38;2;139;147;158") {
@@ -42,7 +42,7 @@ func TestToolStatusUsesExploreColorForListDir(t *testing.T) {
 	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	plain := stripANSI.ReplaceAllString(rendered, "")
 
-	if !strings.Contains(plain, "Running list_dir | workspace...") {
+	if !strings.Contains(plain, "explore list_dir") || !strings.Contains(plain, "workspace") {
 		t.Fatalf("expected list_dir status preserved, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "38;2;227;179;65") {
@@ -66,7 +66,7 @@ func TestToolStatusUsesSemanticColorForCompactedAliases(t *testing.T) {
 	if strings.Contains(plain, "lspdocumentsymbols") {
 		t.Fatalf("expected compact lsp alias canonicalized, got %q", plain)
 	}
-	if !strings.Contains(plain, "Tool error: lsp_document_symbols src/entrypoints/cli.tsx | LSP config error") {
+	if !strings.Contains(plain, "semantic lsp_document_symbols") || !strings.Contains(plain, "src/entrypoints/cli.tsx | LSP config error") {
 		t.Fatalf("expected tool error text preserved, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "38;2;94;215;200") {
@@ -84,7 +84,7 @@ func TestLatestRunningToolStatusShowsSpinner(t *testing.T) {
 
 	rendered := model.RenderTranscriptForTest(64, 2)
 
-	if !strings.Contains(rendered, "⠸ Calling tool: list_dir | workspace...") {
+	if !strings.Contains(rendered, "⠸") || !strings.Contains(rendered, "explore list_dir") || !strings.Contains(rendered, "workspace") {
 		t.Fatalf("expected animated tool-call spinner line, got %q", rendered)
 	}
 }
@@ -114,14 +114,14 @@ func TestToolStatusNormalizesCompactedToolNamesForDisplay(t *testing.T) {
 	if strings.Contains(plain, "outlinefile") || strings.Contains(plain, "readrange") {
 		t.Fatalf("expected compact tool aliases canonicalized, got %q", plain)
 	}
-	if !strings.Contains(plain, "Running outline_file | agent/promptbuilder.py...") {
+	if !strings.Contains(plain, "semantic outline_file") || !strings.Contains(plain, "agent/promptbuilder.py") {
 		t.Fatalf("expected running outline_file display, got %q", plain)
 	}
-	if !strings.Contains(plain, "Tool: read_range agent/promptbuilder.py | range content hidden") {
+	if !strings.Contains(plain, "read read_range") || !strings.Contains(plain, "agent/promptbuilder.py | range content hidden") {
 		t.Fatalf("expected read_range tool display, got %q", plain)
 	}
-	if !strings.Contains(plain, "Tool: read_range agent/context.py | range content hidden") ||
-		!strings.Contains(plain, "Tool: outline_file cli.py | Outline for cli.py") {
+	if !strings.Contains(plain, "agent/context.py | range content hidden") ||
+		!strings.Contains(plain, "cli.py | Outline for cli.py") {
 		t.Fatalf("expected every tool line in a multi-line message canonicalized, got %q", plain)
 	}
 	if !strings.Contains(plain, "❯ Tool: outline_file agent/promptbuilder.py | Outline for agent/prompt_builder.py") ||
@@ -444,7 +444,8 @@ func TestGitDiffToolStatusUsesBorderedDiffBlock(t *testing.T) {
 	plain := stripANSI.ReplaceAllString(rendered, "")
 
 	for _, expected := range []string{
-		"Tool: git_diff src/app.ts | [unstaged]",
+		"git git_diff",
+		"src/app.ts | [unstaged]",
 		"╭─ diff preview",
 		"▌ unstaged",
 		"diff --git a/src/app.ts b/src/app.ts",

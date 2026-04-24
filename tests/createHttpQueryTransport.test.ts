@@ -965,9 +965,6 @@ describe("createHttpQueryTransport tool exposure", () => {
       expect.objectContaining({
         type: "text",
         text: expect.stringContaining("Tool results:"),
-        cache_control: {
-          type: "ephemeral",
-        },
       }),
       expect.objectContaining({
         type: "text",
@@ -984,8 +981,13 @@ describe("createHttpQueryTransport tool exposure", () => {
         ),
       }),
     ]);
-    expect(contentBlocks[1]?.cache_control).toBeUndefined();
-    expect(contentBlocks[2]?.cache_control).toBeUndefined();
+    expect(contentBlocks[0]?.cache_control).toBeUndefined();
+    expect(contentBlocks[1]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
+    expect(contentBlocks[2]?.cache_control).toEqual({
+      type: "ephemeral",
+    });
     expect(contentBlocks[3]?.cache_control).toBeUndefined();
   });
 
@@ -1073,11 +1075,9 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(contentBlocks[0]).toEqual(
       expect.objectContaining({
         type: "text",
-        cache_control: {
-          type: "ephemeral",
-        },
       })
     );
+    expect(contentBlocks[0]?.cache_control).toBeUndefined();
     expect(contentBlocks[0]?.text).toContain("Original user task:");
     expect(contentBlocks[0]?.text).toContain("Tool results:");
     expect(contentBlocks[0]?.text).not.toContain("Execution state:");
@@ -1085,9 +1085,11 @@ describe("createHttpQueryTransport tool exposure", () => {
       expect.objectContaining({
         type: "text",
         text: expect.stringContaining("[tool_result] file"),
+        cache_control: {
+          type: "ephemeral",
+        },
       })
     );
-    expect(contentBlocks[1]?.cache_control).toBeUndefined();
     expect(contentBlocks[2]).toEqual(
       expect.objectContaining({
         type: "text",
@@ -1096,6 +1098,187 @@ describe("createHttpQueryTransport tool exposure", () => {
     );
     expect(contentBlocks[2]?.cache_control).toBeUndefined();
     expect(contentBlocks[2]?.text).toContain("Runtime note:");
+  });
+
+  test("anthropic marks the latest accumulated tool result as the fourth cache breakpoint", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Search memory:",
+      "known hit paths: README.md",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: list_dir . | confirmed directory state | [F] package.json",
+      "",
+      "[tool_result] file",
+      "Tool: read_files package.json, tsconfig.json | package.json, tsconfig.json (2 files)",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const contentBlocks = requestBody.messages[0]?.content;
+    expect(contentBlocks[0]?.cache_control).toBeUndefined();
+    expect(contentBlocks[1]?.text).toContain("Tool: list_dir .");
+    expect(contentBlocks[1]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(contentBlocks[2]?.text).toContain("Tool: read_files package.json");
+    expect(contentBlocks[2]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(contentBlocks[3]?.text).toContain("Search memory:");
+    expect(contentBlocks[3]?.cache_control).toBeUndefined();
+  });
+
+  test("anthropic pins truncated tool result windows at the stable truncation anchor", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              "event: message_stop",
+              'data: {"type":"message_stop"}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+    });
+
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Search memory:",
+      "known hit paths: README.md",
+      "",
+      "Tool results:",
+      "[tool results truncated] omitted 6 older result(s) to stay within the prompt budget.",
+      "",
+      "[tool_result] file",
+      "Tool: read_range src/a.ts | chunk A",
+      "",
+      "[tool_result] file",
+      "Tool: read_range src/b.ts | chunk B",
+      "",
+      "[tool_result] file",
+      "Tool: read_range src/c.ts | chunk C",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const contentBlocks = requestBody.messages[0]?.content;
+    expect(contentBlocks[0]?.cache_control).toBeUndefined();
+    expect(contentBlocks[1]?.text).toBe(
+      "[tool results truncated] older results omitted to stay within the prompt budget."
+    );
+    expect(contentBlocks[1]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(contentBlocks[2]?.text).toContain("chunk A");
+    expect(contentBlocks[2]?.cache_control).toBeUndefined();
+    expect(contentBlocks[3]?.text).toContain("chunk B");
+    expect(contentBlocks[3]?.cache_control).toBeUndefined();
+    expect(contentBlocks[4]?.text).toContain("chunk C");
+    expect(contentBlocks[4]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(contentBlocks[5]?.text).toContain("Search memory:");
+    expect(contentBlocks[5]?.cache_control).toBeUndefined();
   });
 
   test("anthropic keeps cache_control on text blocks when image attachments are present", async () => {
@@ -1189,6 +1372,14 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(contentBlocks[1]).toEqual(
       expect.objectContaining({
         type: "text",
+        text: expect.stringContaining("Tool results:"),
+      })
+    );
+    expect(contentBlocks[1]?.cache_control).toBeUndefined();
+    expect(contentBlocks[2]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("[tool_result] file"),
         cache_control: {
           type: "ephemeral",
         },
@@ -1285,7 +1476,7 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(snapshot.summary.cacheBreakpointPaths).toEqual([
       "tools[0]",
       "system[0]",
-      "messages[0].content[0]",
+      "messages[0].content[1]",
     ]);
     expect(snapshot.summary.resolvedCacheControl).toEqual({
       type: "ephemeral",
@@ -1311,7 +1502,7 @@ describe("createHttpQueryTransport tool exposure", () => {
         },
       })
     );
-    expect(snapshot.requestBody.messages[0]?.content[0]).toEqual(
+    expect(snapshot.requestBody.messages[0]?.content[1]).toEqual(
       expect.objectContaining({
         type: "text",
         cache_control: {
@@ -1319,6 +1510,123 @@ describe("createHttpQueryTransport tool exposure", () => {
         },
       })
     );
+  });
+
+  test("anthropic debug snapshots include previous block prefix and latest cache usage diagnostics", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: claude-3-7-sonnet-latest",
+        "last_used_model: claude-3-7-sonnet-latest",
+        "provider_base_url: https://api.anthropic.com",
+        "models:",
+        "  - claude-3-7-sonnet-latest",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    let responseCount = 0;
+    globalThis.fetch = mock(async (url: string) => {
+      if (!String(url).endsWith("/v1/messages")) {
+        return Response.json({ data: [{ id: "claude-3-7-sonnet-latest" }] });
+      }
+      responseCount += 1;
+      const usage =
+        responseCount === 1
+          ? {
+              input_tokens: 100,
+              output_tokens: 1,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 400,
+            }
+          : {
+              input_tokens: 120,
+              output_tokens: 2,
+              cache_read_input_tokens: 400,
+              cache_creation_input_tokens: 0,
+            };
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                [
+                  "event: message_start",
+                  `data: ${JSON.stringify({
+                    type: "message_start",
+                    message: { usage },
+                  })}`,
+                  "",
+                  "event: message_stop",
+                  'data: {"type":"message_stop"}',
+                  "",
+                ].join("\n")
+              )
+            );
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_ANTHROPIC_API_KEY: "anthropic-key",
+      },
+      debugAnthropicRequests: {
+        capture: true,
+        directory: join("logs", "anthropic-prefix-debug"),
+      },
+    });
+
+    for (const query of ["hello", "hello again"]) {
+      const streamUrl = await transport.requestStreamUrl(query);
+      for await (const _event of transport.stream(streamUrl)) {
+        // consume stream
+      }
+    }
+
+    const snapshotDir = join(root, "logs", "anthropic-prefix-debug");
+    const snapshotFiles = (await readdir(snapshotDir)).sort();
+    expect(snapshotFiles.length).toBe(2);
+    const firstSnapshotPath = join(snapshotDir, snapshotFiles[0]!);
+    const secondSnapshot = JSON.parse(
+      await readFile(join(snapshotDir, snapshotFiles[1]!), "utf8")
+    );
+
+    expect(secondSnapshot.summary.previous).toEqual(
+      expect.objectContaining({
+        path: firstSnapshotPath,
+        cacheBreakpointPaths: [
+          "tools[0]",
+          "system[0]",
+          "messages[0].content[0]",
+        ],
+        identicalUserContentBlockCount: 0,
+        previousUserContentBlockCount: 1,
+        currentUserContentBlockCount: 1,
+        firstDifferentUserContentBlockIndex: 0,
+        firstDifferentCurrentBlockCacheControl: true,
+        firstDifferentPreviousBlockCacheControl: true,
+      })
+    );
+    expect(secondSnapshot.summary.latestUsage).toEqual({
+      inputTokens: 120,
+      outputTokens: 2,
+      cacheReadInputTokens: 400,
+      cacheCreationInputTokens: 0,
+    });
   });
 
   test("anthropic latches TTL and scope per transport session", async () => {
@@ -1513,33 +1821,27 @@ describe("createHttpQueryTransport streaming usage", () => {
       "utf8"
     );
 
-    const encoder = new TextEncoder();
-    const streamBody = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(
-          encoder.encode(
-            [
-              'data: {"choices":[{"delta":{"content":"hello"}}]}',
-              "",
-              'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":9}}}',
-              "",
-              "data: [DONE]",
-              "",
-            ].join("\n")
-          )
-        );
-        controller.close();
-      },
-    });
-
     const fetchMock = mock(async (url: string, init?: RequestInit) => {
       fetchCalls.push({ url, init });
-      return new Response(streamBody, {
+      if (String(url).endsWith("/models")) {
+        return Response.json({ data: [{ id: "gpt-test" }] });
+      }
+      return new Response(
+        [
+          'data: {"choices":[{"delta":{"content":"hello"}}]}',
+          "",
+          'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":9}}}',
+          "",
+          "data: [DONE]",
+          "",
+        ].join("\n"),
+        {
         status: 200,
         headers: {
           "Content-Type": "text/event-stream",
         },
-      });
+        }
+      );
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -1559,9 +1861,13 @@ describe("createHttpQueryTransport streaming usage", () => {
       events.push(event);
     }
 
-    expect(fetchCalls).toHaveLength(1);
-    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const streamCall = fetchCalls.find(call =>
+      String(call.url).endsWith("/chat/completions")
+    );
+    expect(streamCall).toBeDefined();
+    const requestBody = JSON.parse(String(streamCall?.init?.body));
     expect(requestBody.temperature).toBe(0.2);
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
     expect(requestBody.stream_options).toEqual({ include_usage: true });
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "hello" }),
@@ -1588,11 +1894,11 @@ describe("createHttpQueryTransport streaming usage", () => {
     await writeFile(
       modelFile,
       [
-        "default_model: gpt-test",
-        "last_used_model: gpt-test",
-        "provider_base_url: https://example.test/v1",
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://api.deepseek.com",
         "models:",
-        "  - gpt-test",
+        "  - deepseek-v4-flash",
         "",
       ].join("\n"),
       "utf8"
@@ -1635,9 +1941,9 @@ describe("createHttpQueryTransport streaming usage", () => {
       appRoot: root,
       cyreneHome,
       env: {
-        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_BASE_URL: "https://api.deepseek.com",
         CYRENE_API_KEY: "test-key",
-        CYRENE_MODEL: "gpt-test",
+        CYRENE_MODEL: "deepseek-v4-flash",
       },
     });
     const streamUrl = await transport.requestStreamUrl("hello");
@@ -1672,6 +1978,859 @@ describe("createHttpQueryTransport streaming usage", () => {
       }),
       JSON.stringify({ type: "done" }),
     ]);
+  });
+
+  test("openai chat preserves cached tokens when final usage omits cached details", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[],"usage":{"prompt_tokens":1100,"completion_tokens":0,"total_tokens":1100,"prompt_tokens_details":{"cached_tokens":1024}}}',
+              "",
+              'data: {"choices":[],"usage":{"prompt_tokens":1100,"completion_tokens":9,"total_tokens":1109}}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(
+      async () =>
+        new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        })
+    ) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toContain(
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 1100,
+        cachedTokens: 1024,
+        completionTokens: 9,
+        totalTokens: 1109,
+      })
+    );
+  });
+
+  test("deepseek chat maps prompt_cache_hit_tokens to cached usage tokens", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://api.deepseek.com",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":8,"total_tokens":1208,"prompt_cache_hit_tokens":1024,"prompt_cache_miss_tokens":176}}',
+              "",
+              "data: [DONE]",
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async () => {
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.deepseek.com",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toContain(
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 1200,
+        cachedTokens: 1024,
+        completionTokens: 8,
+        totalTokens: 1208,
+      })
+    );
+  });
+
+  test("openai chat retries without prompt cache params when provider rejects them", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { error: { message: "Unknown parameter: prompt_cache_key" } },
+          { status: 400 }
+        );
+      }
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    expect(fetchCalls).toHaveLength(2);
+    expect(JSON.parse(String(fetchCalls[0]?.init?.body)).prompt_cache_key).toBe(
+      "cyrene-example-test-gpt-test"
+    );
+    expect(
+      JSON.parse(String(fetchCalls[1]?.init?.body)).prompt_cache_key
+    ).toBeUndefined();
+  });
+
+  test("openai chat preserves prompt cache key when only retention is rejected", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { error: { message: "Unsupported parameter: prompt_cache_retention" } },
+          { status: 400 }
+        );
+      }
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+        CYRENE_OPENAI_PROMPT_CACHE_RETENTION: "24h",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    expect(fetchCalls).toHaveLength(2);
+    const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(firstBody.prompt_cache_retention).toBe("24h");
+    expect(secondBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(secondBody.prompt_cache_retention).toBeUndefined();
+  });
+
+  test("openai chat moves structured prompt state after stable system prefix", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const structuredPrompt = [
+      "SYSTEM PROMPT (highest priority):",
+      "system prompt block",
+      "",
+      ".CYRENE.MD POLICY (second priority):",
+      "project policy block",
+      "",
+      "SELECTED EXTENSIONS (request-scoped summary):",
+      "- request-scoped extension summary",
+      "",
+      "EXECUTION PLAN PROTOCOL:",
+      "plan protocol block",
+      "",
+      "TASK STATE CONTEXT:",
+      "Working state (durable reducer):",
+      "- dynamic state",
+      "",
+      "Current user query (act on this now):",
+      "continue",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(structuredPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(requestBody.messages[0]?.content).toContain(
+      "SYSTEM PROMPT (highest priority):"
+    );
+    expect(requestBody.messages[0]?.content).toContain("EXECUTION PLAN PROTOCOL:");
+    expect(requestBody.messages[0]?.content).toContain(
+      "SELECTED EXTENSIONS (request-scoped summary):"
+    );
+    expect(requestBody.messages[0]?.content).not.toContain("TASK STATE CONTEXT:");
+    expect(requestBody.messages[1]?.content).toContain("TASK STATE CONTEXT:");
+    expect(requestBody.messages[1]?.content).toContain(
+      "Current user query (act on this now):"
+    );
+  });
+
+  test("openai chat moves continuation tool results after stable system prefix", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Runtime fact sections below may be synthesized from structured tool metadata, including approved review results.",
+      "",
+      "Search memory:",
+      "- dynamic search memory",
+      "",
+      "File read ledger:",
+      "- dynamic file read ledger",
+      "",
+      "Execution state:",
+      "mode: project_analysis",
+      "phase: synthesize",
+      "",
+      "Heuristic nudges:",
+      "1. Continue from confirmed facts.",
+      "",
+      "Tool results:",
+      "[tool results truncated] omitted 3 older result(s) to stay within the prompt budget.",
+      "",
+      "[tool_result] file",
+      "Tool: read_files README.md | README.md (1 file)",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(requestBody.messages[0]?.content).toBe(TOOL_USAGE_SYSTEM_PROMPT);
+    expect(requestBody.messages[0]?.content).not.toContain("Original user task:");
+    expect(requestBody.messages[0]?.content).not.toContain("Tool results:");
+    expect(requestBody.messages[0]?.content).not.toContain("Search memory:");
+    expect(requestBody.messages[0]?.content).not.toContain("Execution state:");
+    expect(requestBody.messages[1]?.content).toContain("Original user task:");
+    expect(requestBody.messages[1]?.content).toContain(
+      "Continue based on tool results"
+    );
+    expect(requestBody.messages[1]?.content).toContain("Search memory:");
+    expect(requestBody.messages[1]?.content).toContain("File read ledger:");
+    expect(requestBody.messages[1]?.content).toContain("Execution state:");
+    expect(requestBody.messages[1]?.content).toContain("Tool results:");
+    expect(requestBody.messages[1]?.content).toContain(
+      "Dynamic context:\n(raw tool results and runtime facts appear after this stable cache prefix.)"
+    );
+    expect(requestBody.messages[1]?.content).toContain(
+      "Stable cache anchor: dynamic context begins below."
+    );
+    expect(requestBody.messages[1]?.content).toContain(
+      "[tool results truncated] older results omitted to stay within the prompt budget."
+    );
+    expect(requestBody.messages[1]?.content).not.toContain("omitted 3 older result(s)");
+    expect(requestBody.messages[1]?.content).toContain("[tool_result] file");
+    const userContent = String(requestBody.messages[1]?.content);
+    expect(userContent.indexOf("Original user task:")).toBeLessThan(
+      userContent.indexOf("Dynamic context:")
+    );
+    expect(userContent.indexOf("Dynamic context:")).toBeLessThan(
+      userContent.indexOf("Tool results:")
+    );
+    expect(userContent.indexOf("Tool results:")).toBeGreaterThanOrEqual(4096);
+    expect(userContent.indexOf("Tool results:")).toBeLessThan(
+      userContent.indexOf("File read ledger:")
+    );
+    expect(userContent.indexOf("Search memory:")).toBeGreaterThan(
+      userContent.indexOf("Tool results:")
+    );
+    expect(userContent.indexOf("Execution state:")).toBeGreaterThan(
+      userContent.indexOf("Tool results:")
+    );
+  });
+
+  test("deepseek chat preserves message prefix caching semantics instead of OpenAI prompt cache params", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://api.deepseek.com",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.deepseek.com",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+      },
+    });
+
+    const firstStreamUrl = await transport.requestStreamUrl("hello one");
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+    const secondStreamUrl = await transport.requestStreamUrl("hello two");
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    const rawBody = String(fetchCalls[0]?.init?.body);
+    const secondRawBody = String(fetchCalls[1]?.init?.body);
+    const firstBody = JSON.parse(rawBody);
+    const secondBody = JSON.parse(secondRawBody);
+    expect(rawBody.indexOf('"messages"')).toBeGreaterThan(-1);
+    expect(rawBody.indexOf('"tools"')).toBeGreaterThan(-1);
+    expect(firstBody.prompt_cache_key).toBeUndefined();
+    expect(secondBody.prompt_cache_key).toBeUndefined();
+    expect(rawBody.indexOf('"messages"')).toBeLessThan(rawBody.indexOf('"tools"'));
+    expect(secondRawBody.indexOf('"messages"')).toBeLessThan(
+      secondRawBody.indexOf('"tools"')
+    );
+    let commonPrefixLength = 0;
+    while (
+      commonPrefixLength < rawBody.length &&
+      commonPrefixLength < secondRawBody.length &&
+      rawBody[commonPrefixLength] === secondRawBody[commonPrefixLength]
+    ) {
+      commonPrefixLength += 1;
+    }
+    expect(commonPrefixLength).toBeGreaterThanOrEqual(
+      rawBody.indexOf("hello one") + "hello ".length
+    );
+  });
+
+  test("deepseek chat splits continuation stable prefix from dynamic tool context", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://api.deepseek.com",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.deepseek.com",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+      },
+    });
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Search memory:",
+      "- dynamic search memory",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: read_file README.md",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.prompt_cache_key).toBeUndefined();
+    expect(requestBody.messages).toHaveLength(3);
+    expect(requestBody.messages[0]).toEqual({
+      role: "system",
+      content: TOOL_USAGE_SYSTEM_PROMPT,
+    });
+    expect(requestBody.messages[1]?.role).toBe("user");
+    expect(requestBody.messages[1]?.content).toContain("Original user task:");
+    expect(requestBody.messages[1]?.content).toContain("Dynamic context:");
+    expect(requestBody.messages[1]?.content).not.toContain("Tool results:");
+    expect(requestBody.messages[1]?.content).not.toContain("Search memory:");
+    expect(requestBody.messages[2]?.role).toBe("user");
+    expect(requestBody.messages[2]?.content).toContain("Tool results:");
+    expect(requestBody.messages[2]?.content).toContain("[tool_result] file");
+    expect(requestBody.messages[2]?.content).toContain("Search memory:");
+    expect(requestBody.messages[2]?.content.startsWith("Dynamic continuation context:")).toBe(
+      true
+    );
+    expect(
+      requestBody.messages[2]?.content.indexOf("Stable runtime fact index:")
+    ).toBeGreaterThan(0);
+    expect(requestBody.messages[2]?.content.indexOf("Search memory:")).toBeGreaterThanOrEqual(
+      4096
+    );
+    expect(requestBody.messages[2]?.content.indexOf("Search memory:")).toBeLessThan(
+      requestBody.messages[2]?.content.indexOf("Tool results:")
+    );
+    expect(requestBody.messages[2]?.content.indexOf("Tool results:")).toBeLessThan(
+      requestBody.messages[2]?.content.indexOf("[tool_result] file")
+    );
+    expect(String(requestBody.messages[1]?.content).length).toBeGreaterThanOrEqual(4096);
+  });
+
+  test("openai chat keeps the same stable system prefix for initial and continuation rounds", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+      },
+    });
+
+    const structuredPrompt = [
+      "SYSTEM PROMPT (highest priority):",
+      "system prompt block",
+      "",
+      "EXECUTION PLAN PROTOCOL:",
+      "plan protocol block",
+      "",
+      "TASK STATE CONTEXT:",
+      "Current user query (act on this now):",
+      "inspect repo",
+    ].join("\n");
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: read_file README.md",
+    ].join("\n");
+
+    const firstStreamUrl = await transport.requestStreamUrl(structuredPrompt);
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+    const secondStreamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(firstBody.messages[0]?.content.startsWith(TOOL_USAGE_SYSTEM_PROMPT)).toBe(true);
+    expect(secondBody.messages[0]?.content.startsWith(TOOL_USAGE_SYSTEM_PROMPT)).toBe(true);
+    expect(secondBody.messages[0]?.content).toBe(TOOL_USAGE_SYSTEM_PROMPT);
+    expect(secondBody.messages[0]?.content).not.toContain("Original user task:");
+    expect(secondBody.messages[1]?.content).toContain("Original user task:");
+    expect(secondBody.messages[1]?.content.indexOf("Original user task:")).toBeLessThan(
+      secondBody.messages[1]?.content.indexOf("Tool results:")
+    );
+    expect(firstBody.messages[0]?.content.slice(0, TOOL_USAGE_SYSTEM_PROMPT.length)).toBe(
+      secondBody.messages[0]?.content.slice(0, TOOL_USAGE_SYSTEM_PROMPT.length)
+    );
+  });
+
+  test("openai chat can snapshot outbound request bodies with prefix diffs", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const snapshotDir = join(root, "openai-debug");
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    globalThis.fetch = mock(async () => {
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+        CYRENE_CAPTURE_OPENAI_REQUESTS: "1",
+        CYRENE_CAPTURE_OPENAI_REQUESTS_DIR: snapshotDir,
+      },
+    });
+
+    const firstStreamUrl = await transport.requestStreamUrl("first");
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+    const secondStreamUrl = await transport.requestStreamUrl("second");
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    const snapshotFiles = (await readdir(snapshotDir)).sort();
+    expect(snapshotFiles).toHaveLength(2);
+    const snapshots = await Promise.all(
+      snapshotFiles.map(async file =>
+        JSON.parse(await readFile(join(snapshotDir, file), "utf8"))
+      )
+    );
+    const firstSnapshot = snapshots[0]!;
+    const secondSnapshot = snapshots.find(snapshot => snapshot.summary.previous);
+    expect(secondSnapshot).toBeDefined();
+    expect(firstSnapshot.format).toBe("openai_chat");
+    expect(firstSnapshot.summary.keyOrder.indexOf("tools")).toBeLessThan(
+      firstSnapshot.summary.keyOrder.indexOf("messages")
+    );
+    expect(secondSnapshot?.summary.previous.commonPrefixLength).toBeGreaterThan(0);
+    expect(secondSnapshot?.summary.previous.firstDiffIndex).toBeGreaterThanOrEqual(0);
+    expect(secondSnapshot?.requestBodyPrefix.length).toBeGreaterThan(0);
+  });
+
+  test("openai snapshots include message-prefix and cache diagnostics", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    const snapshotDir = join(root, "deepseek-debug");
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://api.deepseek.com",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        [
+          'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":8,"total_tokens":1208,"prompt_cache_hit_tokens":1024,"prompt_cache_miss_tokens":176}}',
+          "",
+          "data: [DONE]",
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://api.deepseek.com",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+        CYRENE_CAPTURE_OPENAI_REQUESTS: "1",
+        CYRENE_CAPTURE_OPENAI_REQUESTS_DIR: snapshotDir,
+      },
+    });
+    const buildContinuationPrompt = (toolResult: string) =>
+      [
+        "Original user task:",
+        "inspect repo",
+        "",
+        "Continue based on tool results while staying strictly on the original task.",
+        "",
+        "Search memory:",
+        "- dynamic search memory",
+        "",
+        "Tool results:",
+        toolResult,
+        "",
+        "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+      ].join("\n");
+
+    const firstStreamUrl = await transport.requestStreamUrl(
+      buildContinuationPrompt("[tool_result] file\nTool: read_file README.md")
+    );
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+    const secondStreamUrl = await transport.requestStreamUrl(
+      buildContinuationPrompt("[tool_result] file\nTool: read_file package.json")
+    );
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    const snapshotFiles = (await readdir(snapshotDir)).sort();
+    expect(snapshotFiles).toHaveLength(2);
+    const snapshots = await Promise.all(
+      snapshotFiles.map(async file =>
+        JSON.parse(await readFile(join(snapshotDir, file), "utf8"))
+      )
+    );
+    const secondSnapshot = snapshots.find(snapshot => snapshot.summary.previous);
+    expect(secondSnapshot?.summary.messagePrefix).toEqual(
+      expect.objectContaining({
+        currentMessageCount: 3,
+        previousMessageCount: 3,
+        identicalMessageCount: 2,
+        firstDifferentMessageIndex: 2,
+        firstDifferentMessageRole: "user",
+        firstDifferentPreviousRole: "user",
+      })
+    );
+    expect(
+      secondSnapshot?.summary.messagePrefix.firstDifferentContentCommonPrefixLength
+    ).toBeGreaterThan(0);
+    expect(secondSnapshot?.summary.latestCache).toEqual({
+      cachedTokens: 1024,
+      promptCacheHitTokens: 1024,
+      promptCacheMissTokens: 176,
+    });
   });
 
   test("prefers output_text over plain text parts in structured content array chunks", async () => {
@@ -3487,6 +4646,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     expect(requestBody.model).toBe("gpt-test");
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
     expect(requestBody.stream).toBe(true);
     expect(requestBody.tool_choice).toBe("auto");
     expect(requestBody.input).toEqual([
@@ -3604,6 +4764,466 @@ describe("createHttpQueryTransport streaming usage", () => {
       }),
       JSON.stringify({ type: "done" }),
     ]);
+  });
+
+  test("openai responses preserves cached tokens when completed usage omits cached details", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'data: {"type":"response.in_progress","response":{"usage":{"input_tokens":1200,"output_tokens":0,"total_tokens":1200,"input_tokens_details":{"cached_tokens":1024}}}}',
+              "",
+              'data: {"type":"response.completed","response":{"usage":{"input_tokens":1200,"output_tokens":8,"total_tokens":1208}}}',
+              "",
+            ].join("\n")
+          )
+        );
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(
+      async () =>
+        new Response(streamBody, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        })
+    ) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("hello");
+    const events: string[] = [];
+    for await (const event of transport.stream(streamUrl)) {
+      events.push(event);
+    }
+
+    expect(events).toContain(
+      JSON.stringify({
+        type: "usage",
+        promptTokens: 1200,
+        cachedTokens: 1024,
+        completionTokens: 8,
+        totalTokens: 1208,
+      })
+    );
+  });
+
+  test("openai responses preserves prompt cache key when only retention is rejected", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { detail: "Unsupported parameter: prompt_cache_retention" },
+          { status: 400 }
+        );
+      }
+      return new Response(
+        [
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+        CYRENE_OPENAI_PROMPT_CACHE_RETENTION: "24h",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    expect(fetchCalls).toHaveLength(2);
+    const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(firstBody.prompt_cache_retention).toBe("24h");
+    expect(secondBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(secondBody.prompt_cache_retention).toBeUndefined();
+  });
+
+  test("openai responses retries without prompt cache key when provider rejects it", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { detail: "Unknown parameter: prompt_cache_key" },
+          { status: 400 }
+        );
+      }
+      return new Response(
+        [
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    expect(fetchCalls).toHaveLength(2);
+    const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
+    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(secondBody.prompt_cache_key).toBeUndefined();
+    expect(secondBody.prompt_cache_retention).toBeUndefined();
+  });
+
+  test("openai responses moves structured prompt state after stable instructions", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(
+        [
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const structuredPrompt = [
+      "SYSTEM PROMPT (highest priority):",
+      "system prompt block",
+      "",
+      ".CYRENE.MD POLICY (second priority):",
+      "project policy block",
+      "",
+      "SELECTED EXTENSIONS (request-scoped summary):",
+      "- request-scoped extension summary",
+      "",
+      "EXECUTION PLAN PROTOCOL:",
+      "plan protocol block",
+      "",
+      "TASK STATE CONTEXT:",
+      "Working state (durable reducer):",
+      "- dynamic state",
+      "",
+      "Current user query (act on this now):",
+      "continue",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(structuredPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(requestBody.instructions).toContain("SYSTEM PROMPT (highest priority):");
+    expect(requestBody.instructions).toContain("EXECUTION PLAN PROTOCOL:");
+    expect(requestBody.instructions).toContain(
+      "SELECTED EXTENSIONS (request-scoped summary):"
+    );
+    expect(requestBody.instructions).not.toContain("TASK STATE CONTEXT:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain("TASK STATE CONTEXT:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain(
+      "Current user query (act on this now):"
+    );
+  });
+
+  test("openai responses moves continuation tool results after stable instructions", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(
+        [
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const continuationPrompt = [
+      "Original user task:",
+      "inspect repo",
+      "",
+      "Continue based on tool results while staying strictly on the original task.",
+      "",
+      "Runtime fact sections below may be synthesized from structured tool metadata, including approved review results.",
+      "",
+      "Search memory:",
+      "- dynamic search memory",
+      "",
+      "File read ledger:",
+      "- dynamic file read ledger",
+      "",
+      "Execution state:",
+      "mode: project_analysis",
+      "phase: synthesize",
+      "",
+      "Heuristic nudges:",
+      "1. Continue from confirmed facts.",
+      "",
+      "Tool results:",
+      "[tool_result] file",
+      "Tool: read_files README.md | README.md (1 file)",
+      "",
+      "If more tool usage is needed, call tools again. Otherwise provide final answer.",
+    ].join("\n");
+
+    const streamUrl = await transport.requestStreamUrl(continuationPrompt);
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expect(requestBody.instructions).toBe(TOOL_USAGE_SYSTEM_PROMPT);
+    expect(requestBody.instructions).not.toContain("Original user task:");
+    expect(requestBody.instructions).not.toContain("Tool results:");
+    expect(requestBody.instructions).not.toContain("Search memory:");
+    expect(requestBody.instructions).not.toContain("Execution state:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain("Original user task:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain(
+      "Continue based on tool results"
+    );
+    expect(requestBody.input[0]?.content[0]?.text).toContain("Search memory:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain("File read ledger:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain("Execution state:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain("Tool results:");
+    expect(requestBody.input[0]?.content[0]?.text).toContain(
+      "Dynamic context:\n(raw tool results and runtime facts appear after this stable cache prefix.)"
+    );
+    expect(requestBody.input[0]?.content[0]?.text).toContain(
+      "Stable cache anchor: dynamic context begins below."
+    );
+    expect(requestBody.input[0]?.content[0]?.text).toContain("[tool_result] file");
+    const userContent = String(requestBody.input[0]?.content[0]?.text);
+    expect(userContent.indexOf("Original user task:")).toBeLessThan(
+      userContent.indexOf("Dynamic context:")
+    );
+    expect(userContent.indexOf("Dynamic context:")).toBeLessThan(
+      userContent.indexOf("Tool results:")
+    );
+    expect(userContent.indexOf("Tool results:")).toBeGreaterThanOrEqual(4096);
+    expect(userContent.indexOf("Tool results:")).toBeLessThan(
+      userContent.indexOf("File read ledger:")
+    );
+    expect(userContent.indexOf("Search memory:")).toBeGreaterThan(
+      userContent.indexOf("Tool results:")
+    );
+    expect(userContent.indexOf("Execution state:")).toBeGreaterThan(
+      userContent.indexOf("Tool results:")
+    );
+  });
+
+  test("deepseek responses preserves prompt-before-tools compatibility and skips OpenAI prompt cache params", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(
+        [
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}',
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+      },
+    });
+
+    await transport.listModels();
+    await transport.setProviderFormat?.("https://example.test/v1", "openai_responses");
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const rawBody = String(fetchCalls[0]?.init?.body);
+    const requestBody = JSON.parse(rawBody);
+    expect(requestBody.prompt_cache_key).toBeUndefined();
+    expect(rawBody.indexOf('"instructions"')).toBeGreaterThan(-1);
+    expect(rawBody.indexOf('"input"')).toBeGreaterThan(-1);
+    expect(rawBody.indexOf('"tools"')).toBeGreaterThan(-1);
+    expect(rawBody.indexOf('"instructions"')).toBeLessThan(rawBody.indexOf('"tools"'));
+    expect(rawBody.indexOf('"input"')).toBeLessThan(rawBody.indexOf('"tools"'));
   });
 
   test("openai responses format includes image attachments in structured input", async () => {

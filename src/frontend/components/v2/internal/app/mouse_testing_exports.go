@@ -68,6 +68,10 @@ func (m *Model) ComposerAttachmentAddMousePointForTest() (int, int, bool) {
 		style = inputBoxStyle
 	}
 	inner := insetRectForStyle(layout.Composer, style)
+	if railWidth := composerRailWidth(m.ActivePanel); railWidth > 0 {
+		inner.Left += railWidth
+		inner.Width = maxInt(0, inner.Width-railWidth)
+	}
 	line := m.composerAttachmentBarLine(inner.Width)
 	for _, segment := range line.Segments {
 		if segment.Kind != "add" {
@@ -87,6 +91,10 @@ func (m *Model) ComposerAttachmentRemoveMousePointForTest(index int) (int, int, 
 		style = inputBoxStyle
 	}
 	inner := insetRectForStyle(layout.Composer, style)
+	if railWidth := composerRailWidth(m.ActivePanel); railWidth > 0 {
+		inner.Left += railWidth
+		inner.Width = maxInt(0, inner.Width-railWidth)
+	}
 	line := m.composerAttachmentBarLine(inner.Width)
 	for _, segment := range line.Segments {
 		if segment.Kind != "attachment" || segment.Index != index {

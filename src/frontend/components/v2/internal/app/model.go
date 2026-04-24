@@ -355,6 +355,7 @@ type Model struct {
 	AuthModel         []rune
 	AuthCursor        int
 	AuthSaving        bool
+	AuthError         string
 	LastClickAt       time.Time
 	LastClickIdx      int
 	LastClickPan      Panel
@@ -545,7 +546,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clearComposerComposition()
 		return m, nil
 	case bridgeEventMsg:
-		m.handleBridgeEvent(value.Event)
+		clearScreen := m.handleBridgeEvent(value.Event)
 		if appRoot := value.Event.appRoot(); appRoot != "" {
 			if err := syncProcessAppRoot(appRoot); err != nil {
 				m.Status = StatusError
@@ -553,19 +554,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.withStatusSpinner(nil)
 			}
 		}
-		return m, m.withStatusSpinner(waitForBridgeEvent(m.bridge))
+		cmd := waitForBridgeEvent(m.bridge)
+		if clearScreen {
+			cmd = tea.Batch(tea.ClearScreen, cmd)
+		}
+		return m, m.withStatusSpinner(cmd)
 	case bridgeErrorMsg:
+		wasAuthSaving := m.AuthSaving
 		m.freezeRequestTiming(m.statusClockNow())
 		m.Status = StatusError
 		m.AuthSaving = false
+		if m.ActivePanel == PanelAuth || wasAuthSaving {
+			m.setAuthError(value.Message)
+		}
 		m.setNotice(value.Message, true)
 		return m, m.withStatusSpinner(nil)
 	case bridgeExitedMsg:
+		wasAuthSaving := m.AuthSaving
 		m.freezeRequestTiming(m.statusClockNow())
 		m.BridgeReady = false
 		m.bridge = nil
 		m.AuthSaving = false
 		if value.Err != nil {
+			if m.ActivePanel == PanelAuth || wasAuthSaving {
+				m.setAuthError(value.Err.Error())
+			}
 			m.Status = StatusError
 			m.setNotice(value.Err.Error(), true)
 		} else if !m.ShouldQuit {
@@ -638,10 +651,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, m.withStatusSpinner(nil)
 }
 
-func (m *Model) handleBridgeEvent(event bridgeEvent) {
+func (m *Model) handleBridgeEvent(event bridgeEvent) bool {
+	clearScreen := false
 	switch event.Type {
 	case "init":
 		m.applyBridgeSnapshot(event.Snapshot)
+		clearScreen = true
 	case "set_status":
 		m.BridgeReady = true
 		m.Status = parseStatus(event.Status)
@@ -658,7 +673,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 	case "append_items":
 		m.BridgeReady = true
 		if len(event.Items) == 0 {
-			return
+			return false
 		}
 		if isDefaultEmptyState(m.Items) {
 			m.Items = cloneMessages(event.Items)
@@ -678,6 +693,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.resetTranscriptMessageCache()
 		m.invalidateTranscriptCache()
 		m.clampTranscriptOffset()
+		clearScreen = true
 	case "set_sessions":
 		m.BridgeReady = true
 		m.Sessions = cloneSessions(event.Sessions)
@@ -699,6 +715,7 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 		m.UsageSummary = event.UsageSummary
 	case "set_auth_defaults":
 		m.BridgeReady = true
+		m.AuthError = ""
 		m.AuthProvider = []rune(strings.TrimSpace(event.ProviderBaseURL))
 		m.AuthProviderType = []rune(strings.TrimSpace(event.ProviderType))
 		m.AuthModel = []rune(strings.TrimSpace(event.Model))
@@ -728,11 +745,16 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) {
 			m.AuthCursor = 0
 		}
 	case "error":
+		wasAuthSaving := m.AuthSaving
 		m.freezeRequestTiming(time.Now())
 		m.Status = StatusError
 		m.AuthSaving = false
+		if m.ActivePanel == PanelAuth || wasAuthSaving {
+			m.setAuthError(event.Message)
+		}
 		m.setNotice(event.Message, true)
 	}
+	return clearScreen
 }
 
 func (m *Model) isAnimatingStatus() bool {
@@ -959,6 +981,7 @@ func (m *Model) handleAuthRefreshSideEffects() {
 	}
 	m.AuthSaving = false
 	if m.Auth.HTTPReady {
+		m.AuthError = ""
 		m.ActivePanel = PanelNone
 		m.setNotice("HTTP login updated.", false)
 	}
@@ -1262,9 +1285,12 @@ func (m *Model) transcriptViewportMetrics() (int, int) {
 	contentWidth := maxInt(30, framedInnerWidth(appShellStyle, width))
 	contentHeight := maxInt(12, framedInnerHeight(appShellStyle, height))
 	header := m.renderTopStatusBar(contentWidth)
-	composer := m.renderComposer(contentWidth)
+	composer := ""
+	if !m.shouldHideComposerForPanel() {
+		composer = m.renderComposer(contentWidth)
+	}
 	footer := m.renderBottomStatusBar(contentWidth)
-	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer) + 2
+	fixedHeight := lipgloss.Height(header) + lipgloss.Height(composer) + lipgloss.Height(footer)
 	bodyHeight := maxInt(5, contentHeight-fixedHeight)
 	contentAreaHeight := maxInt(1, bodyHeight)
 
@@ -1659,6 +1685,7 @@ func (m *Model) handlePanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEscape {
 		m.ActivePanel = PanelNone
 		m.AuthSaving = false
+		m.AuthError = ""
 		m.setNotice("", false)
 		return m, nil
 	}
@@ -1967,22 +1994,26 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if provider == "" {
 				m.AuthStep = AuthStepProvider
 				m.AuthCursor = len(m.AuthProvider)
+				m.setAuthError("Provider is required.")
 				m.setNotice("Provider is required.", true)
 				return m, nil
 			}
 			if providerType == "" {
 				m.AuthStep = AuthStepProviderType
 				m.AuthCursor = len(m.AuthProviderType)
+				m.setAuthError("Provider type is required.")
 				m.setNotice("Provider type is required.", true)
 				return m, nil
 			}
 			if apiKey == "" {
 				m.AuthStep = AuthStepAPIKey
 				m.AuthCursor = len(m.AuthAPIKey)
+				m.setAuthError("API key is required.")
 				m.setNotice("API key is required.", true)
 				return m, nil
 			}
 			m.AuthSaving = true
+			m.AuthError = ""
 			m.Status = StatusPreparing
 			m.setNotice("Saving HTTP login...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{
@@ -2195,8 +2226,8 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.removeAttachmentAt(index - 1)
 		return true, nil
 	case query == "/cancel":
-		m.setNotice("No cancellable in-flight operation in v2 bridge mode.", true)
-		return true, nil
+		m.setNotice("Cancelling current request...", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "cancel"})
 	case query == "/clear":
 		m.Status = StatusPreparing
 		m.setNotice("Starting a new session...", false)
@@ -2679,6 +2710,7 @@ func emptyFallback(value, fallback string) string {
 func (m *Model) openAuthPanel() {
 	m.ActivePanel = PanelAuth
 	m.AuthSaving = false
+	m.AuthError = ""
 	m.AuthStep = AuthStepProvider
 	if len(m.AuthProvider) == 0 {
 		provider := strings.TrimSpace(m.CurrentProvider)
@@ -2791,6 +2823,7 @@ func (m *Model) insertAuthRunes(values []rune) {
 	next = append(next, (*field)[cursor:]...)
 	*field = next
 	m.AuthCursor = cursor + len(values)
+	m.AuthError = ""
 }
 
 func filterAuthInputRunes(values []rune) []rune {
@@ -2820,6 +2853,7 @@ func (m *Model) deleteAuthForward() {
 	next = append(next, (*field)[:cursor]...)
 	next = append(next, (*field)[cursor+1:]...)
 	*field = next
+	m.AuthError = ""
 }
 
 func (m *Model) deleteAuthBackward() {
@@ -2833,6 +2867,7 @@ func (m *Model) deleteAuthBackward() {
 	next = append(next, (*field)[cursor:]...)
 	*field = next
 	m.AuthCursor = cursor - 1
+	m.AuthError = ""
 }
 
 func (m *Model) deleteAuthWordBackward() {
@@ -2843,6 +2878,7 @@ func (m *Model) deleteAuthWordBackward() {
 	next, cursor := deleteWordBackwardRunes(*field, m.AuthCursor)
 	*field = next
 	m.AuthCursor = cursor
+	m.AuthError = ""
 }
 
 func (m *Model) deleteAuthToEnd() {
@@ -2852,6 +2888,7 @@ func (m *Model) deleteAuthToEnd() {
 	}
 	cursor := clampInt(m.AuthCursor, 0, len(*field))
 	*field = append([]rune{}, (*field)[:cursor]...)
+	m.AuthError = ""
 }
 
 func (m *Model) clearAuthField() {
@@ -2861,6 +2898,11 @@ func (m *Model) clearAuthField() {
 	}
 	*field = (*field)[:0]
 	m.AuthCursor = 0
+	m.AuthError = ""
+}
+
+func (m *Model) setAuthError(text string) {
+	m.AuthError = strings.TrimSpace(text)
 }
 
 func (m *Model) setNotice(text string, isError bool) {

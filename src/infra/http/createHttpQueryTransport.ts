@@ -21,6 +21,7 @@ import {
   type ProviderTypeOverrideMap,
   type ProviderTypeSetResult,
   type QueryTransport,
+  type QueryTransportStreamOptions,
   type QueryInput,
   type QueryAttachment,
   normalizeQueryInput,
@@ -151,43 +152,101 @@ const parseSseEventData = (rawEvent: string): string[] => {
     .map(line => line.replace(/^data:\s?/, ""));
 };
 
-const usagePayloadSchema = z.object({
-  prompt_tokens: z.number().int().nonnegative(),
-  completion_tokens: z.number().int().nonnegative(),
-  total_tokens: z.number().int().nonnegative(),
-  prompt_tokens_details: z
-    .object({
-      cached_tokens: z.number().int().nonnegative().optional(),
-    })
-    .passthrough()
-    .optional(),
-}).passthrough();
+type OpenAiUsageState = {
+  cachedTokens?: number;
+};
 
-const extractUsage = (payload: unknown): TokenUsage | null => {
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+
+const toNonnegativeInt = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : undefined;
+
+const extractOpenAiCachedTokens = (
+  usageRecord: Record<string, unknown>
+): number | undefined => {
+  for (const detailsKey of [
+    "prompt_tokens_details",
+    "input_tokens_details",
+  ]) {
+    const detailsRecord = asRecord(usageRecord[detailsKey]);
+    const cachedTokens = toNonnegativeInt(detailsRecord?.cached_tokens);
+    if (typeof cachedTokens === "number") {
+      return cachedTokens;
+    }
+  }
+
+  for (const cachedKey of [
+    "cached_tokens",
+    "prompt_cached_tokens",
+    "cached_input_tokens",
+    "cache_read_input_tokens",
+    "prompt_cache_hit_tokens",
+  ]) {
+    const cachedTokens = toNonnegativeInt(usageRecord[cachedKey]);
+    if (typeof cachedTokens === "number") {
+      return cachedTokens;
+    }
+  }
+
+  return undefined;
+};
+
+const resolveOpenAiCachedTokens = (
+  usageRecord: Record<string, unknown>,
+  state?: OpenAiUsageState
+): number | undefined => {
+  const cachedTokens = extractOpenAiCachedTokens(usageRecord);
+  if (typeof cachedTokens === "number") {
+    if (state) {
+      state.cachedTokens = Math.max(state.cachedTokens ?? 0, cachedTokens);
+      return state.cachedTokens;
+    }
+    return cachedTokens;
+  }
+  return state?.cachedTokens;
+};
+
+const extractUsage = (
+  payload: unknown,
+  state?: OpenAiUsageState
+): TokenUsage | null => {
   if (!payload || typeof payload !== "object" || !("usage" in payload)) {
     return null;
   }
 
-  const parsedUsage = usagePayloadSchema.safeParse(
-    (payload as { usage?: unknown }).usage
-  );
-  if (!parsedUsage.success) {
+  const usageRecord = asRecord((payload as { usage?: unknown }).usage);
+  if (!usageRecord) {
     return null;
   }
 
+  const promptTokens = toNonnegativeInt(usageRecord.prompt_tokens);
+  const completionTokens = toNonnegativeInt(usageRecord.completion_tokens);
+  if (
+    typeof promptTokens !== "number" ||
+    typeof completionTokens !== "number"
+  ) {
+    return null;
+  }
+
+  const totalTokens =
+    toNonnegativeInt(usageRecord.total_tokens) ?? promptTokens + completionTokens;
+  const cachedTokens = resolveOpenAiCachedTokens(usageRecord, state);
   return {
-    promptTokens: parsedUsage.data.prompt_tokens,
-    cachedTokens: parsedUsage.data.prompt_tokens_details?.cached_tokens,
-    completionTokens: parsedUsage.data.completion_tokens,
-    totalTokens: parsedUsage.data.total_tokens,
+    promptTokens,
+    cachedTokens,
+    completionTokens,
+    totalTokens,
   };
 };
 
 const buildUsageSignature = (usage: TokenUsage) =>
   `${usage.promptTokens}:${usage.cachedTokens ?? 0}:${usage.completionTokens}:${usage.totalTokens}`;
 
-const extractUsageEvent = (payload: unknown) => {
-  const usage = extractUsage(payload);
+const extractUsageEvent = (payload: unknown, state?: OpenAiUsageState) => {
+  const usage = extractUsage(payload, state);
   if (!usage) {
     return null;
   }
@@ -205,6 +264,107 @@ const extractUsageEvent = (payload: unknown) => {
     }),
   };
 };
+
+type OpenAiPromptCacheRetention = "in_memory" | "24h";
+
+type OpenAiPromptCacheConfig = {
+  key: string;
+  retention?: OpenAiPromptCacheRetention;
+};
+
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+
+const normalizeOpenAiPromptCacheKey = (value: string) =>
+  value
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH);
+
+const buildDefaultOpenAiPromptCacheKey = (provider: string, model: string) => {
+  const normalizedProvider = normalizeOpenAiPromptCacheKey(
+    provider
+      .replace(/^https?:\/\//i, "")
+      .replace(/\/v\d+(?:beta)?\/?$/i, "")
+      .replace(/[/?#].*$/, "")
+  );
+  const normalizedModel = normalizeOpenAiPromptCacheKey(model);
+  return normalizeOpenAiPromptCacheKey(
+    ["cyrene", normalizedProvider, normalizedModel].filter(Boolean).join("-")
+  );
+};
+
+const parseOpenAiPromptCacheRetention = (
+  value: string | undefined
+): OpenAiPromptCacheRetention | undefined => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || normalized === "default" || normalized === "auto") {
+    return undefined;
+  }
+  if (
+    normalized === "24h" ||
+    normalized === "24hr" ||
+    normalized === "24-hour" ||
+    normalized === "24-hours"
+  ) {
+    return "24h";
+  }
+  if (
+    normalized === "memory" ||
+    normalized === "in-memory" ||
+    normalized === "in_memory"
+  ) {
+    return "in_memory";
+  }
+  return undefined;
+};
+
+const resolveOpenAiPromptCacheConfig = (options: {
+  env?: NodeJS.ProcessEnv;
+  provider: string;
+  model: string;
+  family?: ProviderFamily;
+}): OpenAiPromptCacheConfig | null => {
+  if (options.family === "gemini") {
+    return null;
+  }
+  if (hasDeepSeekMarker(options.provider) || hasDeepSeekMarker(options.model)) {
+    return null;
+  }
+  if (options.env?.CYRENE_OPENAI_PROMPT_CACHE === "0") {
+    return null;
+  }
+  const explicitKey = options.env?.CYRENE_OPENAI_PROMPT_CACHE_KEY;
+  const key = normalizeOpenAiPromptCacheKey(
+    explicitKey?.trim() || buildDefaultOpenAiPromptCacheKey(options.provider, options.model)
+  );
+  if (!key) {
+    return null;
+  }
+  return {
+    key,
+    retention: parseOpenAiPromptCacheRetention(
+      options.env?.CYRENE_OPENAI_PROMPT_CACHE_RETENTION
+    ),
+  };
+};
+
+const buildOpenAiPromptCacheFields = (config: OpenAiPromptCacheConfig) => ({
+  prompt_cache_key: config.key,
+  ...(config.retention ? { prompt_cache_retention: config.retention } : {}),
+});
+
+const hasDeepSeekMarker = (value: string | undefined) =>
+  Boolean(value?.toLowerCase().includes("deepseek"));
+
+const shouldPreferPromptBeforeTools = (options: {
+  provider: string;
+  model: string;
+}) => hasDeepSeekMarker(options.provider) || hasDeepSeekMarker(options.model);
+
+const shouldPreferToolsBeforePrompt = (options: {
+  cacheConfig?: OpenAiPromptCacheConfig | null;
+}) => Boolean(options.cacheConfig);
 
 const MAX_HTTP_FAILURE_DETAIL_LENGTH = 1200;
 
@@ -308,6 +468,440 @@ const isUnsupportedTemperatureFailureDetail = (detail: string | null) => {
       normalized.includes("does not support") ||
       normalized.includes("not support"))
   );
+};
+
+const isUnsupportedParameterFailure = (normalizedDetail: string) =>
+  normalizedDetail.includes("unsupported parameter") ||
+  normalizedDetail.includes("unknown parameter") ||
+  normalizedDetail.includes("unrecognized") ||
+  normalizedDetail.includes("does not support") ||
+  normalizedDetail.includes("not support");
+
+const isUnsupportedPromptCacheKeyFailureDetail = (detail: string | null) => {
+  if (!detail) {
+    return false;
+  }
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("prompt_cache_key") &&
+    isUnsupportedParameterFailure(normalized)
+  );
+};
+
+const isUnsupportedPromptCacheRetentionFailureDetail = (
+  detail: string | null
+) => {
+  if (!detail) {
+    return false;
+  }
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("prompt_cache_retention") &&
+    isUnsupportedParameterFailure(normalized)
+  );
+};
+
+const isUnsupportedPromptCacheFailureDetail = (detail: string | null) =>
+  isUnsupportedPromptCacheKeyFailureDetail(detail) ||
+  isUnsupportedPromptCacheRetentionFailureDetail(detail);
+
+const nextOpenAiPromptCacheConfigAfterFailure = (
+  config: OpenAiPromptCacheConfig | null,
+  detail: string | null
+): OpenAiPromptCacheConfig | null => {
+  if (!config) {
+    return null;
+  }
+  if (
+    config.retention &&
+    isUnsupportedPromptCacheRetentionFailureDetail(detail)
+  ) {
+    return { key: config.key };
+  }
+  if (isUnsupportedPromptCacheKeyFailureDetail(detail)) {
+    return null;
+  }
+  return config;
+};
+
+type OpenAiRequestCaptureRecord = {
+  createdAt: string;
+  captureId: string;
+  format: "openai_chat" | "openai_responses";
+  provider: string;
+  model: string;
+  requestUrl: string;
+  summary: {
+    requestBodyLength: number;
+    prefixLength: number;
+    promptCacheKey: string | null;
+    promptBeforeTools: boolean;
+    keyOrder: string[];
+    previous?: {
+      path: string;
+      commonPrefixLength: number;
+      firstDiffIndex: number | null;
+      leftContext: string;
+      rightContext: string;
+    };
+    messagePrefix?: OpenAiMessagePrefixDiagnostic;
+    latestCache?: {
+      cachedTokens?: number;
+      promptCacheHitTokens?: number;
+      promptCacheMissTokens?: number;
+    };
+  };
+  requestBody: unknown;
+  requestBodyPrefix: string;
+  responseUsageEvents?: OpenAiCapturedUsageEvent[];
+};
+
+type OpenAiCapturePrevious = {
+  path: string;
+  body: string;
+  parsedBody: unknown;
+};
+
+type OpenAiCapturedUsageEvent = {
+  capturedAt: string;
+  usage: unknown;
+  normalized?: TokenUsage;
+};
+
+type OpenAiMessagePrefixDiagnostic = {
+  currentMessageCount: number;
+  previousMessageCount?: number;
+  identicalMessageCount?: number;
+  firstDifferentMessageIndex?: number | null;
+  firstDifferentMessageRole?: string | null;
+  firstDifferentPreviousRole?: string | null;
+  firstDifferentContentCommonPrefixLength?: number | null;
+  firstDifferentContentLeftContext?: string;
+  firstDifferentContentRightContext?: string;
+};
+
+const openAiCapturePreviousByKey = new Map<string, OpenAiCapturePrevious>();
+
+const shouldCaptureOpenAiRequests = (env?: NodeJS.ProcessEnv) =>
+  isTruthyEnvFlag(env?.CYRENE_CAPTURE_OPENAI_REQUESTS) ||
+  isTruthyEnvFlag(env?.CYRENE_DEBUG_HTTP_REQUESTS);
+
+const resolveOpenAiSnapshotDir = (options?: {
+  appRoot?: string;
+  env?: NodeJS.ProcessEnv;
+}) => {
+  const configuredDir =
+    options?.env?.CYRENE_CAPTURE_OPENAI_REQUESTS_DIR?.trim() ||
+    options?.env?.CYRENE_DEBUG_HTTP_REQUESTS_DIR?.trim();
+  if (configuredDir) {
+    if (isAbsolute(configuredDir)) {
+      return resolve(configuredDir);
+    }
+    return resolve(options?.appRoot ?? process.cwd(), configuredDir);
+  }
+  return join(
+    resolveUserHomeDir({ env: options?.env }),
+    ".cyrene",
+    "debug",
+    "openai-requests"
+  );
+};
+
+const findFirstDiffIndex = (left: string, right: string) => {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if (left.charCodeAt(index) !== right.charCodeAt(index)) {
+      return index;
+    }
+  }
+  return left.length === right.length ? null : length;
+};
+
+const sliceDiffContext = (value: string, index: number | null, radius = 180) => {
+  if (index === null) {
+    return "";
+  }
+  const start = Math.max(0, index - radius);
+  const end = Math.min(value.length, index + radius);
+  return value.slice(start, end);
+};
+
+const collectTopLevelKeyOrder = (bodyText: string) => {
+  try {
+    const parsed = JSON.parse(bodyText) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? Object.keys(parsed)
+      : [];
+  } catch {
+    return [];
+  }
+};
+
+const extractPromptCacheKeyFromBody = (bodyText: string) => {
+  try {
+    const parsed = JSON.parse(bodyText) as { prompt_cache_key?: unknown };
+    return typeof parsed.prompt_cache_key === "string"
+      ? parsed.prompt_cache_key
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const extractOpenAiSnapshotMessages = (body: unknown): unknown[] => {
+  const bodyRecord = asRecord(body);
+  if (!bodyRecord) {
+    return [];
+  }
+  if (Array.isArray(bodyRecord.messages)) {
+    return bodyRecord.messages;
+  }
+  if (Array.isArray(bodyRecord.input)) {
+    return bodyRecord.input;
+  }
+  return [];
+};
+
+const extractOpenAiSnapshotMessageRole = (message: unknown) => {
+  const messageRecord = asRecord(message);
+  const role = messageRecord?.role;
+  return typeof role === "string" ? role : null;
+};
+
+const stringifyOpenAiSnapshotMessageContent = (message: unknown) => {
+  const messageRecord = asRecord(message);
+  if (!messageRecord) {
+    return "";
+  }
+  const content = messageRecord.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return JSON.stringify(content);
+  }
+  return typeof content === "undefined" ? "" : JSON.stringify(content);
+};
+
+const sectionStartsWithAny = (text: string, markers: readonly string[]) =>
+  markers.some(marker => text.startsWith(marker.trim()));
+
+const splitTextIntoDoubleNewlineSections = (text: string) =>
+  text
+    .trim()
+    .split(/\n\n+/)
+    .map(section => section.trim())
+    .filter(Boolean);
+
+const buildOpenAiMessagePrefixDiagnostic = (
+  currentBody: unknown,
+  previousBody?: unknown
+): OpenAiMessagePrefixDiagnostic | undefined => {
+  const currentMessages = extractOpenAiSnapshotMessages(currentBody);
+  if (currentMessages.length === 0) {
+    return undefined;
+  }
+  const previousMessages = previousBody
+    ? extractOpenAiSnapshotMessages(previousBody)
+    : [];
+  if (previousMessages.length === 0) {
+    return {
+      currentMessageCount: currentMessages.length,
+    };
+  }
+
+  let identicalMessageCount = 0;
+  const comparableLength = Math.min(currentMessages.length, previousMessages.length);
+  while (
+    identicalMessageCount < comparableLength &&
+    JSON.stringify(currentMessages[identicalMessageCount]) ===
+      JSON.stringify(previousMessages[identicalMessageCount])
+  ) {
+    identicalMessageCount += 1;
+  }
+
+  const firstDifferentMessageIndex =
+    identicalMessageCount === comparableLength &&
+    currentMessages.length === previousMessages.length
+      ? null
+      : identicalMessageCount;
+  const currentDifferent =
+    typeof firstDifferentMessageIndex === "number"
+      ? currentMessages[firstDifferentMessageIndex]
+      : undefined;
+  const previousDifferent =
+    typeof firstDifferentMessageIndex === "number"
+      ? previousMessages[firstDifferentMessageIndex]
+      : undefined;
+  const currentContent = stringifyOpenAiSnapshotMessageContent(currentDifferent);
+  const previousContent = stringifyOpenAiSnapshotMessageContent(previousDifferent);
+  const firstDifferentContentDiffIndex =
+    typeof firstDifferentMessageIndex === "number"
+      ? findFirstDiffIndex(previousContent, currentContent)
+      : null;
+
+  return {
+    currentMessageCount: currentMessages.length,
+    previousMessageCount: previousMessages.length,
+    identicalMessageCount,
+    firstDifferentMessageIndex,
+    firstDifferentMessageRole: extractOpenAiSnapshotMessageRole(currentDifferent),
+    firstDifferentPreviousRole: extractOpenAiSnapshotMessageRole(previousDifferent),
+    firstDifferentContentCommonPrefixLength:
+      firstDifferentContentDiffIndex ?? Math.min(previousContent.length, currentContent.length),
+    firstDifferentContentLeftContext: sliceDiffContext(
+      previousContent,
+      firstDifferentContentDiffIndex
+    ),
+    firstDifferentContentRightContext: sliceDiffContext(
+      currentContent,
+      firstDifferentContentDiffIndex
+    ),
+  };
+};
+
+const writeOpenAiRequestSnapshot = async (options: {
+  appRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  captureId: string;
+  format: "openai_chat" | "openai_responses";
+  provider: string;
+  model: string;
+  requestUrl: string;
+  bodyText: string;
+  promptBeforeTools: boolean;
+}) => {
+  if (!shouldCaptureOpenAiRequests(options.env)) {
+    return null;
+  }
+  const snapshotDir = resolveOpenAiSnapshotDir({
+    appRoot: options.appRoot,
+    env: options.env,
+  });
+  const createdAt = new Date().toISOString();
+  const promptCacheKey = extractPromptCacheKeyFromBody(options.bodyText);
+  const cacheIdentity = [
+    options.format,
+    options.provider,
+    options.model,
+    promptCacheKey ?? "no-cache-key",
+  ].join("\u0000");
+  const previous = openAiCapturePreviousByKey.get(cacheIdentity);
+  const firstDiffIndex = previous
+    ? findFirstDiffIndex(previous.body, options.bodyText)
+    : null;
+  const snapshotPath = join(
+    snapshotDir,
+    `${createdAt.replaceAll(":", "-")}-${options.captureId}-${options.format}.json`
+  );
+  let parsedBody: unknown;
+  try {
+    parsedBody = JSON.parse(options.bodyText) as unknown;
+  } catch {
+    parsedBody = options.bodyText;
+  }
+  const messagePrefix = buildOpenAiMessagePrefixDiagnostic(
+    parsedBody,
+    previous?.parsedBody
+  );
+  const record: OpenAiRequestCaptureRecord = {
+    createdAt,
+    captureId: options.captureId,
+    format: options.format,
+    provider: options.provider,
+    model: options.model,
+    requestUrl: options.requestUrl,
+    summary: {
+      requestBodyLength: options.bodyText.length,
+      prefixLength: Math.min(4096, options.bodyText.length),
+      promptCacheKey,
+      promptBeforeTools: options.promptBeforeTools,
+      keyOrder: collectTopLevelKeyOrder(options.bodyText),
+      ...(messagePrefix ? { messagePrefix } : {}),
+      ...(previous
+        ? {
+            previous: {
+              path: previous.path,
+              commonPrefixLength:
+                firstDiffIndex ?? Math.min(previous.body.length, options.bodyText.length),
+              firstDiffIndex,
+              leftContext: sliceDiffContext(previous.body, firstDiffIndex),
+              rightContext: sliceDiffContext(options.bodyText, firstDiffIndex),
+            },
+          }
+        : {}),
+    },
+    requestBody: parsedBody,
+    requestBodyPrefix: options.bodyText.slice(0, 4096),
+  };
+  await mkdir(snapshotDir, { recursive: true });
+  await writeFile(snapshotPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  openAiCapturePreviousByKey.set(cacheIdentity, {
+    path: snapshotPath,
+    body: options.bodyText,
+    parsedBody,
+  });
+  return snapshotPath;
+};
+
+const appendOpenAiSnapshotUsage = async (options: {
+  env?: NodeJS.ProcessEnv;
+  snapshotPath: string | null;
+  usage: unknown;
+  normalized?: TokenUsage;
+}) => {
+  if (!options.snapshotPath || !shouldCaptureOpenAiRequests(options.env)) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(
+      await readFile(options.snapshotPath, "utf8")
+    ) as OpenAiRequestCaptureRecord & {
+      summary?: OpenAiRequestCaptureRecord["summary"] & {
+        latestUsage?: unknown;
+      };
+    };
+    const event: OpenAiCapturedUsageEvent = {
+      capturedAt: new Date().toISOString(),
+      usage: options.usage,
+      ...(options.normalized ? { normalized: options.normalized } : {}),
+    };
+    const usageRecord = asRecord(options.usage);
+    const promptCacheHitTokens =
+      typeof usageRecord?.prompt_cache_hit_tokens === "number"
+        ? Math.max(0, Math.floor(usageRecord.prompt_cache_hit_tokens))
+        : undefined;
+    const promptCacheMissTokens =
+      typeof usageRecord?.prompt_cache_miss_tokens === "number"
+        ? Math.max(0, Math.floor(usageRecord.prompt_cache_miss_tokens))
+        : undefined;
+    parsed.responseUsageEvents = [
+      ...(parsed.responseUsageEvents ?? []),
+      event,
+    ];
+    parsed.summary = {
+      ...parsed.summary,
+      latestUsage: event,
+      latestCache: {
+        ...(typeof options.normalized?.cachedTokens === "number"
+          ? { cachedTokens: options.normalized.cachedTokens }
+          : {}),
+        ...(typeof promptCacheHitTokens === "number"
+          ? { promptCacheHitTokens }
+          : {}),
+        ...(typeof promptCacheMissTokens === "number"
+          ? { promptCacheMissTokens }
+          : {}),
+      },
+    };
+    await writeFile(
+      options.snapshotPath,
+      `${JSON.stringify(parsed, null, 2)}\n`,
+      "utf8"
+    );
+  } catch {
+    // Debug capture should never affect the provider stream.
+  }
 };
 
 export const FILE_TOOL = {
@@ -857,6 +1451,16 @@ type AnthropicPromptProjection = {
   userText: string;
 };
 
+type OpenAiPromptProjection = {
+  systemPrompt: string;
+  userText: string;
+};
+
+type OpenAiContinuationPromptParts = {
+  stableUserPrefix: string;
+  dynamicUserText: string;
+};
+
 type AnthropicToolDefinition = {
   name: string;
   description?: string;
@@ -958,11 +1562,30 @@ const ANTHROPIC_TOOL_RESULTS_SUFFIX =
 const ANTHROPIC_DYNAMIC_CONTINUATION_MARKERS = [
   "\n\nRecent confirmed file mutations:\n",
   "\n\nMulti-file progress ledger:\n",
+  "\n\nSearch memory:\n",
+  "\n\nFile read ledger:\n",
   "\n\nExecution state:\n",
   "\n\nHeuristic nudges:\n",
 ] as const;
 const ANTHROPIC_NORMALIZED_OMITTED_TOOL_RESULTS_PREFIX =
   "[tool results truncated] older results omitted to stay within the prompt budget.";
+const OPENAI_CONTINUATION_STABLE_PREFIX_TARGET_CHARS = 4096;
+const OPENAI_CONTINUATION_DYNAMIC_CONTEXT_PLACEHOLDER =
+  "Dynamic context:\n(raw tool results and runtime facts appear after this stable cache prefix.)";
+const OPENAI_CONTINUATION_STABLE_PREFIX_ANCHOR_LINE =
+  "Stable cache anchor: dynamic context begins below.\n";
+const DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX_TARGET_CHARS = 4096;
+const DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX = [
+  "Dynamic continuation context:",
+  "",
+  "Stable runtime fact index:",
+  "- Search memory details appear below in the Search memory section.",
+  "- File read ledger details appear below in the File read ledger section.",
+  "- Execution state and heuristic nudges appear below when present.",
+  "- Tool result payloads appear after runtime facts.",
+].join("\n");
+const DEEPSEEK_DYNAMIC_CONTEXT_STABLE_ANCHOR_LINE =
+  "Stable dynamic context anchor: runtime details begin below.\n";
 
 type AnthropicTextBlock = {
   type: "text";
@@ -1059,6 +1682,8 @@ type AnthropicRequestSnapshotRecord = {
       cachedSystemTextLength: number;
       uncachedSystemTailTextLength: number;
     };
+    previous?: AnthropicPreviousRequestDiagnostic;
+    latestUsage?: AnthropicLatestUsageDiagnostic;
   };
   requestBody: AnthropicMessagesRequestBody;
   response?: {
@@ -1075,6 +1700,35 @@ type AnthropicRequestCaptureOptions = {
   capture?: boolean;
   directory?: string;
 };
+
+type AnthropicPreviousRequestDiagnostic = {
+  path: string;
+  cacheBreakpointPaths: string[];
+  identicalUserContentBlockCount: number;
+  previousUserContentBlockCount: number;
+  currentUserContentBlockCount: number;
+  firstDifferentUserContentBlockIndex: number | null;
+  firstDifferentCurrentBlockCacheControl?: boolean;
+  firstDifferentPreviousBlockCacheControl?: boolean;
+  firstDifferentContentCommonPrefixLength: number;
+  firstDifferentContentLeftContext: string;
+  firstDifferentContentRightContext: string;
+};
+
+type AnthropicLatestUsageDiagnostic = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+type AnthropicCapturePrevious = {
+  path: string;
+  requestBody: AnthropicMessagesRequestBody;
+  cacheBreakpointPaths: string[];
+};
+
+const anthropicCapturePreviousByKey = new Map<string, AnthropicCapturePrevious>();
 
 const isTruthyEnvFlag = (value: string | undefined) =>
   /^(?:1|true|yes|on)$/iu.test(value?.trim() ?? "");
@@ -1105,6 +1759,122 @@ const collectAnthropicCacheBreakpointPaths = (
     });
   });
   return paths;
+};
+
+const stringifyAnthropicUserContentBlock = (
+  block: AnthropicTextBlock | AnthropicImageBlock | undefined
+) => {
+  if (!block) {
+    return "";
+  }
+  return isAnthropicTextBlock(block) ? block.text : JSON.stringify(block);
+};
+
+const hasAnthropicTextCacheControl = (
+  block: AnthropicTextBlock | AnthropicImageBlock | undefined
+) => Boolean(block && isAnthropicTextBlock(block) && block.cache_control);
+
+const buildAnthropicPreviousRequestDiagnostic = (
+  current: AnthropicMessagesRequestBody,
+  previous: AnthropicCapturePrevious
+): AnthropicPreviousRequestDiagnostic => {
+  const currentBlocks = current.messages[0]?.content ?? [];
+  const previousBlocks = previous.requestBody.messages[0]?.content ?? [];
+  const comparableLength = Math.min(currentBlocks.length, previousBlocks.length);
+  let identicalUserContentBlockCount = 0;
+  while (
+    identicalUserContentBlockCount < comparableLength &&
+    JSON.stringify(currentBlocks[identicalUserContentBlockCount]) ===
+      JSON.stringify(previousBlocks[identicalUserContentBlockCount])
+  ) {
+    identicalUserContentBlockCount += 1;
+  }
+
+  const firstDifferentUserContentBlockIndex =
+    identicalUserContentBlockCount === comparableLength &&
+    currentBlocks.length === previousBlocks.length
+      ? null
+      : identicalUserContentBlockCount;
+  const currentDifferent =
+    typeof firstDifferentUserContentBlockIndex === "number"
+      ? currentBlocks[firstDifferentUserContentBlockIndex]
+      : undefined;
+  const previousDifferent =
+    typeof firstDifferentUserContentBlockIndex === "number"
+      ? previousBlocks[firstDifferentUserContentBlockIndex]
+      : undefined;
+  const currentContent = stringifyAnthropicUserContentBlock(currentDifferent);
+  const previousContent = stringifyAnthropicUserContentBlock(previousDifferent);
+  const firstDifferentContentDiffIndex =
+    typeof firstDifferentUserContentBlockIndex === "number"
+      ? findFirstDiffIndex(previousContent, currentContent)
+      : null;
+
+  return {
+    path: previous.path,
+    cacheBreakpointPaths: previous.cacheBreakpointPaths,
+    identicalUserContentBlockCount,
+    previousUserContentBlockCount: previousBlocks.length,
+    currentUserContentBlockCount: currentBlocks.length,
+    firstDifferentUserContentBlockIndex,
+    ...(currentDifferent
+      ? {
+          firstDifferentCurrentBlockCacheControl:
+            hasAnthropicTextCacheControl(currentDifferent),
+        }
+      : {}),
+    ...(previousDifferent
+      ? {
+          firstDifferentPreviousBlockCacheControl:
+            hasAnthropicTextCacheControl(previousDifferent),
+        }
+      : {}),
+    firstDifferentContentCommonPrefixLength:
+      firstDifferentContentDiffIndex ??
+      Math.min(previousContent.length, currentContent.length),
+    firstDifferentContentLeftContext: sliceDiffContext(
+      previousContent,
+      firstDifferentContentDiffIndex
+    ),
+    firstDifferentContentRightContext: sliceDiffContext(
+      currentContent,
+      firstDifferentContentDiffIndex
+    ),
+  };
+};
+
+const extractAnthropicLatestUsageDiagnostic = (
+  usageEvents: Array<{ eventType: string; usage: unknown }>
+): AnthropicLatestUsageDiagnostic | undefined => {
+  const latestUsage = usageEvents.at(-1)?.usage;
+  const usageRecord = asRecord(latestUsage);
+  if (!usageRecord) {
+    return undefined;
+  }
+  return {
+    ...(typeof usageRecord.input_tokens === "number"
+      ? { inputTokens: Math.max(0, Math.floor(usageRecord.input_tokens)) }
+      : {}),
+    ...(typeof usageRecord.output_tokens === "number"
+      ? { outputTokens: Math.max(0, Math.floor(usageRecord.output_tokens)) }
+      : {}),
+    ...(typeof usageRecord.cache_read_input_tokens === "number"
+      ? {
+          cacheReadInputTokens: Math.max(
+            0,
+            Math.floor(usageRecord.cache_read_input_tokens)
+          ),
+        }
+      : {}),
+    ...(typeof usageRecord.cache_creation_input_tokens === "number"
+      ? {
+          cacheCreationInputTokens: Math.max(
+            0,
+            Math.floor(usageRecord.cache_creation_input_tokens)
+          ),
+        }
+      : {}),
+  };
 };
 
 const resolveAnthropicSnapshotDir = (options?: {
@@ -1172,6 +1942,29 @@ const updateAnthropicRequestSnapshot = async (
   await writeFile(snapshotPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
 };
 
+const updateAnthropicSnapshotLatestUsage = async (
+  snapshotPath: string,
+  usageEvents: Array<{ eventType: string; usage: unknown }>
+) => {
+  const current = JSON.parse(
+    await readFile(snapshotPath, "utf8")
+  ) as AnthropicRequestSnapshotRecord;
+  const latestUsage = extractAnthropicLatestUsageDiagnostic(usageEvents);
+  const next: AnthropicRequestSnapshotRecord = {
+    ...current,
+    usageEvents,
+    ...(latestUsage
+      ? {
+          summary: {
+            ...current.summary,
+            latestUsage,
+          },
+        }
+      : {}),
+  };
+  await writeFile(snapshotPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+};
+
 const writeAnthropicRequestSnapshot = async (options: {
   appRoot?: string;
   env?: NodeJS.ProcessEnv;
@@ -1199,6 +1992,15 @@ const writeAnthropicRequestSnapshot = async (options: {
     snapshotDir,
     `${createdAt.replaceAll(":", "-")}-${options.captureId}.json`
   );
+  const cacheBreakpointPaths = collectAnthropicCacheBreakpointPaths(
+    options.requestBody
+  );
+  const cacheIdentity = [
+    options.provider,
+    options.model,
+    options.requestUrl,
+  ].join("\u0000");
+  const previous = anthropicCapturePreviousByKey.get(cacheIdentity);
   const snapshot: AnthropicRequestSnapshotRecord = {
     createdAt,
     captureId: options.captureId,
@@ -1212,9 +2014,7 @@ const writeAnthropicRequestSnapshot = async (options: {
       messageCount: options.requestBody.messages.length,
       userContentBlockCount:
         options.requestBody.messages[0]?.content.length ?? 0,
-      cacheBreakpointPaths: collectAnthropicCacheBreakpointPaths(
-        options.requestBody
-      ),
+      cacheBreakpointPaths,
       resolvedCacheControl: options.resolvedCacheControl,
       resolvedBetaHeaders: options.resolvedBetaHeaders,
       systemSplitSummary: {
@@ -1222,11 +2022,24 @@ const writeAnthropicRequestSnapshot = async (options: {
         uncachedSystemTailTextLength:
           options.systemProjection.uncachedSystemTailText.length,
       },
+      ...(previous
+        ? {
+            previous: buildAnthropicPreviousRequestDiagnostic(
+              options.requestBody,
+              previous
+            ),
+          }
+        : {}),
     },
     requestBody: options.requestBody,
   };
   await mkdir(snapshotDir, { recursive: true });
   await writeFile(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  anthropicCapturePreviousByKey.set(cacheIdentity, {
+    path: snapshotPath,
+    requestBody: options.requestBody,
+    cacheBreakpointPaths,
+  });
   return snapshotPath;
 };
 
@@ -1296,6 +2109,107 @@ const splitAnthropicPromptForCaching = (
   };
 };
 
+const splitOpenAiPromptForCaching = (
+  query: string,
+  fallbackSystemPrompt: string
+): OpenAiPromptProjection => {
+  const stableSystemPrompt = fallbackSystemPrompt.trim();
+  const joinStableSystemPrompt = (parts: Array<string | undefined>) =>
+    [stableSystemPrompt, ...parts.map(part => part?.trim()).filter(Boolean)]
+      .filter(Boolean)
+      .join("\n\n");
+  const taskStateIndex = query.indexOf(ANTHROPIC_TASK_STATE_MARKER);
+  if (taskStateIndex <= 0) {
+    const continuationProjection = splitOpenAiContinuationPromptForCaching(
+      query,
+      stableSystemPrompt
+    );
+    if (continuationProjection) {
+      return continuationProjection;
+    }
+    return {
+      systemPrompt: stableSystemPrompt,
+      userText: query,
+    };
+  }
+
+  const stablePrefix = query.slice(0, taskStateIndex).trim();
+  const dynamicSuffix = query.slice(taskStateIndex).trim();
+  if (!stablePrefix || !dynamicSuffix) {
+    return {
+      systemPrompt: stableSystemPrompt,
+      userText: query,
+    };
+  }
+
+  const systemSplit = splitAnthropicSystemPromptForCaching(stablePrefix);
+  return {
+    systemPrompt: joinStableSystemPrompt([
+      systemSplit.cachedSystemText,
+      systemSplit.uncachedSystemTailText,
+    ]),
+    userText: dynamicSuffix,
+  };
+};
+
+const splitOpenAiContinuationPromptForCaching = (
+  query: string,
+  fallbackSystemPrompt: string
+): OpenAiPromptProjection | null => {
+  const continuationParts = splitOpenAiContinuationPromptParts(query);
+  if (!continuationParts) {
+    return null;
+  }
+
+  return {
+    systemPrompt: fallbackSystemPrompt.trim(),
+    userText: [
+      continuationParts.stableUserPrefix,
+      continuationParts.dynamicUserText,
+    ].filter(Boolean).join("\n\n"),
+  };
+};
+
+const splitOpenAiContinuationPromptParts = (
+  query: string
+): OpenAiContinuationPromptParts | null => {
+  const toolResultsIndex = query.indexOf(ANTHROPIC_TOOL_RESULTS_MARKER);
+  if (toolResultsIndex <= 0) {
+    return null;
+  }
+
+  const prefixText = query.slice(0, toolResultsIndex).trim();
+  const remainder = query.slice(toolResultsIndex + ANTHROPIC_TOOL_RESULTS_MARKER.length);
+  if (!prefixText || !remainder.trim()) {
+    return null;
+  }
+
+  const { stablePrefix, dynamicPrefix } =
+    splitAnthropicContinuationPrefix(prefixText);
+  if (!stablePrefix) {
+    return null;
+  }
+
+  const suffixIndex = remainder.indexOf(ANTHROPIC_TOOL_RESULTS_SUFFIX);
+  const toolResultsText =
+    suffixIndex >= 0 ? remainder.slice(0, suffixIndex).trim() : remainder.trim();
+  const suffixText =
+    suffixIndex >= 0 ? remainder.slice(suffixIndex).trim() : "";
+  const normalizedToolResultsText =
+    normalizeOpenAiContinuationToolResultsText(toolResultsText);
+  const stableUserPrefix =
+    buildOpenAiContinuationStableUserPrefix(stablePrefix);
+
+  return {
+    stableUserPrefix,
+    dynamicUserText: [
+    `Tool results:\n${normalizedToolResultsText}`,
+    dynamicPrefix,
+    suffixText,
+    ].filter(Boolean).join("\n\n"),
+  };
+};
+
 const splitAnthropicUserTextAroundCurrentQuery = (userText: string) => {
   const queryIndex = userText.indexOf(ANTHROPIC_CURRENT_USER_QUERY_MARKER);
   if (queryIndex <= 0) {
@@ -1322,6 +2236,60 @@ const parseAnthropicToolResultBlocks = (text: string) => {
     .split(/\n\n(?=\[tool_result\]\s+)/)
     .map(part => part.trim())
     .filter(Boolean);
+};
+
+const normalizeOpenAiContinuationToolResultsText = (text: string) => {
+  const parsedToolResults = parseAnthropicToolResultBlocks(text);
+  if (
+    parsedToolResults.length === 0 ||
+    !parsedToolResults[0]?.startsWith("[tool results truncated]")
+  ) {
+    return text;
+  }
+
+  return [
+    normalizeAnthropicOmittedToolResultsPrefix(parsedToolResults[0] ?? ""),
+    ...parsedToolResults.slice(1),
+  ].join("\n\n");
+};
+
+const buildOpenAiContinuationStableUserPrefix = (stablePrefix: string) => {
+  const basePrefix = [
+    stablePrefix.trim(),
+    OPENAI_CONTINUATION_DYNAMIC_CONTEXT_PLACEHOLDER,
+  ].filter(Boolean).join("\n\n");
+
+  if (basePrefix.length >= OPENAI_CONTINUATION_STABLE_PREFIX_TARGET_CHARS) {
+    return basePrefix;
+  }
+
+  const paddingLength =
+    OPENAI_CONTINUATION_STABLE_PREFIX_TARGET_CHARS - basePrefix.length;
+  const padding = OPENAI_CONTINUATION_STABLE_PREFIX_ANCHOR_LINE.repeat(
+    Math.ceil(
+      paddingLength / OPENAI_CONTINUATION_STABLE_PREFIX_ANCHOR_LINE.length
+    )
+  );
+  return `${basePrefix}\n\n${padding}`;
+};
+
+const buildDeepSeekDynamicContextStablePrefix = () => {
+  if (
+    DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX.length >=
+    DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX_TARGET_CHARS
+  ) {
+    return DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX;
+  }
+
+  const paddingLength =
+    DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX_TARGET_CHARS -
+    DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX.length;
+  const padding = DEEPSEEK_DYNAMIC_CONTEXT_STABLE_ANCHOR_LINE.repeat(
+    Math.ceil(
+      paddingLength / DEEPSEEK_DYNAMIC_CONTEXT_STABLE_ANCHOR_LINE.length
+    )
+  );
+  return `${DEEPSEEK_DYNAMIC_CONTEXT_STABLE_PREFIX}\n\n${padding}`;
 };
 
 const splitAnthropicContinuationPrefix = (text: string) => {
@@ -1388,13 +2356,14 @@ const buildAnthropicUserBlocks = (
     const parsedToolResults = parseAnthropicToolResultBlocks(toolResultsText);
     const blocks: Array<AnthropicTextBlock | AnthropicImageBlock> = [...imageBlocks];
 
+    const shouldCacheStablePrefix = parsedToolResults.length === 0;
     if (stablePrefix) {
       blocks.push({
         type: "text",
         text: parsedToolResults.length
           ? `${stablePrefix}\n\nTool results:`
           : stablePrefix,
-        cache_control: cacheControl,
+        ...(shouldCacheStablePrefix ? { cache_control: cacheControl } : {}),
       });
     }
 
@@ -1402,17 +2371,37 @@ const buildAnthropicUserBlocks = (
       parsedToolResults[0]?.startsWith("[tool results truncated]")
         ? normalizeAnthropicOmittedToolResultsPrefix(parsedToolResults.shift() ?? "")
         : "";
+    let omittedPrefixBlockIndex: number | null = null;
     if (omittedPrefix) {
+      omittedPrefixBlockIndex = blocks.length;
       blocks.push({ type: "text", text: omittedPrefix });
     }
 
-    parsedToolResults.forEach((result, index) => {
-      void index;
+    const toolResultBlockIndexes: number[] = [];
+    parsedToolResults.forEach(result => {
+      toolResultBlockIndexes.push(blocks.length);
       blocks.push({
         type: "text",
         text: result,
       });
     });
+
+    const toolResultCacheBreakpointIndexes =
+      omittedPrefixBlockIndex === null
+        ? toolResultBlockIndexes.slice(-2)
+        : [
+            omittedPrefixBlockIndex,
+            ...toolResultBlockIndexes.slice(-1),
+          ];
+    for (const index of toolResultCacheBreakpointIndexes) {
+      const block = blocks[index];
+      if (block && isAnthropicTextBlock(block)) {
+        blocks[index] = {
+          ...block,
+          cache_control: cacheControl,
+        };
+      }
+    }
 
     if (!parsedToolResults.length && toolResultsText) {
       blocks.push({
@@ -1742,6 +2731,36 @@ const resolveGeminiGenerateContentUrl = (
   return `${normalized}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 };
 const DONE_EVENT = JSON.stringify({ type: "done" });
+
+const throwIfAborted = (signal?: AbortSignal) => {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  throw error;
+};
+
+const readStreamChunk = async (
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal
+) => {
+  throwIfAborted(signal);
+  try {
+    const result = await reader.read();
+    throwIfAborted(signal);
+    return result;
+  } catch (error) {
+    if (signal?.aborted) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore reader cancellation failures after an abort.
+      }
+    }
+    throw error;
+  }
+};
 const buildCompletionEvent = (completion: {
   source: "provider" | "runtime";
   reason: string;
@@ -2214,6 +3233,74 @@ const buildOpenAIChatUserContent = (
       ]
     : input.text;
 
+type OpenAIChatMessage = {
+  role: "system" | "user";
+  content: ReturnType<typeof buildOpenAIChatUserContent>;
+};
+
+const splitProjectedOpenAiContinuationUserText = (
+  userText: string
+): OpenAiContinuationPromptParts | null => {
+  const toolResultsIndex = userText.indexOf(ANTHROPIC_TOOL_RESULTS_MARKER);
+  if (toolResultsIndex <= 0) {
+    return null;
+  }
+  const stableUserPrefix = userText.slice(0, toolResultsIndex).trim();
+  const dynamicUserText = userText
+    .slice(toolResultsIndex + ANTHROPIC_TOOL_RESULTS_MARKER.length)
+    .trim();
+  if (!stableUserPrefix || !dynamicUserText) {
+    return null;
+  }
+  const dynamicSections = splitTextIntoDoubleNewlineSections(dynamicUserText);
+  const runtimeSections = dynamicSections.filter(section =>
+    sectionStartsWithAny(section, [
+      ...ANTHROPIC_DYNAMIC_CONTINUATION_MARKERS,
+      ANTHROPIC_TOOL_RESULTS_SUFFIX,
+    ])
+  );
+  const toolResultSections = dynamicSections.filter(
+    section =>
+      !sectionStartsWithAny(section, [
+        ...ANTHROPIC_DYNAMIC_CONTINUATION_MARKERS,
+        ANTHROPIC_TOOL_RESULTS_SUFFIX,
+      ])
+  );
+  return {
+    stableUserPrefix,
+    dynamicUserText: [
+      buildDeepSeekDynamicContextStablePrefix(),
+      ...runtimeSections,
+      "Tool results:",
+      ...toolResultSections,
+    ].filter(Boolean).join("\n\n"),
+  };
+};
+
+const buildDeepSeekOpenAIChatMessages = (options: {
+  systemPrompt: string;
+  userText: string;
+  projectedInput: QueryInput;
+  attachments: EncodedImageAttachment[];
+}): OpenAIChatMessage[] => {
+  const continuationParts = splitProjectedOpenAiContinuationUserText(options.userText);
+  if (!continuationParts || options.attachments.length > 0) {
+    return [
+      { role: "system", content: options.systemPrompt },
+      {
+        role: "user",
+        content: buildOpenAIChatUserContent(options.projectedInput, options.attachments),
+      },
+    ];
+  }
+
+  return [
+    { role: "system", content: options.systemPrompt },
+    { role: "user", content: continuationParts.stableUserPrefix },
+    { role: "user", content: continuationParts.dynamicUserText },
+  ];
+};
+
 const buildOpenAIResponsesInput = (
   input: QueryInput,
   attachments: EncodedImageAttachment[]
@@ -2239,21 +3326,38 @@ const buildOpenAIResponsesInput = (
 
 const buildOpenAIResponsesRequestBody = (options: {
   model: string;
+  provider: string;
   input: QueryInput;
   attachments: EncodedImageAttachment[];
   temperature?: number;
   systemPrompt?: string;
   mcpTools: McpToolDescriptor[];
+  cacheConfig?: OpenAiPromptCacheConfig | null;
+  includeCacheConfig?: boolean;
 }) => ({
   model: options.model,
   ...(typeof options.temperature === "number"
     ? { temperature: options.temperature }
     : {}),
+  ...(options.cacheConfig && options.includeCacheConfig !== false
+    ? buildOpenAiPromptCacheFields(options.cacheConfig)
+    : {}),
   stream: true,
   tool_choice: "auto" as const,
-  tools: buildOpenAIResponsesTools(options.mcpTools),
-  instructions: options.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
-  input: buildOpenAIResponsesInput(options.input, options.attachments),
+  ...(shouldPreferPromptBeforeTools({
+    provider: options.provider,
+    model: options.model,
+  }) && !shouldPreferToolsBeforePrompt({ cacheConfig: options.cacheConfig })
+    ? {
+        instructions: options.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+        input: buildOpenAIResponsesInput(options.input, options.attachments),
+        tools: buildOpenAIResponsesTools(options.mcpTools),
+      }
+    : {
+        tools: buildOpenAIResponsesTools(options.mcpTools),
+        instructions: options.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+        input: buildOpenAIResponsesInput(options.input, options.attachments),
+      }),
 });
 
 const buildGeminiUserParts = (
@@ -2288,8 +3392,11 @@ async function* streamSseOpenAI(
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
     appRoot?: string;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
+  throwIfAborted(options?.signal);
   const attachments = await encodeImageAttachments(
     input.attachments ?? [],
     options?.appRoot ?? process.cwd()
@@ -2307,27 +3414,133 @@ async function* streamSseOpenAI(
     baseUrl,
     options?.endpointOverride
   );
-  const response = await fetch(
-    requestUrl,
-    {
+  const cacheConfig = resolveOpenAiPromptCacheConfig({
+    env: options?.env,
+    provider: baseUrl,
+    model,
+    family: options?.family,
+  });
+  const promptProjection = splitOpenAiPromptForCaching(
+    input.text,
+    options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT
+  );
+  const baseSystemPrompt = (options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT).trim();
+  let effectiveSystemPrompt = promptProjection.systemPrompt;
+  let effectiveUserText = promptProjection.userText;
+  const isDeepSeekRequest = hasDeepSeekMarker(baseUrl) || hasDeepSeekMarker(model);
+  if (isDeepSeekRequest) {
+    if (
+      effectiveSystemPrompt.startsWith(baseSystemPrompt) &&
+      effectiveSystemPrompt.length > baseSystemPrompt.length
+    ) {
+      const stableSystemExtra = effectiveSystemPrompt
+        .slice(baseSystemPrompt.length)
+        .trim();
+      effectiveSystemPrompt = baseSystemPrompt;
+      effectiveUserText = stableSystemExtra
+        ? stableSystemExtra + "\n\n" + effectiveUserText
+        : effectiveUserText;
+    }
+  }
+  const projectedInput: QueryInput = {
+    ...input,
+    text: effectiveUserText,
+  };
+  const promptBeforeTools = shouldPreferPromptBeforeTools({
+    provider: baseUrl,
+    model,
+  }) && !shouldPreferToolsBeforePrompt({ cacheConfig });
+  const buildChatMessages = () =>
+    isDeepSeekRequest
+      ? buildDeepSeekOpenAIChatMessages({
+          systemPrompt: effectiveSystemPrompt,
+          userText: effectiveUserText,
+          projectedInput,
+          attachments,
+        })
+      : [
+          { role: "system" as const, content: effectiveSystemPrompt },
+          {
+            role: "user" as const,
+            content: buildOpenAIChatUserContent(projectedInput, attachments),
+          },
+        ];
+  const buildRequestBody = (cacheConfigOverride: OpenAiPromptCacheConfig | null) =>
+    JSON.stringify(
+      promptBeforeTools
+        ? {
+            model,
+            temperature: options?.temperature ?? 0.2,
+            ...(cacheConfigOverride
+              ? buildOpenAiPromptCacheFields(cacheConfigOverride)
+              : {}),
+            stream: true,
+            stream_options: {
+              include_usage: true,
+            },
+            messages: buildChatMessages(),
+            tool_choice: "auto",
+            tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
+          }
+        : {
+            model,
+            temperature: options?.temperature ?? 0.2,
+            ...(cacheConfigOverride
+              ? buildOpenAiPromptCacheFields(cacheConfigOverride)
+              : {}),
+            stream: true,
+            stream_options: {
+              include_usage: true,
+            },
+            tool_choice: "auto",
+            tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
+            messages: buildChatMessages(),
+          }
+    );
+  let activeCacheConfig = cacheConfig;
+  const captureId = crypto.randomUUID();
+  const buildCapturedRequestBody = async (
+    cacheConfigOverride: OpenAiPromptCacheConfig | null
+  ) => {
+    const bodyText = buildRequestBody(cacheConfigOverride);
+    activeSnapshotPath = await writeOpenAiRequestSnapshot({
+      appRoot: options?.appRoot,
+      env: options?.env,
+      captureId,
+      format: "openai_chat",
+      provider: baseUrl,
+      model,
+      requestUrl,
+      bodyText,
+      promptBeforeTools,
+    });
+    return bodyText;
+  };
+  let activeSnapshotPath: string | null = null;
+  let response = await fetch(requestUrl, {
     method: "POST",
     headers,
-    body: JSON.stringify({
-      model,
-      temperature: options?.temperature ?? 0.2,
-      stream: true,
-      stream_options: {
-        include_usage: true,
-      },
-      tool_choice: "auto",
-      tools: buildDynamicFunctionTools(options?.mcpTools ?? []),
-      messages: [
-        { role: "system", content: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT },
-        { role: "user", content: buildOpenAIChatUserContent(input, attachments) },
-      ],
-    }),
+    body: await buildCapturedRequestBody(activeCacheConfig),
+    signal: options?.signal,
+  });
+
+  for (let retryCount = 0; retryCount < 3 && activeCacheConfig && !response.ok; retryCount++) {
+    const failureDetail = await readHttpFailureDetail(response.clone());
+    const downgradedCacheConfig = nextOpenAiPromptCacheConfigAfterFailure(
+      activeCacheConfig,
+      failureDetail
+    );
+    if (downgradedCacheConfig === activeCacheConfig) {
+      break;
     }
-  );
+    activeCacheConfig = downgradedCacheConfig;
+    response = await fetch(requestUrl, {
+      method: "POST",
+      headers,
+      body: await buildCapturedRequestBody(activeCacheConfig),
+      signal: options?.signal,
+    });
+  }
 
   if (!response.ok || !response.body) {
     throw new Error(await formatHttpFailure("Stream error", response, requestUrl));
@@ -2337,11 +3550,12 @@ async function* streamSseOpenAI(
   const decoder = new TextDecoder();
   let buffer = "";
   const toolState = new Map<number, { name?: string; args: string; emitted: boolean }>();
+  const usageState: OpenAiUsageState = {};
   let lastUsageSignature = "";
   let sawExplicitCompletion = false;
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, options?.signal);
     if (done) {
       break;
     }
@@ -2380,11 +3594,17 @@ async function* streamSseOpenAI(
               finish_reason?: string | null;
             }>;
           };
-          const usageEvent = extractUsageEvent(parsed);
+          const usageEvent = extractUsageEvent(parsed, usageState);
           if (usageEvent) {
             const signature = buildUsageSignature(usageEvent.usage);
             if (signature !== lastUsageSignature) {
               lastUsageSignature = signature;
+              await appendOpenAiSnapshotUsage({
+                env: options?.env,
+                snapshotPath: activeSnapshotPath,
+                usage: parsed.usage,
+                normalized: usageEvent.usage,
+              });
               yield usageEvent.event;
             }
           }
@@ -2600,6 +3820,7 @@ const sanitizeGeminiSchema = (value: unknown): GeminiSchema | undefined => {
 };
 
 type ResponsesUsageState = {
+  cachedTokens?: number;
   lastEmitted?: string;
 };
 
@@ -2647,12 +3868,7 @@ const extractResponsesUsageEvent = (
     return null;
   }
 
-  const usageRecord = usageCandidate as {
-    input_tokens?: unknown;
-    output_tokens?: unknown;
-    total_tokens?: unknown;
-    input_tokens_details?: { cached_tokens?: unknown };
-  };
+  const usageRecord = usageCandidate as Record<string, unknown>;
   const promptTokens =
     typeof usageRecord.input_tokens === "number"
       ? Math.max(0, Math.floor(usageRecord.input_tokens))
@@ -2665,22 +3881,26 @@ const extractResponsesUsageEvent = (
     typeof usageRecord.total_tokens === "number"
       ? Math.max(0, Math.floor(usageRecord.total_tokens))
       : promptTokens + completionTokens;
-  const cachedTokens =
-    typeof usageRecord.input_tokens_details?.cached_tokens === "number"
-      ? Math.max(0, Math.floor(usageRecord.input_tokens_details.cached_tokens))
-      : undefined;
+  const cachedTokens = resolveOpenAiCachedTokens(usageRecord, state);
   const signature = `${promptTokens}:${cachedTokens ?? 0}:${completionTokens}:${totalTokens}`;
   if (state.lastEmitted === signature) {
     return null;
   }
   state.lastEmitted = signature;
-  return JSON.stringify({
-    type: "usage",
+  const normalized: TokenUsage = {
     promptTokens,
     ...(typeof cachedTokens === "number" ? { cachedTokens } : {}),
     completionTokens,
     totalTokens,
-  });
+  };
+  return {
+    event: JSON.stringify({
+      type: "usage",
+      ...normalized,
+    }),
+    usage: usageCandidate,
+    normalized,
+  };
 };
 
 async function* streamSseOpenAIResponses(
@@ -2695,8 +3915,11 @@ async function* streamSseOpenAIResponses(
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
     appRoot?: string;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
+  throwIfAborted(options?.signal);
   const attachments = await encodeImageAttachments(
     input.attachments ?? [],
     options?.appRoot ?? process.cwd()
@@ -2710,34 +3933,92 @@ async function* streamSseOpenAIResponses(
     headers["x-goog-api-key"] = apiKey;
   }
 
-  const requestBodyWithTemperature = JSON.stringify(
-    buildOpenAIResponsesRequestBody({
-      model,
-      input,
-      attachments,
-      temperature: options?.temperature ?? 0.2,
-      systemPrompt: options?.systemPrompt,
-      mcpTools: options?.mcpTools ?? [],
-    })
+  const cacheConfig = resolveOpenAiPromptCacheConfig({
+    env: options?.env,
+    provider: baseUrl,
+    model,
+    family: options?.family,
+  });
+  const promptProjection = splitOpenAiPromptForCaching(
+    input.text,
+    options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT
   );
-  const requestBodyWithoutTemperature = JSON.stringify(
-    buildOpenAIResponsesRequestBody({
+  const baseSystemPrompt = (options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT).trim();
+  let effectiveSystemPrompt = promptProjection.systemPrompt;
+  let effectiveUserText = promptProjection.userText;
+  if (hasDeepSeekMarker(baseUrl) || hasDeepSeekMarker(model)) {
+    if (
+      effectiveSystemPrompt.startsWith(baseSystemPrompt) &&
+      effectiveSystemPrompt.length > baseSystemPrompt.length
+    ) {
+      const stableSystemExtra = effectiveSystemPrompt
+        .slice(baseSystemPrompt.length)
+        .trim();
+      effectiveSystemPrompt = baseSystemPrompt;
+      effectiveUserText = stableSystemExtra
+        ? stableSystemExtra + "\n\n" + effectiveUserText
+        : effectiveUserText;
+    }
+  }
+  const projectedInput: QueryInput = {
+    ...input,
+    text: effectiveUserText,
+  };
+  const buildRequestBody = (
+    temperature: number | undefined,
+    cacheConfigOverride: OpenAiPromptCacheConfig | null
+  ) =>
+    JSON.stringify(buildOpenAIResponsesRequestBody({
       model,
-      input,
+      provider: baseUrl,
+      input: projectedInput,
       attachments,
-      systemPrompt: options?.systemPrompt,
+      temperature,
+      systemPrompt: effectiveSystemPrompt,
       mcpTools: options?.mcpTools ?? [],
-    })
-  );
+      cacheConfig: cacheConfigOverride,
+    }));
   const candidateUrls = resolveResponsesUrls(
     baseUrl,
     options?.endpointOverride
   );
   let attemptedUrl = candidateUrls[0] ?? baseUrl;
+  let activeTemperature: number | undefined = options?.temperature ?? 0.2;
+  let activeCacheConfig = cacheConfig;
+  const captureId = crypto.randomUUID();
+  const promptBeforeTools = shouldPreferPromptBeforeTools({
+    provider: baseUrl,
+    model,
+  }) && !shouldPreferToolsBeforePrompt({ cacheConfig });
+  const buildCapturedRequestBody = async (
+    requestUrl: string,
+    temperature: number | undefined,
+    cacheConfigOverride: OpenAiPromptCacheConfig | null
+  ) => {
+    const bodyText = buildRequestBody(temperature, cacheConfigOverride);
+    activeSnapshotPath = await writeOpenAiRequestSnapshot({
+      appRoot: options?.appRoot,
+      env: options?.env,
+      captureId,
+      format: "openai_responses",
+      provider: baseUrl,
+      model,
+      requestUrl,
+      bodyText,
+      promptBeforeTools,
+    });
+    return bodyText;
+  };
+  let activeSnapshotPath: string | null = null;
   let response = await fetch(attemptedUrl, {
     method: "POST",
     headers,
-    body: requestBodyWithTemperature,
+    body: await buildCapturedRequestBody(
+      attemptedUrl,
+      activeTemperature,
+      activeCacheConfig
+    ),
+    signal: options?.signal,
   });
 
   if (
@@ -2752,19 +4033,45 @@ async function* streamSseOpenAIResponses(
     response = await fetch(attemptedUrl, {
       method: "POST",
       headers,
-      body: requestBodyWithTemperature,
+      body: await buildCapturedRequestBody(
+        attemptedUrl,
+        activeTemperature,
+        activeCacheConfig
+      ),
+      signal: options?.signal,
     });
   }
 
-  if (!response.ok && requestBodyWithTemperature !== requestBodyWithoutTemperature) {
+  for (let retryCount = 0; retryCount < 3 && !response.ok; retryCount++) {
     const failureDetail = await readHttpFailureDetail(response.clone());
-    if (isUnsupportedTemperatureFailureDetail(failureDetail)) {
-      response = await fetch(attemptedUrl, {
-        method: "POST",
-        headers,
-        body: requestBodyWithoutTemperature,
-      });
+    let changed = false;
+    if (typeof activeTemperature === "number" && isUnsupportedTemperatureFailureDetail(failureDetail)) {
+      activeTemperature = undefined;
+      changed = true;
     }
+    if (activeCacheConfig) {
+      const downgradedCacheConfig = nextOpenAiPromptCacheConfigAfterFailure(
+        activeCacheConfig,
+        failureDetail
+      );
+      if (downgradedCacheConfig !== activeCacheConfig) {
+        activeCacheConfig = downgradedCacheConfig;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      break;
+    }
+    response = await fetch(attemptedUrl, {
+      method: "POST",
+      headers,
+      body: await buildCapturedRequestBody(
+        attemptedUrl,
+        activeTemperature,
+        activeCacheConfig
+      ),
+      signal: options?.signal,
+    });
   }
 
   if (!response.ok || !response.body) {
@@ -2786,7 +4093,7 @@ async function* streamSseOpenAIResponses(
   let sawExplicitCompletion = false;
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, options?.signal);
     if (done) {
       break;
     }
@@ -2833,7 +4140,13 @@ async function* streamSseOpenAIResponses(
           };
           const usageEvent = extractResponsesUsageEvent(parsed, usageState);
           if (usageEvent) {
-            yield usageEvent;
+            await appendOpenAiSnapshotUsage({
+              env: options?.env,
+              snapshotPath: activeSnapshotPath,
+              usage: usageEvent.usage,
+              normalized: usageEvent.normalized,
+            });
+            yield usageEvent.event;
           }
 
           const eventType =
@@ -2989,7 +4302,13 @@ async function* streamSseOpenAIResponses(
         };
         const usageEvent = extractResponsesUsageEvent(parsed, usageState);
         if (usageEvent) {
-          yield usageEvent;
+          await appendOpenAiSnapshotUsage({
+            env: options?.env,
+            snapshotPath: activeSnapshotPath,
+            usage: usageEvent.usage,
+            normalized: usageEvent.normalized,
+          });
+          yield usageEvent.event;
         }
 
         const eventType =
@@ -3276,8 +4595,10 @@ async function* streamSseGeminiGenerateContent(
     systemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
     appRoot?: string;
+    signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
+  throwIfAborted(options?.signal);
   const attachments = await encodeImageAttachments(
     input.attachments ?? [],
     options?.appRoot ?? process.cwd()
@@ -3316,6 +4637,7 @@ async function* streamSseGeminiGenerateContent(
           temperature: options?.temperature ?? 0.2,
         },
       }),
+      signal: options?.signal,
     }
   );
 
@@ -3331,7 +4653,7 @@ async function* streamSseGeminiGenerateContent(
   let sawExplicitCompletion = false;
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, options?.signal);
     if (done) {
       break;
     }
@@ -3566,8 +4888,10 @@ async function* streamSseAnthropic(
     captureId?: string;
     debugAnthropicRequests?: AnthropicRequestCaptureOptions;
     cacheSessionState?: AnthropicPromptCacheSessionState;
+    signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
+  throwIfAborted(options?.signal);
   const attachments = await encodeImageAttachments(
     input.attachments ?? [],
     options?.appRoot ?? process.cwd()
@@ -3634,6 +4958,7 @@ async function* streamSseAnthropic(
       method: "POST",
       headers: requestHeaders,
       body: JSON.stringify(requestBody),
+      signal: options?.signal,
     }
   );
 
@@ -3664,7 +4989,7 @@ async function* streamSseAnthropic(
   let stopReason = "";
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, options?.signal);
     if (done) {
       break;
     }
@@ -3735,9 +5060,10 @@ async function* streamSseAnthropic(
             sawExplicitCompletion = true;
             if (snapshotPath && usageEvents.length > 0) {
               try {
-                await updateAnthropicRequestSnapshot(snapshotPath, {
-                  usageEvents,
-                });
+                await updateAnthropicSnapshotLatestUsage(
+                  snapshotPath,
+                  usageEvents
+                );
               } catch {
                 // ignore debug write errors
               }
@@ -3767,9 +5093,10 @@ async function* streamSseAnthropic(
             sawExplicitCompletion = true;
             if (snapshotPath && usageEvents.length > 0) {
               try {
-                await updateAnthropicRequestSnapshot(snapshotPath, {
-                  usageEvents,
-                });
+                await updateAnthropicSnapshotLatestUsage(
+                  snapshotPath,
+                  usageEvents
+                );
               } catch {
                 // ignore debug write errors
               }
@@ -3938,9 +5265,10 @@ async function* streamSseAnthropic(
           sawExplicitCompletion = true;
           if (snapshotPath && usageEvents.length > 0) {
             try {
-              await updateAnthropicRequestSnapshot(snapshotPath, {
-                usageEvents,
-              });
+              await updateAnthropicSnapshotLatestUsage(
+                snapshotPath,
+                usageEvents
+              );
             } catch {
               // ignore debug write errors
             }
@@ -4052,6 +5380,16 @@ async function* streamSseAnthropic(
 
         if (eventType === "message_stop") {
           sawExplicitCompletion = true;
+          if (snapshotPath && usageEvents.length > 0) {
+            try {
+              await updateAnthropicSnapshotLatestUsage(
+                snapshotPath,
+                usageEvents
+              );
+            } catch {
+              // ignore debug write errors
+            }
+          }
           yield stopReason
             ? buildAnthropicStopReasonCompletionEvent(stopReason)
             : buildProviderCompletionEvent(
@@ -4073,9 +5411,7 @@ async function* streamSseAnthropic(
 
   if (snapshotPath && usageEvents.length > 0) {
     try {
-      await updateAnthropicRequestSnapshot(snapshotPath, {
-        usageEvents,
-      });
+      await updateAnthropicSnapshotLatestUsage(snapshotPath, usageEvents);
     } catch {
       // ignore debug write errors
     }
@@ -5611,7 +6947,10 @@ export const createHttpQueryTransport = (
       });
       return `openai://${sessionId}`;
     },
-    stream: async function* (streamUrl: string) {
+    stream: async function* (
+      streamUrl: string,
+      streamOptions?: QueryTransportStreamOptions
+    ) {
       const sessionId = streamUrl.replace("openai://", "");
       const session = sessionQueries.get(sessionId);
       sessionQueries.delete(sessionId);
@@ -5636,6 +6975,7 @@ export const createHttpQueryTransport = (
             captureId: sessionId,
             debugAnthropicRequests: options?.debugAnthropicRequests,
             cacheSessionState: anthropicCacheSessionState,
+            signal: streamOptions?.signal,
           }
         )) {
           yield event;
@@ -5656,6 +6996,8 @@ export const createHttpQueryTransport = (
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
             appRoot,
+            env: effectiveEnv,
+            signal: streamOptions?.signal,
           }
         )) {
           yield event;
@@ -5675,6 +7017,7 @@ export const createHttpQueryTransport = (
             mcpTools: session.mcpTools,
             systemPrompt: session.systemPrompt,
             appRoot,
+            signal: streamOptions?.signal,
           }
         )) {
           yield event;
@@ -5687,18 +7030,20 @@ export const createHttpQueryTransport = (
         session.apiKey,
         session.model,
         session.input,
-          {
-            includeReasoning: includeReasoningInTranscript,
-            temperature: requestTemperature,
-            family: session.family,
-            endpointOverride: session.endpointOverrides.chat_completions,
-            mcpTools: session.mcpTools,
-            systemPrompt: session.systemPrompt,
-            appRoot,
-          }
-        )) {
-          yield event;
+        {
+          includeReasoning: includeReasoningInTranscript,
+          temperature: requestTemperature,
+          family: session.family,
+          endpointOverride: session.endpointOverrides.chat_completions,
+          mcpTools: session.mcpTools,
+          systemPrompt: session.systemPrompt,
+          appRoot,
+          env: effectiveEnv,
+          signal: streamOptions?.signal,
         }
+      )) {
+        yield event;
+      }
     },
   };
 };

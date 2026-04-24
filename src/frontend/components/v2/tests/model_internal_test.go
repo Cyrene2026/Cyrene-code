@@ -116,11 +116,11 @@ func TestUserTranscriptRendersFullWidthGrayBackgroundWithWhiteText(t *testing.T)
 	if !strings.Contains(rendered, "不要调用工具，回答:已经看过的内容") {
 		t.Fatalf("expected user transcript text preserved, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "\x1b[48;2;48;54;60m") {
-		t.Fatalf("expected full-width gray background ANSI, got %q", rendered)
+	if !strings.Contains(rendered, "\x1b[48;2;30;40;59m") {
+		t.Fatalf("expected full-width user surface background ANSI, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "38;2;255;255;255") {
-		t.Fatalf("expected white foreground ANSI for user transcript, got %q", rendered)
+	if !strings.Contains(rendered, "38;2;230;237;243") {
+		t.Fatalf("expected primary foreground ANSI for user transcript, got %q", rendered)
 	}
 }
 
@@ -315,7 +315,7 @@ func TestRenderMarkdownCodeBlockDoesNotUseBackgroundFill(t *testing.T) {
 	if strings.Contains(rendered, "48;2;13;17;23") {
 		t.Fatalf("expected code block body background removed, got %q", rendered)
 	}
-	if strings.Contains(rendered, "48;2;23;34;53") {
+	if strings.Contains(rendered, "48;2;23;34;53") || strings.Contains(rendered, "48;2;23;34;52") {
 		t.Fatalf("expected code block header background removed, got %q", rendered)
 	}
 }
@@ -511,6 +511,37 @@ func TestRenderTranscriptClampsStyledLinesToWidth(t *testing.T) {
 		plain := stripANSI.ReplaceAllString(line, "")
 		if lipgloss.Width(plain) > 24 {
 			t.Fatalf("expected transcript line width <= 24, got %d for %q", lipgloss.Width(plain), plain)
+		}
+	}
+}
+
+func TestRenderTranscriptClampsKeycapEmojiMarkdownLayoutToWidth(t *testing.T) {
+	model := app.NewModel()
+	model.Items = []app.Message{
+		{Role: "assistant", Kind: "transcript", Text: strings.Join([]string{
+			"4️⃣ 默认配置（cyrene-cli.js 中）",
+			"",
+			"| 模块 | 职责 |",
+			"| --- | --- |",
+			"| infra/config/ | appRoot、loadCyreneConfig、loadPromptPolicy、CyreneConfig、PromptPolicy |",
+			"| infra/auth/ | createAuthRuntime、AuthRuntime、AuthStatus |",
+			"",
+			"```js",
+			"DEFAULT_CONFIG = {",
+			"  requestTemperature: 0.2,",
+			"}",
+			"```",
+			"",
+			"5️⃣ Provider 支持",
+		}, "\n")},
+	}
+
+	rendered := model.RenderTranscriptForTest(42, 18)
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, line := range strings.Split(rendered, "\n") {
+		plain := stripANSI.ReplaceAllString(line, "")
+		if app.RenderedLineWidthForTest(plain) > 42 {
+			t.Fatalf("expected keycap emoji layout line width <= 42, got %d for %q", app.RenderedLineWidthForTest(plain), plain)
 		}
 	}
 }

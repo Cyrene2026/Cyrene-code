@@ -34,6 +34,13 @@ import * as ProgressTracker from "./ProgressTracker";
 import * as ToolObservationStore from "./ToolObservationStore";
 
 const COMPLETED_RESULT: RunQuerySessionResult = { status: "completed" };
+const CANCELLED_COMPLETION_EVENT: QueryCompletionEvent = {
+  type: "completion",
+  source: "runtime",
+  reason: "cancelled",
+  detail: "The active request was cancelled by the user.",
+  expected: true,
+};
 const SILENT_REVIEW_RESUME_RECOVERY_NOTE = [
   "The approved tool result above was applied successfully.",
   "The previous continuation ended without any assistant output or further tool action.",
@@ -245,11 +252,10 @@ const formatToolResultsForRoundPrompt = (toolResults: string[]) => {
     remainingBudget -= nextResult.length + 2;
   }
 
-  const omittedCount = normalizedResults.length - selected.length;
   const parts =
-    omittedCount > 0
+    normalizedResults.length > selected.length
       ? [
-          `[tool results truncated] omitted ${omittedCount} older result(s) to stay within the prompt budget.`,
+          "[tool results truncated] older results omitted to stay within the prompt budget.",
           ...selected,
         ]
       : selected;
@@ -1220,6 +1226,82 @@ const buildImplicitProviderDoneCompletion = (): QueryCompletionEvent => ({
   expected: false,
 });
 
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>(resolve => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      resolve();
+    };
+    timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+
+const parsePositiveDelayMs = (value: string | undefined) => {
+  if (!value?.trim()) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return Math.floor(parsed);
+};
+
+const hasDeepSeekMarker = (value: string) => {
+  try {
+    return new URL(value).hostname.toLowerCase().includes("deepseek");
+  } catch {
+    return value.toLowerCase().includes("deepseek");
+  }
+};
+
+const resolveDeepSeekCacheSettleDelayMs = (
+  provider: string,
+  model: string,
+  env?: NodeJS.ProcessEnv
+) => {
+  if (!hasDeepSeekMarker(provider) && !hasDeepSeekMarker(model)) {
+    return 0;
+  }
+  if (env?.CYRENE_DEEPSEEK_CACHE_SETTLE_MS === "0") {
+    return 0;
+  }
+  return parsePositiveDelayMs(env?.CYRENE_DEEPSEEK_CACHE_SETTLE_MS) ?? 2500;
+};
+
+const resolveAnthropicCacheSettleDelayMs = (
+  transport: Pick<
+    RunQuerySessionParams["transport"],
+    "getProvider" | "getProviderFormat"
+  >,
+  env?: NodeJS.ProcessEnv
+) => {
+  if (transport.getProviderFormat?.() !== "anthropic_messages") {
+    return 0;
+  }
+  if (env?.CYRENE_ANTHROPIC_CACHE_SETTLE_MS === "0") {
+    return 0;
+  }
+  return parsePositiveDelayMs(env?.CYRENE_ANTHROPIC_CACHE_SETTLE_MS) ?? 2500;
+};
+
+const isAbortError = (error: unknown) =>
+  error instanceof Error ? error.name === "AbortError" : false;
+
 const countPatternMatches = (text: string, pattern: RegExp) => {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
   const matcher = new RegExp(pattern.source, flags);
@@ -1458,16 +1540,27 @@ const runExecutionRuntime = async ({
   originalTask,
   queryMaxToolSteps = DEFAULT_QUERY_MAX_TOOL_STEPS,
   transport,
+  env,
   onState,
   onTextDelta,
   onUsage,
   onToolStatus,
   onToolCall,
   onError,
+  abortSignal,
 }: RunQuerySessionParams): Promise<RunQuerySessionResult> => {
   const normalizedQuery = normalizeQueryInput(query);
   let state = createQuerySessionState();
   const task = originalTask ?? normalizedQuery.text;
+  const deepSeekCacheSettleDelayMs = resolveDeepSeekCacheSettleDelayMs(
+    transport.getProvider(),
+    transport.getModel(),
+    env
+  );
+  const anthropicCacheSettleDelayMs = resolveAnthropicCacheSettleDelayMs(
+    transport,
+    env
+  );
   let filesystemMutationRevision = 0;
   let recentConfirmedFileMutations: ConfirmedFileMutation[] = [];
   let progressLedger = ProgressTracker.createInitialMultiFileProgressLedger(
@@ -1492,6 +1585,12 @@ const runExecutionRuntime = async ({
   const dispatch: QuerySessionDispatch = event => {
     state = querySessionReducer(state, event);
     onState(state);
+  };
+  const isCancelled = () => abortSignal?.aborted === true;
+  const completeCancelledRound = () => {
+    dispatch(CANCELLED_COMPLETION_EVENT);
+    dispatch({ type: "complete" });
+    return COMPLETED_RESULT;
   };
 
   const applyToolResultSideEffects = (
@@ -1586,10 +1685,17 @@ const runExecutionRuntime = async ({
   ): Promise<RunQuerySessionResult> => {
     dispatch({ type: "start" });
 
+    if (isCancelled()) {
+      return completeCancelledRound();
+    }
+
     const streamUrl = await transport.requestStreamUrl({
       text: roundPrompt,
       attachments: normalizedQuery.attachments,
     });
+    if (isCancelled()) {
+      return completeCancelledRound();
+    }
     let completed = false;
     let sawToolCall = false;
     let streamOpened = false;
@@ -1647,9 +1753,15 @@ const runExecutionRuntime = async ({
     };
 
     try {
-      for await (const chunk of transport.stream(streamUrl)) {
+      for await (const chunk of transport.stream(streamUrl, { signal: abortSignal })) {
+        if (isCancelled()) {
+          return completeCancelledRound();
+        }
         const events = parseStreamChunk(chunk);
         for (const event of events) {
+        if (isCancelled()) {
+          return completeCancelledRound();
+        }
         if (!streamOpened && event.type !== "done") {
           dispatch({ type: "stream_open" });
           streamOpened = true;
@@ -2089,7 +2201,13 @@ const runExecutionRuntime = async ({
             input: event.input,
           });
           onToolStatus?.(buildToolStatusMessage(event.toolName, event.input));
+          if (isCancelled()) {
+            return completeCancelledRound();
+          }
           const toolResult = await onToolCall(event.toolName, event.input);
+          if (isCancelled()) {
+            return completeCancelledRound();
+          }
           if (
             ToolObservationStore.didApplyFileMutation(
               event.toolName,
@@ -2252,6 +2370,9 @@ const runExecutionRuntime = async ({
       }
     } catch (error) {
       flushUsage();
+      if (isCancelled() || isAbortError(error)) {
+        return completeCancelledRound();
+      }
       throw error;
     }
 
@@ -2354,6 +2475,16 @@ const runExecutionRuntime = async ({
 
     accumulatedToolResults = [...accumulatedToolResults, ...toolResults];
     flushUsage();
+    const roundGapMs = Math.max(
+      deepSeekCacheSettleDelayMs,
+      anthropicCacheSettleDelayMs
+    );
+    if (roundGapMs > 0) {
+      await sleep(roundGapMs, abortSignal);
+      if (isCancelled()) {
+        return completeCancelledRound();
+      }
+    }
     const nextPrompt = buildRoundPrompt(
       task,
       accumulatedToolResults,
@@ -2365,6 +2496,9 @@ const runExecutionRuntime = async ({
       readLedger,
       filesystemMutationRevision
     );
+    if (isCancelled()) {
+      return completeCancelledRound();
+    }
     return runRounds(
       nextPrompt,
       runtimeCorrection,
@@ -2375,6 +2509,9 @@ const runExecutionRuntime = async ({
   };
 
   try {
+    if (isCancelled()) {
+      return completeCancelledRound();
+    }
     return await runRounds(
       buildInitialExecutionMemo(
         normalizedQuery.text,

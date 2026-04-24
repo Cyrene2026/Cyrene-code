@@ -29,7 +29,9 @@ export type RunQuerySessionParams = {
   query: string | QueryInput;
   originalTask?: string;
   queryMaxToolSteps?: number;
+  abortSignal?: AbortSignal;
   transport: QueryTransport;
+  env?: NodeJS.ProcessEnv;
   onState: (state: QuerySessionState) => void;
   onTextDelta: (text: string) => void;
   onUsage?: (usage: TokenUsage) => void;

@@ -1,9 +1,11 @@
 package tests
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -94,6 +96,33 @@ func sgrTokensContain(tokens, sequence []string) bool {
 		}
 	}
 	return false
+}
+
+func commandEmitsClearScreen(cmd tea.Cmd) bool {
+	for _, msg := range collectCommandMessages(cmd) {
+		if reflect.TypeOf(msg).String() == "tea.clearScreenMsg" {
+			return true
+		}
+	}
+	return false
+}
+
+func collectCommandMessages(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if msg == nil {
+		return nil
+	}
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		messages := make([]tea.Msg, 0, len(batch))
+		for _, nested := range batch {
+			messages = append(messages, collectCommandMessages(nested)...)
+		}
+		return messages
+	}
+	return []tea.Msg{msg}
 }
 
 func TestSubmitWithoutBridgeShowsErrorNotice(t *testing.T) {
@@ -931,7 +960,7 @@ func TestLiveTranscriptRendersAfterTrailingToolStatuses(t *testing.T) {
 
 	view := model.View()
 	liveIndex := strings.Index(view, "先补齐中间实现，再直接改 simplex.py。")
-	toolIndex := strings.Index(view, "Running read_file | main.go...")
+	toolIndex := strings.Index(view, "read read_file")
 	if liveIndex < 0 || toolIndex < 0 {
 		t.Fatalf("expected both live transcript and tool status, got %q", view)
 	}
@@ -954,10 +983,57 @@ func TestStartupSplashReturnsAfterLiveTextClears(t *testing.T) {
 
 	view := model.View()
 	if strings.Contains(view, "No transcript yet.") || strings.Contains(view, "Type a request below") || strings.Contains(view, "cyrene ready") {
-		t.Fatalf("expected blank transcript empty state after live text clears, got %q", view)
+		t.Fatalf("expected legacy empty state removed after live text clears, got %q", view)
 	}
-	if strings.Contains(view, "CYRENE") {
-		t.Fatalf("expected no left status sidebar after live text clears, got %q", view)
+	if !strings.Contains(view, "██████") || !strings.Contains(view, "Ask naturally") {
+		t.Fatalf("expected startup guide after live text clears, got %q", view)
+	}
+}
+
+func TestStartupGuideRendersDoubleLogoAndHints(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 30
+	model.AppRoot = "/workspace/demo"
+	model.CurrentModel = "gpt-5.4"
+	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+
+	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	if strings.Contains(view, "> Cyrene") || strings.Contains(view, "terminal-first agentic coding workspace") {
+		t.Fatalf("expected startup header copy removed, got %q", view)
+	}
+	if !strings.Contains(view, "██████") {
+		t.Fatalf("expected ANSI shadow logo, got %q", view)
+	}
+	for _, hint := range []string{"Ask naturally", "/model", "/provider", "Ctrl+O"} {
+		if !strings.Contains(view, hint) {
+			t.Fatalf("expected startup hint %q, got %q", hint, view)
+		}
+	}
+	if !strings.Contains(plainView, "WORKSPACE demo") ||
+		!strings.Contains(plainView, "MODEL gpt-5.4") ||
+		!strings.Contains(plainView, "PROVIDER Newcli") {
+		t.Fatalf("expected startup runtime status line, got %q", view)
+	}
+
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	lines := strings.Split(view, "\n")
+	for _, line := range lines {
+		plain := stripANSI.ReplaceAllString(line, "")
+		if app.RenderedLineWidthForTest(plain) > model.Width {
+			t.Fatalf("expected startup line width <= %d, got %d for %q", model.Width, app.RenderedLineWidthForTest(plain), plain)
+		}
+	}
+	logoLine := -1
+	for index, line := range lines {
+		if strings.Contains(line, "██████") {
+			logoLine = index
+			break
+		}
+	}
+	if logoLine < 4 {
+		t.Fatalf("expected startup landing block to be vertically centered, first logo line=%d in %q", logoLine, view)
 	}
 }
 
@@ -1075,7 +1151,10 @@ func TestWideNavigationPanelUsesFullMainArea(t *testing.T) {
 		t.Fatalf("expected transcript hidden behind full-page navigation panel, got %q", view)
 	}
 	if !strings.Contains(view, "┌") || !strings.Contains(view, "┘") {
-		t.Fatalf("expected panels to render with a white border, got %q", view)
+		t.Fatalf("expected panels to render with a visible border, got %q", view)
+	}
+	if strings.Contains(view, "48;2;255;255;255") {
+		t.Fatalf("expected panel chrome to avoid high-contrast white header/background, got %q", view)
 	}
 }
 
@@ -1147,7 +1226,7 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	model.CurrentModel = "gpt-5.4"
 	model.CurrentProvider = "https://code.newcli.com/codex/v1"
 	model.CurrentProviderFormat = "openai_responses"
-	model.UsageSummary = app.BridgeUsageSummary{TotalTokens: 1560}
+	model.UsageSummary = app.BridgeUsageSummary{CachedTokens: 400, TotalTokens: 1560}
 
 	view := model.View()
 	plainView := ansiPattern.ReplaceAllString(view, "")
@@ -1163,6 +1242,7 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	for _, line := range strings.Split(view, "\n") {
 		plainLine := ansiPattern.ReplaceAllString(line, "")
 		if strings.Contains(plainLine, "TOKENS 1.6k") &&
+			strings.Contains(plainLine, "CACHE 400") &&
 			strings.Contains(plainLine, "TIME") &&
 			strings.Contains(plainLine, "BRANCH") &&
 			strings.Contains(plainLine, "PROJECT") &&
@@ -1186,28 +1266,64 @@ func TestHeaderMovesCommandHintsToHelp(t *testing.T) {
 	if !strings.Contains(footerLine, "TOKENS 1.6k") {
 		t.Fatalf("expected token usage in unified footer row, got %q", footerLine)
 	}
+	if !strings.Contains(footerLine, "CACHE 400") {
+		t.Fatalf("expected cached token usage in unified footer row, got %q", footerLine)
+	}
 	if !strings.Contains(footerLine, "TIME") {
 		t.Fatalf("expected request timer in unified footer row, got %q", footerLine)
 	}
 	if !strings.Contains(footerLine, "BRANCH") {
 		t.Fatalf("expected git branch label in unified footer row, got %q", footerLine)
 	}
-	if !strings.Contains(footerLine, "PROJECT") {
-		t.Fatalf("expected project path in unified footer row, got %q", footerLine)
-	}
-	if !regexp.MustCompile(`\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b`).MatchString(footerLine) {
-		t.Fatalf("expected detailed clock on footer right side, got %q", footerLine)
+	if regexp.MustCompile(`\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b`).MatchString(footerLine) && !strings.Contains(footerLine, "PROJECT") {
+		t.Fatalf("expected project metadata when detailed clock fits, got %q", footerLine)
 	}
 	if strings.Contains(plainView, "Enter send | Tab complete") {
 		t.Fatalf("expected legacy helper line removed from composer, got %q", view)
 	}
 	promptIndex := strings.Index(plainView, "❯ Ask Cyrene, add images with Ctrl+O, use / commands, or mention files with @...")
-	statusIndex := strings.Index(plainView, "MODEL gpt-5.4")
+	statusIndex := strings.Index(plainView, "TOKENS 1.6k")
 	if promptIndex < 0 || statusIndex < 0 || promptIndex > statusIndex {
 		t.Fatalf("expected prompt block above footer status row, got %q", view)
 	}
-	if !strings.Contains(plainView, strings.Repeat("─", 20)) {
-		t.Fatalf("expected solid divider lines around composer, got %q", view)
+	if !strings.Contains(plainView, "┃ ❯ Ask Cyrene") {
+		t.Fatalf("expected composer focus rail without solid divider lines, got %q", view)
+	}
+}
+
+func TestFooterPrioritizesCoreStatusAndCacheOnNarrowWidth(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 72
+	model.Height = 24
+	model.AppRoot = "/workspace/demo/project/very/long/path/example"
+	model.GitBranch = "feature/very-long-branch-name"
+	model.CurrentModel = "gpt-5.4"
+	model.CurrentProvider = "https://code.newcli.com/codex/v1"
+	model.UsageSummary = app.BridgeUsageSummary{CachedTokens: 0, TotalTokens: 1560}
+
+	footer := ansiPattern.ReplaceAllString(model.RenderBottomStatusBarForTest(72), "")
+	for _, required := range []string{"TOKENS 1.6k", "CACHE 0", "MODEL gpt-5.4", "PROVIDER Newcli", "STATUS"} {
+		if !strings.Contains(footer, required) {
+			t.Fatalf("expected narrow footer to keep %q, got %q", required, footer)
+		}
+	}
+	for _, hidden := range []string{"PROJECT", "BRANCH", "TIME"} {
+		if strings.Contains(footer, hidden) {
+			t.Fatalf("expected narrow footer to hide %q, got %q", hidden, footer)
+		}
+	}
+}
+
+func TestFooterAvoidsDedicatedBackgroundLayer(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 120
+	model.Height = 24
+
+	footer := model.RenderBottomStatusBarForTest(120)
+	if strings.Contains(footer, "48;2;8;13;22") {
+		t.Fatalf("expected footer to avoid dedicated gray background layer, got %q", footer)
 	}
 }
 
@@ -1218,16 +1334,32 @@ func TestComposerUsesTextareaCursorRendering(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
 
 	rendered := model.RenderComposerForTest(40)
-	plainRendered := ansiPattern.ReplaceAllString(rendered, "")
 
-	if !strings.Contains(plainRendered, "hello") {
+	if !strings.Contains(rendered, "hello") {
 		t.Fatalf("expected composer textarea to render input text, got %q", rendered)
 	}
-	if strings.Contains(plainRendered, "hello|") {
+	if strings.Contains(rendered, "hello|") {
 		t.Fatalf("expected composer textarea to stop rendering pipe cursor, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "48;2;22;27;34") {
-		t.Fatalf("expected composer to render with gray background, got %q", rendered)
+		t.Fatalf("expected composer input surface to render gray background, got %q", rendered)
+	}
+}
+
+func TestComposerFocusAccentTracksStatus(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 100
+	model.Height = 24
+	model.Status = app.StatusStreaming
+
+	view := model.View()
+	if !strings.Contains(view, "38;2;121;192;255") {
+		t.Fatalf("expected focused composer accent to use active blue status color, got %q", view)
+	}
+	if !strings.Contains(view, "┃") {
+		t.Fatalf("expected focused composer to render a left accent rail, got %q", view)
 	}
 }
 
@@ -1248,8 +1380,87 @@ func TestComposerKeepsBackgroundColorOnTypedText(t *testing.T) {
 	if lineWithInput == "" {
 		t.Fatalf("expected rendered composer line containing input, got %q", rendered)
 	}
-	if strings.Count(lineWithInput, "48;2;22;27;34") < 2 {
-		t.Fatalf("expected typed text to keep composer background after prompt styling reset, got %q", lineWithInput)
+	if !strings.Contains(lineWithInput, "48;2;22;27;34") {
+		t.Fatalf("expected typed text to keep composer gray background, got %q", lineWithInput)
+	}
+}
+
+func TestComposerRendersThreeInputRowsWithoutSolidDividers(t *testing.T) {
+	model := app.NewModel()
+
+	rendered := model.RenderComposerForTest(40)
+
+	if got := lipgloss.Height(rendered); got != 3 {
+		t.Fatalf("expected composer to render exactly three rows, got %d in %q", got, rendered)
+	}
+	for _, line := range strings.Split(ansiPattern.ReplaceAllString(rendered, ""), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len([]rune(trimmed)) >= 20 && strings.Trim(trimmed, "─") == "" {
+			t.Fatalf("expected composer to avoid solid divider rows, got %q in %q", line, rendered)
+		}
+	}
+}
+
+func TestComposerPromptRendersOnSecondInputRow(t *testing.T) {
+	model := app.NewModel()
+
+	rendered := model.RenderComposerForTest(40)
+	lines := strings.Split(ansiPattern.ReplaceAllString(rendered, ""), "\n")
+
+	if len(lines) < 2 {
+		t.Fatalf("expected composer to render multiple rows, got %q", rendered)
+	}
+	if strings.TrimSpace(lines[0]) != "┃" {
+		t.Fatalf("expected first composer row to be blank inside focus rail, got %q in %q", lines[0], rendered)
+	}
+	if strings.Contains(lines[0], "Ask Cyrene") {
+		t.Fatalf("expected first composer row to stay blank, got %q in %q", lines[0], rendered)
+	}
+	if !strings.Contains(lines[1], "❯ Ask Cyrene") {
+		t.Fatalf("expected composer prompt on second row, got %q in %q", lines[1], rendered)
+	}
+}
+
+func TestComposerTypedTextStartsOnFirstInputRow(t *testing.T) {
+	model := app.NewModel()
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+
+	rendered := model.RenderComposerForTest(40)
+	lines := strings.Split(ansiPattern.ReplaceAllString(rendered, ""), "\n")
+
+	if len(lines) < 2 {
+		t.Fatalf("expected composer to render multiple rows, got %q", rendered)
+	}
+	if !strings.Contains(lines[0], "❯ hello") {
+		t.Fatalf("expected typed text on first composer row, got %q in %q", lines[0], rendered)
+	}
+	if strings.Contains(lines[1], "hello") {
+		t.Fatalf("expected second composer row to stay available after typed text starts, got %q in %q", lines[1], rendered)
+	}
+}
+
+func TestPagePanelsHideComposer(t *testing.T) {
+	for _, panel := range []app.Panel{app.PanelAuth, app.PanelProviders, app.PanelModels, app.PanelPlans} {
+		model := app.NewModel()
+		model.Width = 140
+		model.Height = 32
+		model.ActivePanel = panel
+		model.Items = []app.Message{{Role: "assistant", Kind: "transcript", Text: "ready"}}
+		model.AvailableProviders = []string{"https://api.example.com/v1"}
+		model.AvailableModels = []string{"gpt-5.4"}
+		model.ExecutionPlan = app.ExecutionPlan{
+			Summary: "Test plan",
+			Steps:   []app.ExecutionPlanStep{{ID: "step-1", Title: "Do work", Status: "pending"}},
+		}
+
+		view := model.View()
+		plainView := ansiPattern.ReplaceAllString(view, "")
+		if strings.Contains(plainView, "❯ Ask Cyrene") || strings.Contains(plainView, "Panel "+string(panel)+" active") {
+			t.Fatalf("expected %s panel to hide composer, got %q", panel, view)
+		}
+		if anchor := model.TerminalCursorAnchorForTest(); anchor.Active {
+			t.Fatalf("expected %s panel to clear terminal cursor anchor, got %+v", panel, anchor)
+		}
 	}
 }
 
@@ -1317,6 +1528,29 @@ func TestViewAnchorsTerminalCursorToComposer(t *testing.T) {
 	}
 }
 
+func TestCursorAnchoredOutputWritesRestoreAndAnchorSequences(t *testing.T) {
+	var buffer bytes.Buffer
+	anchor := app.TerminalCursorAnchor{Active: true, RowsUp: 2, ColumnsRight: 7}
+	output := app.NewCursorAnchoredWriterForTest(&buffer, func() app.TerminalCursorAnchor {
+		return anchor
+	})
+
+	if n, err := output.Write([]byte("first")); err != nil || n != len("first") {
+		t.Fatalf("first write returned n=%d err=%v", n, err)
+	}
+	if got, want := buffer.String(), "first\x1b[2A\x1b[7C"; got != want {
+		t.Fatalf("expected first write to anchor cursor, got %q want %q", got, want)
+	}
+
+	anchor = app.TerminalCursorAnchor{}
+	if n, err := output.Write([]byte("second")); err != nil || n != len("second") {
+		t.Fatalf("second write returned n=%d err=%v", n, err)
+	}
+	if got, want := buffer.String(), "first\x1b[2A\x1b[7C\r\x1b[2Bsecond"; got != want {
+		t.Fatalf("expected second write to restore before rendering, got %q want %q", got, want)
+	}
+}
+
 func TestSlashSuggestionsIncludeExtensionsAndRenderProfessionalHints(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 120
@@ -1341,11 +1575,8 @@ func TestSlashSuggestionsIncludeExtensionsAndRenderProfessionalHints(t *testing.
 	if firstSuggestionLine <= 0 || promptLine <= firstSuggestionLine || promptLine+1 >= len(lines) {
 		t.Fatalf("expected slash suggestion block layout discoverable, got %q", view)
 	}
-	if !strings.Contains(lines[firstSuggestionLine-1], strings.Repeat("─", 20)) {
-		t.Fatalf("expected solid separator above slash suggestions, got %q", view)
-	}
-	if !strings.Contains(lines[promptLine+1], strings.Repeat("─", 20)) {
-		t.Fatalf("expected solid separator below slash prompt, got %q", view)
+	if !strings.Contains(lines[firstSuggestionLine], "┃") || !strings.Contains(lines[promptLine], "┃") {
+		t.Fatalf("expected slash suggestion block to stay inside focused composer rail, got %q", view)
 	}
 	if !strings.Contains(view, "show extensions runtime summary") {
 		t.Fatalf("expected suggestion description in composer, got %q", view)
@@ -1546,6 +1777,49 @@ func TestFooterShowsActiveRequestElapsedTime(t *testing.T) {
 	}
 }
 
+func TestToolStatusRendersDedicatedChip(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 110
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file src/main.go | content hidden"},
+		{Role: "system", Kind: "tool_status", Text: "Tool: git_diff . | 3 files changed"},
+	}
+
+	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	for _, expected := range []string{"read read_file", "git git_diff"} {
+		if !strings.Contains(plainView, expected) {
+			t.Fatalf("expected dedicated tool chip %q, got %q", expected, view)
+		}
+	}
+	if strings.Contains(plainView, "❯ Tool: read_file") {
+		t.Fatalf("expected tool status not to use generic transcript prompt, got %q", view)
+	}
+}
+
+func TestConsecutiveToolStatusesRenderCompactGroup(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 110
+	model.Height = 24
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file a.go | content hidden"},
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file b.go | content hidden"},
+		{Role: "assistant", Kind: "transcript", Text: "done"},
+	}
+
+	rendered := model.RenderTranscriptForTest(100, 14)
+	plain := ansiPattern.ReplaceAllString(rendered, "")
+	if strings.Contains(plain, "read read_file\n\nread read_file") {
+		t.Fatalf("expected consecutive tool statuses to stay compact, got %q", rendered)
+	}
+	if strings.Count(plain, "read read_file") != 2 {
+		t.Fatalf("expected both tool statuses in compact group, got %q", rendered)
+	}
+}
+
 func TestFooterShowsFinalizedRequestElapsedTime(t *testing.T) {
 	model := app.NewModel()
 	model.Width = 160
@@ -1630,8 +1904,8 @@ func TestCustomProviderNameRendersInFooter(t *testing.T) {
 	if strings.Contains(plainView, "FORMAT Gemini Native") {
 		t.Fatalf("expected provider format removed from footer, got %q", view)
 	}
-	if !strings.Contains(plainView, "BRANCH") || !strings.Contains(plainView, "PROJECT") {
-		t.Fatalf("expected footer metadata in unified status row, got %q", view)
+	if !strings.Contains(plainView, "CACHE") || !strings.Contains(plainView, "STATUS") {
+		t.Fatalf("expected prioritized footer metadata in unified status row, got %q", view)
 	}
 }
 
@@ -1741,8 +2015,8 @@ func TestComposerShowsSmartCommandMatches(t *testing.T) {
 
 	view := model.View()
 
-	if !strings.Contains(view, "─") {
-		t.Fatalf("expected compact slash suggestion block, got %q", view)
+	if !strings.Contains(view, "┃") {
+		t.Fatalf("expected compact slash suggestion block inside composer rail, got %q", view)
 	}
 	if !strings.Contains(view, "/provider") {
 		t.Fatalf("expected provider command in matches, got %q", view)
@@ -1788,7 +2062,8 @@ func TestToolStatusHidesLeakedToolJSONPayload(t *testing.T) {
 	if strings.Contains(view, "\"action\":\"apply_patch\"") || strings.Contains(view, "to=functions.file") {
 		t.Fatalf("expected leaked tool JSON payload hidden from tool status, got %q", view)
 	}
-	if !strings.Contains(view, "Tool: read_range simplex.py | range content hidden") {
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	if !strings.Contains(plainView, "read read_range") || !strings.Contains(plainView, "simplex.py | range content hidden") {
 		t.Fatalf("expected visible tool status preserved, got %q", view)
 	}
 }
@@ -2336,6 +2611,36 @@ func TestAuthPanelSelectedEntryUsesInverseHighlight(t *testing.T) {
 	assertLineUsesInverseSelection(t, view, "[5] Confirm and connect")
 }
 
+func TestAuthErrorRendersInsideLoginPanelWhenComposerHidden(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 150
+	model.Height = 36
+	model.ActivePanel = app.PanelAuth
+	model.AuthSaving = true
+
+	err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"error",
+		"message":"login failed: invalid API key"
+	}`)
+	if err != nil {
+		t.Fatalf("ApplyBridgeEventJSONForTest returned error: %v", err)
+	}
+
+	view := model.View()
+	plainView := ansiPattern.ReplaceAllString(view, "")
+	if !strings.Contains(plainView, "ERROR") || !strings.Contains(plainView, "login failed: invalid API key") {
+		t.Fatalf("expected login error inside auth panel, got %q", view)
+	}
+	if strings.Contains(plainView, "❯ Ask Cyrene") {
+		t.Fatalf("expected auth panel to keep composer hidden, got %q", view)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if model.AuthError != "" {
+		t.Fatalf("expected editing auth field to clear auth error, got %q", model.AuthError)
+	}
+}
+
 func TestAuthControlRunesAreIgnored(t *testing.T) {
 	model := app.NewModel()
 	model.ActivePanel = app.PanelAuth
@@ -2458,6 +2763,90 @@ func TestIncrementalBridgeAppendReplaceAndLiveText(t *testing.T) {
 	}
 }
 
+func TestBridgeResetEventsRequestTerminalClear(t *testing.T) {
+	model := app.NewModel()
+
+	clear, err := model.ApplyBridgeEventJSONNeedsClearForTest(`{"type":"init","snapshot":{"status":"idle","items":[{"role":"system","kind":"system_hint","text":"No messages in the current session. Start typing."}]}}`)
+	if err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if !clear {
+		t.Fatalf("expected init snapshot to request terminal clear")
+	}
+
+	clear, err = model.ApplyBridgeEventJSONNeedsClearForTest(`{"type":"replace_items","items":[{"role":"user","kind":"transcript","text":"new session"}]}`)
+	if err != nil {
+		t.Fatalf("replace_items failed: %v", err)
+	}
+	if !clear {
+		t.Fatalf("expected replace_items to request terminal clear")
+	}
+
+	clear, err = model.ApplyBridgeEventJSONNeedsClearForTest(`{"type":"append_items","items":[{"role":"assistant","kind":"transcript","text":"incremental"}]}`)
+	if err != nil {
+		t.Fatalf("append_items failed: %v", err)
+	}
+	if clear {
+		t.Fatalf("expected append_items to avoid terminal clear")
+	}
+
+	clear, err = model.ApplyBridgeEventJSONNeedsClearForTest(`{"type":"set_live_text","liveText":"streaming"}`)
+	if err != nil {
+		t.Fatalf("set_live_text failed: %v", err)
+	}
+	if clear {
+		t.Fatalf("expected live text updates to avoid terminal clear")
+	}
+}
+
+func TestBridgeResetEventsEmitClearScreenCommand(t *testing.T) {
+	model := app.NewModel()
+
+	cmd, err := model.UpdateBridgeEventJSONForTest(`{"type":"init","snapshot":{"status":"idle","items":[{"role":"system","kind":"system_hint","text":"No messages in the current session. Start typing."}]}}`)
+	if err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if !commandEmitsClearScreen(cmd) {
+		t.Fatalf("expected init snapshot Update command to emit Bubble Tea clear-screen message")
+	}
+
+	cmd, err = model.UpdateBridgeEventJSONForTest(`{"type":"replace_items","items":[{"role":"user","kind":"transcript","text":"new session"}]}`)
+	if err != nil {
+		t.Fatalf("replace_items failed: %v", err)
+	}
+	if !commandEmitsClearScreen(cmd) {
+		t.Fatalf("expected replace_items Update command to emit Bubble Tea clear-screen message")
+	}
+
+	cmd, err = model.UpdateBridgeEventJSONForTest(`{"type":"append_items","items":[{"role":"assistant","kind":"transcript","text":"incremental"}]}`)
+	if err != nil {
+		t.Fatalf("append_items failed: %v", err)
+	}
+	if commandEmitsClearScreen(cmd) {
+		t.Fatalf("expected append_items Update command to avoid clear-screen message")
+	}
+}
+
+func TestANSILinesWrapInNarrowWidthWithoutDroppingContent(t *testing.T) {
+	line := "\x1b[31malpha beta gamma delta epsilon\x1b[0m"
+	rows := app.WrapLinesToWidthForTest([]string{line}, 10)
+	if len(rows) < 3 {
+		t.Fatalf("expected ANSI line to wrap into multiple rows, got %#v", rows)
+	}
+
+	plainRows := make([]string, 0, len(rows))
+	for _, row := range rows {
+		width := app.RenderedLineWidthForTest(row)
+		if width > 10 {
+			t.Fatalf("expected wrapped row width <= 10, got %d for %q", width, row)
+		}
+		plainRows = append(plainRows, ansiPattern.ReplaceAllString(row, ""))
+	}
+	if got, want := strings.Join(strings.Fields(strings.Join(plainRows, " ")), " "), "alpha beta gamma delta epsilon"; got != want {
+		t.Fatalf("expected ANSI wrap to preserve full content, got %q want %q in %#v", got, want, rows)
+	}
+}
+
 func TestSingleSystemResultDoesNotKeepStartupSplash(t *testing.T) {
 	model := app.NewModel()
 
@@ -2471,6 +2860,96 @@ func TestSingleSystemResultDoesNotKeepStartupSplash(t *testing.T) {
 	}
 	if strings.Contains(rendered, "No transcript yet.") {
 		t.Fatalf("expected startup splash hidden once real system content exists, got %q", rendered)
+	}
+}
+
+func TestViewClampsMixedTranscriptLayoutToTerminalBounds(t *testing.T) {
+	enableColorRenderingForTest(t)
+
+	model := app.NewModel()
+	model.Width = 165
+	model.Height = 20
+	model.GitBranch = "master"
+	model.AppRoot = "/home/administrator/Cyrene-code"
+	model.CurrentModel = "deepseek-v4-flash"
+	model.CurrentProvider = "openai"
+	model.Status = app.StatusIdle
+	model.Items = []app.Message{
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file bin/lib/cyrene-cli.js | content hidden"},
+		{Role: "user", Kind: "transcript", Text: "你好,看看项目结构"},
+		{Role: "system", Kind: "tool_status", Text: "Tool: list_dir . | confirmed directory state | [F] SECURITY.md, [D] bin, [D] .cursor, [F] Dockerfile (26 items, +22 more)"},
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file package.json | content hidden"},
+		{Role: "system", Kind: "tool_status", Text: "Tool: read_file tsconfig.json | content hidden"},
+		{Role: "assistant", Kind: "transcript", Text: strings.Join([]string{
+			"Cyrene 项目结构总览",
+			"",
+			"概览",
+			"",
+			"Cyrene 是一个混合架构的 CLI 工具，由 Node.js 和 Go 两部分组成。Node.js 部分负责配置管理、CLI 参数解析和启动桥接，Go 部分运行基于 BubbleTea（Go TUI 框架）的主交互界面。",
+			"",
+			"入口与启动链",
+			"",
+			"```",
+			"bin/cyrene.js            <- 入口点",
+			"  handleCyreneCli()      <- bin/lib/cyrene-cli.js 处理 CLI 参数",
+			"```",
+			"",
+			"源码核心模块（`src/` 目录）",
+			"",
+			"| 模块 | 职责 |",
+			"| --- | --- |",
+			"| core/query/ | runQuerySession、QueryTransport、StreamEvent、ToolCallFrame、SessionMachine |",
+			"| core/execution/ | ExecutionRuntime、ExecutionSnapshot、ToolObservationStore、ProgressTracker |",
+			"| core/session/ | SessionStore、SessionRecord、SessionMessage、buildPromptWithContext、stateReducer、pendingChoice、workingState |",
+			"| core/mcp/ | McpManager、McpToolRouter、McpPolicy、createMcpRuntime、builtinTools、toolTypes |",
+			"| core/skills/ | SkillsRuntime、SkillDefinition、chooseSkillCreationTask、detectStableSkillPattern、parseAssistantSkillUpdate |",
+			"| core/extensions/ | createExtensionManager、ExtensionManager |",
+			"",
+			"3️⃣ 基础设施层 — `src/infra/`",
+			"",
+			"| 模块 | 职责 |",
+			"| --- | --- |",
+			"| infra/config/ | appRoot、loadCyreneConfig、loadPromptPolicy、CyreneConfig、PromptPolicy |",
+			"| infra/auth/ | createAuthRuntime、AuthRuntime、AuthStatus |",
+			"| infra/session/ | createFileSessionStore — 文件级会话存储 |",
+			"| infra/http/ | createHttpQueryTransport、normalizeProviderBaseUrl |",
+			"",
+			"4️⃣ 默认配置（cyrene-cli.js 中）",
+			"",
+			"```js",
+			"DEFAULT_CONFIG = {",
+			"  pinMaxCount: 6,",
+			"  queryMaxToolSteps: 19200,",
+			"  autoSummaryRefresh: true,",
+			"  requestTemperature: 0.2,",
+			"  debugCaptureAnthropicRequests: false,",
+			"}",
+			"```",
+			"",
+			"5️⃣ Provider 支持",
+			"",
+			"| 别名 | 实际端点 |",
+			"| --- | --- |",
+			"| openai | https://api.openai.com/v1 |",
+			"| gemini | https://generativelanguage.googleapis.com/v1beta/openai |",
+			"| anthropic / claude | https://api.anthropic.com |",
+			"| custom | 用户自定义 |",
+		}, "\n")},
+	}
+
+	view := model.View()
+	lines := strings.Split(view, "\n")
+	stripANSI := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	if len(lines) > model.Height {
+		t.Fatalf("expected rendered height <= %d, got %d in %q", model.Height, len(lines), view)
+	}
+
+	for _, line := range lines {
+		plain := stripANSI.ReplaceAllString(line, "")
+		if app.RenderedLineWidthForTest(plain) > model.Width {
+			t.Fatalf("expected line width <= %d, got %d for %q in %q", model.Width, app.RenderedLineWidthForTest(plain), plain, view)
+		}
 	}
 }
 

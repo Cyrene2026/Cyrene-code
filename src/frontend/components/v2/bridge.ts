@@ -86,6 +86,7 @@ type BridgeCommand =
   | { type: "init"; root?: string }
   | { type: "command"; text: string }
   | { type: "submit"; text: string; attachments?: QueryAttachment[] }
+  | { type: "cancel" }
   | { type: "new_session" }
   | { type: "list_sessions" }
   | { type: "load_session"; id: string }
@@ -306,6 +307,7 @@ type ActiveStreamingTurn = {
   startedAt: string;
   assistantBufferRef: { current: string };
   assistantStreamRef: { committedVisibleText: string };
+  abortController: AbortController;
 };
 
 type RequestTimingState = BridgeRequestTiming & {
@@ -694,6 +696,7 @@ export class BubbleTeaBridge {
   private shutdownPromise: Promise<void> | null = null;
   private isShuttingDown = false;
   private activeStreamingTurn: ActiveStreamingTurn | null = null;
+  private activeCancellationMessage = "";
   private requestTiming: RequestTimingState = {
     active: false,
     startedAt: "",
@@ -704,6 +707,10 @@ export class BubbleTeaBridge {
   enqueue(command: BridgeCommand) {
     if (command.type === "shutdown") {
       void this.shutdown();
+      return;
+    }
+    if (command.type === "cancel") {
+      void this.cancelActiveTurn("Cancelled by user.");
       return;
     }
     if (this.isShuttingDown) {
@@ -735,6 +742,9 @@ export class BubbleTeaBridge {
         return;
       case "load_session":
         await this.loadSession(command.id);
+        return;
+      case "cancel":
+        await this.cancelActiveTurn("Cancelled by user.");
         return;
       case "approve":
         await this.approve(command.id);
@@ -1608,6 +1618,41 @@ export class BubbleTeaBridge {
     await this.waitForSessionMutations(active.sessionId);
   }
 
+  private async cancelActiveTurn(message: string) {
+    const normalizedMessage = message.trim() || "Cancelled by user.";
+    if (this.suspended) {
+      await this.cancelSuspended(normalizedMessage);
+      return;
+    }
+
+    const active = this.activeStreamingTurn;
+    if (!active) {
+      await this.pushSystemMessage("No active request to cancel.", {
+        kind: "system_hint",
+      });
+      this.status = this.pendingReviews.length > 0 ? "awaiting_review" : "idle";
+      this.emitStatus();
+      return;
+    }
+
+    if (!active.abortController.signal.aborted) {
+      this.activeCancellationMessage = normalizedMessage;
+      active.abortController.abort();
+      this.status = "preparing";
+      await this.pushPersistentSessionItem(active.sessionId, {
+        role: "system",
+        kind: "review_status",
+        text: normalizedMessage,
+      });
+      this.emitStatus();
+      return;
+    }
+
+    await this.pushSystemMessage("Cancellation is already in progress.", {
+      kind: "system_hint",
+    });
+  }
+
   private async drainAllSessionMutations() {
     while (this.pendingSessionMutations.size > 0) {
       await Promise.all(
@@ -2180,10 +2225,7 @@ export class BubbleTeaBridge {
     }
 
     if (query === "/cancel") {
-      await this.pushSystemMessage(
-        "Cancel is not wired in v2 bridge mode yet.",
-        { kind: "error" }
-      );
+      await this.cancelActiveTurn("Cancelled by user.");
       return;
     }
 
@@ -2974,6 +3016,7 @@ export class BubbleTeaBridge {
 
     const assistantBufferRef = { current: "" };
     const assistantStreamRef = { committedVisibleText: "" };
+    const abortController = new AbortController();
     this.activeStreamingTurn = {
       sessionId: session.id,
       userText,
@@ -2981,6 +3024,7 @@ export class BubbleTeaBridge {
       startedAt,
       assistantBufferRef,
       assistantStreamRef,
+      abortController,
     };
     try {
       const result = await runQuerySession({
@@ -2990,8 +3034,13 @@ export class BubbleTeaBridge {
         },
         originalTask: input.originalTask?.trim() || userText,
         queryMaxToolSteps: this.config!.queryMaxToolSteps,
+        abortSignal: abortController.signal,
         transport: this.transport!,
+        env: process.env,
         onState: next => {
+          if (abortController.signal.aborted && next.status !== "idle") {
+            return;
+          }
           if (this.status === next.status) {
             return;
           }
@@ -3188,6 +3237,9 @@ export class BubbleTeaBridge {
         this.activeStreamingTurn.assistantBufferRef === assistantBufferRef
       ) {
         this.activeStreamingTurn = null;
+      }
+      if (this.activeCancellationMessage) {
+        this.activeCancellationMessage = "";
       }
     }
   }

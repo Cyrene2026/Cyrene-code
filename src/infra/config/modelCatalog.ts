@@ -10,6 +10,12 @@ import type {
   TransportFormat,
 } from "../../core/query/transport";
 import {
+  isManualProviderProfile,
+  isProviderEndpointKind,
+  isProviderType,
+  isTransportFormat,
+} from "../../core/query/transport";
+import {
   getCyreneConfigDir,
   getLegacyProjectCyreneDir,
   resolveAppRoot,
@@ -57,27 +63,15 @@ type PersistedTransportFormat = TransportFormat;
 type PersistedProviderEndpointKind = ProviderEndpointKind;
 type PersistedProviderModelCatalogMode = ProviderModelCatalogMode;
 
-const isPersistedProviderProfile = (
-  value: string
-): value is PersistedProviderProfile =>
-  value === "openai" || value === "gemini" || value === "anthropic";
-
 const isPersistedTransportFormat = (
   value: string
 ): value is PersistedTransportFormat =>
-  value === "openai_chat" ||
-  value === "openai_responses" ||
-  value === "anthropic_messages" ||
-  value === "gemini_generate_content";
+  isTransportFormat(value);
 
 const isPersistedProviderEndpointKind = (
   value: string
 ): value is PersistedProviderEndpointKind =>
-  value === "responses" ||
-  value === "chat_completions" ||
-  value === "models" ||
-  value === "anthropic_messages" ||
-  value === "gemini_generate_content";
+  isProviderEndpointKind(value);
 
 const isPersistedProviderModelCatalogMode = (
   value: string
@@ -87,10 +81,7 @@ const isPersistedProviderModelCatalogMode = (
 const isPersistedProviderType = (
   value: string
 ): value is PersistedProviderType =>
-  value === "openai-compatible" ||
-  value === "openai-responses" ||
-  value === "gemini" ||
-  value === "anthropic";
+  isProviderType(value);
 
 export const loadModelYaml = async (
   appRoot = resolveAppRoot(),
@@ -416,7 +407,7 @@ export const loadModelYaml = async (
           const profileCandidate = parseScalar(
             rawEntry.slice("profile:".length)
           ).toLowerCase();
-          pendingProviderProfile = isPersistedProviderProfile(profileCandidate)
+          pendingProviderProfile = isManualProviderProfile(profileCandidate)
             ? { profile: profileCandidate }
             : {};
           continue;
@@ -439,7 +430,7 @@ export const loadModelYaml = async (
         ).toLowerCase();
         pendingProviderProfile = {
           ...(pendingProviderProfile ?? {}),
-          ...(isPersistedProviderProfile(profileCandidate)
+          ...(isManualProviderProfile(profileCandidate)
             ? { profile: profileCandidate }
             : {}),
         };
@@ -754,7 +745,7 @@ export const saveModelYaml = async (
     .map(([provider, profile]) => [provider.trim(), profile] as const)
     .filter(
       ([provider, profile]) =>
-        Boolean(provider) && isPersistedProviderProfile(profile)
+        Boolean(provider) && isManualProviderProfile(profile)
     )
     .sort(([left], [right]) => left.localeCompare(right));
   const providerTypeEntries = Object.entries(options?.providerTypes ?? {})

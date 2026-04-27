@@ -1,11 +1,21 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import {
   inferProviderType,
+  isManualProviderProfile,
+  isProviderEndpointKind,
+  isTransportFormat,
   isProviderType,
+  normalizeProviderBaseUrl,
+  parseProviderBaseUrl,
+  repairCommonSchemeTypos,
+  resolveProviderFamily,
   resolveProviderTypeFamily,
   resolveProviderTypeFormat,
+  safeNormalizeProviderBaseUrl,
+  supportsImageAttachmentsForFormat,
   type ProviderEndpointKind,
   type ProviderEndpointOverrideEntry,
   type ProviderEndpointOverrideMap,
@@ -17,6 +27,8 @@ import {
   type ProviderFormatSetResult,
   type ProviderProfile,
   type ProviderProfileOverrideMap,
+  type ProviderFamily,
+  type ManualProviderProfile,
   type ProviderType,
   type ProviderTypeOverrideMap,
   type ProviderTypeSetResult,
@@ -32,6 +44,8 @@ import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import { resolveAmbientAppRoot, resolveUserHomeDir } from "../config/appRoot";
 
+export { normalizeProviderBaseUrl };
+
 const envSchema = z.object({
   CYRENE_BASE_URL: z.string().min(1).optional(),
   CYRENE_API_KEY: z.string().min(1).optional(),
@@ -40,36 +54,6 @@ const envSchema = z.object({
   CYRENE_ANTHROPIC_API_KEY: z.string().min(1).optional(),
   CYRENE_MODEL: z.string().min(1).optional(),
 });
-
-const PROVIDER_ALIASES = {
-  openai: "https://api.openai.com/v1",
-  gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
-  anthropic: "https://api.anthropic.com",
-  claude: "https://api.anthropic.com",
-} as const;
-
-type ProviderAlias = keyof typeof PROVIDER_ALIASES;
-type ProviderFamily = "openai" | "gemini" | "anthropic" | "glm";
-type ManualProviderProfile = Exclude<ProviderProfile, "custom">;
-const PROVIDER_PROFILE_VALUES = ["openai", "gemini", "anthropic"] as const;
-const TRANSPORT_FORMAT_VALUES = [
-  "openai_chat",
-  "openai_responses",
-  "anthropic_messages",
-  "gemini_generate_content",
-] as const;
-const PROVIDER_ENDPOINT_KIND_VALUES = [
-  "responses",
-  "chat_completions",
-  "models",
-  "anthropic_messages",
-  "gemini_generate_content",
-] as const;
-
-type ParsedProvider = {
-  providerBaseUrl: string;
-  family: ProviderFamily;
-};
 
 type EncodedImageAttachment = QueryAttachment & {
   absolutePath: string;
@@ -86,19 +70,6 @@ const IMAGE_ATTACHMENT_MIME_TYPES: Record<string, string> = {
 };
 
 const MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-
-const isManualProviderProfile = (
-  value: string
-): value is ManualProviderProfile =>
-  (PROVIDER_PROFILE_VALUES as readonly string[]).includes(value);
-
-const isTransportFormat = (value: string): value is TransportFormat =>
-  (TRANSPORT_FORMAT_VALUES as readonly string[]).includes(value);
-
-const supportsImageAttachmentsForFormat = (format: TransportFormat) =>
-  format === "openai_responses" ||
-  format === "anthropic_messages" ||
-  format === "gemini_generate_content";
 
 const resolveAttachmentAbsolutePath = (attachment: QueryAttachment, appRoot: string) =>
   isAbsolute(attachment.path)
@@ -141,9 +112,6 @@ const encodeImageAttachments = async (
       };
     })
   );
-
-const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
-  (PROVIDER_ENDPOINT_KIND_VALUES as readonly string[]).includes(value);
 
 const parseSseEventData = (rawEvent: string): string[] => {
   const lines = rawEvent.split("\n");
@@ -272,7 +240,16 @@ type OpenAiPromptCacheConfig = {
   retention?: OpenAiPromptCacheRetention;
 };
 
+type OpenAiPromptCacheCapability = {
+  supportsKey: boolean;
+  supportsRetention: boolean;
+};
+
+type OpenAiPromptCacheCapabilityStore = Map<string, OpenAiPromptCacheCapability>;
+
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+const OPENAI_PROMPT_CACHE_SCOPE_HASH_LENGTH = 12;
+const OPENAI_PROMPT_CACHE_SCOPE_VERSION = "v2";
 
 const normalizeOpenAiPromptCacheKey = (value: string) =>
   value
@@ -281,7 +258,35 @@ const normalizeOpenAiPromptCacheKey = (value: string) =>
     .replace(/^-+|-+$/g, "")
     .slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH);
 
-const buildDefaultOpenAiPromptCacheKey = (provider: string, model: string) => {
+const hashOpenAiPromptCacheScope = (parts: unknown[]) =>
+  createHash("sha256")
+    .update(JSON.stringify([OPENAI_PROMPT_CACHE_SCOPE_VERSION, ...parts]))
+    .digest("hex")
+    .slice(0, OPENAI_PROMPT_CACHE_SCOPE_HASH_LENGTH);
+
+const buildOpenAiPromptCacheScopeHash = (options: {
+  appRoot?: string;
+  format?: TransportFormat;
+  mcpTools?: McpToolDescriptor[];
+  systemPrompt?: string;
+}) =>
+  hashOpenAiPromptCacheScope([
+    options.appRoot ? resolve(options.appRoot) : "",
+    options.format ?? "",
+    options.systemPrompt ?? "",
+    (options.mcpTools ?? []).map(tool => [
+      tool.serverId,
+      tool.name,
+      tool.id,
+      tool.description ?? "",
+    ]),
+  ]);
+
+const buildDefaultOpenAiPromptCacheKey = (
+  provider: string,
+  model: string,
+  scopeHash?: string
+) => {
   const normalizedProvider = normalizeOpenAiPromptCacheKey(
     provider
       .replace(/^https?:\/\//i, "")
@@ -289,9 +294,21 @@ const buildDefaultOpenAiPromptCacheKey = (provider: string, model: string) => {
       .replace(/[/?#].*$/, "")
   );
   const normalizedModel = normalizeOpenAiPromptCacheKey(model);
-  return normalizeOpenAiPromptCacheKey(
+  const baseKey = normalizeOpenAiPromptCacheKey(
     ["cyrene", normalizedProvider, normalizedModel].filter(Boolean).join("-")
   );
+  const normalizedScopeHash = normalizeOpenAiPromptCacheKey(scopeHash ?? "");
+  if (!normalizedScopeHash) {
+    return baseKey;
+  }
+  const prefixMaxLength = Math.max(
+    1,
+    OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH - normalizedScopeHash.length - 1
+  );
+  const prefix = (baseKey || "cyrene")
+    .slice(0, prefixMaxLength)
+    .replace(/-+$/g, "");
+  return normalizeOpenAiPromptCacheKey(`${prefix}-${normalizedScopeHash}`);
 };
 
 const parseOpenAiPromptCacheRetention = (
@@ -324,28 +341,55 @@ const resolveOpenAiPromptCacheConfig = (options: {
   provider: string;
   model: string;
   family?: ProviderFamily;
+  format?: TransportFormat;
+  appRoot?: string;
+  mcpTools?: McpToolDescriptor[];
+  systemPrompt?: string;
+  capability?: OpenAiPromptCacheCapability;
 }): OpenAiPromptCacheConfig | null => {
   if (options.family === "gemini") {
     return null;
   }
-  if (hasDeepSeekMarker(options.provider) || hasDeepSeekMarker(options.model)) {
+  if (
+    resolveDeepSeekCompatibilityMode({
+      provider: options.provider,
+      model: options.model,
+      env: options.env,
+    })
+  ) {
     return null;
   }
   if (options.env?.CYRENE_OPENAI_PROMPT_CACHE === "0") {
     return null;
   }
+  if (options.capability?.supportsKey === false) {
+    return null;
+  }
   const explicitKey = options.env?.CYRENE_OPENAI_PROMPT_CACHE_KEY;
+  const scopeHash = explicitKey?.trim()
+    ? undefined
+    : buildOpenAiPromptCacheScopeHash({
+        appRoot: options.appRoot,
+        format: options.format,
+        mcpTools: options.mcpTools,
+        systemPrompt: options.systemPrompt,
+      });
   const key = normalizeOpenAiPromptCacheKey(
-    explicitKey?.trim() || buildDefaultOpenAiPromptCacheKey(options.provider, options.model)
+    explicitKey?.trim() ||
+      buildDefaultOpenAiPromptCacheKey(options.provider, options.model, scopeHash)
   );
   if (!key) {
     return null;
   }
+  const retention =
+    options.capability?.supportsRetention === false
+      ? undefined
+      : parseOpenAiPromptCacheRetention(
+          options.env?.CYRENE_OPENAI_PROMPT_CACHE_RETENTION
+        );
   return {
     key,
-    retention: parseOpenAiPromptCacheRetention(
-      options.env?.CYRENE_OPENAI_PROMPT_CACHE_RETENTION
-    ),
+    ...(retention ? { retention } : {}),
   };
 };
 
@@ -354,13 +398,53 @@ const buildOpenAiPromptCacheFields = (config: OpenAiPromptCacheConfig) => ({
   ...(config.retention ? { prompt_cache_retention: config.retention } : {}),
 });
 
-const hasDeepSeekMarker = (value: string | undefined) =>
-  Boolean(value?.toLowerCase().includes("deepseek"));
+const parseBooleanEnvOverride = (value: string | undefined) => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+};
+
+const isDeepSeekProvider = (provider: string | undefined) => {
+  if (!provider) {
+    return false;
+  }
+  try {
+    return new URL(provider).hostname.toLowerCase().split(".").includes("deepseek");
+  } catch {
+    return provider.toLowerCase().split(/[^a-z0-9]+/u).includes("deepseek");
+  }
+};
+
+const isDeepSeekModel = (model: string | undefined) =>
+  Boolean(model?.toLowerCase().split(/[^a-z0-9]+/u).includes("deepseek"));
+
+const resolveDeepSeekCompatibilityMode = (options: {
+  provider?: string;
+  model?: string;
+  env?: NodeJS.ProcessEnv;
+}) => {
+  const explicit =
+    parseBooleanEnvOverride(options.env?.CYRENE_DEEPSEEK_COMPATIBILITY) ??
+    parseBooleanEnvOverride(options.env?.CYRENE_DEEPSEEK_COMPAT);
+  if (typeof explicit === "boolean") {
+    return explicit;
+  }
+  return isDeepSeekProvider(options.provider) || isDeepSeekModel(options.model);
+};
 
 const shouldPreferPromptBeforeTools = (options: {
   provider: string;
   model: string;
-}) => hasDeepSeekMarker(options.provider) || hasDeepSeekMarker(options.model);
+  env?: NodeJS.ProcessEnv;
+}) => resolveDeepSeekCompatibilityMode(options);
 
 const shouldPreferToolsBeforePrompt = (options: {
   cacheConfig?: OpenAiPromptCacheConfig | null;
@@ -522,6 +606,56 @@ const nextOpenAiPromptCacheConfigAfterFailure = (
     return null;
   }
   return config;
+};
+
+const buildOpenAiPromptCacheCapabilityKey = (options: {
+  provider: string;
+  model: string;
+  format: TransportFormat;
+}) =>
+  [
+    resolveProviderBaseUrl(options.provider) ?? options.provider.trim(),
+    options.model.trim(),
+    options.format,
+  ].join("\u0000");
+
+const getOpenAiPromptCacheCapability = (
+  store: OpenAiPromptCacheCapabilityStore | undefined,
+  options: {
+    provider: string;
+    model: string;
+    format: TransportFormat;
+  }
+): OpenAiPromptCacheCapability => ({
+  supportsKey: true,
+  supportsRetention: true,
+  ...(store?.get(buildOpenAiPromptCacheCapabilityKey(options)) ?? {}),
+});
+
+const rememberOpenAiPromptCacheFailure = (
+  store: OpenAiPromptCacheCapabilityStore | undefined,
+  options: {
+    provider: string;
+    model: string;
+    format: TransportFormat;
+  },
+  detail: string | null
+) => {
+  if (!store || !isUnsupportedPromptCacheFailureDetail(detail)) {
+    return;
+  }
+  const key = buildOpenAiPromptCacheCapabilityKey(options);
+  const previous = getOpenAiPromptCacheCapability(store, options);
+  store.set(key, {
+    supportsKey: isUnsupportedPromptCacheKeyFailureDetail(detail)
+      ? false
+      : previous.supportsKey,
+    supportsRetention:
+      isUnsupportedPromptCacheKeyFailureDetail(detail) ||
+      isUnsupportedPromptCacheRetentionFailureDetail(detail)
+        ? false
+        : previous.supportsRetention,
+  });
 };
 
 type OpenAiRequestCaptureRecord = {
@@ -1446,9 +1580,13 @@ type AnthropicPromptCacheSessionState = {
 };
 
 type AnthropicPromptProjection = {
-  cachedSystemText: string;
-  uncachedSystemTailText: string;
+  systemBlocks: AnthropicSystemProjectionBlock[];
   userText: string;
+};
+
+type AnthropicSystemProjectionBlock = {
+  text: string;
+  cacheable: boolean;
 };
 
 type OpenAiPromptProjection = {
@@ -1609,44 +1747,23 @@ const isAnthropicTextBlock = (
 type AnthropicSystemBlock = AnthropicTextBlock;
 
 const buildAnthropicSystemBlocks = (
-  systemProjection: Pick<
-    AnthropicPromptProjection,
-    "cachedSystemText" | "uncachedSystemTailText"
-  >,
+  systemProjection: Pick<AnthropicPromptProjection, "systemBlocks">,
   cacheControl: AnthropicCacheControl
 ): AnthropicSystemBlock[] => {
-  const cachedSystemText = systemProjection.cachedSystemText.trim();
-  const uncachedSystemTailText = systemProjection.uncachedSystemTailText.trim();
-
-  if (!cachedSystemText && !uncachedSystemTailText) {
+  const blocks = systemProjection.systemBlocks
+    .map(block => ({
+      ...block,
+      text: block.text.trim(),
+    }))
+    .filter(block => block.text);
+  if (blocks.length === 0) {
     return [];
   }
-
-  if (!cachedSystemText) {
-    return [
-      {
-        type: "text",
-        text: uncachedSystemTailText,
-        cache_control: cacheControl,
-      },
-    ];
-  }
-
-  return [
-    {
-      type: "text",
-      text: cachedSystemText,
-      cache_control: cacheControl,
-    },
-    ...(uncachedSystemTailText
-      ? [
-          {
-            type: "text" as const,
-            text: uncachedSystemTailText,
-          },
-        ]
-      : []),
-  ];
+  return blocks.map(block => ({
+    type: "text",
+    text: block.text,
+    ...(block.cacheable ? { cache_control: cacheControl } : {}),
+  }));
 };
 
 type AnthropicMessagesRequestBody = {
@@ -1977,10 +2094,7 @@ const writeAnthropicRequestSnapshot = async (options: {
   requestBody: AnthropicMessagesRequestBody;
   resolvedCacheControl: AnthropicCacheControl;
   resolvedBetaHeaders: string[];
-  systemProjection: Pick<
-    AnthropicPromptProjection,
-    "cachedSystemText" | "uncachedSystemTailText"
-  >;
+  systemProjection: Pick<AnthropicPromptProjection, "systemBlocks">;
 }) => {
   const snapshotDir = resolveAnthropicSnapshotDir({
     appRoot: options.appRoot,
@@ -2018,9 +2132,12 @@ const writeAnthropicRequestSnapshot = async (options: {
       resolvedCacheControl: options.resolvedCacheControl,
       resolvedBetaHeaders: options.resolvedBetaHeaders,
       systemSplitSummary: {
-        cachedSystemTextLength: options.systemProjection.cachedSystemText.length,
-        uncachedSystemTailTextLength:
-          options.systemProjection.uncachedSystemTailText.length,
+        cachedSystemTextLength: options.systemProjection.systemBlocks
+          .filter(block => block.cacheable)
+          .reduce((total, block) => total + block.text.length, 0),
+        uncachedSystemTailTextLength: options.systemProjection.systemBlocks
+          .filter(block => !block.cacheable)
+          .reduce((total, block) => total + block.text.length, 0),
       },
       ...(previous
         ? {
@@ -2049,8 +2166,7 @@ const splitAnthropicSystemPromptForCaching = (systemPrompt: string) => {
   );
   if (extensionIndex < 0) {
     return {
-      cachedSystemText: systemPrompt.trim(),
-      uncachedSystemTailText: "",
+      systemBlocks: [{ text: systemPrompt.trim(), cacheable: true }],
     };
   }
 
@@ -2060,8 +2176,7 @@ const splitAnthropicSystemPromptForCaching = (systemPrompt: string) => {
   );
   if (executionPlanIndex < 0) {
     return {
-      cachedSystemText: systemPrompt.trim(),
-      uncachedSystemTailText: "",
+      systemBlocks: [{ text: systemPrompt.trim(), cacheable: true }],
     };
   }
 
@@ -2072,8 +2187,11 @@ const splitAnthropicSystemPromptForCaching = (systemPrompt: string) => {
   const suffixText = systemPrompt.slice(executionPlanIndex).trim();
 
   return {
-    cachedSystemText: [prefixText, suffixText].filter(Boolean).join("\n\n"),
-    uncachedSystemTailText: extensionText,
+    systemBlocks: [
+      { text: prefixText, cacheable: true },
+      { text: extensionText, cacheable: false },
+      { text: suffixText, cacheable: true },
+    ].filter(block => block.text),
   };
 };
 
@@ -2084,8 +2202,7 @@ const splitAnthropicPromptForCaching = (
   const taskStateIndex = query.indexOf(ANTHROPIC_TASK_STATE_MARKER);
   if (taskStateIndex <= 0) {
     return {
-      cachedSystemText: fallbackSystemPrompt.trim(),
-      uncachedSystemTailText: "",
+      systemBlocks: [{ text: fallbackSystemPrompt.trim(), cacheable: true }],
       userText: query,
     };
   }
@@ -2095,16 +2212,14 @@ const splitAnthropicPromptForCaching = (
 
   if (!stablePrefix || !dynamicSuffix) {
     return {
-      cachedSystemText: fallbackSystemPrompt.trim(),
-      uncachedSystemTailText: "",
+      systemBlocks: [{ text: fallbackSystemPrompt.trim(), cacheable: true }],
       userText: query,
     };
   }
 
   const systemSplit = splitAnthropicSystemPromptForCaching(stablePrefix);
   return {
-    cachedSystemText: systemSplit.cachedSystemText,
-    uncachedSystemTailText: systemSplit.uncachedSystemTailText,
+    systemBlocks: systemSplit.systemBlocks,
     userText: dynamicSuffix,
   };
 };
@@ -2144,10 +2259,9 @@ const splitOpenAiPromptForCaching = (
 
   const systemSplit = splitAnthropicSystemPromptForCaching(stablePrefix);
   return {
-    systemPrompt: joinStableSystemPrompt([
-      systemSplit.cachedSystemText,
-      systemSplit.uncachedSystemTailText,
-    ]),
+    systemPrompt: joinStableSystemPrompt(
+      systemSplit.systemBlocks.map(block => block.text)
+    ),
     userText: dynamicSuffix,
   };
 };
@@ -2521,71 +2635,6 @@ const buildToolUsageSystemPrompt = (
     "Use these additional tools directly when they are a better match than `file`.",
   ].join("\n");
 };
-
-const trimProviderInput = (value: string) => value.trim();
-
-const repairCommonSchemeTypos = (value: string) => {
-  const trimmed = value.trim();
-  if (/^https\/\//i.test(trimmed)) {
-    return `https://${trimmed.slice("https//".length)}`;
-  }
-  if (/^http\/\//i.test(trimmed)) {
-    return `http://${trimmed.slice("http//".length)}`;
-  }
-  return trimmed;
-};
-
-const resolveProviderAlias = (value: string) => {
-  const normalizedKey = trimProviderInput(value).toLowerCase() as ProviderAlias;
-  return PROVIDER_ALIASES[normalizedKey];
-};
-
-const parseProviderBaseUrl = (provider: string): ParsedProvider => {
-  const trimmed = repairCommonSchemeTypos(trimProviderInput(provider));
-  if (!trimmed) {
-    throw new Error("Provider cannot be empty.");
-  }
-
-  const aliased = resolveProviderAlias(trimmed);
-  const candidate = aliased ?? trimmed;
-  let parsed: URL;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    if (aliased) {
-      parsed = new URL(aliased);
-    } else {
-      throw new Error(
-        "Provider must be a valid URL or one of: openai, gemini, anthropic."
-      );
-    }
-  }
-
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Provider base URL must use http or https.");
-  }
-
-  const normalized = parsed.toString().replace(/\/+$/, "");
-  const host = parsed.hostname.toLowerCase();
-  const family: ProviderFamily = host.includes("anthropic.com")
-    ? "anthropic"
-    : host.includes("generativelanguage.googleapis.com")
-      ? "gemini"
-      : host.includes("bigmodel.cn") || host.includes("zhipuai.cn")
-        ? "glm"
-        : "openai";
-
-  return {
-    providerBaseUrl: normalized,
-    family,
-  };
-};
-
-export const normalizeProviderBaseUrl = (url: string) =>
-  parseProviderBaseUrl(url).providerBaseUrl;
-
-const resolveProviderFamily = (providerBaseUrl: string): ProviderFamily =>
-  parseProviderBaseUrl(providerBaseUrl).family;
 
 const resolveProviderEndpointOverrideUrl = (
   baseUrl: string,
@@ -3046,16 +3095,7 @@ const extractGeminiCompletionEvent = (payload: unknown) => {
   return null;
 };
 
-const resolveProviderBaseUrl = (baseUrl: string | undefined) => {
-  if (!baseUrl) {
-    return undefined;
-  }
-  try {
-    return normalizeProviderBaseUrl(baseUrl);
-  } catch {
-    return undefined;
-  }
-};
+const resolveProviderBaseUrl = safeNormalizeProviderBaseUrl;
 const joinVisibleParts = (parts: string[]) => parts.filter(Boolean).join("");
 
 const extractTextValue = (value: unknown): string => {
@@ -3334,6 +3374,7 @@ const buildOpenAIResponsesRequestBody = (options: {
   mcpTools: McpToolDescriptor[];
   cacheConfig?: OpenAiPromptCacheConfig | null;
   includeCacheConfig?: boolean;
+  env?: NodeJS.ProcessEnv;
 }) => ({
   model: options.model,
   ...(typeof options.temperature === "number"
@@ -3347,6 +3388,7 @@ const buildOpenAIResponsesRequestBody = (options: {
   ...(shouldPreferPromptBeforeTools({
     provider: options.provider,
     model: options.model,
+    env: options.env,
   }) && !shouldPreferToolsBeforePrompt({ cacheConfig: options.cacheConfig })
     ? {
         instructions: options.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
@@ -3393,6 +3435,7 @@ async function* streamSseOpenAI(
     mcpTools?: McpToolDescriptor[];
     appRoot?: string;
     env?: NodeJS.ProcessEnv;
+    promptCacheCapabilities?: OpenAiPromptCacheCapabilityStore;
     signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
@@ -3414,11 +3457,24 @@ async function* streamSseOpenAI(
     baseUrl,
     options?.endpointOverride
   );
+  const cacheCapability = getOpenAiPromptCacheCapability(
+    options?.promptCacheCapabilities,
+    {
+      provider: baseUrl,
+      model,
+      format: "openai_chat",
+    }
+  );
   const cacheConfig = resolveOpenAiPromptCacheConfig({
     env: options?.env,
     provider: baseUrl,
     model,
     family: options?.family,
+    format: "openai_chat",
+    appRoot: options?.appRoot,
+    mcpTools: options?.mcpTools,
+    systemPrompt: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+    capability: cacheCapability,
   });
   const promptProjection = splitOpenAiPromptForCaching(
     input.text,
@@ -3427,7 +3483,11 @@ async function* streamSseOpenAI(
   const baseSystemPrompt = (options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT).trim();
   let effectiveSystemPrompt = promptProjection.systemPrompt;
   let effectiveUserText = promptProjection.userText;
-  const isDeepSeekRequest = hasDeepSeekMarker(baseUrl) || hasDeepSeekMarker(model);
+  const isDeepSeekRequest = resolveDeepSeekCompatibilityMode({
+    provider: baseUrl,
+    model,
+    env: options?.env,
+  });
   if (isDeepSeekRequest) {
     if (
       effectiveSystemPrompt.startsWith(baseSystemPrompt) &&
@@ -3449,6 +3509,7 @@ async function* streamSseOpenAI(
   const promptBeforeTools = shouldPreferPromptBeforeTools({
     provider: baseUrl,
     model,
+    env: options?.env,
   }) && !shouldPreferToolsBeforePrompt({ cacheConfig });
   const buildChatMessages = () =>
     isDeepSeekRequest
@@ -3533,6 +3594,11 @@ async function* streamSseOpenAI(
     if (downgradedCacheConfig === activeCacheConfig) {
       break;
     }
+    rememberOpenAiPromptCacheFailure(options?.promptCacheCapabilities, {
+      provider: baseUrl,
+      model,
+      format: "openai_chat",
+    }, failureDetail);
     activeCacheConfig = downgradedCacheConfig;
     response = await fetch(requestUrl, {
       method: "POST",
@@ -3916,6 +3982,7 @@ async function* streamSseOpenAIResponses(
     mcpTools?: McpToolDescriptor[];
     appRoot?: string;
     env?: NodeJS.ProcessEnv;
+    promptCacheCapabilities?: OpenAiPromptCacheCapabilityStore;
     signal?: AbortSignal;
   }
 ): AsyncGenerator<string> {
@@ -3933,11 +4000,24 @@ async function* streamSseOpenAIResponses(
     headers["x-goog-api-key"] = apiKey;
   }
 
+  const cacheCapability = getOpenAiPromptCacheCapability(
+    options?.promptCacheCapabilities,
+    {
+      provider: baseUrl,
+      model,
+      format: "openai_responses",
+    }
+  );
   const cacheConfig = resolveOpenAiPromptCacheConfig({
     env: options?.env,
     provider: baseUrl,
     model,
     family: options?.family,
+    format: "openai_responses",
+    appRoot: options?.appRoot,
+    mcpTools: options?.mcpTools,
+    systemPrompt: options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT,
+    capability: cacheCapability,
   });
   const promptProjection = splitOpenAiPromptForCaching(
     input.text,
@@ -3946,7 +4026,13 @@ async function* streamSseOpenAIResponses(
   const baseSystemPrompt = (options?.systemPrompt ?? TOOL_USAGE_SYSTEM_PROMPT).trim();
   let effectiveSystemPrompt = promptProjection.systemPrompt;
   let effectiveUserText = promptProjection.userText;
-  if (hasDeepSeekMarker(baseUrl) || hasDeepSeekMarker(model)) {
+  if (
+    resolveDeepSeekCompatibilityMode({
+      provider: baseUrl,
+      model,
+      env: options?.env,
+    })
+  ) {
     if (
       effectiveSystemPrompt.startsWith(baseSystemPrompt) &&
       effectiveSystemPrompt.length > baseSystemPrompt.length
@@ -3977,6 +4063,7 @@ async function* streamSseOpenAIResponses(
       systemPrompt: effectiveSystemPrompt,
       mcpTools: options?.mcpTools ?? [],
       cacheConfig: cacheConfigOverride,
+      env: options?.env,
     }));
   const candidateUrls = resolveResponsesUrls(
     baseUrl,
@@ -3989,6 +4076,7 @@ async function* streamSseOpenAIResponses(
   const promptBeforeTools = shouldPreferPromptBeforeTools({
     provider: baseUrl,
     model,
+    env: options?.env,
   }) && !shouldPreferToolsBeforePrompt({ cacheConfig });
   const buildCapturedRequestBody = async (
     requestUrl: string,
@@ -4055,6 +4143,11 @@ async function* streamSseOpenAIResponses(
         failureDetail
       );
       if (downgradedCacheConfig !== activeCacheConfig) {
+        rememberOpenAiPromptCacheFailure(options?.promptCacheCapabilities, {
+          provider: baseUrl,
+          model,
+          format: "openai_responses",
+        }, failureDetail);
         activeCacheConfig = downgradedCacheConfig;
         changed = true;
       }
@@ -4868,6 +4961,12 @@ const extractAnthropicUsageEvent = (
     type: "usage",
     promptTokens,
     ...(cachedTokens > 0 ? { cachedTokens } : {}),
+    ...(typeof state.cacheReadInputTokens === "number"
+      ? { cacheReadInputTokens: state.cacheReadInputTokens }
+      : {}),
+    ...(typeof state.cacheCreationInputTokens === "number"
+      ? { cacheCreationInputTokens: state.cacheCreationInputTokens }
+      : {}),
     completionTokens,
     totalTokens: promptTokens + completionTokens,
   });
@@ -5761,6 +5860,7 @@ export const createHttpQueryTransport = (
   let providerEndpointOverrides: ProviderEndpointOverrideMap = {};
   let providerNameOverrides: ProviderNameOverrideMap = {};
   let initializationError: string | null = null;
+  const openAiPromptCacheCapabilities: OpenAiPromptCacheCapabilityStore = new Map();
   const anthropicCacheSessionState = createAnthropicPromptCacheSessionState();
   const sessionQueries = new Map<
     string,
@@ -6997,6 +7097,7 @@ export const createHttpQueryTransport = (
             systemPrompt: session.systemPrompt,
             appRoot,
             env: effectiveEnv,
+            promptCacheCapabilities: openAiPromptCacheCapabilities,
             signal: streamOptions?.signal,
           }
         )) {
@@ -7039,6 +7140,7 @@ export const createHttpQueryTransport = (
           systemPrompt: session.systemPrompt,
           appRoot,
           env: effectiveEnv,
+          promptCacheCapabilities: openAiPromptCacheCapabilities,
           signal: streamOptions?.signal,
         }
       )) {

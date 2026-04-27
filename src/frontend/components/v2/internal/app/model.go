@@ -50,6 +50,7 @@ const (
 	PanelSessions  Panel = "sessions"
 	PanelModels    Panel = "models"
 	PanelProviders Panel = "providers"
+	PanelSettings  Panel = "settings"
 	PanelAuth      Panel = "auth"
 
 	ApprovalSummary ApprovalPreviewMode = "summary"
@@ -60,6 +61,10 @@ const (
 	AuthStepAPIKey       AuthStep = "api_key"
 	AuthStepModel        AuthStep = "model"
 	AuthStepConfirm      AuthStep = "confirm"
+
+	defaultSettingsPinMaxCount      = 6
+	defaultSettingsQueryMaxToolStep = 64
+	defaultSettingsTemperature      = 0.2
 
 	scrollStep               = 8
 	approvalQueuePageSize    = 5
@@ -112,6 +117,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/login", Description: "open HTTP login panel"},
 	{Command: "/logout", Description: "remove managed user auth and rebuild transport"},
 	{Command: "/auth", Description: "show auth mode, source, and persistence target"},
+	{Command: "/settings", Description: "open project config settings"},
 	{Command: "/provider", Description: "open provider picker"},
 	{Command: "/provider refresh", Description: "refresh current provider models"},
 	{Command: "/provider type list", Description: "list manual provider type overrides"},
@@ -318,6 +324,7 @@ type Model struct {
 	SessionIndex          int
 	ModelIndex            int
 	ProviderIndex         int
+	SettingIndex          int
 
 	ActiveSessionID          string
 	ExecutionPlan            ExecutionPlan
@@ -333,6 +340,8 @@ type Model struct {
 	ManagedSkills            []BridgeManagedSkill
 	ManagedMcpServers        []BridgeManagedMcpServer
 	UsageSummary             BridgeUsageSummary
+	Settings                 BridgeConfig
+	SettingsPath             string
 	RequestTimingActive      bool
 	RequestTimingStartedAt   time.Time
 	RequestTimingElapsedMs   int64
@@ -356,6 +365,11 @@ type Model struct {
 	AuthCursor        int
 	AuthSaving        bool
 	AuthError         string
+	SettingEditing    bool
+	SettingEditBuffer []rune
+	SettingEditCursor int
+	SettingSaving     bool
+	SettingError      string
 	LastClickAt       time.Time
 	LastClickIdx      int
 	LastClickPan      Panel
@@ -393,6 +407,14 @@ func NewModel() *Model {
 		ProviderEndpoints:      map[string]map[string]string{},
 		ProviderProfileSources: map[string]string{},
 		ProviderNames:          map[string]string{},
+		Settings: BridgeConfig{
+			PinMaxCount:                      defaultSettingsPinMaxCount,
+			QueryMaxToolSteps:                defaultSettingsQueryMaxToolStep,
+			AutoSummaryRefresh:               true,
+			RequestTemperature:               defaultSettingsTemperature,
+			DebugCaptureAnthropicRequests:    false,
+			DebugCaptureAnthropicRequestsDir: "",
+		},
 		Items: []Message{{
 			Role: "system",
 			Kind: "system_hint",
@@ -561,23 +583,33 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.withStatusSpinner(cmd)
 	case bridgeErrorMsg:
 		wasAuthSaving := m.AuthSaving
+		wasSettingSaving := m.SettingSaving
 		m.freezeRequestTiming(m.statusClockNow())
 		m.Status = StatusError
 		m.AuthSaving = false
+		m.SettingSaving = false
 		if m.ActivePanel == PanelAuth || wasAuthSaving {
 			m.setAuthError(value.Message)
+		}
+		if m.ActivePanel == PanelSettings || wasSettingSaving {
+			m.SettingError = strings.TrimSpace(value.Message)
 		}
 		m.setNotice(value.Message, true)
 		return m, m.withStatusSpinner(nil)
 	case bridgeExitedMsg:
 		wasAuthSaving := m.AuthSaving
+		wasSettingSaving := m.SettingSaving
 		m.freezeRequestTiming(m.statusClockNow())
 		m.BridgeReady = false
 		m.bridge = nil
 		m.AuthSaving = false
+		m.SettingSaving = false
 		if value.Err != nil {
 			if m.ActivePanel == PanelAuth || wasAuthSaving {
 				m.setAuthError(value.Err.Error())
+			}
+			if m.ActivePanel == PanelSettings || wasSettingSaving {
+				m.SettingError = strings.TrimSpace(value.Err.Error())
 			}
 			m.Status = StatusError
 			m.setNotice(value.Err.Error(), true)
@@ -713,6 +745,17 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) bool {
 	case "set_usage_summary":
 		m.BridgeReady = true
 		m.UsageSummary = event.UsageSummary
+	case "set_settings":
+		m.BridgeReady = true
+		m.Settings = event.Config
+		m.SettingsPath = event.ConfigPath
+		if strings.TrimSpace(m.SettingsPath) == "" {
+			m.SettingsPath = event.Path
+		}
+		m.SettingIndex = clampInt(m.SettingIndex, 0, maxInt(0, len(settingsSpecs)-1))
+		m.SettingSaving = false
+		m.SettingEditing = false
+		m.SettingError = ""
 	case "set_auth_defaults":
 		m.BridgeReady = true
 		m.AuthError = ""
@@ -746,11 +789,16 @@ func (m *Model) handleBridgeEvent(event bridgeEvent) bool {
 		}
 	case "error":
 		wasAuthSaving := m.AuthSaving
+		wasSettingSaving := m.SettingSaving
 		m.freezeRequestTiming(time.Now())
 		m.Status = StatusError
 		m.AuthSaving = false
+		m.SettingSaving = false
 		if m.ActivePanel == PanelAuth || wasAuthSaving {
 			m.setAuthError(event.Message)
+		}
+		if m.ActivePanel == PanelSettings || wasSettingSaving {
+			m.SettingError = strings.TrimSpace(event.Message)
 		}
 		m.setNotice(event.Message, true)
 	}
@@ -893,6 +941,9 @@ func (m *Model) applyBridgeSnapshot(snapshot *bridgeSnapshot) {
 	m.ManagedSkills = cloneManagedSkills(snapshot.ManagedSkills)
 	m.ManagedMcpServers = cloneManagedMcpServers(snapshot.ManagedMcpServers)
 	m.UsageSummary = snapshot.UsageSummary
+	m.Settings = snapshot.Config
+	m.SettingsPath = snapshot.ConfigPath
+	m.SettingIndex = clampInt(m.SettingIndex, 0, maxInt(0, len(settingsSpecs)-1))
 	m.CurrentModel = snapshot.CurrentModel
 	m.CurrentProvider = snapshot.CurrentProvider
 	m.CurrentProviderFormat = snapshot.CurrentProviderFormat
@@ -1104,6 +1155,12 @@ func (m *Model) handleClipboardPaste() (tea.Model, tea.Cmd) {
 		}
 	case PanelAuth:
 		m.insertAuthRunes(filterAuthInputRunes([]rune(text)))
+	case PanelSettings:
+		if m.SettingEditing {
+			m.insertSettingEditRunes(filterSettingInputRunes([]rune(text)))
+		} else {
+			m.setNotice("Press Enter on a setting before pasting a value.", false)
+		}
 	default:
 		m.setNotice("Clipboard paste is only available in text input fields.", false)
 	}
@@ -1269,6 +1326,10 @@ func (m *Model) handleWheelScroll(direction int, hit mouseHit) {
 		if len(m.AvailableProviders) > 0 {
 			m.ProviderIndex = cycleIndex(m.ProviderIndex, len(m.AvailableProviders), direction)
 		}
+	case mouseRegionSettingsList, mouseRegionSettingsListScrollbar:
+		if len(settingsSpecs) > 0 {
+			m.SettingIndex = cycleIndex(m.SettingIndex, len(settingsSpecs), direction)
+		}
 	}
 }
 
@@ -1365,6 +1426,11 @@ func (m *Model) handleMouseLeftClick(hit mouseHit) (tea.Model, tea.Cmd) {
 			m.Status = StatusPreparing
 			m.setNotice("Switching provider...", false)
 			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "set_provider", Value: m.AvailableProviders[index]})
+		}
+	case mouseRegionSettingsList:
+		m.SettingIndex = clampInt(index, 0, maxInt(0, len(settingsSpecs)-1))
+		if doubleClick {
+			return m, m.startOrToggleSelectedSetting()
 		}
 	default:
 		return m, nil
@@ -1541,6 +1607,8 @@ func (m *Model) setScrollbarOffset(region mouseRegion, scroll panelScrollState, 
 		m.ModelIndex = pageSelectionForOffset(m.ModelIndex, len(m.AvailableModels), m.modelPanelPageSize(), offset)
 	case mouseRegionProviderListScrollbar:
 		m.ProviderIndex = pageSelectionForOffset(m.ProviderIndex, len(m.AvailableProviders), m.providerPanelPageSize(), offset)
+	case mouseRegionSettingsListScrollbar:
+		m.SettingIndex = pageSelectionForOffset(m.SettingIndex, len(settingsSpecs), m.settingsPanelPageSize(), offset)
 	}
 }
 
@@ -1600,6 +1668,20 @@ func (m *Model) providerPanelPageSizeForDimensions(width, height int) int {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
 	return dynamicPanelPageSize(bodyHeight, 10+providerPanelLeadRows(bodyWidth), 3)
+}
+
+func (m *Model) settingsPanelPageSize() int {
+	_, _, panelWidth, panelHeight, ok := m.activePanelRect()
+	if !ok {
+		return 1
+	}
+	return m.settingsPanelPageSizeForDimensions(panelWidth, panelHeight)
+}
+
+func (m *Model) settingsPanelPageSizeForDimensions(width, height int) int {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	return dynamicPanelPageSize(bodyHeight, 10+settingsPanelLeadRows(bodyWidth), 3)
 }
 
 func (m *Model) planPanelPageSize() int {
@@ -1664,6 +1746,10 @@ func providerPanelLeadRows(bodyWidth int) int {
 	return 1 + len(wrapPlainText("Enter switch | refresh reloads providers and models | Esc back", bodyWidth))
 }
 
+func settingsPanelLeadRows(bodyWidth int) int {
+	return 1 + len(wrapPlainText("Enter edit/toggle | r reload | Esc back", bodyWidth))
+}
+
 func listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataStartLine int) (int, bool) {
 	if total <= 0 || innerY < dataStartLine {
 		return 0, false
@@ -1682,10 +1768,16 @@ func listIndexAtPanelLine(total, selected, pageSize, rowsPerItem, innerY, dataSt
 }
 
 func (m *Model) handlePanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyEscape && m.ActivePanel == PanelSettings && m.SettingEditing {
+		return m.handleSettingsKey(msg)
+	}
 	if msg.Type == tea.KeyEscape {
 		m.ActivePanel = PanelNone
 		m.AuthSaving = false
 		m.AuthError = ""
+		m.SettingEditing = false
+		m.SettingSaving = false
+		m.SettingError = ""
 		m.setNotice("", false)
 		return m, nil
 	}
@@ -1701,6 +1793,8 @@ func (m *Model) handlePanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleModelKey(msg)
 	case PanelProviders:
 		return m.handleProviderKey(msg)
+	case PanelSettings:
+		return m.handleSettingsKey(msg)
 	case PanelAuth:
 		return m.handleAuthKey(msg)
 	default:
@@ -1975,6 +2069,119 @@ func (m *Model) handleProviderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.SettingEditing {
+		return m.handleSettingEditKey(msg)
+	}
+
+	switch msg.Type {
+	case tea.KeyUp:
+		if len(settingsSpecs) > 0 {
+			m.SettingIndex = cycleIndex(m.SettingIndex, len(settingsSpecs), -1)
+		}
+		return m, nil
+	case tea.KeyDown:
+		if len(settingsSpecs) > 0 {
+			m.SettingIndex = cycleIndex(m.SettingIndex, len(settingsSpecs), 1)
+		}
+		return m, nil
+	case tea.KeyLeft:
+		if len(settingsSpecs) > 0 {
+			m.SettingIndex = movePagedSelection(m.SettingIndex, len(settingsSpecs), m.settingsPanelPageSize(), "left")
+		}
+		return m, nil
+	case tea.KeyRight:
+		if len(settingsSpecs) > 0 {
+			m.SettingIndex = movePagedSelection(m.SettingIndex, len(settingsSpecs), m.settingsPanelPageSize(), "right")
+		}
+		return m, nil
+	case tea.KeyEnter:
+		return m, m.startOrToggleSelectedSetting()
+	case tea.KeyRunes:
+		if len(msg.Runes) != 1 {
+			return m, nil
+		}
+		switch strings.ToLower(string(msg.Runes)) {
+		case "r":
+			m.Status = StatusPreparing
+			m.setNotice("Reloading settings...", false)
+			return m, sendBridgeCommand(m.bridge, bridgeCommand{Type: "get_settings"})
+		case "e":
+			return m, m.startOrToggleSelectedSetting()
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) handleSettingEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEscape:
+		m.SettingEditing = false
+		m.SettingError = ""
+		m.setNotice("Setting edit cancelled.", false)
+		return m, nil
+	case tea.KeyEnter:
+		return m.saveSelectedSettingFromBuffer()
+	case tea.KeyHome:
+		m.SettingEditCursor = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.SettingEditCursor = len(m.SettingEditBuffer)
+		return m, nil
+	case tea.KeyCtrlU:
+		m.SettingEditBuffer = m.SettingEditBuffer[:0]
+		m.SettingEditCursor = 0
+		m.SettingError = ""
+		return m, nil
+	case tea.KeyCtrlK:
+		cursor := clampInt(m.SettingEditCursor, 0, len(m.SettingEditBuffer))
+		m.SettingEditBuffer = m.SettingEditBuffer[:cursor]
+		m.SettingError = ""
+		return m, nil
+	case tea.KeyCtrlW:
+		next, cursor := deleteWordBackwardRunes(m.SettingEditBuffer, m.SettingEditCursor)
+		m.SettingEditBuffer = next
+		m.SettingEditCursor = cursor
+		m.SettingError = ""
+		return m, nil
+	case tea.KeyBackspace:
+		if m.SettingEditCursor > 0 && len(m.SettingEditBuffer) > 0 {
+			cursor := clampInt(m.SettingEditCursor, 0, len(m.SettingEditBuffer))
+			m.SettingEditBuffer = append(m.SettingEditBuffer[:cursor-1], m.SettingEditBuffer[cursor:]...)
+			m.SettingEditCursor = cursor - 1
+			m.SettingError = ""
+		}
+		return m, nil
+	case tea.KeyDelete, tea.KeyCtrlD:
+		if len(m.SettingEditBuffer) > 0 {
+			cursor := clampInt(m.SettingEditCursor, 0, len(m.SettingEditBuffer))
+			if cursor < len(m.SettingEditBuffer) {
+				m.SettingEditBuffer = append(m.SettingEditBuffer[:cursor], m.SettingEditBuffer[cursor+1:]...)
+				m.SettingError = ""
+			}
+		}
+		return m, nil
+	case tea.KeyLeft:
+		if m.SettingEditCursor > 0 {
+			m.SettingEditCursor--
+		}
+		return m, nil
+	case tea.KeyRight:
+		if m.SettingEditCursor < len(m.SettingEditBuffer) {
+			m.SettingEditCursor++
+		}
+		return m, nil
+	case tea.KeySpace:
+		m.insertSettingEditRunes([]rune{' '})
+		return m, nil
+	case tea.KeyRunes:
+		m.insertSettingEditRunes(filterSettingInputRunes(msg.Runes))
+		return m, nil
+	default:
+		return m, nil
+	}
 }
 
 func (m *Model) handleAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2648,6 +2855,13 @@ func (m *Model) handleSlashCommand(query string) (bool, tea.Cmd) {
 		m.invalidateTranscriptCache()
 		m.setNotice("Auth status appended to transcript.", false)
 		return true, nil
+	case query == "/settings":
+		m.ActivePanel = PanelSettings
+		m.SettingEditing = false
+		m.SettingSaving = false
+		m.SettingError = ""
+		m.setNotice("Settings panel opened.", false)
+		return true, sendBridgeCommand(m.bridge, bridgeCommand{Type: "get_settings"})
 	case strings.HasPrefix(query, "/load "):
 		id := strings.TrimSpace(strings.TrimPrefix(query, "/load "))
 		if id == "" {
@@ -2697,6 +2911,129 @@ func formatOptionalDetail(value string) string {
 		return ""
 	}
 	return fmt.Sprintf(" (%s)", trimmed)
+}
+
+type settingsValueKind string
+
+const (
+	settingsValueInt    settingsValueKind = "int"
+	settingsValueFloat  settingsValueKind = "float"
+	settingsValueBool   settingsValueKind = "bool"
+	settingsValueString settingsValueKind = "string"
+)
+
+type settingsSpec struct {
+	Key         string
+	Label       string
+	Kind        settingsValueKind
+	Description string
+}
+
+var settingsSpecs = []settingsSpec{
+	{Key: "query_max_tool_steps", Label: "Max Tool Steps", Kind: settingsValueInt, Description: "Hard cap for tool calls in one request."},
+	{Key: "request_temperature", Label: "Temperature", Kind: settingsValueFloat, Description: "Sampling temperature for HTTP model requests, 0..2."},
+	{Key: "auto_summary_refresh", Label: "Auto Summary Refresh", Kind: settingsValueBool, Description: "Controls automatic working-state summary refresh."},
+	{Key: "pin_max_count", Label: "Pin Limit", Kind: settingsValueInt, Description: "Maximum pinned session notes."},
+	{Key: "debug_capture_anthropic_requests", Label: "Capture Anthropic Debug", Kind: settingsValueBool, Description: "Writes Anthropic request payloads for debugging."},
+	{Key: "debug_capture_anthropic_requests_dir", Label: "Anthropic Debug Dir", Kind: settingsValueString, Description: "Directory for captured Anthropic requests."},
+}
+
+func (m *Model) selectedSettingSpec() settingsSpec {
+	if len(settingsSpecs) == 0 {
+		return settingsSpec{}
+	}
+	return settingsSpecs[clampInt(m.SettingIndex, 0, len(settingsSpecs)-1)]
+}
+
+func (m *Model) settingValue(spec settingsSpec) string {
+	switch spec.Key {
+	case "pin_max_count":
+		return strconv.Itoa(maxInt(0, m.Settings.PinMaxCount))
+	case "query_max_tool_steps":
+		return strconv.Itoa(maxInt(0, m.Settings.QueryMaxToolSteps))
+	case "auto_summary_refresh":
+		return strconv.FormatBool(m.Settings.AutoSummaryRefresh)
+	case "request_temperature":
+		return strconv.FormatFloat(m.Settings.RequestTemperature, 'f', -1, 64)
+	case "debug_capture_anthropic_requests":
+		return strconv.FormatBool(m.Settings.DebugCaptureAnthropicRequests)
+	case "debug_capture_anthropic_requests_dir":
+		return strings.TrimSpace(m.Settings.DebugCaptureAnthropicRequestsDir)
+	default:
+		return ""
+	}
+}
+
+func (m *Model) startOrToggleSelectedSetting() tea.Cmd {
+	spec := m.selectedSettingSpec()
+	if strings.TrimSpace(spec.Key) == "" {
+		return nil
+	}
+	if spec.Kind == settingsValueBool {
+		current := strings.EqualFold(m.settingValue(spec), "true")
+		m.SettingSaving = true
+		m.SettingError = ""
+		m.Status = StatusPreparing
+		m.setNotice("Saving setting...", false)
+		return sendBridgeCommand(m.bridge, bridgeCommand{
+			Type:  "set_setting",
+			Key:   spec.Key,
+			Value: strconv.FormatBool(!current),
+		})
+	}
+	m.SettingEditing = true
+	m.SettingEditBuffer = []rune(m.settingValue(spec))
+	m.SettingEditCursor = len(m.SettingEditBuffer)
+	m.SettingError = ""
+	m.setNotice("Edit setting value, Enter saves.", false)
+	return nil
+}
+
+func (m *Model) saveSelectedSettingFromBuffer() (tea.Model, tea.Cmd) {
+	spec := m.selectedSettingSpec()
+	value := strings.TrimSpace(string(m.SettingEditBuffer))
+	if spec.Kind != settingsValueString && value == "" {
+		m.SettingError = "Value is required."
+		m.setNotice("Value is required.", true)
+		return m, nil
+	}
+	m.SettingSaving = true
+	m.SettingError = ""
+	m.Status = StatusPreparing
+	m.setNotice("Saving setting...", false)
+	return m, sendBridgeCommand(m.bridge, bridgeCommand{
+		Type:  "set_setting",
+		Key:   spec.Key,
+		Value: value,
+	})
+}
+
+func (m *Model) insertSettingEditRunes(values []rune) {
+	if len(values) == 0 {
+		return
+	}
+	cursor := clampInt(m.SettingEditCursor, 0, len(m.SettingEditBuffer))
+	next := make([]rune, 0, len(m.SettingEditBuffer)+len(values))
+	next = append(next, m.SettingEditBuffer[:cursor]...)
+	next = append(next, values...)
+	next = append(next, m.SettingEditBuffer[cursor:]...)
+	m.SettingEditBuffer = next
+	m.SettingEditCursor = cursor + len(values)
+	m.SettingError = ""
+}
+
+func filterSettingInputRunes(values []rune) []rune {
+	filtered := make([]rune, 0, len(values))
+	for _, value := range values {
+		if value == '\r' || value == '\n' || value == '\t' {
+			continue
+		}
+		if unicode.IsControl(value) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func emptyFallback(value, fallback string) string {

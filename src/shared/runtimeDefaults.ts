@@ -1,2 +1,2 @@
 export const DEFAULT_PIN_MAX_COUNT = 6;
-export const DEFAULT_QUERY_MAX_TOOL_STEPS = 19200;
+export const DEFAULT_QUERY_MAX_TOOL_STEPS = 64;

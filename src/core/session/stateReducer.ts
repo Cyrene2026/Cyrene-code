@@ -236,6 +236,12 @@ const CONSTRAINT_SECTION_SIGNAL =
 const REAL_FAILURE_SIGNAL =
   /\b(?:failed|error|errored|timeout|timed out|rejected|blocked|denied|missing|exception|crash|aborted|not found|conflict)\b|(?:失败|错误|超时|拒绝|阻塞|缺失|异常|崩溃|中止|未找到|冲突)/iu;
 
+const HARD_FAILURE_SIGNAL =
+  /\b(?:tool error|approval error|command failed|test failed|failed with|timed out|timeout|exception|crash|aborted|denied|rejected|conflict|blocked plan step|ENOENT|no such file or directory)\b|(?:失败[:：]|错误[:：]|超时|拒绝|阻塞|缺失|异常|崩溃|中止|未找到|冲突)/iu;
+
+const FAILURE_EVIDENCE_SIGNAL =
+  /\b(?:tool|read_file|read_range|read_json|read_yaml|write_file|edit_file|apply_patch|search_text|find_files|run_command|run_shell|command|test|tests|build|lint|typecheck|approval|plan step|ENOENT)\b|(?:工具|命令|测试|构建|审批|计划步骤|读取|写入|编辑|补丁)/iu;
+
 const META_FAILURE_SIGNAL =
   /\b(?:used to|used for|helps determine|determines whether|detects whether|checks whether|classification|type)\b|(?:用于|用来|帮助判断|判断|检测|识别|类型)/iu;
 
@@ -249,10 +255,13 @@ const META_NARRATION_PREFIX =
   /^(?:已确认结果|搜索模式|当前状态|结论|说明|也就是|所以|因此|我就能|如果你愿意|下一步可以|继续看|再往下看|继续抓|继续顺着|顺着)/iu;
 
 const LOW_SIGNAL_TASK_LINE =
-  /^(?:查看|继续|梳理|分析|检查|确认|定位|阅读|走查)(?:主线|细节|结构|逻辑|代码|内容|部分|附近|后面|前面|更多内容|关键调用点)?$|^(?:做|继续做|进行)(?:详细)?(?:分析|梳理|检查)$/u;
+  /^(?:查看|继续|梳理|分析|检查|确认|定位|阅读|走查)(?:主线|细节|结构|逻辑|代码|内容|部分|附近|后面|前面|更多内容|关键调用点)?$|^(?:做|继续做|进行)(?:详细)?(?:分析|梳理|检查)$|^(?:目标是|目标为|目的是).+|^(?:定义|梳理|整理).*(?:运行脚本|运行环境要求|依赖).*$/u;
 
 const ACTION_META_PREFIX =
-  /^(?:这里|下面|当前|本轮|这说明|这意味着|也就是|所以|因此|已确认结果|搜索模式)/iu;
+  /^(?:这里|下面|当前|本轮|这说明|这意味着|也就是|所以|因此|目标是|目标为|目的是|已确认结果|搜索模式)/iu;
+
+const STALE_DIRECT_EDIT_ACTION_SIGNAL =
+  /^(?:直接编辑|directly edit|edit directly)\s+`?[A-Za-z0-9_./-]+\.[A-Za-z0-9]+`?$/iu;
 
 const FACT_META_PREFIX =
   /^(?:已确认结果|搜索模式|当前状态|结论|说明|真正的首入口)/iu;
@@ -511,13 +520,19 @@ const isPurePathLine = (line: string) => {
 const isExecutableTaskLine = (line: string) =>
   EXECUTABLE_TASK_SIGNAL.test(stripLeadingPhrases(line, TASK_LEADIN_PREFIXES));
 
-const isRealFailureLine = (line: string) =>
-  REAL_FAILURE_SIGNAL.test(
-    line.replace(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g, " ")
-  ) &&
-  !META_FAILURE_PREFIX.test(line) &&
-  !META_FAILURE_SIGNAL.test(line) &&
-  !QUESTION_OR_OPTION_SIGNAL.test(line);
+const isRealFailureLine = (line: string) => {
+  const withoutPaths = line.replace(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g, " ");
+  return (
+    REAL_FAILURE_SIGNAL.test(withoutPaths) &&
+    HARD_FAILURE_SIGNAL.test(line) &&
+    FAILURE_EVIDENCE_SIGNAL.test(line) &&
+    !PATH_ABSENCE_FACT_SIGNAL.test(line) &&
+    !LEADING_PATH_ABSENCE_FACT_SIGNAL.test(line) &&
+    !META_FAILURE_PREFIX.test(line) &&
+    !META_FAILURE_SIGNAL.test(line) &&
+    !QUESTION_OR_OPTION_SIGNAL.test(line)
+  );
+};
 
 const isStableFactLine = (line: string) =>
   !QUESTION_OR_OPTION_SIGNAL.test(line) &&
@@ -557,19 +572,28 @@ const isConstraintCandidate = (line: string) =>
     TOKEN_OR_SETUP_CONSTRAINT_SIGNAL.test(line) ||
     (CONSTRAINT_MODAL_SIGNAL.test(line) && !isExecutableTaskLine(line)));
 
-const isSafeFactFragment = (line: string) => {
+const normalizePathAbsenceFact = (line: string) => {
   const pathAbsenceMatch =
     line.match(PATH_ABSENCE_FACT_SIGNAL) ?? line.match(LEADING_PATH_ABSENCE_FACT_SIGNAL);
-  if (pathAbsenceMatch?.[1]) {
-    const path = pathAbsenceMatch[1].trim();
-    const kind = (pathAbsenceMatch[2] ?? "").trim();
-    if (path) {
-      return kind === "目录"
-        ? `项目中不存在 \`${path}\` 目录`
-        : kind === "文件"
-          ? `项目中不存在 \`${path}\` 文件`
-          : `项目中不存在 \`${path}\``;
-    }
+  if (!pathAbsenceMatch?.[1]) {
+    return "";
+  }
+  const path = pathAbsenceMatch[1].trim();
+  const kind = (pathAbsenceMatch[2] ?? "").trim();
+  if (!path) {
+    return "";
+  }
+  return kind === "目录"
+    ? `项目中不存在 \`${path}\` 目录`
+    : kind === "文件"
+      ? `项目中不存在 \`${path}\` 文件`
+      : `项目中不存在 \`${path}\``;
+};
+
+const isSafeFactFragment = (line: string) => {
+  const pathAbsenceFact = normalizePathAbsenceFact(line);
+  if (pathAbsenceFact) {
+    return pathAbsenceFact;
   }
 
   const endpointMatch = line.match(ENDPOINT_LABEL_SIGNAL);
@@ -723,6 +747,14 @@ const normalizeCandidateForSection = (
       : null;
   }
 
+  const pathAbsenceFact = normalizePathAbsenceFact(candidate);
+  if (pathAbsenceFact) {
+    return {
+      section: "CONFIRMED FACTS",
+      line: withCandidateRefs(pathAbsenceFact, sourceRefs),
+    };
+  }
+
   if (isRealFailureLine(candidate)) {
     return { section: "RECENT FAILURES", line: withCandidateRefs(candidate, sourceRefs) };
   }
@@ -813,6 +845,7 @@ const normalizeCandidateForSection = (
     !action ||
     QUESTION_OR_OPTION_SIGNAL.test(action) ||
     ACTION_META_PREFIX.test(action) ||
+    STALE_DIRECT_EDIT_ACTION_SIGNAL.test(action) ||
     !isExecutableTaskLine(action) ||
     LOW_SIGNAL_TASK_LINE.test(action) ||
     !isAnchoredTaskLine(action)
@@ -839,7 +872,10 @@ const createEmptySectionMap = (): Record<WorkingStateSectionName, string[]> =>
 const normalizeUniqueLines = (
   section: WorkingStateSectionName,
   lines: string[] | undefined,
-  limit: number
+  limit: number,
+  options?: {
+    allowedKeys?: ReadonlySet<string>;
+  }
 ) => {
   if (!lines || lines.length === 0) {
     return [];
@@ -852,6 +888,10 @@ const normalizeUniqueLines = (
     if (!candidate || candidate.section !== section || seen.has(candidate.line)) {
       continue;
     }
+    const key = normalizeLooseLine(candidate.line);
+    if (!key || (options?.allowedKeys && !options.allowedKeys.has(key))) {
+      continue;
+    }
     seen.add(candidate.line);
     normalized.push(candidate.line);
     if (normalized.length >= limit) {
@@ -859,6 +899,25 @@ const normalizeUniqueLines = (
     }
   }
   return normalized;
+};
+
+const collectSectionLineKeys = (...sectionMaps: WorkingStateSectionMap[]) => {
+  const keys = Object.fromEntries(
+    WORKING_STATE_SECTION_ORDER.map(section => [section, new Set<string>()])
+  ) as Record<WorkingStateSectionName, Set<string>>;
+
+  for (const sections of sectionMaps) {
+    for (const section of WORKING_STATE_SECTION_ORDER) {
+      for (const line of sections[section] ?? []) {
+        const key = normalizeLooseLine(line);
+        if (key) {
+          keys[section].add(key);
+        }
+      }
+    }
+  }
+
+  return keys;
 };
 
 type AbsentPathSpec = {
@@ -881,7 +940,8 @@ const extractAbsentPathSpecs = (sections: WorkingStateSectionMap) => {
   };
 
   for (const line of sections["CONFIRMED FACTS"] ?? []) {
-    const match = line.match(CANONICAL_PATH_ABSENCE_FACT_SIGNAL);
+    const text = getWorkingStateEntryText(line) || line;
+    const match = text.match(CANONICAL_PATH_ABSENCE_FACT_SIGNAL);
     if (match?.[1]) {
       pushSpec(match[1], (match[2] ?? "").trim() === "目录");
     }
@@ -914,6 +974,12 @@ const keepLineWithinAllowedPaths = (
 ) => {
   if (section === "KNOWN PATHS") {
     return allowedPaths.has(line);
+  }
+  if (
+    section === "CONFIRMED FACTS" &&
+    CANONICAL_PATH_ABSENCE_FACT_SIGNAL.test(getWorkingStateEntryText(line) || line)
+  ) {
+    return true;
   }
   if (section === "RECENT FAILURES" || section === "CONSTRAINTS" || section === "OBJECTIVE") {
     return true;
@@ -1000,7 +1066,10 @@ const finalizeSectionMap = (
       "NEXT BEST ACTIONS",
     ] as const) {
       finalized[section] = finalized[section].filter(line => {
-        if (section === "CONFIRMED FACTS" && CANONICAL_PATH_ABSENCE_FACT_SIGNAL.test(line)) {
+        if (
+          section === "CONFIRMED FACTS" &&
+          CANONICAL_PATH_ABSENCE_FACT_SIGNAL.test(getWorkingStateEntryText(line) || line)
+        ) {
           return true;
         }
         return !lineReferencesAbsentSpec(line, absentPathSpecs);
@@ -1475,6 +1544,24 @@ const synthesizeToolFailureLine = (
   return `${action} 失败: ${normalizedDetail || "工具调用失败"}`;
 };
 
+const isMissingPathToolFailure = (toolMessage: string) =>
+  NOT_FOUND_FAILURE_SIGNAL.test(toolMessage);
+
+const extractMissingPathFactFromToolFailure = (
+  path: string,
+  toolMessage: string
+) => {
+  const candidate =
+    path ||
+    extractLinePathLiterals(toolMessage)[0] ||
+    collectPathCandidates(toolMessage)[0] ||
+    "";
+  if (!candidate) {
+    return "";
+  }
+  return `项目中不存在 \`${candidate}\``;
+};
+
 const mergePendingSections = (
   current: WorkingStateSectionMap,
   incoming: WorkingStateSectionMap
@@ -1534,24 +1621,27 @@ export const applyToolResultPendingDigestUpdate = (
     /^\[tool error\]/i.test(params.toolMessage) || isRealFailureLine(params.toolMessage);
 
   if (messageLooksLikeError) {
-    incoming["RECENT FAILURES"].push(
-      attachWorkingStateSourceRefs(synthesizeToolFailureLine(action, path, params.toolMessage), [
-        {
-          ...toolSourceRefs[0],
-          kind: "error",
-        },
-      ])
-    );
-    if (primaryPath) {
-      incoming["NEXT BEST ACTIONS"].push(
+    const errorRefs = [
+      {
+        ...toolSourceRefs[0],
+        kind: "error" as const,
+      },
+    ];
+    if (isMissingPathToolFailure(params.toolMessage)) {
+      const absenceFact = extractMissingPathFactFromToolFailure(
+        primaryPath || path,
+        params.toolMessage
+      );
+      if (absenceFact) {
+        incoming["CONFIRMED FACTS"].push(
+          attachWorkingStateSourceRefs(absenceFact, errorRefs)
+        );
+      }
+    } else {
+      incoming["RECENT FAILURES"].push(
         attachWorkingStateSourceRefs(
-          `改用更小的 read_range 或 search_text_context 查看 \`${primaryPath}\``,
-          [
-            {
-              ...toolSourceRefs[0],
-              kind: "error",
-            },
-          ]
+          synthesizeToolFailureLine(action, path, params.toolMessage),
+          errorRefs
         )
       );
     }
@@ -1568,9 +1658,6 @@ export const applyToolResultPendingDigestUpdate = (
     );
     incoming.COMPLETED.push(
       attachWorkingStateSourceRefs(`已确认读取 \`${primaryPath}\` 第 ${readRange} 行`, toolSourceRefs)
-    );
-    incoming["NEXT BEST ACTIONS"].push(
-      attachWorkingStateSourceRefs(`直接编辑 \`${primaryPath}\``, toolSourceRefs)
     );
   } else if (
     (action === "read_file" ||
@@ -1589,9 +1676,6 @@ export const applyToolResultPendingDigestUpdate = (
           : `已确认读取 \`${primaryPath}\``,
         toolSourceRefs
       )
-    );
-    incoming["NEXT BEST ACTIONS"].push(
-      attachWorkingStateSourceRefs(`直接编辑 \`${primaryPath}\``, toolSourceRefs)
     );
   } else if (
     (action === "search_text" ||
@@ -1793,6 +1877,8 @@ export const buildStateReducerPrompt = ({
     recoveryLine,
     "Use only these section names: OBJECTIVE, CONFIRMED FACTS, CONSTRAINTS, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, NEXT BEST ACTIONS.",
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
+    "Merge trust rule: in merge_and_digest, summaryPatch may only contain entries already present in the previous pending digest or existing durable summary. New current-turn observations must stay in nextPendingDigest.",
+    "Promotion rule: do not promote weak, generic, or convenience notes into durable summary. Durable summary is for stable facts and unresolved work that materially changes future turns.",
     "Cold-start rule: if durable context is still sparse, leave summaryPatch empty and rely on nextPendingDigest instead of fabricating a full durable summary from one weak clue.",
     "Cold-start priority: during early exploration, first capture the startup mechanism, launch command, entrypoint files, and bootstrap chain in CONFIRMED FACTS and KNOWN PATHS, then record the next action needed to confirm unresolved startup flow.",
     "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
@@ -1913,6 +1999,13 @@ export const applyParsedStateUpdate = (params: {
     params.update.mode === "full_rebuild_and_digest"
       ? createEmptySectionMap()
       : parseStructuredStateText(normalizedSummary);
+  const priorPendingSections = params.pendingDigest.trim()
+    ? parseStructuredStateText(params.pendingDigest)
+    : createEmptySectionMap();
+  const summaryPatchAllowedKeys =
+    params.update.mode === "merge_and_digest"
+      ? collectSectionLineKeys(parseStructuredStateText(normalizedSummary), priorPendingSections)
+      : null;
 
   for (const section of WORKING_STATE_SECTION_ORDER) {
     const patch = params.update.summaryPatch?.[section];
@@ -1924,7 +2017,10 @@ export const applyParsedStateUpdate = (params: {
       baseSections[section] = normalizeUniqueLines(
         section,
         patch.set,
-        SECTION_ITEM_LIMITS[section]
+        SECTION_ITEM_LIMITS[section],
+        summaryPatchAllowedKeys
+          ? { allowedKeys: summaryPatchAllowedKeys[section] }
+          : undefined
       );
       continue;
     }
@@ -1934,7 +2030,14 @@ export const applyParsedStateUpdate = (params: {
       ...baseSections[section].filter(
         line => !removes.has(normalizeLooseLine(line))
       ),
-      ...normalizeUniqueLines(section, patch.add, SECTION_ITEM_LIMITS[section]),
+      ...normalizeUniqueLines(
+        section,
+        patch.add,
+        SECTION_ITEM_LIMITS[section],
+        summaryPatchAllowedKeys
+          ? { allowedKeys: summaryPatchAllowedKeys[section] }
+          : undefined
+      ),
     ];
     baseSections[section] = normalizeUniqueLines(
       section,

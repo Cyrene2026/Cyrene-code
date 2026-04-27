@@ -127,6 +127,14 @@ const collectParsedStreamEvents = async (
   return events;
 };
 
+const expectScopedOpenAiCacheKey = (
+  value: unknown,
+  prefix = "cyrene-example-test-gpt-test"
+) => {
+  expect(typeof value).toBe("string");
+  expect(value).toMatch(new RegExp(`^${prefix}-[a-f0-9]{12}$`));
+};
+
 afterEach(async () => {
   resetConfiguredAppRoot();
   for (const service of tempServices.splice(0)) {
@@ -845,7 +853,6 @@ describe("createHttpQueryTransport tool exposure", () => {
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     expect(requestBody.system[0]?.text).toContain("SYSTEM PROMPT (highest priority):");
-    expect(requestBody.system[0]?.text).toContain("EXECUTION PLAN PROTOCOL:");
     expect(requestBody.system[0]?.text).not.toContain(
       "SELECTED EXTENSIONS (request-scoped summary):"
     );
@@ -859,6 +866,15 @@ describe("createHttpQueryTransport tool exposure", () => {
       })
     );
     expect(requestBody.system[1]?.cache_control).toBeUndefined();
+    expect(requestBody.system[2]).toEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("EXECUTION PLAN PROTOCOL:"),
+        cache_control: {
+          type: "ephemeral",
+        },
+      })
+    );
     expect(requestBody.messages).toEqual([
       {
         role: "user",
@@ -1867,7 +1883,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(streamCall).toBeDefined();
     const requestBody = JSON.parse(String(streamCall?.init?.body));
     expect(requestBody.temperature).toBe(0.2);
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.stream_options).toEqual({ include_usage: true });
     expect(events).toEqual([
       JSON.stringify({ type: "text_delta", text: "hello" }),
@@ -2166,12 +2182,118 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     expect(fetchCalls).toHaveLength(2);
-    expect(JSON.parse(String(fetchCalls[0]?.init?.body)).prompt_cache_key).toBe(
-      "cyrene-example-test-gpt-test"
+    expectScopedOpenAiCacheKey(
+      JSON.parse(String(fetchCalls[0]?.init?.body)).prompt_cache_key
     );
     expect(
       JSON.parse(String(fetchCalls[1]?.init?.body)).prompt_cache_key
     ).toBeUndefined();
+  });
+
+  test("openai chat remembers provider prompt cache key rejection", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      if (fetchCalls.length === 1) {
+        return Response.json(
+          { error: { message: "Unknown parameter: prompt_cache_key" } },
+          { status: 400 }
+        );
+      }
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+    });
+
+    const firstStreamUrl = await transport.requestStreamUrl("hello one");
+    for await (const _event of transport.stream(firstStreamUrl)) {
+      // consume stream
+    }
+    const secondStreamUrl = await transport.requestStreamUrl("hello two");
+    for await (const _event of transport.stream(secondStreamUrl)) {
+      // consume stream
+    }
+
+    expect(fetchCalls).toHaveLength(3);
+    expectScopedOpenAiCacheKey(
+      JSON.parse(String(fetchCalls[0]?.init?.body)).prompt_cache_key
+    );
+    expect(JSON.parse(String(fetchCalls[1]?.init?.body)).prompt_cache_key).toBeUndefined();
+    expect(JSON.parse(String(fetchCalls[2]?.init?.body)).prompt_cache_key).toBeUndefined();
+  });
+
+  test("openai chat preserves explicit prompt cache key without scope suffix", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+        CYRENE_OPENAI_PROMPT_CACHE_KEY: "my-project",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    expect(JSON.parse(String(fetchCalls[0]?.init?.body)).prompt_cache_key).toBe(
+      "my-project"
+    );
   });
 
   test("openai chat preserves prompt cache key when only retention is rejected", async () => {
@@ -2225,9 +2347,9 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(fetchCalls).toHaveLength(2);
     const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
-    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(firstBody.prompt_cache_key);
     expect(firstBody.prompt_cache_retention).toBe("24h");
-    expect(secondBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(secondBody.prompt_cache_key);
     expect(secondBody.prompt_cache_retention).toBeUndefined();
   });
 
@@ -2294,7 +2416,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.messages[0]?.content).toContain(
       "SYSTEM PROMPT (highest priority):"
     );
@@ -2381,7 +2503,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.messages[0]?.content).toBe(TOOL_USAGE_SYSTEM_PROMPT);
     expect(requestBody.messages[0]?.content).not.toContain("Original user task:");
     expect(requestBody.messages[0]?.content).not.toContain("Tool results:");
@@ -2493,6 +2615,57 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(commonPrefixLength).toBeGreaterThanOrEqual(
       rawBody.indexOf("hello one") + "hello ".length
     );
+  });
+
+  test("deepseek compatibility can be disabled for OpenAI-compatible relays", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: deepseek-v4-flash",
+        "last_used_model: deepseek-v4-flash",
+        "provider_base_url: https://relay.example.test/v1",
+        "models:",
+        "  - deepseek-v4-flash",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(["data: [DONE]", ""].join("\n"), {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://relay.example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "deepseek-v4-flash",
+        CYRENE_DEEPSEEK_COMPATIBILITY: "0",
+      },
+    });
+
+    const streamUrl = await transport.requestStreamUrl("hello");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const rawBody = String(fetchCalls[0]?.init?.body);
+    const requestBody = JSON.parse(rawBody);
+    expectScopedOpenAiCacheKey(
+      requestBody.prompt_cache_key,
+      "cyrene-relay-example-test-deepseek-v4-flash"
+    );
+    expect(rawBody.indexOf('"tools"')).toBeLessThan(rawBody.indexOf('"messages"'));
   });
 
   test("deepseek chat splits continuation stable prefix from dynamic tool context", async () => {
@@ -4392,6 +4565,8 @@ describe("createHttpQueryTransport streaming usage", () => {
         type: "usage",
         promptTokens: 140,
         cachedTokens: 90,
+        cacheReadInputTokens: 90,
+        cacheCreationInputTokens: 40,
         completionTokens: 0,
         totalTokens: 140,
       }),
@@ -4399,6 +4574,8 @@ describe("createHttpQueryTransport streaming usage", () => {
         type: "usage",
         promptTokens: 140,
         cachedTokens: 90,
+        cacheReadInputTokens: 90,
+        cacheCreationInputTokens: 40,
         completionTokens: 5,
         totalTokens: 145,
       }),
@@ -4646,7 +4823,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(fetchCalls[0]?.url).toBe("https://example.test/v1/responses");
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     expect(requestBody.model).toBe("gpt-test");
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.stream).toBe(true);
     expect(requestBody.tool_choice).toBe("auto");
     expect(requestBody.input).toEqual([
@@ -4896,9 +5073,9 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(fetchCalls).toHaveLength(2);
     const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
-    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(firstBody.prompt_cache_key);
     expect(firstBody.prompt_cache_retention).toBe("24h");
-    expect(secondBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(secondBody.prompt_cache_key);
     expect(secondBody.prompt_cache_retention).toBeUndefined();
   });
 
@@ -4960,7 +5137,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     expect(fetchCalls).toHaveLength(2);
     const firstBody = JSON.parse(String(fetchCalls[0]?.init?.body));
     const secondBody = JSON.parse(String(fetchCalls[1]?.init?.body));
-    expect(firstBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(firstBody.prompt_cache_key);
     expect(secondBody.prompt_cache_key).toBeUndefined();
     expect(secondBody.prompt_cache_retention).toBeUndefined();
   });
@@ -5036,7 +5213,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.instructions).toContain("SYSTEM PROMPT (highest priority):");
     expect(requestBody.instructions).toContain("EXECUTION PLAN PROTOCOL:");
     expect(requestBody.instructions).toContain(
@@ -5127,7 +5304,7 @@ describe("createHttpQueryTransport streaming usage", () => {
     }
 
     const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
-    expect(requestBody.prompt_cache_key).toBe("cyrene-example-test-gpt-test");
+    expectScopedOpenAiCacheKey(requestBody.prompt_cache_key);
     expect(requestBody.instructions).toBe(TOOL_USAGE_SYSTEM_PROMPT);
     expect(requestBody.instructions).not.toContain("Original user task:");
     expect(requestBody.instructions).not.toContain("Tool results:");

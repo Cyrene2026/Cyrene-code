@@ -25,6 +25,8 @@ const (
 	mouseRegionModelListScrollbar       mouseRegion = "model_list_scrollbar"
 	mouseRegionProviderList             mouseRegion = "provider_list"
 	mouseRegionProviderListScrollbar    mouseRegion = "provider_list_scrollbar"
+	mouseRegionSettingsList             mouseRegion = "settings_list"
+	mouseRegionSettingsListScrollbar    mouseRegion = "settings_list_scrollbar"
 	mouseRegionComposerAttachmentAdd    mouseRegion = "composer_attachment_add"
 	mouseRegionComposerAttachmentRemove mouseRegion = "composer_attachment_remove"
 	mouseRegionComposer                 mouseRegion = "composer"
@@ -321,7 +323,8 @@ func (m *Model) scrollbarGeometryByRegion(region mouseRegion) (scrollbarGeometry
 		mouseRegionPlanListScrollbar,
 		mouseRegionSessionListScrollbar,
 		mouseRegionModelListScrollbar,
-		mouseRegionProviderListScrollbar:
+		mouseRegionProviderListScrollbar,
+		mouseRegionSettingsListScrollbar:
 		if !layout.HasPanel {
 			return scrollbarGeometry{}, false
 		}
@@ -478,6 +481,26 @@ func (m *Model) panelScrollbarGeometry(panelRect mouseRect) (scrollbarGeometry, 
 				Total:   maxInt(1, page.TotalPages),
 			},
 		)
+	case PanelSettings:
+		if len(settingsSpecs) == 0 {
+			return scrollbarGeometry{}, false
+		}
+		page := pageForSelection(len(settingsSpecs), m.SettingIndex, m.settingsPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		listRows := maxInt(1, (page.End-page.Start)*3)
+		startLine := 2 + settingsPanelLeadRows(bodyWidth)
+		visibleRows := minInt(listRows, maxInt(0, bodyHeight-1-startLine))
+		return scrollbarGeometryForBlock(
+			mouseRegionSettingsListScrollbar,
+			x,
+			inner.Top+startLine,
+			listRows,
+			visibleRows,
+			panelScrollState{
+				Offset:  maxInt(0, page.CurrentPage-1),
+				Visible: 1,
+				Total:   maxInt(1, page.TotalPages),
+			},
+		)
 	default:
 		return scrollbarGeometry{}, false
 	}
@@ -522,6 +545,11 @@ func (m *Model) panelMouseHit(panelRect mouseRect, mouseX, mouseY int) mouseHit 
 		startLine := 2 + providerPanelLeadRows(bodyWidth)
 		if index, ok := listIndexAtPanelLine(len(m.AvailableProviders), m.ProviderIndex, m.providerPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 3, innerY, startLine); ok {
 			return mouseHit{Region: mouseRegionProviderList, Index: index}
+		}
+	case PanelSettings:
+		startLine := 2 + settingsPanelLeadRows(bodyWidth)
+		if index, ok := listIndexAtPanelLine(len(settingsSpecs), m.SettingIndex, m.settingsPanelPageSizeForDimensions(panelRect.Width, panelRect.Height), 3, innerY, startLine); ok {
+			return mouseHit{Region: mouseRegionSettingsList, Index: index}
 		}
 	}
 

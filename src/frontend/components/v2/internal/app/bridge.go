@@ -25,6 +25,7 @@ type bridgeCommand struct {
 	Text            string       `json:"text,omitempty"`
 	Attachments     []Attachment `json:"attachments,omitempty"`
 	ID              string       `json:"id,omitempty"`
+	Key             string       `json:"key,omitempty"`
 	Value           string       `json:"value,omitempty"`
 	Name            string       `json:"name,omitempty"`
 	Profile         string       `json:"profile,omitempty"`
@@ -71,6 +72,15 @@ type BridgeUsageSummary struct {
 	CachedTokens     int `json:"cachedTokens"`
 	CompletionTokens int `json:"completionTokens"`
 	TotalTokens      int `json:"totalTokens"`
+}
+
+type BridgeConfig struct {
+	PinMaxCount                      int     `json:"pinMaxCount"`
+	QueryMaxToolSteps                int     `json:"queryMaxToolSteps"`
+	AutoSummaryRefresh               bool    `json:"autoSummaryRefresh"`
+	RequestTemperature               float64 `json:"requestTemperature"`
+	DebugCaptureAnthropicRequests    bool    `json:"debugCaptureAnthropicRequests"`
+	DebugCaptureAnthropicRequestsDir string  `json:"debugCaptureAnthropicRequestsDir"`
 }
 
 type BridgeManagedSkill struct {
@@ -140,6 +150,8 @@ type bridgeSnapshot struct {
 	ManagedMcpServers        []BridgeManagedMcpServer     `json:"managedMcpServers"`
 	UsageSummary             BridgeUsageSummary           `json:"usageSummary"`
 	Auth                     BridgeAuthStatus             `json:"auth"`
+	Config                   BridgeConfig                 `json:"config"`
+	ConfigPath               string                       `json:"configPath"`
 }
 
 type bridgeEvent struct {
@@ -169,11 +181,15 @@ type bridgeEvent struct {
 	ManagedMcpServers        []BridgeManagedMcpServer     `json:"managedMcpServers,omitempty"`
 	UsageSummary             BridgeUsageSummary           `json:"usageSummary,omitempty"`
 	Auth                     BridgeAuthStatus             `json:"auth,omitempty"`
+	Config                   BridgeConfig                 `json:"config,omitempty"`
+	ConfigPath               string                       `json:"configPath,omitempty"`
+	Path                     string                       `json:"path,omitempty"`
 	AppRoot                  string                       `json:"appRoot,omitempty"`
 	ProviderBaseURL          string                       `json:"providerBaseUrl,omitempty"`
 	Model                    string                       `json:"model,omitempty"`
 	APIKey                   string                       `json:"apiKey,omitempty"`
 	ProviderType             string                       `json:"providerType,omitempty"`
+	Key                      string                       `json:"key,omitempty"`
 }
 
 type bridgeStartedMsg struct {

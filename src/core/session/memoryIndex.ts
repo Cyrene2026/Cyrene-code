@@ -151,6 +151,19 @@ const COMPLETED_SIGNAL =
   /\b(done|completed|finished|wrote|created|updated|implemented|fixed|approved|resolved)\b|完成|已写|已创建|已更新|已实现|已修复|已批准|已解决/iu;
 const FAILURE_SIGNAL =
   /\b(fail|failed|error|denied|timeout|timed out|rejected|blocked)\b|失败|错误|拒绝|超时|阻塞/iu;
+const HARD_FAILURE_SIGNAL =
+  /\b(tool error|approval error|command failed|test failed|failed with|timed out|timeout|exception|crash|aborted|denied|rejected|conflict|blocked plan step|ENOENT|no such file or directory)\b|失败[:：]|错误[:：]|超时|拒绝|阻塞|异常|崩溃|中止|冲突/iu;
+const FAILURE_EVIDENCE_SIGNAL =
+  /\b(tool|read_file|read_range|read_json|read_yaml|write_file|edit_file|apply_patch|search_text|find_files|run_command|run_shell|command|test|tests|build|lint|typecheck|approval|plan step|ENOENT)\b|工具|命令|测试|构建|审批|计划步骤|读取|写入|编辑|补丁/iu;
+const PATH_ABSENCE_MEMORY_SIGNAL =
+  /(?:^|\s)`?[A-Za-z0-9_./-]+`?\s*(?:目录|文件)?\s*(?:不存在|未找到|does not exist|doesn't exist|is missing|missing|not found|is not present)|(?:项目中|仓库中|工作区里?|workspace中|workspace里?)不存在/iu;
+const EXPLANATORY_FAILURE_NARRATION_SIGNAL =
+  /(?:会导致|导致|用于|用来|帮助判断|判断|检测|识别|类型|后续模型|重新踩坑|old information|irrelevant information|wrong information)/iu;
+const ACTION_SIGNAL =
+  /\b(?:continue|resume|verify|run|test|update|edit|create|write|inspect|read|check|fix|patch|implement|review|refactor|trace|locate)\b|继续|恢复|验证|运行|测试|更新|编辑|创建|写|查看|检查|修复|补丁|实现|审查|重构|追踪|定位/iu;
+const ANCHORED_ACTION_SIGNAL = /`[^`]+`|[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/u;
+const GENERIC_ACTION_NARRATION_SIGNAL =
+  /^(?:目标是|目标为|目的是|定义|梳理|整理).*(?:运行脚本|依赖|运行环境要求)|^(?:直接编辑|directly edit|edit directly)\s+`?[A-Za-z0-9_./-]+\.[A-Za-z0-9]+`?$|(?:可运行、可继续修复|running state|runnable state)/iu;
 
 const clipText = (text: string, max = MEMORY_TEXT_LIMIT) => {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -174,6 +187,38 @@ const stripMemorySegmentPrefix = (text: string) =>
     .replace(/^#{1,6}\s+/, "")
     .replace(/^>\s+/, "")
     .trim();
+
+const isPathAbsenceMemoryText = (text: string) =>
+  PATH_ABSENCE_MEMORY_SIGNAL.test(text) ||
+  /\b(?:ENOENT|no such file or directory)\b|(?:不存在|未找到|缺失)/iu.test(text);
+
+export const memoryEntryContributesKnownPaths = (entry: SessionMemoryEntry) =>
+  (entry.entities.path?.length ?? 0) > 0 && !isPathAbsenceMemoryText(entry.text);
+
+const hasAnchoredMemorySignal = (text: string) =>
+  collectPathCandidates(text).length > 0 ||
+  collectToolNames(text).length > 0 ||
+  /`[^`]+`/.test(text);
+
+const isDiscardableMemoryNoise = (kind: MemoryKind, text: string) => {
+  const normalized = normalizeMemoryWhitespace(text);
+  if (!normalized) {
+    return true;
+  }
+  if (kind === "pin" || kind === "tool_result" || kind === "approval") {
+    return false;
+  }
+  if (kind === "error") {
+    return false;
+  }
+  if (EXPLANATORY_FAILURE_NARRATION_SIGNAL.test(normalized) && !hasAnchoredMemorySignal(normalized)) {
+    return true;
+  }
+  if (kind === "task" && GENERIC_ACTION_NARRATION_SIGNAL.test(normalized)) {
+    return true;
+  }
+  return false;
+};
 
 const isMeaningfulToken = (token: string) => {
   if (!token) {
@@ -285,6 +330,9 @@ const normalizeTaskMemoryText = (text: string) => {
   if (!normalized) {
     return null;
   }
+  if (isDiscardableMemoryNoise("task", normalized)) {
+    return null;
+  }
   if (
     LOW_SIGNAL_TASK_PATTERN.test(normalized) &&
     !hasStructuredMemorySignal(normalized)
@@ -297,6 +345,9 @@ const normalizeTaskMemoryText = (text: string) => {
 const normalizeFactMemoryText = (text: string) => {
   const normalized = normalizeMemoryWhitespace(text);
   if (!normalized) {
+    return null;
+  }
+  if (isDiscardableMemoryNoise("fact", normalized)) {
     return null;
   }
 
@@ -318,6 +369,9 @@ const normalizeFactMemoryText = (text: string) => {
 };
 
 const normalizeMemoryTextForKind = (kind: MemoryKind, text: string) => {
+  if (isDiscardableMemoryNoise(kind, text)) {
+    return null;
+  }
   switch (kind) {
     case "task":
       return normalizeTaskMemoryText(text);
@@ -905,10 +959,14 @@ const isConstraintLikeEntry = (entry: SessionMemoryEntry) =>
   entry.kind === "error" || CONSTRAINT_SIGNAL.test(entry.text);
 
 const isFailureLikeEntry = (entry: SessionMemoryEntry) =>
-  entry.kind === "error" ||
-  entry.entities.status?.includes("error") === true ||
-  entry.entities.status?.includes("rejected") === true ||
-  FAILURE_SIGNAL.test(entry.text);
+  !PATH_ABSENCE_MEMORY_SIGNAL.test(entry.text) &&
+  !EXPLANATORY_FAILURE_NARRATION_SIGNAL.test(entry.text) &&
+  (entry.kind === "error" ||
+    entry.entities.status?.includes("error") === true ||
+    entry.entities.status?.includes("rejected") === true ||
+    (FAILURE_SIGNAL.test(entry.text) &&
+      HARD_FAILURE_SIGNAL.test(entry.text) &&
+      FAILURE_EVIDENCE_SIGNAL.test(entry.text)));
 
 const isCompletedLikeEntry = (entry: SessionMemoryEntry) =>
   entry.kind === "tool_result" ||
@@ -930,6 +988,31 @@ const formatArchiveSectionItem = (
     }
   }
   return normalizeMemoryText(entry);
+};
+
+const archiveItemMatchesSection = (
+  section: WorkingStateSectionName,
+  item: string
+) => {
+  const text = stripMemorySegmentPrefix(item.replace(/^\[[^\]]+\]\s*/, ""));
+  switch (section) {
+    case "RECENT FAILURES":
+      return (
+        HARD_FAILURE_SIGNAL.test(text) &&
+        FAILURE_EVIDENCE_SIGNAL.test(text) &&
+        !PATH_ABSENCE_MEMORY_SIGNAL.test(text) &&
+        !EXPLANATORY_FAILURE_NARRATION_SIGNAL.test(text)
+      );
+    case "NEXT BEST ACTIONS":
+      return (
+        ACTION_SIGNAL.test(text) &&
+        ANCHORED_ACTION_SIGNAL.test(text) &&
+        !GENERIC_ACTION_NARRATION_SIGNAL.test(text) &&
+        !EXPLANATORY_FAILURE_NARRATION_SIGNAL.test(text)
+      );
+    default:
+      return true;
+  }
 };
 
 const flattenArchiveSections = (sections: WorkingStateSectionMap) =>
@@ -1090,8 +1173,9 @@ const selectArchiveEntriesForSection = (
       }
       return right.entry.createdAt.localeCompare(left.entry.createdAt);
     })
-    .slice(0, limit)
-    .map(item => formatArchiveSectionItem(section, item.entry));
+    .map(item => formatArchiveSectionItem(section, item.entry))
+    .filter(item => archiveItemMatchesSection(section, item))
+    .slice(0, limit);
 
 const selectKnownPathsForArchive = (
   entries: SessionMemoryEntry[],
@@ -1104,6 +1188,9 @@ const selectKnownPathsForArchive = (
   const scoredPaths = new Map<string, number>();
 
   for (const entry of entries) {
+    if (!memoryEntryContributesKnownPaths(entry)) {
+      continue;
+    }
     const paths = entry.entities.path ?? [];
     if (paths.length === 0) {
       continue;

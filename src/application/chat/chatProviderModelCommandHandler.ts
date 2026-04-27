@@ -1,5 +1,7 @@
 import {
-  PROVIDER_ENDPOINT_KINDS,
+  isProviderEndpointKind,
+  isProviderProfile,
+  isProviderType,
   type ProviderEndpointKind,
   type ProviderProfile,
   type ProviderType,
@@ -67,8 +69,6 @@ const PROVIDER_ENDPOINT_USAGE =
 const PROVIDER_NAME_USAGE =
   "Usage: /provider name <display_name> | /provider name clear [url] | /provider name list";
 const MODEL_CUSTOM_USAGE = "Usage: /model custom <model_id>";
-const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
-  (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
 export const handleProviderModelCommand = ({
   query,
@@ -165,12 +165,7 @@ export const handleProviderModelCommand = ({
       let normalizedProfile: ProviderProfile | null = null;
       if (profileToken === "clear") {
         normalizedProfile = "custom";
-      } else if (
-        profileToken === "openai" ||
-        profileToken === "gemini" ||
-        profileToken === "anthropic" ||
-        profileToken === "custom"
-      ) {
+      } else if (profileToken && isProviderProfile(profileToken)) {
         normalizedProfile = profileToken;
       }
       if (!normalizedProfile) {
@@ -266,13 +261,8 @@ export const handleProviderModelCommand = ({
       const normalizedType =
         typeToken === "clear"
           ? null
-          : (
-              typeToken === "openai-compatible" ||
-              typeToken === "openai-responses" ||
-              typeToken === "gemini" ||
-              typeToken === "anthropic"
-            )
-            ? (typeToken as ProviderType)
+          : typeToken && isProviderType(typeToken)
+            ? typeToken
             : undefined;
       if (typeof normalizedType === "undefined") {
         pushSystemMessage(

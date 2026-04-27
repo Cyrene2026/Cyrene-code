@@ -1,6 +1,8 @@
 export type TokenUsage = {
   promptTokens: number;
   cachedTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   completionTokens: number;
   totalTokens: number;
 };

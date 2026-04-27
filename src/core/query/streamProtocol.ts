@@ -31,6 +31,8 @@ const usageSchema = z.object({
   type: z.literal("usage"),
   promptTokens: z.number().int().nonnegative(),
   cachedTokens: z.number().int().nonnegative().optional(),
+  cacheReadInputTokens: z.number().int().nonnegative().optional(),
+  cacheCreationInputTokens: z.number().int().nonnegative().optional(),
   completionTokens: z.number().int().nonnegative(),
   totalTokens: z.number().int().nonnegative(),
 });

@@ -8,6 +8,7 @@ import {
   createMessageMemoryInputs,
   deriveFocusFromMemoryIndex,
   getPromptContextFromMemoryIndex,
+  memoryEntryContributesKnownPaths,
   rebuildMemoryLookup,
   removePinMemoryEntry,
   upsertMemoryEntries,
@@ -353,6 +354,9 @@ const deriveWorkingStateAllowedPaths = (index: SessionMemoryIndex) => {
 
   for (const entry of index.entries) {
     if (entry.kind === "fact") {
+      continue;
+    }
+    if (!memoryEntryContributesKnownPaths(entry)) {
       continue;
     }
     for (const path of entry.entities.path ?? []) {

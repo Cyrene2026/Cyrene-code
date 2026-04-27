@@ -94,7 +94,7 @@ describe("bridge session persistence", () => {
       "CONFIRMED FACTS:\n- 目标文件是 `src/app.ts`"
     );
     expect(loaded?.pendingDigest).toContain("COMPLETED:\n- 已确认读取 `src/app.ts` 第 1-80 行");
-    expect(loaded?.pendingDigest).toContain("NEXT BEST ACTIONS:\n- 直接编辑 `src/app.ts`");
+    expect(loaded?.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
   });
 
   test("records structured tool-result memory with source anchors", async () => {

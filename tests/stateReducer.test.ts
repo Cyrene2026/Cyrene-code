@@ -37,6 +37,12 @@ describe("stateReducer", () => {
     expect(prompt).toContain(
       "Cold-start priority: during early exploration, first capture the startup mechanism, launch command, entrypoint files, and bootstrap chain"
     );
+    expect(prompt).toContain(
+      "Merge trust rule: in merge_and_digest, summaryPatch may only contain entries already present in the previous pending digest"
+    );
+    expect(prompt).toContain(
+      "Promotion rule: do not promote weak, generic, or convenience notes into durable summary."
+    );
   });
 
   test("applyParsedStateUpdate strips chatter, user-echo facts, fake failures, and completed/remaining overlap", () => {
@@ -133,6 +139,73 @@ describe("stateReducer", () => {
     expect(applied.pendingDigest).not.toContain("REMAINING:\n- wrote reducer tests");
   });
 
+  test("merge_and_digest rejects summaryPatch entries not grounded in previous pending digest", () => {
+    const applied = applyParsedStateUpdate({
+      durableSummary: [
+        "OBJECTIVE:",
+        "- stabilize provider settings",
+        "",
+        "CONFIRMED FACTS:",
+        "- 项目使用 Bun 作为包管理器",
+        "- `src/core/session/stateReducer.ts` 存储 reducer 规则",
+        "",
+        "REMAINING:",
+        "- 检查 `src/core/session/stateReducer.ts`",
+        "",
+        "KNOWN PATHS:",
+        "- src/core/session/stateReducer.ts",
+        "- tests/stateReducer.test.ts",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- stabilize provider settings",
+        "",
+        "CONFIRMED FACTS:",
+        "- `src/core/session/stateReducer.ts` 包含 reducer prompt",
+        "",
+        "REMAINING:",
+        "- 优化 `src/core/session/stateReducer.ts` 的 summary merge 规则",
+        "",
+        "KNOWN PATHS:",
+        "- src/core/session/stateReducer.ts",
+      ].join("\n"),
+      update: {
+        version: 1,
+        mode: "merge_and_digest",
+        summaryPatch: {
+          "CONFIRMED FACTS": {
+            op: "merge",
+            add: [
+              "`src/core/session/stateReducer.ts` 包含 reducer prompt",
+              "工具不强大，太弱了",
+            ],
+          },
+          REMAINING: {
+            op: "merge",
+            add: [
+              "优化 `src/core/session/stateReducer.ts` 的 summary merge 规则",
+              "继续泛泛看项目",
+            ],
+          },
+        },
+        nextPendingDigest: {
+          "CONFIRMED FACTS": ["当前轮发现 settings 面板可编辑 config"],
+          REMAINING: ["验证 settings 命令"],
+        },
+      },
+    });
+
+    expect(applied.summary).toContain(
+      "`src/core/session/stateReducer.ts` 包含 reducer prompt"
+    );
+    expect(applied.summary).toContain(
+      "优化 `src/core/session/stateReducer.ts` 的 summary merge 规则"
+    );
+    expect(applied.summary).not.toContain("工具不强大，太弱了");
+    expect(applied.summary).not.toContain("继续泛泛看项目");
+    expect(applied.pendingDigest).toContain("验证 settings 命令");
+  });
+
   test("buildFallbackPendingDigest keeps durable facts and drops chatter", () => {
     const digest = buildFallbackPendingDigest({
       userText: "inspect the project",
@@ -151,7 +224,7 @@ describe("stateReducer", () => {
     expect(digest).not.toContain("plain visible answer only");
   });
 
-  test("applyToolResultPendingDigestUpdate persists read coverage and next action before assistant finalizes", () => {
+  test("applyToolResultPendingDigestUpdate persists read coverage before assistant finalizes", () => {
     const applied = applyToolResultPendingDigestUpdate({
       durableSummary: "",
       pendingDigest: "",
@@ -185,7 +258,7 @@ describe("stateReducer", () => {
     expect(applied.pendingDigest).toContain("`src/app.ts` 的已读范围是 `1-80`");
     expect(applied.pendingDigest).toContain("COMPLETED:\n- 已确认读取 `src/app.ts` 第 1-80 行");
     expect(applied.pendingDigest).toContain("KNOWN PATHS:\n- src/app.ts");
-    expect(applied.pendingDigest).toContain("NEXT BEST ACTIONS:\n- 直接编辑 `src/app.ts`");
+    expect(applied.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
     expect(applied.pendingDigest).toContain(
       'refs: [{"kind":"tool_result","label":"read_range","path":"src/app.ts","startLine":1,"endLine":80}]'
     );
@@ -215,7 +288,7 @@ describe("stateReducer", () => {
     expect(applied.pendingDigest).toContain("NEXT BEST ACTIONS:\n- 查看 `src/output.ts`");
   });
 
-  test("applyToolResultPendingDigestUpdate persists real tool failures immediately", () => {
+  test("applyToolResultPendingDigestUpdate records missing-path tool errors as negative facts", () => {
     const applied = applyToolResultPendingDigestUpdate({
       durableSummary: "",
       pendingDigest: "",
@@ -231,12 +304,61 @@ describe("stateReducer", () => {
 
     expect(applied.updated).toBe(true);
     expect(applied.pendingDigest).toContain(
-      "RECENT FAILURES:\n- read_file `src/missing.ts` 失败: ENOENT: no such file or directory"
+      "CONFIRMED FACTS:\n- 项目中不存在 `src/missing.ts`"
     );
+    expect(applied.pendingDigest).toContain("RECENT FAILURES:\n- (none)");
     expect(applied.pendingDigest).not.toContain("KNOWN PATHS:\n- src/missing.ts");
     expect(applied.pendingDigest).not.toContain(
       "NEXT BEST ACTIONS:\n- 改用更小的 read_range 或 search_text_context 查看 `src/missing.ts`"
     );
+  });
+
+  test("applyToolResultPendingDigestUpdate still keeps non-missing hard tool failures", () => {
+    const applied = applyToolResultPendingDigestUpdate({
+      durableSummary: "",
+      pendingDigest: "",
+      userText: "run tests for src/app.ts",
+      toolName: "shell",
+      toolInput: {
+        action: "run_command",
+      },
+      toolMessage: "[tool error] run_command bun test\nCommand failed with exit code 1",
+    });
+
+    expect(applied.pendingDigest).toContain(
+      "RECENT FAILURES:\n- run_command 失败: Command failed with exit code 1"
+    );
+  });
+
+  test("sanitizeStoredWorkingState drops explanatory failure chatter and generic actions", () => {
+    const sanitized = sanitizeStoredWorkingState({
+      summary: "",
+      pendingDigest: [
+        "RECENT FAILURES:",
+        "- src/memdir/paths.js 不存在",
+        "- 这会导致模型被旧信息、无关信息甚至错误信息影响",
+        "- 失败尝试没保留会导致后续模型重新踩坑",
+        "",
+        "NEXT BEST ACTIONS:",
+        "- 直接编辑 src/bootstrap-entry.ts",
+        "- 直接编辑 src/QueryEngine.ts",
+        "- 目标是尽量恢复到“可运行、可继续修复”的状态",
+        "- 定义运行脚本、依赖、运行环境要求",
+      ].join("\n"),
+      allowedPaths: [],
+    });
+
+    expect(sanitized.summary).toBe("");
+    expect(sanitized.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 项目中不存在 `src/memdir/paths.js`"
+    );
+    expect(sanitized.pendingDigest).toContain("RECENT FAILURES:\n- (none)");
+    expect(sanitized.pendingDigest).toContain("NEXT BEST ACTIONS:\n- (none)");
+    expect(sanitized.pendingDigest).not.toContain("这会导致模型");
+    expect(sanitized.pendingDigest).not.toContain("后续模型重新踩坑");
+    expect(sanitized.pendingDigest).not.toContain("直接编辑 src/bootstrap-entry.ts");
+    expect(sanitized.pendingDigest).not.toContain("可运行、可继续修复");
+    expect(sanitized.pendingDigest).not.toContain("定义运行脚本");
   });
 
   test("sanitizeStoredWorkingState repairs polluted persisted state and drops unknown paths", () => {

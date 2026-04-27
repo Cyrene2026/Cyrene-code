@@ -215,6 +215,16 @@ export const buildPromptWithContext = (
         ];
       }).join("\n")
     : "";
+  const shouldDeferArchiveMemory =
+    lowSignalContinuation &&
+    Boolean(recentLines || promptContext.pendingDigest.trim() || promptContext.interruptedTurn);
+  const archiveMemorySection = shouldDeferArchiveMemory
+    ? "Retrieved archive memory:\n(deferred for low-information continuation; use pending digest, interrupted turn, and recent transcript first)"
+    : archiveSectionLines
+      ? `Retrieved archive memory (section-aware):\n${archiveSectionLines}`
+      : relevantLines
+        ? `Retrieved archive memory:\n${relevantLines}`
+        : "Retrieved archive memory:\n(none)";
 
   const recencyGuardLine =
     lowSignalContinuation &&
@@ -282,11 +292,7 @@ export const buildPromptWithContext = (
     pinLines
       ? `Pinned memory (stable user priorities):\n${pinLines}`
       : "Pinned memory (stable user priorities):\n(none)",
-    archiveSectionLines
-      ? `Retrieved archive memory (section-aware):\n${archiveSectionLines}`
-      : relevantLines
-        ? `Retrieved archive memory:\n${relevantLines}`
-        : "Retrieved archive memory:\n(none)",
+    archiveMemorySection,
     `Current user query (act on this now):\n${clipPromptBlock(
       query,
       PROMPT_QUERY_CHAR_LIMIT

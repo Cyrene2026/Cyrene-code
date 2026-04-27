@@ -1,9 +1,14 @@
-import { createHttpQueryTransport, fetchProviderModelCatalog, normalizeProviderBaseUrl } from "../http/createHttpQueryTransport";
+import { createHttpQueryTransport, fetchProviderModelCatalog } from "../http/createHttpQueryTransport";
 import { createLocalCoreTransport } from "../local/createLocalCoreTransport";
 import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import {
+  inferProviderFamilyFromBaseUrl,
+  isProviderEndpointKind,
   isProviderType,
+  normalizeProviderBaseUrl,
+  type ProviderFamily,
+  type ProviderType,
   resolveProviderTypeFamily,
 } from "../../core/query/transport";
 import {
@@ -16,7 +21,6 @@ import type {
   ProviderFormatOverrideMap,
   ProviderModelCatalogModeMap,
   ProviderProfileOverrideMap,
-  ProviderType,
   ProviderTypeOverrideMap,
   QueryTransport,
 } from "../../core/query/transport";
@@ -135,22 +139,7 @@ const PROVIDER_API_KEY_ENV_BY_FAMILY = {
   gemini: "CYRENE_GEMINI_API_KEY",
   anthropic: "CYRENE_ANTHROPIC_API_KEY",
 } as const satisfies Record<string, ManagedAuthEnvName>;
-type ProviderFamily = keyof typeof PROVIDER_API_KEY_ENV_BY_FAMILY | "glm";
 type ManagedAuthEnvValues = Partial<Record<ManagedAuthEnvName, string>>;
-
-const inferProviderFamilyFromBaseUrl = (
-  providerBaseUrl: string
-): ProviderFamily => {
-  const normalized = normalizeProviderBaseUrl(providerBaseUrl);
-  const host = new URL(normalized).hostname.toLowerCase();
-  return host.includes("anthropic.com")
-    ? "anthropic"
-    : host.includes("generativelanguage.googleapis.com")
-      ? "gemini"
-      : host.includes("bigmodel.cn") || host.includes("zhipuai.cn")
-        ? "glm"
-      : "openai";
-};
 
 const resolveProviderFamily = (
   providerBaseUrl: string,
@@ -459,9 +448,18 @@ export const createAuthRuntime = (
                   Object.entries(endpoints ?? {})
                     .map(([kind, endpoint]) => {
                       const trimmedEndpoint = trimNonEmpty(endpoint);
-                      return trimmedEndpoint ? ([kind, trimmedEndpoint] as const) : null;
+                      return isProviderEndpointKind(kind) && trimmedEndpoint
+                        ? ([kind, trimmedEndpoint] as const)
+                        : null;
                     })
-                    .filter((entry): entry is [string, string] => Boolean(entry))
+                    .filter(
+                      (
+                        entry
+                      ): entry is [
+                        keyof ProviderEndpointOverrideMap[string],
+                        string,
+                      ] => Boolean(entry)
+                    )
                 );
                 return Object.keys(normalizedEndpoints).length > 0
                   ? ([normalized, normalizedEndpoints] as const)
@@ -470,7 +468,14 @@ export const createAuthRuntime = (
                 return null;
               }
             })
-            .filter((entry): entry is [string, ProviderEndpointOverrideMap[string]] => Boolean(entry))
+            .filter(
+              (
+                entry
+              ): entry is [
+                string,
+                ProviderEndpointOverrideMap[string],
+              ] => Boolean(entry)
+            )
         ) as ProviderEndpointOverrideMap,
         providerNames: Object.fromEntries(
           Object.entries(loaded.providerNames ?? {})

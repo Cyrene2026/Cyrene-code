@@ -51,6 +51,7 @@ const SILENT_REVIEW_RESUME_RECOVERY_NOTE = [
 const LATE_TOOL_CALL_VISIBLE_ANSWER_CHAR_GUARD = 200;
 const MAX_NON_PROGRESS_CHATTER_CHARS = 240;
 const BROAD_DISCOVERY_SCOPE_BUDGET = 3;
+const INVALID_TOOL_INPUT_CORRECTION_LIMIT = 1;
 const ROUND_PROMPT_TASK_CHAR_LIMIT = 12000;
 const ROUND_PROMPT_TOOL_RESULT_CHAR_LIMIT = 16000;
 const ROUND_PROMPT_TOOL_RESULT_ITEM_CHAR_LIMIT = 3000;
@@ -1261,12 +1262,43 @@ const parsePositiveDelayMs = (value: string | undefined) => {
   return Math.floor(parsed);
 };
 
-const hasDeepSeekMarker = (value: string) => {
-  try {
-    return new URL(value).hostname.toLowerCase().includes("deepseek");
-  } catch {
-    return value.toLowerCase().includes("deepseek");
+const parseBooleanEnvOverride = (value: string | undefined) => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
+    return null;
   }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+};
+
+const isDeepSeekProvider = (value: string) => {
+  try {
+    return new URL(value).hostname.toLowerCase().split(".").includes("deepseek");
+  } catch {
+    return value.toLowerCase().split(/[^a-z0-9]+/u).includes("deepseek");
+  }
+};
+
+const isDeepSeekModel = (value: string) =>
+  value.toLowerCase().split(/[^a-z0-9]+/u).includes("deepseek");
+
+const resolveDeepSeekCompatibilityMode = (
+  provider: string,
+  model: string,
+  env?: NodeJS.ProcessEnv
+) => {
+  const explicit =
+    parseBooleanEnvOverride(env?.CYRENE_DEEPSEEK_COMPATIBILITY) ??
+    parseBooleanEnvOverride(env?.CYRENE_DEEPSEEK_COMPAT);
+  if (typeof explicit === "boolean") {
+    return explicit;
+  }
+  return isDeepSeekProvider(provider) || isDeepSeekModel(model);
 };
 
 const resolveDeepSeekCacheSettleDelayMs = (
@@ -1274,7 +1306,7 @@ const resolveDeepSeekCacheSettleDelayMs = (
   model: string,
   env?: NodeJS.ProcessEnv
 ) => {
-  if (!hasDeepSeekMarker(provider) && !hasDeepSeekMarker(model)) {
+  if (!resolveDeepSeekCompatibilityMode(provider, model, env)) {
     return 0;
   }
   if (env?.CYRENE_DEEPSEEK_CACHE_SETTLE_MS === "0") {
@@ -1299,8 +1331,65 @@ const resolveAnthropicCacheSettleDelayMs = (
   return parsePositiveDelayMs(env?.CYRENE_ANTHROPIC_CACHE_SETTLE_MS) ?? 2500;
 };
 
+const MIN_PROMPT_CACHE_SETTLE_PROMPT_TOKENS = 1024;
+const APPROX_CHARS_PER_TOKEN = 4;
+
+const estimatePromptTokens = (text: string) =>
+  Math.ceil(text.trim().length / APPROX_CHARS_PER_TOKEN);
+
+const shouldWaitForPromptCacheSettle = (
+  prompt: string,
+  usage: TokenUsage | null,
+  delayMs: number
+) => {
+  if (delayMs <= 0) {
+    return false;
+  }
+  if (usage) {
+    const cacheCreationTokens = Math.max(0, usage.cacheCreationInputTokens ?? 0);
+    if (cacheCreationTokens > 0) {
+      return true;
+    }
+    const cachedTokens = Math.max(0, usage.cachedTokens ?? 0);
+    if (cachedTokens > 0 && cacheCreationTokens === 0) {
+      return false;
+    }
+    return usage.promptTokens >= MIN_PROMPT_CACHE_SETTLE_PROMPT_TOKENS;
+  }
+  return estimatePromptTokens(prompt) >= MIN_PROMPT_CACHE_SETTLE_PROMPT_TOKENS;
+};
+
 const isAbortError = (error: unknown) =>
   error instanceof Error ? error.name === "AbortError" : false;
+
+const stableStringify = (value: unknown): string => {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+};
+
+const buildToolInputSignature = (toolName: string, input: unknown) =>
+  `${toolName}\u0000${stableStringify(input)}`;
+
+const isInvalidToolInputResult = (message: string) =>
+  /^\s*(?:\[tool error\]\s*)?Invalid tool input\b/i.test(message);
+
+const buildInvalidToolInputStopMessage = (toolName: string, input: unknown) => {
+  const action = getToolAction(toolName, input);
+  return [
+    "[tool loop stopped] Repeated invalid tool input.",
+    `The model retried ${action || toolName} with the same invalid arguments after being corrected.`,
+    "Stopping this turn to avoid runaway token usage. Adjust the request or retry; the next turn should provide the required tool fields instead of repeating the same call.",
+  ].join(" ");
+};
 
 const countPatternMatches = (text: string, pattern: RegExp) => {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
@@ -1577,6 +1666,7 @@ const runExecutionRuntime = async ({
   let planExecutionAutoContinueCount = 0;
   const searchMemory = ToolObservationStore.createSearchMemory();
   const readLedger = new Map<string, FileReadLedgerEntry>();
+  const invalidToolInputCorrections = new Map<string, number>();
   let latestConfirmedFileMutation: ConfirmedFileMutation | null = null;
   const maxToolSteps =
     Number.isFinite(queryMaxToolSteps) && queryMaxToolSteps > 0
@@ -2208,6 +2298,38 @@ const runExecutionRuntime = async ({
           if (isCancelled()) {
             return completeCancelledRound();
           }
+          if (isInvalidToolInputResult(toolResult.message)) {
+            const signature = buildToolInputSignature(event.toolName, event.input);
+            const correctionCount =
+              invalidToolInputCorrections.get(signature) ?? 0;
+            if (correctionCount >= INVALID_TOOL_INPUT_CORRECTION_LIMIT) {
+              const stopMessage = buildInvalidToolInputStopMessage(
+                event.toolName,
+                event.input
+              );
+              recordCompletion({
+                type: "completion",
+                source: "runtime",
+                reason: "invalid_tool_input_loop",
+                detail: stopMessage,
+                expected: false,
+              });
+              emitRoundText(`\n${stopMessage}\n`);
+              return completeRound();
+            }
+            invalidToolInputCorrections.set(signature, correctionCount + 1);
+            const actionName = getToolAction(event.toolName, event.input);
+            runtimeCorrection = [
+              "Invalid tool input correction:",
+              `${actionName || event.toolName} was rejected by the tool runtime.`,
+              toolResult.message,
+              "Do not repeat the exact same tool call. Provide the missing required fields or choose a different valid tool.",
+            ].join("\n");
+          } else {
+            invalidToolInputCorrections.delete(
+              buildToolInputSignature(event.toolName, event.input)
+            );
+          }
           if (
             ToolObservationStore.didApplyFileMutation(
               event.toolName,
@@ -2336,6 +2458,8 @@ const runExecutionRuntime = async ({
           latestUsage = {
             promptTokens: event.promptTokens,
             cachedTokens: event.cachedTokens,
+            cacheReadInputTokens: event.cacheReadInputTokens,
+            cacheCreationInputTokens: event.cacheCreationInputTokens,
             completionTokens: event.completionTokens,
             totalTokens: event.totalTokens,
           };
@@ -2479,7 +2603,7 @@ const runExecutionRuntime = async ({
       deepSeekCacheSettleDelayMs,
       anthropicCacheSettleDelayMs
     );
-    if (roundGapMs > 0) {
+    if (shouldWaitForPromptCacheSettle(roundPrompt, latestUsage, roundGapMs)) {
       await sleep(roundGapMs, abortSignal);
       if (isCancelled()) {
         return completeCancelledRound();

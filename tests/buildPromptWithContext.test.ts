@@ -169,7 +169,14 @@ describe("buildPromptWithContext", () => {
   test("low-information continuation queries prioritize pending digest and recent context ahead of durable summary", () => {
     const prompt = buildPromptWithContext("继续", "system", "project", {
       pins: [],
-      relevantMemories: [],
+      relevantMemories: [
+        "[task] 直接编辑 src/bootstrap-entry.ts",
+        "[fact] ???claude code是这个项目的东西，你搞错了",
+      ],
+      archiveSections: {
+        "NEXT BEST ACTIONS": ["直接编辑 src/bootstrap-entry.ts"],
+        "RECENT FAILURES": ["这会导致模型被旧信息、无关信息甚至错误信息影响"],
+      },
       recent: [
         {
           role: "assistant",
@@ -213,6 +220,12 @@ describe("buildPromptWithContext", () => {
     );
     expect(prompt).toContain("Latest actionable user request before this continuation:");
     expect(prompt).toContain("完善下 lsp doctor/list 的一致性和可诊断性");
+    expect(prompt).toContain(
+      "Retrieved archive memory:\n(deferred for low-information continuation"
+    );
+    expect(prompt).not.toContain("直接编辑 src/bootstrap-entry.ts");
+    expect(prompt).not.toContain("这会导致模型被旧信息");
+    expect(prompt).not.toContain("???claude code是这个项目的东西");
   });
 
   test("injects only selected extension summary instead of full skill prompt bodies", () => {

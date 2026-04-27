@@ -585,6 +585,187 @@ describe("session memory index", () => {
     expect(context.relevantMemories.some(item => item.includes("src/auth/oauth.ts"))).toBe(true);
   });
 
+  test("archive section retrieval filters polluted failures and generic next actions", async () => {
+    const { store } = await createStore();
+    const session = await store.createSession("polluted archive");
+
+    await store.recordMemory(session.id, {
+      kind: "error",
+      text: "src/memdir/paths.js 不存在",
+      priority: 92,
+      entities: {
+        path: ["src/memdir/paths.js"],
+        status: ["error"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "fact",
+      text: "这会导致模型被旧信息、无关信息甚至错误信息影响",
+      priority: 80,
+    });
+    await store.recordMemory(session.id, {
+      kind: "task",
+      text: "目标是尽量恢复到“可运行、可继续修复”的状态",
+      priority: 90,
+    });
+    await store.recordMemory(session.id, {
+      kind: "task",
+      text: "直接编辑 src/bootstrap-entry.ts",
+      priority: 90,
+      entities: {
+        path: ["src/bootstrap-entry.ts"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "error",
+      text: "Tool error: run_command bun test timed out",
+      priority: 93,
+      entities: {
+        action: ["run_command"],
+        toolName: ["run_command"],
+        status: ["error"],
+      },
+    });
+    await store.recordMemory(session.id, {
+      kind: "task",
+      text: "验证 `src/core/session/stateReducer.ts` 的 summary 过滤测试",
+      priority: 91,
+      entities: {
+        path: ["src/core/session/stateReducer.ts"],
+      },
+    });
+
+    const context = await store.getPromptContext(session.id, "summary 过滤");
+
+    expect(context.archiveSections?.["RECENT FAILURES"]).toContain(
+      "[error] Tool error: run_command bun test timed out"
+    );
+    expect(context.archiveSections?.["RECENT FAILURES"]?.join("\n")).not.toContain(
+      "src/memdir/paths.js 不存在"
+    );
+    expect(context.archiveSections?.["RECENT FAILURES"]?.join("\n")).not.toContain(
+      "旧信息"
+    );
+    expect(context.archiveSections?.["NEXT BEST ACTIONS"]).toContain(
+      "验证 `src/core/session/stateReducer.ts` 的 summary 过滤测试"
+    );
+    expect(context.archiveSections?.["NEXT BEST ACTIONS"]?.join("\n")).not.toContain(
+      "目标是尽量恢复"
+    );
+  });
+
+  test("rebuild drops disposable memory noise and missing-path entries do not restore known paths", async () => {
+    const { root, store } = await createStore();
+    const sessionId = "discard-memory-noise";
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await writeFile(
+      join(root, `${sessionId}.json`),
+      JSON.stringify(
+        {
+          id: sessionId,
+          title: "discard noise",
+          createdAt: now,
+          updatedAt: now,
+          summary: "",
+          pendingDigest: [
+            "CONFIRMED FACTS:",
+            "- 项目中不存在 `src/memdir/paths.js`",
+            "",
+            "KNOWN PATHS:",
+            "- src/memdir/paths.js",
+          ].join("\n"),
+          focus: [],
+          tags: [],
+          messages: [],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    await writeFile(
+      join(root, `${sessionId}.index.json`),
+      JSON.stringify(
+        {
+          version: 1,
+          sessionId,
+          updatedAt: now,
+          entries: [
+            {
+              id: "fact-noise",
+              sessionId,
+              kind: "fact",
+              text: "这会导致模型被旧信息、无关信息甚至错误信息影响",
+              priority: 80,
+              createdAt: now,
+              tags: [],
+              entities: {},
+              dedupeKey: "fact:noise",
+            },
+            {
+              id: "task-noise",
+              sessionId,
+              kind: "task",
+              text: "目标是尽量恢复到“可运行、可继续修复”的状态",
+              priority: 90,
+              createdAt: now,
+              tags: [],
+              entities: {},
+              dedupeKey: "task:noise",
+            },
+            {
+              id: "missing-error",
+              sessionId,
+              kind: "error",
+              text: "read_file `src/memdir/paths.js` 失败: ENOENT: no such file or directory",
+              priority: 92,
+              createdAt: now,
+              tags: ["src/memdir/paths.js", "error"],
+              entities: {
+                path: ["src/memdir/paths.js"],
+                action: ["read_file"],
+                status: ["error"],
+              },
+              dedupeKey: "error:read_file:src/memdir/paths.js:enoent",
+            },
+          ],
+          byKind: {
+            fact: ["fact-noise"],
+            task: ["task-noise"],
+            error: ["missing-error"],
+          },
+          byPath: {
+            "src/memdir/paths.js": ["missing-error"],
+          },
+          byTool: {},
+          byAction: {
+            read_file: ["missing-error"],
+          },
+          byPriority: ["missing-error", "task-noise", "fact-noise"],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const loaded = await store.loadSession(sessionId);
+    const index = await store.getMemoryIndex(sessionId);
+    const context = await store.getPromptContext(sessionId, "continue");
+
+    expect(index.entries.some(entry => entry.text.includes("旧信息"))).toBe(false);
+    expect(index.entries.some(entry => entry.text.includes("可运行、可继续修复"))).toBe(false);
+    expect(loaded?.pendingDigest).toContain(
+      "CONFIRMED FACTS:\n- 项目中不存在 `src/memdir/paths.js`"
+    );
+    expect(loaded?.pendingDigest).not.toContain("KNOWN PATHS:\n- src/memdir/paths.js");
+    expect(context.archiveSections?.["KNOWN PATHS"] ?? []).not.toContain(
+      "src/memdir/paths.js"
+    );
+  });
+
   test("prompt context retrieves a larger archive slice for low-information continuations", async () => {
     const { store } = await createStore();
     const session = await store.createSession("archive budget");

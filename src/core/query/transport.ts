@@ -1,8 +1,50 @@
+import type {
+  ProviderEndpointKind,
+  ProviderProfile,
+  ProviderType,
+  TransportFormat,
+} from "./provider";
+
 export type ModelRefreshResult = {
   ok: boolean;
   message: string;
   models?: string[];
 };
+
+export {
+  MANUAL_PROVIDER_PROFILES,
+  PROVIDER_ALIASES,
+  PROVIDER_ENDPOINT_KINDS,
+  PROVIDER_PROFILES,
+  PROVIDER_TYPES,
+  TRANSPORT_FORMATS,
+  inferProviderFamilyFromBaseUrl,
+  inferProviderFamilyFromHost,
+  inferProviderType,
+  isManualProviderProfile,
+  isProviderEndpointKind,
+  isProviderProfile,
+  isProviderType,
+  isTransportFormat,
+  normalizeProviderBaseUrl,
+  parseProviderBaseUrl,
+  repairCommonSchemeTypos,
+  resolveProviderAlias,
+  resolveProviderFamily,
+  resolveProviderTypeFamily,
+  resolveProviderTypeFormat,
+  safeNormalizeProviderBaseUrl,
+  supportsImageAttachmentsForFormat,
+  trimProviderInput,
+  type ManualProviderProfile,
+  type ParsedProvider,
+  type ProviderAlias,
+  type ProviderEndpointKind,
+  type ProviderFamily,
+  type ProviderProfile,
+  type ProviderType,
+  type TransportFormat,
+} from "./provider";
 
 export type ModelSetResult = {
   ok: boolean;
@@ -53,67 +95,6 @@ export const normalizeQueryInput = (
   };
 };
 
-export type ProviderProfile = "openai" | "gemini" | "anthropic" | "custom";
-export type TransportFormat =
-  | "openai_chat"
-  | "openai_responses"
-  | "anthropic_messages"
-  | "gemini_generate_content";
-export type ProviderType =
-  | "openai-compatible"
-  | "openai-responses"
-  | "gemini"
-  | "anthropic";
-export const PROVIDER_TYPES = [
-  "openai-compatible",
-  "openai-responses",
-  "gemini",
-  "anthropic",
-] as const;
-export const isProviderType = (value: string): value is ProviderType =>
-  (PROVIDER_TYPES as readonly string[]).includes(value);
-export const resolveProviderTypeFamily = (
-  type: ProviderType
-): "openai" | "gemini" | "anthropic" =>
-  type === "gemini"
-    ? "gemini"
-    : type === "anthropic"
-      ? "anthropic"
-      : "openai";
-export const resolveProviderTypeFormat = (
-  type: ProviderType,
-  provider?: string
-): TransportFormat => {
-  if (type === "anthropic") {
-    return "anthropic_messages";
-  }
-  if (type === "gemini") {
-    return provider?.includes("/openai")
-      ? "openai_chat"
-      : "gemini_generate_content";
-  }
-  return type === "openai-responses"
-    ? "openai_responses"
-    : "openai_chat";
-};
-export const inferProviderType = (options: {
-  family: "openai" | "gemini" | "anthropic" | "glm";
-  format: TransportFormat;
-}): ProviderType | null => {
-  if (options.family === "anthropic") {
-    return "anthropic";
-  }
-  if (options.family === "gemini") {
-    return "gemini";
-  }
-  if (options.family === "glm") {
-    return null;
-  }
-  return options.format === "openai_responses"
-    ? "openai-responses"
-    : "openai-compatible";
-};
-
 export type ProviderProfileOverrideMap = Record<
   string,
   Exclude<ProviderProfile, "custom">
@@ -124,15 +105,6 @@ export type ProviderModelCatalogModeMap = Record<string, ProviderModelCatalogMod
 export type ProviderNameOverrideMap = Record<string, string>;
 export type ProviderTypeOverrideMap = Record<string, ProviderType>;
 export type ProviderFormatOverrideMap = Record<string, TransportFormat>;
-export const PROVIDER_ENDPOINT_KINDS = [
-  "responses",
-  "chat_completions",
-  "models",
-  "anthropic_messages",
-  "gemini_generate_content",
-] as const;
-export type ProviderEndpointKind =
-  (typeof PROVIDER_ENDPOINT_KINDS)[number];
 
 export type ProviderEndpointOverrideEntry = Partial<
   Record<ProviderEndpointKind, string>

@@ -842,7 +842,7 @@ func formatRequestElapsed(elapsedMs int64) string {
 
 func usesPagePanelLayout(panel Panel) bool {
 	switch panel {
-	case PanelSessions, PanelModels, PanelProviders, PanelAuth, PanelPlans:
+	case PanelSessions, PanelModels, PanelProviders, PanelSettings, PanelAuth, PanelPlans:
 		return true
 	default:
 		return false
@@ -851,7 +851,7 @@ func usesPagePanelLayout(panel Panel) bool {
 
 func (m *Model) shouldHideComposerForPanel() bool {
 	switch m.ActivePanel {
-	case PanelAuth, PanelProviders, PanelModels, PanelPlans:
+	case PanelAuth, PanelProviders, PanelModels, PanelSettings, PanelPlans:
 		return true
 	default:
 		return false
@@ -971,6 +971,8 @@ func panelAccentColor(panel Panel) lipgloss.Color {
 		return uiAccentYellowColor
 	case PanelProviders:
 		return uiAccentCyanColor
+	case PanelSettings:
+		return uiAccentBlueColor
 	case PanelModels:
 		return uiAccentPurpleColor
 	case PanelPlans:
@@ -3805,6 +3807,8 @@ func (m *Model) renderActivePanel(width, height int) string {
 		return m.renderModels(width, height)
 	case PanelProviders:
 		return m.renderProviders(width, height)
+	case PanelSettings:
+		return m.renderSettings(width, height)
 	case PanelAuth:
 		return m.renderAuthPanel(width, height)
 	default:
@@ -4738,6 +4742,76 @@ func (m *Model) renderProviders(width, height int) string {
 	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
 }
 
+func (m *Model) renderSettings(width, height int) string {
+	bodyWidth := framedInnerWidth(panelBoxStyle, width)
+	bodyHeight := framedInnerHeight(panelBoxStyle, height)
+	listWidth := maxInt(1, bodyWidth-2)
+	page := pageForSelection(len(settingsSpecs), m.SettingIndex, m.settingsPanelPageSizeForDimensions(width, height))
+	headerLines := []string{
+		renderPanelHeaderColumns(bodyWidth, "sel ↑/↓", "page ←/→", "edit ↵", "reload r", "esc"),
+	}
+	footerLines := []string{renderPanelSummaryColumns(bodyWidth, "settings", fmt.Sprintf("page %d/%d", page.CurrentPage, page.TotalPages), fmt.Sprintf("total %d", page.Total))}
+	bodyLines := []string{}
+	bodyLines = append(bodyLines, renderPanelTitleLine(bodyWidth, PanelSettings, "settings", "project config"))
+	hint := "Enter edits the selected setting; booleans toggle immediately. Changes are written to .cyrene/config.yaml."
+	bodyLines = append(bodyLines, renderPageHintLines(bodyWidth, hint)...)
+	bodyLines = append(bodyLines, renderPanelErrorBanner(bodyWidth, m.SettingError)...)
+	bodyLines = append(bodyLines, renderPanelSectionLabel("config"))
+
+	listLines := make([]string, 0, maxInt(1, (page.End-page.Start)*3))
+	for index := page.Start; index < page.End; index++ {
+		spec := settingsSpecs[index]
+		prefix := "  "
+		if index == m.SettingIndex {
+			prefix = "> "
+		}
+		value := emptyFallback(m.settingValue(spec), "(empty)")
+		if m.SettingEditing && index == m.SettingIndex {
+			value = string(m.SettingEditBuffer)
+		}
+		nameLine := fmt.Sprintf("%s%s", prefix, truncatePlain(spec.Label, bodyWidth-4))
+		valueLine := fmt.Sprintf("   %s = %s", spec.Key, truncatePlain(value, maxInt(8, bodyWidth-len(spec.Key)-8)))
+		descLine := fmt.Sprintf("   %s", spec.Description)
+		if index == m.SettingIndex {
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, nameLine, listWidth))
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, valueLine, listWidth))
+			listLines = append(listLines, renderFullWidthStyledLine(selectedPanelItemStyle, descLine, listWidth))
+			continue
+		}
+		listLines = append(listLines, nameLine)
+		listLines = append(listLines, dimStyle.Render(valueLine))
+		listLines = append(listLines, dimStyle.Render(descLine))
+	}
+	bodyLines = append(bodyLines, renderScrollableBlock(listLines, bodyWidth, panelScrollState{
+		Offset:  maxInt(0, page.CurrentPage-1),
+		Visible: 1,
+		Total:   maxInt(1, page.TotalPages),
+	})...)
+
+	selected := m.selectedSettingSpec()
+	bodyLines = append(bodyLines, "", renderPanelSectionLabel("detail"))
+	bodyLines = append(bodyLines, pageSelectedBannerStyle.Render(truncatePlain(fmt.Sprintf("selected %s", selected.Key), bodyWidth)))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("type", string(selected.Kind), bodyWidth))
+	bodyLines = append(bodyLines, renderApprovalMetaRow("value", emptyFallback(m.settingValue(selected), "(empty)"), bodyWidth))
+	if strings.TrimSpace(m.SettingsPath) != "" {
+		bodyLines = append(bodyLines, renderApprovalMetaRow("path", m.SettingsPath, bodyWidth))
+	}
+	if m.SettingEditing {
+		bodyLines = append(bodyLines, renderApprovalMetaRow("editing", "Enter saves | Esc cancels", bodyWidth))
+		for _, row := range m.settingEditorLines(bodyWidth) {
+			bodyLines = append(bodyLines, row)
+		}
+	} else if selected.Kind == settingsValueBool {
+		bodyLines = append(bodyLines, dimStyle.Render("Press Enter to toggle this boolean setting."))
+	} else {
+		bodyLines = append(bodyLines, dimStyle.Render("Press Enter to edit this value."))
+	}
+	if m.SettingSaving {
+		bodyLines = append(bodyLines, reviewStyle.Render("Saving setting..."))
+	}
+	return renderPanelBox(width, height, bodyWidth, bodyHeight, headerLines, bodyLines, footerLines)
+}
+
 func (m *Model) renderAuthPanel(width, height int) string {
 	bodyWidth := framedInnerWidth(panelBoxStyle, width)
 	bodyHeight := framedInnerHeight(panelBoxStyle, height)
@@ -4791,6 +4865,22 @@ func maskSecret(value string) string {
 		return ""
 	}
 	return strings.Repeat("*", len([]rune(value)))
+}
+
+func (m *Model) settingEditorLines(width int) []string {
+	current := string(m.SettingEditBuffer)
+	cursor := clampInt(m.SettingEditCursor, 0, len([]rune(current)))
+	runes := []rune(current)
+	plain := string(runes[:cursor]) + "|" + string(runes[cursor:])
+	wrapped := wrapPlainText(plain, maxInt(8, width))
+	if len(wrapped) == 0 {
+		return []string{cursorStyle.Render("|")}
+	}
+	lines := make([]string, 0, len(wrapped))
+	for _, row := range wrapped {
+		lines = append(lines, strings.Replace(row, "|", cursorStyle.Render("|"), 1))
+	}
+	return lines
 }
 
 func (m *Model) authEditorLines(width int) []string {

@@ -165,6 +165,9 @@ func TestSlashHelpSetsNotice(t *testing.T) {
 	if !strings.Contains(helpText, "/model custom <id>") {
 		t.Fatalf("expected custom model command in help text, got %q", helpText)
 	}
+	if !strings.Contains(helpText, "/settings") {
+		t.Fatalf("expected settings command in help text, got %q", helpText)
+	}
 }
 
 func TestWheelDownReturnsToLiveTail(t *testing.T) {
@@ -875,6 +878,54 @@ func TestTallModelsPanelUsesDynamicPageSize(t *testing.T) {
 	}
 }
 
+func TestSettingsPanelRendersAndEditsValues(t *testing.T) {
+	model := app.NewModel()
+	model.Width = 150
+	model.Height = 38
+	model.ActivePanel = app.PanelSettings
+	if err := model.ApplyBridgeEventJSONForTest(`{
+		"type":"set_settings",
+		"path":"/workspace/.cyrene/config.yaml",
+		"config":{
+			"pinMaxCount":6,
+			"queryMaxToolSteps":64,
+			"autoSummaryRefresh":true,
+			"requestTemperature":0.2,
+			"debugCaptureAnthropicRequests":false,
+			"debugCaptureAnthropicRequestsDir":".cyrene/debug/anthropic-requests"
+		}
+	}`); err != nil {
+		t.Fatalf("set_settings failed: %v", err)
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "query_max_tool_steps = 64") {
+		t.Fatalf("expected settings panel to show max tool steps, got %q", view)
+	}
+	if !strings.Contains(view, "/workspace/.cyrene/config.yaml") {
+		t.Fatalf("expected settings panel to show config path, got %q", view)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !model.SettingEditing {
+		t.Fatalf("expected Enter on numeric setting to start inline editing")
+	}
+	if got := string(model.SettingEditBuffer); got != "64" {
+		t.Fatalf("expected edit buffer to contain current value, got %q", got)
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if model.SettingEditing {
+		t.Fatalf("expected Enter on boolean setting to toggle, not enter edit mode")
+	}
+	if !model.SettingSaving {
+		t.Fatalf("expected boolean toggle to enter saving state")
+	}
+}
+
 func TestModelsPanelSelectedEntryUsesInverseHighlight(t *testing.T) {
 	enableColorRenderingForTest(t)
 
@@ -1440,7 +1491,7 @@ func TestComposerTypedTextStartsOnFirstInputRow(t *testing.T) {
 }
 
 func TestPagePanelsHideComposer(t *testing.T) {
-	for _, panel := range []app.Panel{app.PanelAuth, app.PanelProviders, app.PanelModels, app.PanelPlans} {
+	for _, panel := range []app.Panel{app.PanelAuth, app.PanelProviders, app.PanelModels, app.PanelSettings, app.PanelPlans} {
 		model := app.NewModel()
 		model.Width = 140
 		model.Height = 32
@@ -2919,7 +2970,7 @@ func TestViewClampsMixedTranscriptLayoutToTerminalBounds(t *testing.T) {
 			"```js",
 			"DEFAULT_CONFIG = {",
 			"  pinMaxCount: 6,",
-			"  queryMaxToolSteps: 19200,",
+			"  queryMaxToolSteps: 64,",
 			"  autoSummaryRefresh: true,",
 			"  requestTemperature: 0.2,",
 			"  debugCaptureAnthropicRequests: false,",

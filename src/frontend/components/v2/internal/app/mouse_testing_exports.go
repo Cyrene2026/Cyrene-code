@@ -135,6 +135,8 @@ func (m *Model) activePanelScrollbarRegionForTest() mouseRegion {
 		return mouseRegionModelListScrollbar
 	case PanelProviders:
 		return mouseRegionProviderListScrollbar
+	case PanelSettings:
+		return mouseRegionSettingsListScrollbar
 	default:
 		return mouseRegionNone
 	}
@@ -173,6 +175,12 @@ func (m *Model) panelItemLineForTest(panelRect mouseRect, index, rowOffset int) 
 			return 0, false
 		}
 		return 2 + providerPanelLeadRows(bodyWidth) + ((index - page.Start) * 3) + clampInt(rowOffset, 0, 2), true
+	case PanelSettings:
+		page := pageForSelection(len(settingsSpecs), m.SettingIndex, m.settingsPanelPageSizeForDimensions(panelRect.Width, panelRect.Height))
+		if index < page.Start || index >= page.End {
+			return 0, false
+		}
+		return 2 + settingsPanelLeadRows(bodyWidth) + ((index - page.Start) * 3) + clampInt(rowOffset, 0, 2), true
 	default:
 		return 0, false
 	}

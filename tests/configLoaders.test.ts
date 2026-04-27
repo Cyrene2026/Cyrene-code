@@ -15,6 +15,7 @@ import {
 import {
   ensureProjectCyreneConfig,
   loadCyreneConfig,
+  saveProjectCyreneConfig,
 } from "../src/infra/config/loadCyreneConfig";
 import { loadPromptPolicy } from "../src/infra/config/loadPromptPolicy";
 import { DEFAULT_QUERY_MAX_TOOL_STEPS } from "../src/shared/runtimeDefaults";
@@ -106,7 +107,7 @@ describe("config loaders", () => {
     expect(config.systemPrompt).toBe("project prompt");
   });
 
-  test("loadCyreneConfig falls back to raised default tool budget when config is missing", async () => {
+  test("loadCyreneConfig falls back to safe default tool budget when config is missing", async () => {
     const root = await mkdtemp(join(tmpdir(), "cyrene-config-default-"));
     tempRoots.push(root);
 
@@ -117,6 +118,14 @@ describe("config loaders", () => {
     expect(config.requestTemperature).toBe(0.2);
     expect(config.debugCaptureAnthropicRequests).toBe(false);
     expect(config.debugCaptureAnthropicRequestsDir).toBeUndefined();
+  });
+
+  test("loadCyreneConfig migrates the old runaway tool budget default", async () => {
+    const root = await createWorkspace("query_max_tool_steps: 19200");
+
+    const config = await loadCyreneConfig(root);
+
+    expect(config.queryMaxToolSteps).toBe(DEFAULT_QUERY_MAX_TOOL_STEPS);
   });
 
   test("loadPromptPolicy default system prompt enables autonomous execution plans", async () => {
@@ -169,6 +178,36 @@ describe("config loaders", () => {
     expect(configText).toContain("request_temperature:");
     expect(configText).toContain("debug_capture_anthropic_requests:");
     expect(configText).toContain("debug_capture_anthropic_requests_dir:");
+  });
+
+  test("saveProjectCyreneConfig updates project config.yaml and preserves unrelated lines", async () => {
+    const root = await createWorkspace([
+      "# custom project config",
+      "query_max_tool_steps: 31",
+      "request_temperature: 0.15",
+      "workspace_root: .",
+      "",
+    ].join("\n"));
+
+    const saved = await saveProjectCyreneConfig(
+      {
+        queryMaxToolSteps: 64,
+        requestTemperature: 0.4,
+        debugCaptureAnthropicRequests: true,
+      },
+      root
+    );
+    const content = await readFile(saved.path, "utf8");
+    const config = await loadCyreneConfig(root);
+
+    expect(content).toContain("# custom project config");
+    expect(content).toContain("workspace_root: .");
+    expect(content).toContain("query_max_tool_steps: 64");
+    expect(content).toContain("request_temperature: 0.4");
+    expect(content).toContain("debug_capture_anthropic_requests: true");
+    expect(config.queryMaxToolSteps).toBe(64);
+    expect(config.requestTemperature).toBe(0.4);
+    expect(config.debugCaptureAnthropicRequests).toBe(true);
   });
 
   test("loadFilesystemRuleConfig falls back to config.yaml for MCP review settings", async () => {

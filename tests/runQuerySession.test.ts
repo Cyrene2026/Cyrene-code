@@ -649,6 +649,49 @@ describe("runQuerySession", () => {
     expect(completionReasons).toContain("tool_budget_exhausted");
   });
 
+  test("stops repeated invalid tool input after one correction", async () => {
+    const transport = createRoundSequenceTransport([
+      {
+        toolName: "file",
+        input: { action: "search_text", path: "src" },
+      },
+      {
+        toolName: "file",
+        input: { path: "src", action: "search_text" },
+      },
+      null,
+    ]);
+    const textDeltas: string[] = [];
+    const completionReasons: Array<string | null> = [];
+    let toolCallCount = 0;
+
+    const result = await runQuerySession({
+      query: "session prompt",
+      originalTask: "inspect reducer implementation",
+      queryMaxToolSteps: 10,
+      transport,
+      onState: state => {
+        completionReasons.push(state.completion?.reason ?? null);
+      },
+      onTextDelta: text => {
+        textDeltas.push(text);
+      },
+      onToolCall: async () => {
+        toolCallCount += 1;
+        return {
+          message:
+            "Invalid tool input for search_text: search_text is missing a text query. Omit `path` to search the whole workspace, or provide `path` only to narrow the scope.",
+        };
+      },
+      onError: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    expect(toolCallCount).toBe(2);
+    expect(textDeltas.join("")).toContain("[tool loop stopped]");
+    expect(completionReasons).toContain("invalid_tool_input_loop");
+  });
+
   test("preserves tool budget across suspend and resume", async () => {
     const transport = createToolBudgetTransport([1, 4, 1, 0]);
     const textDeltas: string[] = [];
@@ -2841,6 +2884,12 @@ test("replays image attachments on follow-up rounds", async () => {
           toolName: "file",
           input: { action: "read_file", path: "README.md" },
         });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 1300,
+          completionTokens: 4,
+          totalTokens: 1304,
+        });
         yield JSON.stringify({ type: "done" });
         return;
       }
@@ -2901,6 +2950,12 @@ test("waits briefly between tool rounds for DeepSeek providers to let prompt cac
           toolName: "file",
           input: { action: "read_file", path: "README.md" },
         });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 1300,
+          completionTokens: 4,
+          totalTokens: 1304,
+        });
         yield JSON.stringify({ type: "done" });
         return;
       }
@@ -2955,6 +3010,13 @@ test("waits between tool rounds when an OpenAI provider is using a DeepSeek mode
           toolName: "file",
           input: { action: "read_file", path: "README.md" },
         });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 1300,
+          cacheCreationInputTokens: 1100,
+          completionTokens: 4,
+          totalTokens: 1304,
+        });
         yield JSON.stringify({ type: "done" });
         return;
       }
@@ -2979,6 +3041,66 @@ test("waits between tool rounds when an OpenAI provider is using a DeepSeek mode
   expect(requestTimes).toHaveLength(2);
   const deepSeekModelRoundGapMs = requestTimes[1]! - requestTimes[0]!;
   expect(deepSeekModelRoundGapMs).toBeGreaterThanOrEqual(25);
+});
+
+test("does not wait for DeepSeek cache settle on short uncached prompts", async () => {
+  const requestTimes: number[] = [];
+  let streamCount = 0;
+  const transport: QueryTransport = {
+    getModel: () => "deepseek-chat",
+    getProvider: () => "https://api.deepseek.com",
+    listProviders: async () => ["https://api.deepseek.com"],
+    setProvider: async provider => ({
+      ok: true,
+      message: `provider ${provider}`,
+      currentProvider: provider,
+      providers: [provider],
+      models: ["deepseek-chat"],
+    }),
+    setModel: async model => ({ ok: true, message: `set ${model}` }),
+    listModels: async () => ["deepseek-chat"],
+    refreshModels: async () => ({ ok: true, message: "ok", models: ["deepseek-chat"] }),
+    requestStreamUrl: async () => {
+      requestTimes.push(Date.now());
+      return `stream://${++streamCount}`;
+    },
+    stream: async function* (streamUrl: string) {
+      if (streamUrl === "stream://1") {
+        yield JSON.stringify({
+          type: "tool_call",
+          toolName: "file",
+          input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 40,
+          completionTokens: 4,
+          totalTokens: 44,
+        });
+        yield JSON.stringify({ type: "done" });
+        return;
+      }
+      yield JSON.stringify({ type: "text_delta", text: "done" });
+      yield JSON.stringify({ type: "done" });
+    },
+  };
+
+  const result = await runQuerySession({
+    query: "inspect repo",
+    transport,
+    env: {
+      CYRENE_DEEPSEEK_CACHE_SETTLE_MS: "30",
+    },
+    onState: () => {},
+    onTextDelta: () => {},
+    onToolCall: async () => ({ message: "ok" }),
+    onError: () => {},
+  });
+
+  expect(result.status).toBe("completed");
+  expect(requestTimes).toHaveLength(2);
+  const roundGapMs = requestTimes[1]! - requestTimes[0]!;
+  expect(roundGapMs).toBeLessThan(25);
 });
 
 test("cancels during DeepSeek cache settle delay before creating the next round", async () => {
@@ -3012,6 +3134,13 @@ test("cancels during DeepSeek cache settle delay before creating the next round"
         type: "tool_call",
         toolName: "file",
         input: { action: "read_file", path: "README.md" },
+      });
+      yield JSON.stringify({
+        type: "usage",
+        promptTokens: 1300,
+        cacheCreationInputTokens: 1100,
+        completionTokens: 4,
+        totalTokens: 1304,
       });
       yield JSON.stringify({ type: "done" });
     },
@@ -3072,6 +3201,13 @@ test("waits briefly between tool rounds for native Anthropic providers to let pr
           type: "tool_call",
           toolName: "file",
           input: { action: "read_file", path: "README.md" },
+        });
+        yield JSON.stringify({
+          type: "usage",
+          promptTokens: 1300,
+          cacheCreationInputTokens: 1100,
+          completionTokens: 4,
+          totalTokens: 1304,
         });
         yield JSON.stringify({ type: "done" });
         return;

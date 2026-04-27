@@ -3,8 +3,12 @@ import * as readline from "node:readline";
 import { setConfiguredAppRoot } from "../../../infra/config/appRoot";
 import {
   ensureProjectCyreneConfig,
+  getProjectCyreneConfigPath,
   loadCyreneConfig,
+  projectConfigFieldForKey,
+  saveProjectCyreneConfig,
   type CyreneConfig,
+  type CyreneConfigUpdate,
 } from "../../../infra/config/loadCyreneConfig";
 import { loadPromptPolicy, type PromptPolicy } from "../../../infra/config/loadPromptPolicy";
 import { createAuthRuntime, type AuthRuntime } from "../../../infra/auth/authRuntime";
@@ -38,7 +42,12 @@ import {
   type RunQuerySessionResumeInput,
 } from "../../../core/query/runQuerySession";
 import {
-  PROVIDER_ENDPOINT_KINDS,
+  isProviderEndpointKind,
+  isProviderProfile,
+  isProviderType,
+  isTransportFormat,
+  normalizeProviderBaseUrl,
+  supportsImageAttachmentsForFormat,
   type ProviderEndpointKind,
   type ProviderEndpointOverrideMap,
   type ProviderProfile,
@@ -49,7 +58,6 @@ import {
   type QueryTransport,
   type TransportFormat,
 } from "../../../core/query/transport";
-import { normalizeProviderBaseUrl } from "../../../infra/http/createHttpQueryTransport";
 import {
   applyLocalFallbackStateUpdate,
   applyParsedStateUpdate,
@@ -97,6 +105,8 @@ type BridgeCommand =
   | { type: "reject_all" }
   | { type: "list_models" }
   | { type: "list_providers" }
+  | { type: "get_settings" }
+  | { type: "set_setting"; key: string; value: string | number | boolean }
   | { type: "set_model"; value: string }
   | { type: "set_provider"; value: string }
   | { type: "refresh_models" }
@@ -193,6 +203,15 @@ type BridgeUsageSummary = {
   totalTokens: number;
 };
 
+type BridgeConfig = {
+  pinMaxCount: number;
+  queryMaxToolSteps: number;
+  autoSummaryRefresh: boolean;
+  requestTemperature: number;
+  debugCaptureAnthropicRequests: boolean;
+  debugCaptureAnthropicRequestsDir: string;
+};
+
 type BridgeManagedSkill = {
   id: string;
   label: string;
@@ -241,6 +260,8 @@ type BridgeSnapshot = {
   managedMcpServers: BridgeManagedMcpServer[];
   usageSummary: BridgeUsageSummary;
   auth: BridgeAuthStatus;
+  config: BridgeConfig;
+  configPath: string;
 };
 
 type BridgeEvent =
@@ -272,6 +293,7 @@ type BridgeEvent =
       appRoot: string;
     }
   | { type: "set_usage_summary"; usageSummary: BridgeUsageSummary }
+  | { type: "set_settings"; config: BridgeConfig; path: string }
   | {
       type: "set_auth_defaults";
       providerBaseUrl: string;
@@ -328,6 +350,16 @@ const EMPTY_USAGE_SUMMARY: BridgeUsageSummary = {
   totalTokens: 0,
 };
 
+const toBridgeConfig = (config: CyreneConfig | null): BridgeConfig => ({
+  pinMaxCount: config?.pinMaxCount ?? 0,
+  queryMaxToolSteps: config?.queryMaxToolSteps ?? 0,
+  autoSummaryRefresh: config?.autoSummaryRefresh ?? true,
+  requestTemperature: config?.requestTemperature ?? 0.2,
+  debugCaptureAnthropicRequests: config?.debugCaptureAnthropicRequests ?? false,
+  debugCaptureAnthropicRequestsDir:
+    config?.debugCaptureAnthropicRequestsDir ?? "",
+});
+
 const PERSISTED_SESSION_ITEM_KINDS = new Set<SessionMessageKind>([
   "transcript",
   "tool_status",
@@ -340,14 +372,6 @@ const cloneAttachments = (attachments: QueryAttachment[] | null | undefined) =>
   Array.isArray(attachments)
     ? attachments.map(attachment => ({ ...attachment }))
     : [];
-
-const supportsImageAttachmentsForFormat = (format: BridgeTransportFormat | "") =>
-  format === "openai_responses" ||
-  format === "anthropic_messages" ||
-  format === "gemini_generate_content";
-
-const isProviderEndpointKind = (value: string): value is ProviderEndpointKind =>
-  (PROVIDER_ENDPOINT_KINDS as readonly string[]).includes(value);
 
 const isHighRiskReviewAction = (action: string) =>
   action === "apply_patch" ||
@@ -766,6 +790,12 @@ export class BubbleTeaBridge {
         this.markRuntimeMetadataDirty();
         await this.refreshRuntimeMetadata();
         return;
+      case "get_settings":
+        await this.emitSettings();
+        return;
+      case "set_setting":
+        await this.setSetting(command.key, command.value);
+        return;
       case "set_model":
         await this.setModel(command.value);
         return;
@@ -1130,6 +1160,8 @@ export class BubbleTeaBridge {
       managedMcpServers: this.managedMcpServers,
       usageSummary: this.currentUsageSummary(),
       auth: toBridgeAuthStatus(this.authStatus),
+      config: toBridgeConfig(this.config),
+      configPath: getProjectCyreneConfigPath(this.appRoot),
     };
   }
 
@@ -1257,6 +1289,15 @@ export class BubbleTeaBridge {
     this.emit({
       type: "set_usage_summary",
       usageSummary: this.currentUsageSummary(),
+    });
+  }
+
+  private async emitSettings() {
+    await this.ensureRuntime();
+    this.emit({
+      type: "set_settings",
+      config: toBridgeConfig(this.config),
+      path: getProjectCyreneConfigPath(this.appRoot),
     });
   }
 
@@ -2940,7 +2981,10 @@ export class BubbleTeaBridge {
         this.emitError("Image attachments cannot be sent with slash commands.");
         return;
       }
-      if (!supportsImageAttachmentsForFormat(this.currentProviderFormat)) {
+      if (
+        !this.currentProviderFormat ||
+        !supportsImageAttachmentsForFormat(this.currentProviderFormat)
+      ) {
         const formatLabel = this.currentProviderFormat || "current provider format";
         this.emitError(
           `Image attachments are not supported by ${formatLabel}. Switch to a Responses, Anthropic Messages, or Gemini model first.`
@@ -3748,6 +3792,132 @@ export class BubbleTeaBridge {
     }
   }
 
+  private parseSettingUpdate(
+    key: string,
+    rawValue: string | number | boolean
+  ): CyreneConfigUpdate {
+    const field = projectConfigFieldForKey(key);
+    if (!field) {
+      throw new Error(`Unknown setting: ${key}`);
+    }
+
+    const valueText =
+      typeof rawValue === "string" ? rawValue.trim() : String(rawValue);
+    switch (field) {
+      case "pinMaxCount": {
+        const value = Number(valueText);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new Error("pin_max_count must be a positive number.");
+        }
+        return { pinMaxCount: Math.floor(value) };
+      }
+      case "queryMaxToolSteps": {
+        const value = Number(valueText);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new Error("query_max_tool_steps must be a positive number.");
+        }
+        return { queryMaxToolSteps: Math.floor(value) };
+      }
+      case "requestTemperature": {
+        const value = Number(valueText);
+        if (!Number.isFinite(value) || value < 0 || value > 2) {
+          throw new Error("request_temperature must be between 0 and 2.");
+        }
+        return { requestTemperature: value };
+      }
+      case "autoSummaryRefresh": {
+        if (typeof rawValue === "boolean") {
+          return { autoSummaryRefresh: rawValue };
+        }
+        if (/^(true|false)$/i.test(valueText)) {
+          return { autoSummaryRefresh: valueText.toLowerCase() === "true" };
+        }
+        throw new Error("auto_summary_refresh must be true or false.");
+      }
+      case "debugCaptureAnthropicRequests": {
+        if (typeof rawValue === "boolean") {
+          return { debugCaptureAnthropicRequests: rawValue };
+        }
+        if (/^(true|false)$/i.test(valueText)) {
+          return {
+            debugCaptureAnthropicRequests: valueText.toLowerCase() === "true",
+          };
+        }
+        throw new Error("debug_capture_anthropic_requests must be true or false.");
+      }
+      case "debugCaptureAnthropicRequestsDir":
+        return { debugCaptureAnthropicRequestsDir: valueText };
+      case "systemPrompt":
+        return { systemPrompt: valueText };
+      default:
+        throw new Error(`Unsupported setting: ${key}`);
+    }
+  }
+
+  private async rebuildRuntimeAfterConfigUpdate() {
+    const previousDefaultSystemPrompt = this.defaultSystemPrompt;
+    const previousRuntimeSystemPrompt = this.runtimeSystemPrompt;
+    const currentProvider = this.transport?.getProvider();
+    const currentModel = this.transport?.getModel();
+    this.promptPolicy = await loadPromptPolicy(this.config!, this.appRoot, {
+      env: process.env,
+    });
+    this.defaultSystemPrompt = this.promptPolicy.systemPrompt;
+    this.runtimeSystemPrompt =
+      previousRuntimeSystemPrompt &&
+      previousRuntimeSystemPrompt !== previousDefaultSystemPrompt
+        ? previousRuntimeSystemPrompt
+        : this.promptPolicy.systemPrompt;
+    this.authRuntime = createAuthRuntime({
+      appRoot: this.appRoot,
+      requestTemperature: this.config!.requestTemperature,
+      debugAnthropicRequestsCapture: this.config!.debugCaptureAnthropicRequests,
+      debugAnthropicRequestsDir: this.config!.debugCaptureAnthropicRequestsDir,
+    });
+    await this.authRuntime.syncSelection({
+      providerBaseUrl:
+        currentProvider && currentProvider !== "none" && currentProvider !== "local-core"
+          ? currentProvider
+          : undefined,
+      model: currentModel,
+    });
+    this.transport = await this.rebuildTransportForCurrentMcpTools();
+    this.markRuntimeMetadataDirty();
+    await this.refreshRuntimeMetadata(true);
+  }
+
+  private async setSetting(
+    key: string,
+    rawValue: string | number | boolean
+  ) {
+    await this.ensureRuntime();
+    let update: CyreneConfigUpdate;
+    try {
+      update = this.parseSettingUpdate(key, rawValue);
+    } catch (error) {
+      this.status = "error";
+      await this.pushRuntimeResult(
+        error instanceof Error ? error.message : String(error),
+        false
+      );
+      await this.emitSettings();
+      return;
+    }
+
+    const saved = await saveProjectCyreneConfig(update, this.appRoot, {
+      cwd: this.appRoot,
+      env: process.env,
+    });
+    this.config = saved.config;
+    await this.rebuildRuntimeAfterConfigUpdate();
+    await this.emitSettings();
+    this.status = "idle";
+    await this.pushRuntimeResult(
+      `Saved setting ${key.trim()} in ${saved.path}.`,
+      true
+    );
+  }
+
   private async setModel(nextModel: string) {
     await this.ensureRuntime();
     const model = nextModel.trim();
@@ -3946,12 +4116,7 @@ export class BubbleTeaBridge {
   private async setProviderProfile(rawProfile: string, targetProviderRaw?: string) {
     await this.ensureRuntime();
     const profile = rawProfile.trim().toLowerCase() as ProviderProfile;
-    if (
-      profile !== "openai" &&
-      profile !== "gemini" &&
-      profile !== "anthropic" &&
-      profile !== "custom"
-    ) {
+    if (!isProviderProfile(profile)) {
       this.emitError("Profile must be openai, gemini, anthropic, or custom.");
       return;
     }
@@ -3987,12 +4152,7 @@ export class BubbleTeaBridge {
   private async setProviderType(rawType: string, targetProviderRaw?: string) {
     await this.ensureRuntime();
     const providerType = rawType.trim().toLowerCase() as ProviderType;
-    if (
-      providerType !== "openai-compatible" &&
-      providerType !== "openai-responses" &&
-      providerType !== "gemini" &&
-      providerType !== "anthropic"
-    ) {
+    if (!isProviderType(providerType)) {
       this.emitError(
         "Provider type must be openai-compatible, openai-responses, gemini, or anthropic."
       );
@@ -4053,12 +4213,7 @@ export class BubbleTeaBridge {
   private async setProviderFormat(rawFormat: string, targetProviderRaw?: string) {
     await this.ensureRuntime();
     const format = rawFormat.trim().toLowerCase() as TransportFormat;
-    if (
-      format !== "openai_chat" &&
-      format !== "openai_responses" &&
-      format !== "anthropic_messages" &&
-      format !== "gemini_generate_content"
-    ) {
+    if (!isTransportFormat(format)) {
       this.emitError(
         "Format must be openai_chat, openai_responses, anthropic_messages, or gemini_generate_content."
       );

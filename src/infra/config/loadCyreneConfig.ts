@@ -20,6 +20,8 @@ export type CyreneConfig = {
   debugCaptureAnthropicRequestsDir?: string;
 };
 
+export type CyreneConfigUpdate = Partial<CyreneConfig>;
+
 type CyreneConfigLoadContext = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -32,6 +34,8 @@ export const DEFAULT_CYRENE_CONFIG: CyreneConfig = {
   requestTemperature: 0.2,
   debugCaptureAnthropicRequests: false,
 };
+
+const LEGACY_RUNAWAY_QUERY_MAX_TOOL_STEPS = 19200;
 
 export const DEFAULT_PROJECT_CYRENE_CONFIG_YAML = [
   "# Project-local Cyrene config",
@@ -67,6 +71,38 @@ const readOptionalFile = async (path: string) => {
   }
 };
 
+const PROJECT_CONFIG_KEYS = {
+  pinMaxCount: "pin_max_count",
+  queryMaxToolSteps: "query_max_tool_steps",
+  autoSummaryRefresh: "auto_summary_refresh",
+  requestTemperature: "request_temperature",
+  systemPrompt: "system_prompt",
+  debugCaptureAnthropicRequests: "debug_capture_anthropic_requests",
+  debugCaptureAnthropicRequestsDir: "debug_capture_anthropic_requests_dir",
+} satisfies Record<keyof CyreneConfig, string>;
+
+const PROJECT_CONFIG_KEY_TO_FIELD = Object.fromEntries(
+  Object.entries(PROJECT_CONFIG_KEYS).map(([field, key]) => [key, field])
+) as Record<string, keyof CyreneConfig>;
+
+export const getProjectCyreneConfigPath = (
+  appRoot?: string,
+  context?: CyreneConfigLoadContext
+) => {
+  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
+  return join(getLegacyProjectCyreneDir(resolvedAppRoot), "config.yaml");
+};
+
+const serializeConfigValue = (value: string | number | boolean | undefined) => {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "0";
+  }
+  if (typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value ?? "");
+};
+
 const parseCyreneConfigContent = (content: string): Partial<CyreneConfig> => {
   if (!content.trim()) {
     return {};
@@ -99,7 +135,11 @@ const parseCyreneConfigContent = (content: string): Partial<CyreneConfig> => {
     typeof queryMaxToolStepsRaw === "number" &&
     queryMaxToolStepsRaw > 0
   ) {
-    parsed.queryMaxToolSteps = Math.floor(queryMaxToolStepsRaw);
+    const normalized = Math.floor(queryMaxToolStepsRaw);
+    parsed.queryMaxToolSteps =
+      normalized === LEGACY_RUNAWAY_QUERY_MAX_TOOL_STEPS
+        ? DEFAULT_QUERY_MAX_TOOL_STEPS
+        : normalized;
   }
 
   const autoSummaryRefreshRaw = map.get("auto_summary_refresh");
@@ -145,11 +185,7 @@ export const ensureProjectCyreneConfig = async (
   appRoot?: string,
   context?: CyreneConfigLoadContext
 ) => {
-  const resolvedAppRoot = appRoot ?? resolveAmbientAppRoot(context);
-  const configPath = join(
-    getLegacyProjectCyreneDir(resolvedAppRoot),
-    "config.yaml"
-  );
+  const configPath = getProjectCyreneConfigPath(appRoot, context);
 
   try {
     await access(configPath);
@@ -166,6 +202,64 @@ export const ensureProjectCyreneConfig = async (
     };
   }
 };
+
+export const saveProjectCyreneConfig = async (
+  update: CyreneConfigUpdate,
+  appRoot?: string,
+  context?: CyreneConfigLoadContext
+) => {
+  const ensured = await ensureProjectCyreneConfig(appRoot, context);
+  const content = await readOptionalFile(ensured.path);
+  const lines = content.split(/\r?\n/);
+  const pending = new Map<string, string | number | boolean | undefined>();
+
+  for (const [field, key] of Object.entries(PROJECT_CONFIG_KEYS) as Array<
+    [keyof CyreneConfig, string]
+  >) {
+    if (Object.prototype.hasOwnProperty.call(update, field)) {
+      pending.set(key, update[field]);
+    }
+  }
+
+  const nextLines = lines.map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      return line;
+    }
+    const index = line.indexOf(":");
+    if (index <= 0) {
+      return line;
+    }
+    const key = line.slice(0, index).trim();
+    if (!pending.has(key)) {
+      return line;
+    }
+    const value = pending.get(key);
+    pending.delete(key);
+    return `${key}: ${serializeConfigValue(value)}`;
+  });
+
+  if (nextLines.length > 0 && nextLines[nextLines.length - 1] !== "") {
+    nextLines.push("");
+  }
+  for (const [key, value] of pending) {
+    nextLines.push(`${key}: ${serializeConfigValue(value)}`);
+  }
+  if (nextLines[nextLines.length - 1] !== "") {
+    nextLines.push("");
+  }
+
+  await mkdir(dirname(ensured.path), { recursive: true });
+  await writeFile(ensured.path, nextLines.join("\n"), "utf8");
+
+  return {
+    path: ensured.path,
+    config: await loadCyreneConfig(appRoot, context),
+  };
+};
+
+export const projectConfigFieldForKey = (key: string) =>
+  PROJECT_CONFIG_KEY_TO_FIELD[key.trim()] ?? null;
 
 export const loadCyreneConfig = async (
   appRoot?: string,

@@ -144,6 +144,10 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { command: "/tag list", description: "list tags of current session" },
   { command: "/tag add <tag>", description: "add tag to current session" },
   { command: "/tag remove <tag>", description: "remove tag from current session" },
+  {
+    command: "/checkpoint [note]",
+    description: "pin a durable handoff checkpoint from current state",
+  },
   { command: "/pin <note>", description: "pin important context" },
   { command: "/pins", description: "list pinned context" },
   { command: "/unpin <index>", description: "remove a pin" },
@@ -339,6 +343,7 @@ const getCommandGroup = (command: string) => {
   if (
     command.startsWith("/search-session") ||
     command.startsWith("/tag") ||
+    command.startsWith("/checkpoint") ||
     command.startsWith("/pin") ||
     command.startsWith("/pins") ||
     command.startsWith("/unpin")
@@ -401,6 +406,8 @@ const getSlashInsertValue = (command: string) => {
       return "/tag add ";
     case "/tag remove <tag>":
       return "/tag remove ";
+    case "/checkpoint [note]":
+      return "/checkpoint ";
     case "/pin <note>":
       return "/pin ";
     case "/unpin <index>":

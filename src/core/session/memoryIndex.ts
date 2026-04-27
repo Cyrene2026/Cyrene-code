@@ -996,12 +996,28 @@ const archiveItemMatchesSection = (
 ) => {
   const text = stripMemorySegmentPrefix(item.replace(/^\[[^\]]+\]\s*/, ""));
   switch (section) {
+    case "ASSUMPTIONS":
+      return /(?:可能|疑似|推测|待确认|待验证|uncertain|unverified|suspect|likely|maybe)/iu.test(
+        text
+      );
+    case "DECISIONS":
+      return /(?:决定|选择|采用|接受|拒绝|约定|decision|decided|chose|accepted|rejected|approach)/iu.test(
+        text
+      );
+    case "ENTITY STATE":
+      return /(?:`[^`]+`|[A-Za-z0-9_./-]+\.[A-Za-z0-9]+|模块|函数|组件|接口|配置)/iu.test(
+        text
+      );
     case "RECENT FAILURES":
       return (
         HARD_FAILURE_SIGNAL.test(text) &&
         FAILURE_EVIDENCE_SIGNAL.test(text) &&
         !PATH_ABSENCE_MEMORY_SIGNAL.test(text) &&
         !EXPLANATORY_FAILURE_NARRATION_SIGNAL.test(text)
+      );
+    case "STALE OR CONFLICTING":
+      return /(?:过期|陈旧|冲突|矛盾|不再成立|已废弃|stale|outdated|conflict|contradict|superseded)/iu.test(
+        text
       );
     case "NEXT BEST ACTIONS":
       return (
@@ -1097,6 +1113,27 @@ const scoreEntryForArchiveSection = (
         score -= 25;
       }
       break;
+    case "ASSUMPTIONS":
+      if (archiveItemMatchesSection(section, entry.text)) {
+        score += 95;
+      } else if (entry.kind === "fact") {
+        score += 20;
+      }
+      break;
+    case "DECISIONS":
+      if (entry.kind === "approval" || archiveItemMatchesSection(section, entry.text)) {
+        score += 105;
+      } else {
+        score -= 10;
+      }
+      break;
+    case "ENTITY STATE":
+      if ((entry.entities.path?.length ?? 0) > 0 || archiveItemMatchesSection(section, entry.text)) {
+        score += 105;
+      } else {
+        score -= 20;
+      }
+      break;
     case "COMPLETED":
       if (isCompletedLikeEntry(entry)) {
         score += 110;
@@ -1127,6 +1164,13 @@ const scoreEntryForArchiveSection = (
         score += 120;
       } else {
         score -= 30;
+      }
+      break;
+    case "STALE OR CONFLICTING":
+      if (archiveItemMatchesSection(section, entry.text) || isFailureLikeEntry(entry)) {
+        score += 100;
+      } else {
+        score -= 25;
       }
       break;
     case "NEXT BEST ACTIONS":

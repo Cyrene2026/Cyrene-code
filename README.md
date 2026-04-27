@@ -260,11 +260,15 @@ is intentionally structured into sections such as:
 
 - `OBJECTIVE`
 - `CONFIRMED FACTS`
+- `ASSUMPTIONS`
 - `CONSTRAINTS`
+- `DECISIONS`
+- `ENTITY STATE`
 - `COMPLETED`
 - `REMAINING`
 - `KNOWN PATHS`
 - `RECENT FAILURES`
+- `STALE OR CONFLICTING`
 - `NEXT BEST ACTIONS`
 
 ### High-level memory layout

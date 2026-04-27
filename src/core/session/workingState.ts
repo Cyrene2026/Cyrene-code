@@ -1,11 +1,15 @@
 export const WORKING_STATE_SECTION_ORDER = [
   "OBJECTIVE",
   "CONFIRMED FACTS",
+  "ASSUMPTIONS",
   "CONSTRAINTS",
+  "DECISIONS",
+  "ENTITY STATE",
   "COMPLETED",
   "REMAINING",
   "KNOWN PATHS",
   "RECENT FAILURES",
+  "STALE OR CONFLICTING",
   "NEXT BEST ACTIONS",
 ] as const;
 
@@ -267,11 +271,15 @@ const renderSectionBody = (lines: string[]) => {
 const REPAIRED_WORKING_STATE_SECTION_LIMITS: Record<WorkingStateSectionName, number> = {
   OBJECTIVE: 1,
   "CONFIRMED FACTS": 8,
+  ASSUMPTIONS: 6,
   CONSTRAINTS: 6,
+  DECISIONS: 6,
+  "ENTITY STATE": 10,
   COMPLETED: 8,
   REMAINING: 6,
   "KNOWN PATHS": 8,
   "RECENT FAILURES": 6,
+  "STALE OR CONFLICTING": 6,
   "NEXT BEST ACTIONS": 4,
 };
 
@@ -352,6 +360,12 @@ const FAILURE_SIGNAL =
   /\b(fail|failed|error|denied|timeout|timed out|rejected|blocked)\b|失败|错误|拒绝|超时|阻塞/iu;
 const CONSTRAINT_SIGNAL =
   /\b(must|should|cannot|can't|do not|don't|avoid|blocked|pending|requires|limit|constraint)\b|必须|不能|不要|避免|受限|限制|阻塞|待审批|需要/iu;
+const DECISION_SIGNAL =
+  /\b(decided|decision|chose|chosen|selected|accepted|rejected|agreed|prefer|use|using)\b|决定|选择|采用|接受|拒绝|约定|倾向/iu;
+const STALE_OR_CONFLICT_SIGNAL =
+  /\b(stale|outdated|superseded|contradicts?|conflicts?|invalidated|no longer true|changed)\b|过期|陈旧|冲突|矛盾|不再成立|已废弃|被覆盖|不再适用/iu;
+const UNCERTAIN_FACT_SIGNAL =
+  /\b(?:maybe|might|possibly|probably|likely|apparently|appears?|seems?|suspect|guess|inferred?|uncertain|unclear|unverified|tentative|pending confirmation|pending verification)\b|(?:可能|也许|大概|似乎|看起来|疑似|推测|猜测|未确认|尚未确认|待确认|待验证|未定位|尚未定位|还没定位|未查明|未闭合|未对齐|未解决)/iu;
 const REMAINING_SIGNAL =
   /\b(remaining|todo|to do|follow-up|continue|still need|pending|left|next)\b|剩余|待做|继续|还需|未完成|后续|下一步/iu;
 const OBJECTIVE_SIGNAL =
@@ -546,8 +560,20 @@ export const repairWorkingStateSummary = (
       pushUnique("RECENT FAILURES", line);
       continue;
     }
+    if (STALE_OR_CONFLICT_SIGNAL.test(line)) {
+      pushUnique("STALE OR CONFLICTING", line);
+      continue;
+    }
     if (CONSTRAINT_SIGNAL.test(line)) {
       pushUnique("CONSTRAINTS", line);
+      continue;
+    }
+    if (DECISION_SIGNAL.test(line)) {
+      pushUnique("DECISIONS", line);
+      continue;
+    }
+    if (UNCERTAIN_FACT_SIGNAL.test(line)) {
+      pushUnique("ASSUMPTIONS", line);
       continue;
     }
     if (COMPLETED_SIGNAL.test(line)) {

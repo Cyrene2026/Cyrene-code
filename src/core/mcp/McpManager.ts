@@ -8,10 +8,43 @@ import type {
   McpRuntimeSummary,
   McpServerAdapter,
   McpServerDescriptor,
+  McpToolDescriptor,
 } from "./runtimeTypes";
 
 const FILE_TOOL_NAMES = new Set(["file", "fs", "mcp.file"]);
 const DEFAULT_REFRESH_SERVER_TIMEOUT_MS = 2_000;
+
+export const buildTransportToolAliasName = (serverId: string, toolName: string) =>
+  `${serverId}__${toolName}`.replace(/[^A-Za-z0-9_-]+/g, "_");
+
+export const buildTransportToolAliases = (
+  tools: Pick<McpToolDescriptor, "serverId" | "name">[]
+) => {
+  const aliases: Record<string, { serverId: string; toolName: string }> = {};
+  for (const tool of tools) {
+    const normalizedName = tool.name.trim().toLowerCase();
+    const serverId = tool.serverId.trim();
+    if (!normalizedName || !serverId) {
+      continue;
+    }
+    aliases[buildTransportToolAliasName(serverId, tool.name.trim())] = {
+      serverId,
+      toolName: tool.name.trim(),
+    };
+  }
+  return aliases;
+};
+
+const buildDefaultFileLegacyToolServerIds = (servers: McpServerAdapter[]) => {
+  const filesystemServers = servers.filter(
+    server => server.descriptor.transport === "filesystem"
+  );
+  if (filesystemServers.length !== 1) {
+    return {};
+  }
+  const serverId = filesystemServers[0]!.descriptor.id;
+  return Object.fromEntries([...FILE_TOOL_NAMES].map(name => [name, serverId]));
+};
 
 const buildFileServerAliases = (serverId: string) => ({
   file: serverId,
@@ -56,7 +89,11 @@ export class McpManager implements McpRuntime {
       serverAliases: options?.serverAliases,
     });
     this.router = new McpToolRouter(this.registry, {
-      legacyToolServerIds: options?.legacyToolServerIds,
+      legacyToolServerIds: {
+        ...buildDefaultFileLegacyToolServerIds(servers),
+        ...(options?.legacyToolServerIds ?? {}),
+      },
+      transportToolAliases: buildTransportToolAliases(this.registry.listTools()),
     });
     const descriptors = this.registry.listServers();
     this.summary = {
@@ -202,7 +239,15 @@ export class McpManager implements McpRuntime {
   }
 
   async handleToolCall(toolName: string, input: unknown): Promise<McpHandleResult> {
-    const route = this.router.route(toolName);
+    let route;
+    try {
+      route = this.router.route(toolName);
+    } catch (error) {
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     const result = await route.server.handleToolCall(route.forwardedToolName, input);
     return result.pending
       ? {

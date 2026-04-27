@@ -70,19 +70,27 @@ const PENDING_SECTION_ITEM_LIMIT = 4;
 const SECTION_ITEM_LIMITS: Record<WorkingStateSectionName, number> = {
   OBJECTIVE: 1,
   "CONFIRMED FACTS": 8,
+  ASSUMPTIONS: 6,
   CONSTRAINTS: 6,
+  DECISIONS: 6,
+  "ENTITY STATE": 10,
   COMPLETED: 8,
   REMAINING: 6,
   "KNOWN PATHS": 8,
   "RECENT FAILURES": 6,
+  "STALE OR CONFLICTING": 6,
   "NEXT BEST ACTIONS": 4,
 };
 
 const PENDING_DIGEST_TRIM_ORDER: WorkingStateSectionName[] = [
   "KNOWN PATHS",
   "CONFIRMED FACTS",
+  "ENTITY STATE",
+  "ASSUMPTIONS",
   "CONSTRAINTS",
   "RECENT FAILURES",
+  "STALE OR CONFLICTING",
+  "DECISIONS",
   "COMPLETED",
   "REMAINING",
   "NEXT BEST ACTIONS",
@@ -93,11 +101,15 @@ const SECTION_PRIORITY: Record<WorkingStateSectionName, number> = {
   OBJECTIVE: 0,
   "NEXT BEST ACTIONS": 1,
   REMAINING: 2,
-  "CONFIRMED FACTS": 3,
-  "KNOWN PATHS": 4,
-  COMPLETED: 5,
-  CONSTRAINTS: 6,
-  "RECENT FAILURES": 7,
+  ASSUMPTIONS: 3,
+  "CONFIRMED FACTS": 4,
+  "KNOWN PATHS": 5,
+  "ENTITY STATE": 6,
+  DECISIONS: 7,
+  COMPLETED: 8,
+  CONSTRAINTS: 9,
+  "STALE OR CONFLICTING": 10,
+  "RECENT FAILURES": 11,
 };
 
 type NormalizedCandidate = {
@@ -332,6 +344,18 @@ const NOT_FOUND_FAILURE_SIGNAL =
 
 const UNCERTAIN_FACT_SIGNAL =
   /\b(?:maybe|might|possibly|probably|likely|apparently|appears?|seems?|suspect|guess|inferred?|uncertain|unclear|unverified|tentative|pending confirmation|pending verification)\b|(?:可能|也许|大概|似乎|看起来|疑似|推测|猜测|未确认|尚未确认|待确认|待验证|未定位|尚未定位|还没定位|未查明|未闭合|未对齐|未解决)/iu;
+
+const DECISION_SIGNAL =
+  /\b(?:decided|decision|chose|chosen|selected|accepted|rejected|agreed|prefer|preferred|use|using|approach|strategy|tradeoff|because)\b|(?:决定|选择|采用|接受|拒绝|约定|倾向|方案|策略|取舍|因为|原因)/iu;
+
+const STALE_OR_CONFLICT_SIGNAL =
+  /\b(?:stale|outdated|superseded|contradicts?|conflicts?|invalidated|no longer true|changed|regressed|replaced by)\b|(?:过期|陈旧|冲突|矛盾|不再成立|已废弃|被覆盖|不再适用|发生变化|回退|取代)/iu;
+
+const ENTITY_STATE_LABEL_SIGNAL =
+  /^(?:entity|module|file|function|class|component|api|command|setting|实体|模块|文件|函数|类|组件|接口|命令|配置)\s*[：:]\s*(.+)$/iu;
+
+const ENTITY_STATE_INLINE_SIGNAL =
+  /(?:`[^`]+`|[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)\s*(?:is|are|was|were|has|have|uses?|contains?|stores?|persists?|owns?|defines?|tracks?|负责|使用|包含|存储|持久化|定义|跟踪|状态|当前|位于|暴露|依赖)/iu;
 
 const trimLeadingSeparators = (value: string) =>
   value.replace(/^[\s,，:：;；.\-–—]+/u, "").trim();
@@ -722,6 +746,47 @@ const normalizeCompletedClause = (line: string) =>
     .replace(/^回答了/u, "已回答")
     .replace(/^编写了/u, "已编写");
 
+const normalizeAssumptionClause = (line: string) => {
+  const clause = trimTrailingPunctuation(takePrimaryClause(line));
+  if (!clause || !UNCERTAIN_FACT_SIGNAL.test(clause)) {
+    return "";
+  }
+  return clause;
+};
+
+const normalizeDecisionClause = (line: string) => {
+  const clause = trimTrailingPunctuation(takePrimaryClause(line));
+  if (!clause || QUESTION_OR_OPTION_SIGNAL.test(clause) || !DECISION_SIGNAL.test(clause)) {
+    return "";
+  }
+  return clause;
+};
+
+const normalizeEntityStateClause = (line: string) => {
+  const labelMatch = line.match(ENTITY_STATE_LABEL_SIGNAL);
+  const clause = trimTrailingPunctuation(
+    labelMatch?.[1] ? String(labelMatch[1]) : takePrimaryClause(line)
+  );
+  if (
+    !clause ||
+    QUESTION_OR_OPTION_SIGNAL.test(clause) ||
+    isCompletedCandidate(clause) ||
+    isConstraintCandidate(clause) ||
+    isRealFailureLine(clause)
+  ) {
+    return "";
+  }
+  return ENTITY_STATE_INLINE_SIGNAL.test(clause) ? clause : "";
+};
+
+const normalizeStaleOrConflictClause = (line: string) => {
+  const clause = trimTrailingPunctuation(takePrimaryClause(line));
+  if (!clause || !STALE_OR_CONFLICT_SIGNAL.test(clause)) {
+    return "";
+  }
+  return clause;
+};
+
 const withCandidateRefs = (line: string, refs: WorkingStateSourceRef[]) =>
   refs.length > 0 ? attachWorkingStateSourceRefs(line, refs) : line;
 
@@ -755,8 +820,35 @@ const normalizeCandidateForSection = (
     };
   }
 
+  if (targetSection === "CONFIRMED FACTS") {
+    const unresolvedAction = normalizeGapAction(candidate);
+    if (unresolvedAction) {
+      return { section: "REMAINING", line: withCandidateRefs(unresolvedAction, sourceRefs) };
+    }
+    const salvagedFact = isSafeFactFragment(candidate);
+    if (salvagedFact) {
+      return {
+        section: "CONFIRMED FACTS",
+        line: withCandidateRefs(salvagedFact, sourceRefs),
+      };
+    }
+  }
+
   if (isRealFailureLine(candidate)) {
     return { section: "RECENT FAILURES", line: withCandidateRefs(candidate, sourceRefs) };
+  }
+
+  const assumption = normalizeAssumptionClause(candidate);
+  if (assumption) {
+    return { section: "ASSUMPTIONS", line: withCandidateRefs(assumption, sourceRefs) };
+  }
+
+  const staleOrConflict = normalizeStaleOrConflictClause(candidate);
+  if (staleOrConflict) {
+    return {
+      section: "STALE OR CONFLICTING",
+      line: withCandidateRefs(staleOrConflict, sourceRefs),
+    };
   }
 
   if (isConstraintCandidate(candidate)) {
@@ -764,6 +856,16 @@ const normalizeCandidateForSection = (
     return normalized
       ? { section: "CONSTRAINTS", line: withCandidateRefs(normalized, sourceRefs) }
       : null;
+  }
+
+  const entityState = normalizeEntityStateClause(candidate);
+  if (entityState && targetSection !== "CONFIRMED FACTS") {
+    return { section: "ENTITY STATE", line: withCandidateRefs(entityState, sourceRefs) };
+  }
+
+  const decision = normalizeDecisionClause(candidate);
+  if (decision) {
+    return { section: "DECISIONS", line: withCandidateRefs(decision, sourceRefs) };
   }
 
   if (isCompletedCandidate(candidate)) {
@@ -799,18 +901,13 @@ const normalizeCandidateForSection = (
     return { section: "OBJECTIVE", line: withCandidateRefs(objective, sourceRefs) };
   }
 
+  if (targetSection === "ASSUMPTIONS") {
+    return assumption
+      ? { section: "ASSUMPTIONS", line: withCandidateRefs(assumption, sourceRefs) }
+      : null;
+  }
+
   if (targetSection === "CONFIRMED FACTS") {
-    const unresolvedAction = normalizeGapAction(candidate);
-    if (unresolvedAction) {
-      return { section: "REMAINING", line: withCandidateRefs(unresolvedAction, sourceRefs) };
-    }
-    const salvagedFact = isSafeFactFragment(candidate);
-    if (salvagedFact) {
-      return {
-        section: "CONFIRMED FACTS",
-        line: withCandidateRefs(salvagedFact, sourceRefs),
-      };
-    }
     if (
       candidate.length < 4 ||
       FACT_META_PREFIX.test(candidate) ||
@@ -824,6 +921,20 @@ const normalizeCandidateForSection = (
       return null;
     }
     return { section: "CONFIRMED FACTS", line: withCandidateRefs(candidate, sourceRefs) };
+  }
+
+  if (targetSection === "DECISIONS") {
+    return null;
+  }
+
+  if (targetSection === "ENTITY STATE") {
+    return entityState
+      ? { section: "ENTITY STATE", line: withCandidateRefs(entityState, sourceRefs) }
+      : null;
+  }
+
+  if (targetSection === "STALE OR CONFLICTING") {
+    return null;
   }
 
   if (targetSection === "CONSTRAINTS") {
@@ -875,6 +986,8 @@ const normalizeUniqueLines = (
   limit: number,
   options?: {
     allowedKeys?: ReadonlySet<string>;
+    allowedAnyKeys?: ReadonlySet<string>;
+    allowedEvidenceKeys?: ReadonlySet<string>;
   }
 ) => {
   if (!lines || lines.length === 0) {
@@ -889,7 +1002,14 @@ const normalizeUniqueLines = (
       continue;
     }
     const key = normalizeLooseLine(candidate.line);
-    if (!key || (options?.allowedKeys && !options.allowedKeys.has(key))) {
+    const evidenceKey = normalizeEvidenceKey(candidate.line);
+    if (
+      !key ||
+      (options?.allowedKeys &&
+        !options.allowedKeys.has(key) &&
+        !options.allowedAnyKeys?.has(key) &&
+        (!evidenceKey || !options.allowedEvidenceKeys?.has(evidenceKey)))
+    ) {
       continue;
     }
     seen.add(candidate.line);
@@ -981,7 +1101,13 @@ const keepLineWithinAllowedPaths = (
   ) {
     return true;
   }
-  if (section === "RECENT FAILURES" || section === "CONSTRAINTS" || section === "OBJECTIVE") {
+  if (
+    section === "RECENT FAILURES" ||
+    section === "STALE OR CONFLICTING" ||
+    section === "ASSUMPTIONS" ||
+    section === "CONSTRAINTS" ||
+    section === "OBJECTIVE"
+  ) {
     return true;
   }
 
@@ -1061,9 +1187,13 @@ const finalizeSectionMap = (
     );
     for (const section of [
       "CONFIRMED FACTS",
+      "ASSUMPTIONS",
+      "DECISIONS",
+      "ENTITY STATE",
       "COMPLETED",
       "REMAINING",
       "NEXT BEST ACTIONS",
+      "STALE OR CONFLICTING",
     ] as const) {
       finalized[section] = finalized[section].filter(line => {
         if (
@@ -1101,11 +1231,23 @@ const hasDurableSummaryBaseline = (sections: WorkingStateSectionMap) => {
   const pathCount = sections["KNOWN PATHS"]?.length ?? 0;
   const remainingCount = sections.REMAINING?.length ?? 0;
   const nextActionCount = sections["NEXT BEST ACTIONS"]?.length ?? 0;
+  const assumptionCount = sections.ASSUMPTIONS?.length ?? 0;
   const constraintCount = sections.CONSTRAINTS?.length ?? 0;
+  const decisionCount = sections.DECISIONS?.length ?? 0;
+  const entityStateCount = sections["ENTITY STATE"]?.length ?? 0;
   const completedCount = sections.COMPLETED?.length ?? 0;
   const failureCount = sections["RECENT FAILURES"]?.length ?? 0;
+  const staleOrConflictCount = sections["STALE OR CONFLICTING"]?.length ?? 0;
   const progressCount =
-    remainingCount + nextActionCount + constraintCount + completedCount + failureCount;
+    remainingCount +
+    nextActionCount +
+    constraintCount +
+    completedCount +
+    failureCount +
+    decisionCount +
+    entityStateCount +
+    assumptionCount +
+    staleOrConflictCount;
 
   if (factCount >= 2) {
     return true;
@@ -1264,6 +1406,19 @@ export const sanitizeStoredWorkingState = (params: {
 const normalizeForComparison = (lines: string[]) =>
   new Set(lines.map(line => normalizeLooseLine(line)).filter(Boolean));
 
+const normalizeEvidenceKey = (line: string) =>
+  normalizeLooseLine(line)
+    .replace(
+      /\b(?:maybe|might|possibly|probably|likely|apparently|appears?|seems?|suspect|guess|inferred?|uncertain|unclear|unverified|tentative|pending confirmation|pending verification)\b/giu,
+      " "
+    )
+    .replace(
+      /(?:可能|也许|大概|似乎|看起来|疑似|推测|猜测|未确认|尚未确认|待确认|待验证|未定位|尚未定位|还没定位|未查明|未闭合|未对齐|未解决)/gu,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
 const trimTrailingPartialStateTag = (text: string) => {
   for (
     let length = CYRENE_STATE_UPDATE_START_TAG.length - 1;
@@ -1378,9 +1533,33 @@ const buildFallbackSectionMap = (params: {
       continue;
     }
 
+    const staleOrConflict = normalizeCandidateForSection("STALE OR CONFLICTING", candidate);
+    if (staleOrConflict?.section === "STALE OR CONFLICTING") {
+      sections["STALE OR CONFLICTING"].push(staleOrConflict.line);
+      continue;
+    }
+
     const constraint = normalizeCandidateForSection("CONSTRAINTS", candidate);
     if (constraint?.section === "CONSTRAINTS") {
       sections.CONSTRAINTS.push(constraint.line);
+      continue;
+    }
+
+    const decision = normalizeCandidateForSection("DECISIONS", candidate);
+    if (decision?.section === "DECISIONS") {
+      sections.DECISIONS.push(decision.line);
+      continue;
+    }
+
+    const assumption = normalizeCandidateForSection("ASSUMPTIONS", candidate);
+    if (assumption?.section === "ASSUMPTIONS") {
+      sections.ASSUMPTIONS.push(assumption.line);
+      continue;
+    }
+
+    const entityState = normalizeCandidateForSection("ENTITY STATE", candidate);
+    if (entityState?.section === "ENTITY STATE") {
+      sections["ENTITY STATE"].push(entityState.line);
       continue;
     }
 
@@ -1645,6 +1824,10 @@ export const applyToolResultPendingDigestUpdate = (
         )
       );
     }
+  } else if (action === "approval" && /approved|accepted|批准|同意|接受/iu.test(params.toolMessage)) {
+    incoming.DECISIONS.push(
+      attachWorkingStateSourceRefs(`已接受审批或用户确认: ${firstLine(params.toolMessage)}`, toolSourceRefs)
+    );
   } else if (
     action === "read_range" &&
     primaryPath &&
@@ -1875,24 +2058,29 @@ export const buildStateReducerPrompt = ({
       ? "Preserve durable summary facts unless contradicted by newer evidence."
       : "There is no persisted durable summary yet.",
     recoveryLine,
-    "Use only these section names: OBJECTIVE, CONFIRMED FACTS, CONSTRAINTS, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, NEXT BEST ACTIONS.",
+    "Use only these section names: OBJECTIVE, CONFIRMED FACTS, ASSUMPTIONS, CONSTRAINTS, DECISIONS, ENTITY STATE, COMPLETED, REMAINING, KNOWN PATHS, RECENT FAILURES, STALE OR CONFLICTING, NEXT BEST ACTIONS.",
     "Keep each line short, concrete, and deduplicated. Never put the current-turn digest into summaryPatch.",
     "Merge trust rule: in merge_and_digest, summaryPatch may only contain entries already present in the previous pending digest or existing durable summary. New current-turn observations must stay in nextPendingDigest.",
     "Promotion rule: do not promote weak, generic, or convenience notes into durable summary. Durable summary is for stable facts and unresolved work that materially changes future turns.",
     "Cold-start rule: if durable context is still sparse, leave summaryPatch empty and rely on nextPendingDigest instead of fabricating a full durable summary from one weak clue.",
     "Cold-start priority: during early exploration, first capture the startup mechanism, launch command, entrypoint files, and bootstrap chain in CONFIRMED FACTS and KNOWN PATHS, then record the next action needed to confirm unresolved startup flow.",
+    "Update discipline: use ASSUMPTIONS for uncertain or inferred claims, DECISIONS for accepted choices with rationale, ENTITY STATE for current per-file/module/function/API state, and STALE OR CONFLICTING for facts invalidated by newer evidence.",
+    "Promotion rule: move an ASSUMPTION into CONFIRMED FACTS only after concrete evidence confirms it; when newer evidence contradicts durable state, remove the old line and record the conflict in STALE OR CONFLICTING.",
     "Hard rules: never write planner chatter such as 我来 / 我先 / 让我 / 再看一下 / let me / I'll.",
     "Hard rules: never copy the user's raw request into CONFIRMED FACTS. CONFIRMED FACTS only stores stable, durable facts.",
     "Hard rules: CONFIRMED FACTS must be complete factual statements. Do not emit bare identifiers, headings, search metadata, or incomplete conditional fragments.",
     "Hard rules: CONFIRMED FACTS may include confirmed negative facts such as missing files, absent entrypoints, or disproven default project structure guesses when they reduce future hallucinated paths.",
     "Hard rules: OBJECTIVE must be one executable task sentence, not narration or a bare topic fragment.",
+    "Hard rules: ENTITY STATE must name the entity and its current state, e.g. `src/app.ts` owns routing or `buildPromptWithContext` injects working state.",
+    "Hard rules: DECISIONS must state what was chosen and, when known, why. Do not store generic preferences without a concrete choice.",
+    "Hard rules: STALE OR CONFLICTING must name the stale/conflicting claim and the newer evidence or reason.",
     "Hard rules: CONSTRAINTS stores only actual requirements/prohibitions. Drop explanatory preambles and keep the concrete rule clause.",
     "Hard rules: RECENT FAILURES only stores real failures, conflicts, or blockers. Explanations about error handling do not belong there.",
     "Hard rules: COMPLETED and REMAINING must stay mutually exclusive. Remove finished items from REMAINING and NEXT BEST ACTIONS.",
     "Hard rules: KNOWN PATHS only stores concrete repo paths.",
     "When a line is grounded in a concrete tool read, tool result, or file-local failure, preserve its source by appending an indented refs line such as: refs: [{\"kind\":\"tool_result\",\"label\":\"read_range\",\"path\":\"src/app.ts\",\"startLine\":41,\"endLine\":80}]",
     "JSON shape:",
-    `{"version":1,"mode":"${mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."]}}`,
+    `{"version":1,"mode":"${mode}","summaryPatch":{"OBJECTIVE":{"op":"keep|replace","set":["..."]},"CONFIRMED FACTS":{"op":"merge","add":["..."],"remove":["..."]},"ASSUMPTIONS":{"op":"merge","add":["..."],"remove":["..."]},"DECISIONS":{"op":"merge","add":["..."]},"ENTITY STATE":{"op":"merge","add":["..."],"remove":["..."]},"STALE OR CONFLICTING":{"op":"merge","add":["..."]}},"nextPendingDigest":{"OBJECTIVE":["..."],"ASSUMPTIONS":["..."],"ENTITY STATE":["..."]}}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -2006,6 +2194,17 @@ export const applyParsedStateUpdate = (params: {
     params.update.mode === "merge_and_digest"
       ? collectSectionLineKeys(parseStructuredStateText(normalizedSummary), priorPendingSections)
       : null;
+  const summaryPatchAllowedAnyKeys =
+    params.update.mode === "merge_and_digest" && summaryPatchAllowedKeys
+      ? new Set(
+          WORKING_STATE_SECTION_ORDER.flatMap(section => [
+            ...summaryPatchAllowedKeys[section],
+          ])
+        )
+      : null;
+  const summaryPatchAllowedEvidenceKeys = summaryPatchAllowedAnyKeys
+    ? new Set([...summaryPatchAllowedAnyKeys].map(normalizeEvidenceKey).filter(Boolean))
+    : null;
 
   for (const section of WORKING_STATE_SECTION_ORDER) {
     const patch = params.update.summaryPatch?.[section];
@@ -2019,7 +2218,11 @@ export const applyParsedStateUpdate = (params: {
         patch.set,
         SECTION_ITEM_LIMITS[section],
         summaryPatchAllowedKeys
-          ? { allowedKeys: summaryPatchAllowedKeys[section] }
+          ? {
+              allowedKeys: summaryPatchAllowedKeys[section],
+              allowedAnyKeys: summaryPatchAllowedAnyKeys ?? undefined,
+              allowedEvidenceKeys: summaryPatchAllowedEvidenceKeys ?? undefined,
+            }
           : undefined
       );
       continue;
@@ -2035,7 +2238,11 @@ export const applyParsedStateUpdate = (params: {
         patch.add,
         SECTION_ITEM_LIMITS[section],
         summaryPatchAllowedKeys
-          ? { allowedKeys: summaryPatchAllowedKeys[section] }
+          ? {
+              allowedKeys: summaryPatchAllowedKeys[section],
+              allowedAnyKeys: summaryPatchAllowedAnyKeys ?? undefined,
+              allowedEvidenceKeys: summaryPatchAllowedEvidenceKeys ?? undefined,
+            }
           : undefined
       ),
     ];

@@ -1,4 +1,9 @@
 import type { SessionStore } from "../../core/session/store";
+import {
+  getWorkingStateEntryText,
+  parseWorkingStateSummary,
+  type WorkingStateSectionName,
+} from "../../core/session/workingState";
 import type { ChatItem } from "../../shared/types/chat";
 
 type SystemMessageOptions = Pick<ChatItem, "color" | "kind" | "tone">;
@@ -39,6 +44,107 @@ const ERROR_MESSAGE_OPTIONS = {
   tone: "danger",
   color: "red",
 } satisfies SystemMessageOptions;
+
+const CHECKPOINT_SECTIONS: WorkingStateSectionName[] = [
+  "OBJECTIVE",
+  "DECISIONS",
+  "ENTITY STATE",
+  "REMAINING",
+  "NEXT BEST ACTIONS",
+  "STALE OR CONFLICTING",
+];
+
+const sectionCheckpointLabels: Record<WorkingStateSectionName, string> = {
+  OBJECTIVE: "objective",
+  "CONFIRMED FACTS": "facts",
+  ASSUMPTIONS: "assumptions",
+  CONSTRAINTS: "constraints",
+  DECISIONS: "decisions",
+  "ENTITY STATE": "entity state",
+  COMPLETED: "completed",
+  REMAINING: "remaining",
+  "KNOWN PATHS": "paths",
+  "RECENT FAILURES": "failures",
+  "STALE OR CONFLICTING": "stale/conflicting",
+  "NEXT BEST ACTIONS": "next actions",
+};
+
+const checkpointEntryText = (line: string) => {
+  const text = getWorkingStateEntryText(line) || line.trim();
+  return text && text !== "(none)" ? text : "";
+};
+
+const collectCheckpointSectionLines = (
+  session: Awaited<ReturnType<SessionStore["loadSession"]>>,
+  section: WorkingStateSectionName,
+  limit: number
+) => {
+  if (!session) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const source of [session.pendingDigest, session.summary]) {
+    const parsed = parseWorkingStateSummary(source);
+    for (const rawLine of parsed[section] ?? []) {
+      const text = checkpointEntryText(rawLine);
+      const key = text.toLowerCase();
+      if (!text || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      lines.push(text);
+      if (lines.length >= limit) {
+        return lines;
+      }
+    }
+  }
+  return lines;
+};
+
+const formatCheckpointPlanLine = (
+  session: Awaited<ReturnType<SessionStore["loadSession"]>>
+) => {
+  const plan = session?.executionPlan;
+  if (!plan || plan.steps.length === 0) {
+    return "";
+  }
+  const completed = plan.steps.filter(step => step.status === "completed").length;
+  const active =
+    plan.steps.find(step => step.status === "in_progress") ??
+    plan.steps.find(step => step.status === "pending") ??
+    plan.steps.find(step => step.status === "blocked");
+  const status = active ? `${active.status}: ${active.title}` : "no active step";
+  return `plan: ${completed}/${plan.steps.length} completed; ${status}`;
+};
+
+const formatSessionCheckpoint = (
+  session: Awaited<ReturnType<SessionStore["loadSession"]>>,
+  note: string
+) => {
+  const lines = ["Checkpoint"];
+  const trimmedNote = note.trim();
+  if (trimmedNote) {
+    lines.push(`note: ${trimmedNote}`);
+  }
+
+  const planLine = formatCheckpointPlanLine(session);
+  if (planLine) {
+    lines.push(planLine);
+  }
+
+  for (const section of CHECKPOINT_SECTIONS) {
+    for (const item of collectCheckpointSectionLines(session, section, 2)) {
+      lines.push(`${sectionCheckpointLabels[section]}: ${item}`);
+    }
+  }
+
+  if (lines.length === 1) {
+    lines.push("state: no reducer summary, pending digest, or execution plan yet");
+  }
+  return lines.join(" | ");
+};
 
 export const handleSessionCommand = async ({
   query,
@@ -236,6 +342,24 @@ export const handleSessionCommand = async ({
           .join("\n")}`
       );
     }
+    clearInput();
+    return true;
+  }
+
+  if (query === "/checkpoint" || query.startsWith("/checkpoint ")) {
+    const note =
+      query === "/checkpoint" ? "" : query.slice("/checkpoint ".length).trim();
+    const session = await ensureActiveSession("checkpoint");
+    if (session.focus.length >= pinMaxCount) {
+      pushSystemMessage(
+        `Pin limit reached (${pinMaxCount}). Remove low-value pins with /unpin <index> before adding a checkpoint.`
+      );
+      clearInput();
+      return true;
+    }
+    const checkpoint = formatSessionCheckpoint(session, note);
+    const next = await sessionStore.addFocus(session.id, checkpoint);
+    pushSystemMessage(`Checkpoint pinned (${next.focus.length}): ${checkpoint}`);
     clearInput();
     return true;
   }

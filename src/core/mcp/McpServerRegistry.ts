@@ -90,6 +90,10 @@ export class McpServerRegistry {
     );
   }
 
+  getServerToolNames(serverId: string): string[] {
+    return this.getServer(serverId)?.descriptor.tools.map(tool => tool.name) ?? [];
+  }
+
   matchNamespacedServer(toolName: string): NamespacedServerMatch | null {
     const normalizedToolName = normalizeKey(toolName);
     const namespaceCandidates = [

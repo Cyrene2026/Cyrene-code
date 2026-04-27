@@ -4107,7 +4107,13 @@ func (m *Model) composerInputCursorPosition(width int) (int, int, bool) {
 		advance(m.Composition[:compositionCursor])
 	}
 
-	cursorRow, cursorCol := row, col
+	var cursorRow, cursorCol int
+	cursorGlyphWidth := lipgloss.Width(composerCursorGlyph)
+	if col > 0 && col+cursorGlyphWidth > inputWidth {
+		cursorRow, cursorCol = row+1, 0
+	} else {
+		cursorRow, cursorCol = row, col
+	}
 
 	advance([]rune(composerCursorGlyph))
 	if len(m.Composition) > 0 && compositionCursor < len(m.Composition) {
@@ -4134,11 +4140,16 @@ func renderComposerBottomDivider(width int) string {
 	return ""
 }
 
+const workingStateSectionSummary = "12-section working state: objective, facts, assumptions, constraints, decisions, entity state, completed, remaining, paths, failures, stale/conflicting, next actions"
+
 func slashAlternateSummary(item slashCommandSpec) string {
 	command := strings.TrimSpace(item.Command)
 	description := strings.TrimSpace(item.Description)
 	if description == "" {
 		return command
+	}
+	if command == "/state" {
+		description = workingStateSectionSummary
 	}
 	description = strings.ReplaceAll(description, "  |  ", " | ")
 	description = strings.ReplaceAll(description, "  ", " ")

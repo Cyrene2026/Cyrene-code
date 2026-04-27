@@ -97,16 +97,32 @@ describe("McpToolRouter", () => {
     );
   });
 
-  test("falls back to the primary server when a bare tool name is ambiguous", () => {
+  test("throws when a bare tool name is ambiguous", () => {
     const primary = createAdapter("filesystem", ["read_file"]);
     const secondary = createAdapter("archive", ["read_file"]);
     const registry = new McpServerRegistry([primary, secondary]);
     const router = new McpToolRouter(registry);
 
-    expect(router.route("read_file")).toEqual(
+    expect(() => router.route("read_file")).toThrow("Ambiguous MCP tool name");
+  });
+
+  test("routes provider-safe transport aliases to the target server", () => {
+    const filesystem = createAdapter("filesystem", ["read_file"]);
+    const archive = createAdapter("archive", ["read_file"]);
+    const registry = new McpServerRegistry([filesystem, archive]);
+    const router = new McpToolRouter(registry, {
+      transportToolAliases: {
+        archive__read_file: {
+          serverId: "archive",
+          toolName: "read_file",
+        },
+      },
+    });
+
+    expect(router.route("archive__read_file")).toEqual(
       expect.objectContaining({
-        kind: "primary_fallback",
-        server: primary,
+        kind: "transport_alias",
+        server: archive,
         forwardedToolName: "read_file",
       })
     );

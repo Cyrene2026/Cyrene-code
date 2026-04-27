@@ -143,7 +143,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/system", Description: "show current system prompt"},
 	{Command: "/system <text>", Description: "set system prompt for this runtime"},
 	{Command: "/system reset", Description: "restore default system prompt"},
-	{Command: "/state", Description: "show reducer/session state diagnostics"},
+	{Command: "/state", Description: "show 12-section working-state diagnostics"},
 	{Command: "/plan create <task>", Description: "create or refresh an execution plan"},
 	{Command: "/plan revise <instruction>", Description: "ask AI to revise the active execution plan"},
 	{Command: "/plan show", Description: "show the active execution plan"},
@@ -170,6 +170,7 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Command: "/tag list", Description: "list tags of current session"},
 	{Command: "/tag add <tag>", Description: "add tag to current session"},
 	{Command: "/tag remove <tag>", Description: "remove tag from current session"},
+	{Command: "/checkpoint [note]", Description: "pin a durable handoff checkpoint from current state"},
 	{Command: "/pin <note>", Description: "pin important context"},
 	{Command: "/pins", Description: "list pinned context"},
 	{Command: "/unpin <index>", Description: "remove a pin"},
@@ -2932,7 +2933,7 @@ type settingsSpec struct {
 var settingsSpecs = []settingsSpec{
 	{Key: "query_max_tool_steps", Label: "Max Tool Steps", Kind: settingsValueInt, Description: "Hard cap for tool calls in one request."},
 	{Key: "request_temperature", Label: "Temperature", Kind: settingsValueFloat, Description: "Sampling temperature for HTTP model requests, 0..2."},
-	{Key: "auto_summary_refresh", Label: "Auto Summary Refresh", Kind: settingsValueBool, Description: "Controls automatic working-state summary refresh."},
+	{Key: "auto_summary_refresh", Label: "Auto Summary Refresh", Kind: settingsValueBool, Description: "Controls automatic 12-section working-state refresh."},
 	{Key: "pin_max_count", Label: "Pin Limit", Kind: settingsValueInt, Description: "Maximum pinned session notes."},
 	{Key: "debug_capture_anthropic_requests", Label: "Capture Anthropic Debug", Kind: settingsValueBool, Description: "Writes Anthropic request payloads for debugging."},
 	{Key: "debug_capture_anthropic_requests_dir", Label: "Anthropic Debug Dir", Kind: settingsValueString, Description: "Directory for captured Anthropic requests."},
@@ -4363,6 +4364,8 @@ func slashInsertValue(command string) string {
 		return "/tag add "
 	case "/tag remove <tag>":
 		return "/tag remove "
+	case "/checkpoint [note]":
+		return "/checkpoint "
 	case "/pin <note>":
 		return "/pin "
 	case "/unpin <index>":

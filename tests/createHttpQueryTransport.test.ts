@@ -115,6 +115,41 @@ const FILE_ACTION_LIKE_TOOL = {
   tags: [],
 };
 
+const DOCS_SEARCH_TOOL = {
+  id: "docs.search_docs",
+  serverId: "docs",
+  name: "search_docs",
+  label: "search_docs",
+  description: "Search product docs.",
+  capabilities: ["search"] as const,
+  risk: "low" as const,
+  requiresReview: false,
+  enabled: true,
+  exposure: "hinted" as const,
+  tags: [],
+};
+
+const ARCHIVE_SEARCH_TOOL = {
+  ...DOCS_SEARCH_TOOL,
+  id: "archive.search_docs",
+  serverId: "archive",
+  description: "Search archived docs.",
+};
+
+const NO_SCHEMA_TOOL = {
+  id: "noschema.lookup_docs",
+  serverId: "noschema",
+  name: "lookup_docs",
+  label: "lookup_docs",
+  description: "Lookup docs without an upstream schema.",
+  capabilities: ["read"] as const,
+  risk: "low" as const,
+  requiresReview: false,
+  enabled: true,
+  exposure: "hinted" as const,
+  tags: [],
+};
+
 const collectParsedStreamEvents = async (
   transport: ReturnType<typeof createTransport>,
   query: string
@@ -507,11 +542,11 @@ describe("createHttpQueryTransport tool exposure", () => {
     ]);
     expect(requestBody.messages[0]?.content).toContain("Additional available MCP tools:");
     expect(requestBody.messages[0]?.content).toContain(
-      "maps_geo: Convert a structured address into coordinates."
+      "maps_geo: routes to amap-maps.maps_geo. Convert a structured address into coordinates."
     );
   });
 
-  test("dynamic MCP tool exposure skips filesystem action names", async () => {
+  test("dynamic MCP tool exposure namespaces filesystem action name conflicts", async () => {
     const { root, cyreneHome, modelFile } = await createWorkspace();
     await writeFile(
       modelFile,
@@ -565,7 +600,133 @@ describe("createHttpQueryTransport tool exposure", () => {
     expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
       "file",
       "maps_geo",
+      "filesystem__read_file",
     ]);
+    expect(requestBody.messages[0]?.content).toContain(
+      "filesystem__read_file: routes to filesystem.read_file"
+    );
+  });
+
+  test("dynamic MCP tool exposure namespaces duplicate remote tool names", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: [DONE]", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+      mcpTools: [DOCS_SEARCH_TOOL, ARCHIVE_SEARCH_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("查 docs");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.tools.map((tool: any) => tool.function.name)).toEqual([
+      "file",
+      "archive__search_docs",
+      "docs__search_docs",
+    ]);
+    expect(requestBody.messages[0]?.content).toContain(
+      "archive__search_docs: routes to archive.search_docs"
+    );
+    expect(requestBody.messages[0]?.content).toContain(
+      "docs__search_docs: routes to docs.search_docs"
+    );
+  });
+
+  test("dynamic MCP tools without schemas use a closed empty parameter object", async () => {
+    const { root, cyreneHome, modelFile } = await createWorkspace();
+    await writeFile(
+      modelFile,
+      [
+        "default_model: gpt-test",
+        "last_used_model: gpt-test",
+        "provider_base_url: https://example.test/v1",
+        "models:",
+        "  - gpt-test",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const encoder = new TextEncoder();
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(["data: [DONE]", ""].join("\n")));
+        controller.close();
+      },
+    });
+
+    globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init });
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const transport = createTransport({
+      appRoot: root,
+      cyreneHome,
+      env: {
+        CYRENE_BASE_URL: "https://example.test/v1",
+        CYRENE_API_KEY: "test-key",
+        CYRENE_MODEL: "gpt-test",
+      },
+      mcpTools: [NO_SCHEMA_TOOL],
+    });
+
+    const streamUrl = await transport.requestStreamUrl("查 docs");
+    for await (const _event of transport.stream(streamUrl)) {
+      // consume stream
+    }
+
+    const requestBody = JSON.parse(String(fetchCalls[0]?.init?.body));
+    expect(requestBody.tools[1]?.function.parameters).toEqual({
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    });
   });
 
   test("openai responses requests include MCP tools", async () => {

@@ -22,7 +22,11 @@ describe("workingState", () => {
     expect(normalized).not.toContain("LEGACY SUMMARY");
     expect(normalized).toContain("OBJECTIVE:\n(none)");
     expect(normalized).toContain("CONFIRMED FACTS:\n(none)");
+    expect(normalized).toContain("ASSUMPTIONS:\n(none)");
     expect(normalized).toContain("CONSTRAINTS:\n(none)");
+    expect(normalized).toContain("DECISIONS:\n(none)");
+    expect(normalized).toContain("ENTITY STATE:\n(none)");
+    expect(normalized).toContain("STALE OR CONFLICTING:\n(none)");
   });
 
   test("does not silently drop orphan lines when free text is mixed with empty headings", () => {

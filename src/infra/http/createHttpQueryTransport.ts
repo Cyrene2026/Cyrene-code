@@ -41,6 +41,7 @@ import {
 } from "../../core/query/transport";
 import type { TokenUsage } from "../../core/query/tokenUsage";
 import type { McpToolDescriptor } from "../../core/mcp/runtimeTypes";
+import { buildTransportToolAliasName } from "../../core/mcp/McpManager";
 import { loadModelYaml, saveModelYaml } from "../config/modelCatalog";
 import { resolveAmbientAppRoot, resolveUserHomeDir } from "../config/appRoot";
 
@@ -1429,8 +1430,15 @@ export const ANTHROPIC_TOOL_USAGE_SYSTEM_PROMPT = [
 const DEFAULT_DYNAMIC_TOOL_PARAMETERS = {
   type: "object",
   properties: {},
-  additionalProperties: true,
+  additionalProperties: false,
 } as const;
+
+type TransportMcpTool = McpToolDescriptor & {
+  transportName: string;
+  originalName: string;
+  namespacedName: string;
+  renamedForTransport: boolean;
+};
 
 type OpenAIFunctionTool = {
   type: "function";
@@ -1508,10 +1516,56 @@ const normalizeDynamicToolSchema = (inputSchema: unknown) =>
     ? inputSchema
     : DEFAULT_DYNAMIC_TOOL_PARAMETERS;
 
+const normalizeToolNameKey = (value: string) => value.trim().toLowerCase();
+
+const buildTransportMcpTools = (mcpTools: McpToolDescriptor[]): TransportMcpTool[] => {
+  const visibleTools = mcpTools.filter(tool => tool.enabled && tool.exposure !== "hidden");
+  const nameCounts = new Map<string, number>();
+  for (const tool of visibleTools) {
+    const normalized = normalizeToolNameKey(tool.name);
+    if (!normalized) {
+      continue;
+    }
+    nameCounts.set(normalized, (nameCounts.get(normalized) ?? 0) + 1);
+  }
+
+  const seenTransportNames = new Set<string>([FILE_TOOL.function.name]);
+  return visibleTools.flatMap(tool => {
+    const originalName = tool.name.trim();
+    const serverId = tool.serverId.trim();
+    if (!originalName || !serverId) {
+      return [];
+    }
+
+    const normalizedName = normalizeToolNameKey(originalName);
+    const renamedForTransport =
+      FILE_ACTION_NAMES.has(normalizedName) || (nameCounts.get(normalizedName) ?? 0) > 1;
+    let transportName = renamedForTransport
+      ? buildTransportToolAliasName(serverId, originalName)
+      : originalName;
+    if (seenTransportNames.has(transportName)) {
+      transportName = buildTransportToolAliasName(serverId, originalName);
+    }
+    if (seenTransportNames.has(transportName)) {
+      return [];
+    }
+    seenTransportNames.add(transportName);
+
+    return [
+      {
+        ...tool,
+        transportName,
+        originalName,
+        namespacedName: `${serverId}.${originalName}`,
+        renamedForTransport: renamedForTransport || transportName !== originalName,
+      },
+    ];
+  });
+};
+
 const buildDynamicFunctionTools = (
   mcpTools: McpToolDescriptor[]
 ): OpenAIFunctionTool[] => {
-  const seen = new Set<string>([FILE_TOOL.function.name]);
   const tools: OpenAIFunctionTool[] = [
     {
       type: "function",
@@ -1523,16 +1577,11 @@ const buildDynamicFunctionTools = (
     },
   ];
 
-  for (const tool of mcpTools) {
-    const name = tool.name.trim();
-    if (!name || seen.has(name) || FILE_ACTION_NAMES.has(name)) {
-      continue;
-    }
-    seen.add(name);
+  for (const tool of buildTransportMcpTools(mcpTools)) {
     tools.push({
       type: "function" as const,
       function: {
-        name,
+        name: tool.transportName,
         description: tool.description ?? tool.label,
         parameters: normalizeDynamicToolSchema(tool.inputSchema),
       },
@@ -2617,11 +2666,15 @@ const buildToolUsageSystemPrompt = (
   mcpTools: McpToolDescriptor[],
   basePrompt = TOOL_USAGE_SYSTEM_PROMPT
 ) => {
-  const visibleTools = mcpTools
-    .filter(tool => tool.enabled && tool.exposure !== "hidden")
+  const visibleTools = buildTransportMcpTools(mcpTools)
     .map(tool => {
       const description = (tool.description ?? tool.label).trim();
-      return description ? `- ${tool.name}: ${description}` : `- ${tool.name}`;
+      const routeNote = tool.renamedForTransport
+        ? ` routes to ${tool.namespacedName}`
+        : ` routes to ${tool.namespacedName}`;
+      return description
+        ? `- ${tool.transportName}:${routeNote}. ${description}`
+        : `- ${tool.transportName}:${routeNote}.`;
     });
 
   if (visibleTools.length === 0) {
@@ -2630,6 +2683,7 @@ const buildToolUsageSystemPrompt = (
 
   return [
     basePrompt,
+    "Tool visibility note: the model sees the built-in `file` tool plus provider-safe MCP tool names. The `file` tool folds local filesystem/search/git/semantic/shell actions behind its `action` field; remote MCP tools are exposed separately below.",
     "Additional available MCP tools:",
     ...visibleTools,
     "Use these additional tools directly when they are a better match than `file`.",

@@ -87,7 +87,11 @@ describe("McpManager", () => {
     const adapter = createAdapter({
       listPending: mock(() => [pending]),
     });
-    const manager = new McpManager([adapter]);
+    const manager = new McpManager([adapter], {
+      legacyToolServerIds: {
+        file: "filesystem",
+      },
+    });
 
     const approved = await manager.approve("pending-1");
     const rejected = manager.reject("pending-1");
@@ -118,6 +122,34 @@ describe("McpManager", () => {
     });
   });
 
+  test("registers file aliases automatically for a single filesystem server", async () => {
+    const adapter = createAdapter({
+      descriptor: {
+        id: "filesystem",
+        label: "Filesystem",
+        enabled: true,
+        source: "built_in",
+        health: "online",
+        transport: "filesystem",
+        exposure: "full",
+        tags: [],
+        tools: [],
+      },
+    });
+    const manager = new McpManager([adapter]);
+
+    const result = await manager.handleToolCall("file", {
+      action: "read_file",
+      path: "src/example.ts",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(adapter.handleToolCall).toHaveBeenCalledWith("file", {
+      action: "read_file",
+      path: "src/example.ts",
+    });
+  });
+
   test("preserves structured metadata from routed tool results", async () => {
     const adapter = createAdapter({
       handleToolCall: mock(async () => ({
@@ -133,7 +165,7 @@ describe("McpManager", () => {
     });
     const manager = new McpManager([adapter]);
 
-    const result = await manager.handleToolCall("file", {
+    const result = await manager.handleToolCall("filesystem.read_file", {
       action: "read_file",
       path: "src/example.ts",
     });
@@ -183,6 +215,131 @@ describe("McpManager", () => {
     expect(adapter.handleToolCall).toHaveBeenCalledWith("read_file", {
       path: "src/example.ts",
     });
+  });
+
+  test("returns an explicit error for ambiguous bare tool names", async () => {
+    const first = createAdapter({
+      descriptor: {
+        id: "first",
+        label: "first",
+        enabled: true,
+        source: "local",
+        health: "online",
+        exposure: "full",
+        tags: [],
+        tools: [
+          {
+            id: "first.search_docs",
+            serverId: "first",
+            name: "search_docs",
+            label: "search docs",
+            capabilities: ["search"],
+            risk: "low",
+            requiresReview: false,
+            enabled: true,
+            exposure: "full",
+            tags: [],
+          },
+        ],
+      },
+    });
+    const second = createAdapter({
+      descriptor: {
+        id: "second",
+        label: "second",
+        enabled: true,
+        source: "local",
+        health: "online",
+        exposure: "full",
+        tags: [],
+        tools: [
+          {
+            id: "second.search_docs",
+            serverId: "second",
+            name: "search_docs",
+            label: "search docs",
+            capabilities: ["search"],
+            risk: "low",
+            requiresReview: false,
+            enabled: true,
+            exposure: "full",
+            tags: [],
+          },
+        ],
+      },
+    });
+    const manager = new McpManager([first, second]);
+
+    const result = await manager.handleToolCall("search_docs", { query: "cache" });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Ambiguous MCP tool name");
+    expect(first.handleToolCall).not.toHaveBeenCalled();
+    expect(second.handleToolCall).not.toHaveBeenCalled();
+  });
+
+  test("routes provider-safe transport aliases to the owning adapter", async () => {
+    const first = createAdapter({
+      descriptor: {
+        id: "first",
+        label: "first",
+        enabled: true,
+        source: "local",
+        health: "online",
+        exposure: "full",
+        tags: [],
+        tools: [
+          {
+            id: "first.search_docs",
+            serverId: "first",
+            name: "search_docs",
+            label: "search docs",
+            capabilities: ["search"],
+            risk: "low",
+            requiresReview: false,
+            enabled: true,
+            exposure: "full",
+            tags: [],
+          },
+        ],
+      },
+    });
+    const second = createAdapter({
+      descriptor: {
+        id: "second",
+        label: "second",
+        enabled: true,
+        source: "local",
+        health: "online",
+        exposure: "full",
+        tags: [],
+        tools: [
+          {
+            id: "second.search_docs",
+            serverId: "second",
+            name: "search_docs",
+            label: "search docs",
+            capabilities: ["search"],
+            risk: "low",
+            requiresReview: false,
+            enabled: true,
+            exposure: "full",
+            tags: [],
+          },
+        ],
+      },
+    });
+    const manager = new McpManager([first, second]);
+
+    const result = await manager.handleToolCall("second__search_docs", {
+      query: "cache",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(second.handleToolCall).toHaveBeenCalledWith("search_docs", {
+      query: "cache",
+    });
+    expect(first.handleToolCall).not.toHaveBeenCalled();
   });
 
   test("fromFileService adapts namespaced actions back to the file tool backend", async () => {

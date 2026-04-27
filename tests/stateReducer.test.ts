@@ -43,6 +43,108 @@ describe("stateReducer", () => {
     expect(prompt).toContain(
       "Promotion rule: do not promote weak, generic, or convenience notes into durable summary."
     );
+    expect(prompt).toContain("ASSUMPTIONS, CONSTRAINTS, DECISIONS, ENTITY STATE");
+    expect(prompt).toContain(
+      "use ASSUMPTIONS for uncertain or inferred claims, DECISIONS for accepted choices with rationale"
+    );
+    expect(prompt).toContain(
+      "when newer evidence contradicts durable state, remove the old line and record the conflict in STALE OR CONFLICTING"
+    );
+  });
+
+  test("applyParsedStateUpdate writes richer summary sections and promotes assumptions explicitly", () => {
+    const applied = applyParsedStateUpdate({
+      durableSummary: [
+        "OBJECTIVE:",
+        "- 更新 reducer summary 结构",
+        "",
+        "CONFIRMED FACTS:",
+        "- 旧 summary 只有 8 个 section",
+        "",
+        "ASSUMPTIONS:",
+        "- ENTITY STATE 可能是减少重复检索的结构",
+        "",
+        "KNOWN PATHS:",
+        "- src/core/session/stateReducer.ts",
+        "- src/core/session/workingState.ts",
+        "",
+        "REMAINING:",
+        "- 验证新增 summary 字段能被模型更新",
+      ].join("\n"),
+      pendingDigest: [
+        "OBJECTIVE:",
+        "- 更新 reducer summary 结构",
+        "",
+        "ASSUMPTIONS:",
+        "- ENTITY STATE 可能是减少重复检索的结构",
+        "",
+        "DECISIONS:",
+        "- 决定沿用 working-state section 而不是新增并行 JSON 状态",
+        "",
+        "ENTITY STATE:",
+        "- `src/core/session/workingState.ts` 定义 working-state section 顺序",
+        "",
+        "STALE OR CONFLICTING:",
+        "- 旧 summary 只有 8 个 section 已过期",
+      ].join("\n"),
+      update: {
+        version: 1,
+        mode: "merge_and_digest",
+        summaryPatch: {
+          ASSUMPTIONS: {
+            op: "merge",
+            remove: ["ENTITY STATE 可能是减少重复检索的结构"],
+          },
+          "CONFIRMED FACTS": {
+            op: "merge",
+            add: ["ENTITY STATE 是减少重复检索的结构"],
+            remove: ["旧 summary 只有 8 个 section"],
+          },
+          DECISIONS: {
+            op: "merge",
+            add: ["决定沿用 working-state section 而不是新增并行 JSON 状态"],
+          },
+          "ENTITY STATE": {
+            op: "merge",
+            add: ["`src/core/session/workingState.ts` 定义 working-state section 顺序"],
+          },
+          "STALE OR CONFLICTING": {
+            op: "merge",
+            add: ["旧 summary 只有 8 个 section 已过期"],
+          },
+        },
+        nextPendingDigest: {
+          OBJECTIVE: ["更新 reducer summary 结构"],
+          "ENTITY STATE": [
+            "`src/core/session/stateReducer.ts` 负责校验并应用 summaryPatch",
+          ],
+          "NEXT BEST ACTIONS": ["运行 stateReducer 相关测试"],
+        },
+      },
+    });
+
+    expect(applied.summary).toContain(
+      "CONFIRMED FACTS:\n- ENTITY STATE 是减少重复检索的结构"
+    );
+    expect(applied.summary).not.toContain("CONFIRMED FACTS:\n- 旧 summary 只有 8 个 section");
+    expect(applied.summary).not.toContain(
+      "ASSUMPTIONS:\n- ENTITY STATE 可能是减少重复检索的结构"
+    );
+    expect(applied.summary).toContain(
+      "DECISIONS:\n- 决定沿用 working-state section 而不是新增并行 JSON 状态"
+    );
+    expect(applied.summary).toContain(
+      "ENTITY STATE:\n- `src/core/session/workingState.ts` 定义 working-state section 顺序"
+    );
+    expect(applied.summary).toContain(
+      "STALE OR CONFLICTING:\n- 旧 summary 只有 8 个 section 已过期"
+    );
+    expect(applied.pendingDigest).toContain(
+      "ENTITY STATE:\n- `src/core/session/stateReducer.ts` 负责校验并应用 summaryPatch"
+    );
+    expect(applied.pendingDigest).toContain(
+      "NEXT BEST ACTIONS:\n- 运行 stateReducer 相关测试"
+    );
   });
 
   test("applyParsedStateUpdate strips chatter, user-echo facts, fake failures, and completed/remaining overlap", () => {
@@ -656,10 +758,8 @@ describe("stateReducer", () => {
     });
 
     expect(sanitized.pendingDigest).not.toContain("appendSystemPrompt 的最终落点未定位");
-    expect(sanitized.pendingDigest).not.toContain("可能是最后注入点");
-    expect(sanitized.pendingDigest).toContain(
-      "REMAINING:\n- 定位 appendSystemPrompt 的最终落点"
-    );
+    expect(sanitized.pendingDigest).toContain("ASSUMPTIONS:\n- `appendSystemPrompt` 可能是最后注入点");
+    expect(sanitized.pendingDigest).toContain("ASSUMPTIONS:");
     expect(sanitized.pendingDigest).toContain("CONFIRMED FACTS:\n- (none)");
   });
 
